@@ -61,6 +61,7 @@ pub async fn import_file(
                 "{error}; canceling import {id} also failed ({cancel}); its import slot may stay occupied until the retry window ends"
             ),
             retryable: false,
+            class: crate::FailureClass::Unclassified,
         }),
     }
 }

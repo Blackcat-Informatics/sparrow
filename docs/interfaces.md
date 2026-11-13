@@ -278,6 +278,59 @@ has no completion hook for it, so the pass reads the pending counts itself, and 
 cannot change what native work does. The daemon journals every entry to and exit from a
 non-ready phase, and, at most once a minute, the passes that made no progress.
 
+### The free-space pause (#257)
+
+Below `min_free_bytes` the daemon keeps working; only writes wait.
+
+- Accepting. The accept loops of the private socket, the ingest socket, public TCP and
+  syslog TCP no longer stop. Connection slots are still taken before accept (the
+  ceiling, #246) and the 60-second lease is unchanged, so the floor adds no new
+  bound. A syslog TCP frame refused for the floor is held unread past (#243) whether
+  or not its connection was accepted before or during the pause. Syslog UDP keeps its
+  own counted refusal. Three things stay paused, because they are the writes
+  themselves: configured consume and tail watches (their source files are the spool;
+  they observe and claim nothing), the daemon's non-synchronizing maintenance, and
+  opening the store at startup (nothing can answer before the store opens).
+- Writes. A write is answered with `STORAGE_PRESSURE`, `retryable` true and, new,
+  `Failure.class = freeSpaceFloor`. The field is added after `retryable` (no schema
+  version change). An older client ignores it and handles the refusal as the retryable
+  `STORAGE_PRESSURE` it always did; the new Rust client reads it. The class is set only
+  for the floor's own refusal. Budget pressure, `RESOURCE_LIMIT` and every other error
+  stay `unclassified`.
+- Rust client. A floor-labelled refusal is held: the immutable pending batch is retried
+  on the normal backoff, never quarantined or dropped, and later events queue behind it
+  up to the existing 16384-event / 64 MiB bound. `DeliveryStats.floor_refusals` counts
+  the retries the floor caused, and `last_transient_failure` carries the refusal and
+  its class (`Error::is_free_space_floor`) until a batch is acknowledged.
+- Reads. Discovery, status, gets, record, text, key, value and artifact queries are
+  served. Verified: no read path calls the floor's write check, and a read takes a
+  reader slot, not a writer permit. The one read that writes to disk is query staging,
+  which spends free space outside the store's own accounting. Sized separately (R5):
+  above the floor a query stages what it did before (up to 64 MiB, within the store
+  allowance). While paused, all reads together stage at most 32 MiB
+  (`PAUSED_READ_STAGING_BYTES`), and a query never stages so much that free space falls
+  below half the floor. A query that cannot fit is refused with the same floor-labelled
+  `STORAGE_PRESSURE` (retryable; the reader waits for space like a writer) and counted.
+  Reads of memory-only or store-resident data need no staging.
+- Counters. `Status.floorPause` (field 60, additive): `pausedSince`,
+  `connectionsAccepted` (accepted while paused), `writesRefused` (RPC writes answered
+  with the floor class), `readsServed` (reads that began paused and succeeded) and
+  `readStagingRefused`. CLI and MCP status render them as `floor_pause`. The existing
+  `pressureStatus.floorRefusedWrites` counts every refusal at the store, including
+  internal writers and held syslog frames offered again.
+- Journal. The accept loop observes the floor once a second (the cadence the
+  maintenance worker uses; the end of a pause caused by another process freeing space
+  has no event). It writes one line when a pause begins, one each minute while it lasts,
+  with the counters, and one when it ends. A pause that begins within a minute of the
+  last line is announced only if it lasts a minute, so a volume hovering at the floor
+  cannot flood the journal, and no long pause is silent.
+- Spool. A daemon-side file spool is not built; coordination accepted that for UDP. A
+  spool would append to the filesystem the floor protects, so it would need its own
+  higher floor or a separate filesystem. What remains: Syslog UDP datagrams refused at
+  the floor are counted and lost (the kernel buffer is the only hold, see the intake
+  design); every other source holds at the producer (client queue, ship queue, source
+  file, sender socket).
+
 The status `pressureStatus` extends additively (schema 71, no version change; an older
 reader ignores the fields and an older server leaves them zero): `observedAt` (the last
 pass's clock), `linkedBytes`, `episodeSince` (intake refused since), `phaseSince`,
@@ -2488,9 +2541,10 @@ Three limits that used to refuse at once now wait, and every wait is counted.
   peer over the ceiling waits in the kernel listen backlog and is served when a slot
   frees; a slot frees when a connection ends, which includes its 60-second lease
   expiring. The lease is unchanged, so a stalled peer holds its slot until then.
-  Accepting still stops at once on shutdown, and the pause below the free-space
-  floor is unchanged. A syslog TCP listener already holds its arrival and reclaims
-  the longest-idle connection, and is unchanged. The kernel does not report how many
+  Accepting still stops at once on shutdown. The free-space floor no longer pauses
+  accepting (#257, see "The free-space pause"); the ceiling and the lease bound the
+  connections below it exactly as above it. A syslog TCP listener already holds its
+  arrival and reclaims the longest-idle connection, and is unchanged. The kernel does not report how many
   peers wait in a backlog or overflow it, so a ceiling wait counts the times the
   accept loop had to wait for a slot, not peers.
 
@@ -2601,8 +2655,9 @@ stream or discards a frame:
   waiting for an operation permit is held the same way. The daemon holds one
   frame per connection: at most 65536 bytes plus its 4096-byte read buffer, so
   at most 16 connections times that per listener. Arrivals the listener does not
-  accept wait in the kernel backlog; the existing pause of accepting below the
-  free-space floor is unchanged. On shutdown a hold ends: the frame gets one last
+  accept wait in the kernel backlog only at the connection ceiling; the free-space
+  floor no longer stops the listener accepting (#257), and a held frame does not
+  depend on accepting. On shutdown a hold ends: the frame gets one last
   attempt and, if the store still refuses it, is counted `refused` as before.
   A wait for an operation permit is not cut short by a stop: the frame must
   still be published, which takes a permit from the budget shutdown waits on
@@ -3776,7 +3831,10 @@ durability, not retention extension, producer drops or power-loss qualification.
 Typed errors carry `code`, a concise `message`, `retryable`, `request_id` when
 applicable, and bounded `details`. An error does not include a successful query
 prefix after an operational failure. Refusals do not silently select a smaller
-scope, shorter pin, altered datatype, or unrelated source generation.
+scope, shorter pin, altered datatype, or unrelated source generation. The wire
+`Failure` also carries a `class` (additive, #257): `freeSpaceFloor` marks a retryable
+`STORAGE_PRESSURE` made by the free-space floor, and `unclassified` is every other
+refusal and every refusal of an older daemon.
 
 | Code | Meaning |
 | --- | --- |

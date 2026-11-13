@@ -60,6 +60,7 @@ impl From<sparrow_client::Error> for AgentError {
                 code,
                 message,
                 retryable,
+                ..
             } => {
                 return Self {
                     code,

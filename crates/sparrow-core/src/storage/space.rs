@@ -68,6 +68,31 @@ impl Ledger {
     }
 }
 
+/// The text every free-space-floor refusal message starts with. The refusal keeps the code
+/// `STORAGE_PRESSURE`, so every caller that holds and retries it keeps working; this prefix is
+/// how [`Error::is_free_space_floor`] tells it from budget pressure.
+pub const FLOOR_REFUSAL_PREFIX: &str = "free-space floor: ";
+
+/// Total disk bytes all reads together may stage while the floor is paused (R5). Far below the
+/// default 4 GiB floor, so the reserve is not the thing a read spends.
+pub const PAUSED_READ_STAGING_BYTES: u64 = 32 * 1024 * 1024;
+
+fn floor_refusal(detail: &str) -> Error {
+    Error::new(
+        "STORAGE_PRESSURE",
+        format!("{FLOOR_REFUSAL_PREFIX}{detail}"),
+    )
+}
+
+impl Error {
+    /// Whether this is a retryable `STORAGE_PRESSURE` refusal made by the free-space floor,
+    /// as opposed to the store's own budget pressure.
+    #[must_use]
+    pub fn is_free_space_floor(&self) -> bool {
+        self.code == "STORAGE_PRESSURE" && self.message.starts_with(FLOOR_REFUSAL_PREFIX)
+    }
+}
+
 /// What the floor has done since the store opened.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FloorStatus {
@@ -130,15 +155,38 @@ impl SpaceFloor {
         #[cfg(feature = "test-support")]
         if self.place.ledger.forced.load(Ordering::Acquire) {
             self.place.ledger.refused.fetch_add(1, Ordering::Relaxed);
-            return Err(Error::new("STORAGE_PRESSURE", "write refused by a test"));
+            return Err(floor_refusal("write refused by a test"));
         }
         match self.shortfall()? {
             Some(shortfall) => {
                 self.place.ledger.refused.fetch_add(1, Ordering::Relaxed);
-                Err(Error::new("STORAGE_PRESSURE", shortfall))
+                Err(floor_refusal(&shortfall))
             }
             None => Ok(()),
         }
+    }
+
+    /// Whether the floor is paused as the daemon's observers last saw it ([`SpaceFloor::observe`]).
+    /// It reads the ledger, never the volume, so it is cheap on every request.
+    #[must_use]
+    pub fn paused(&self) -> bool {
+        self.place.ledger.paused.load(Ordering::Acquire)
+    }
+
+    /// Disk bytes a read may stage now, at most `wanted`, with `staged` bytes already staged by
+    /// other reads. Above the floor that is `wanted`. While the floor is paused all reads
+    /// together stage at most [`PAUSED_READ_STAGING_BYTES`], and never so much that free space
+    /// falls below half the floor: the floor's reserve is what the store's own flush and
+    /// compaction need, and a read must not spend it. Zero means a read that needs staging is
+    /// refused with the floor label until space returns.
+    pub fn read_staging_allowance(&self, wanted: u64, staged: u64) -> Result<u64, Error> {
+        let free = self.free()?;
+        if free >= self.min_free {
+            return Ok(wanted);
+        }
+        Ok(wanted
+            .min(PAUSED_READ_STAGING_BYTES.saturating_sub(staged))
+            .min(free.saturating_sub(self.min_free / 2)))
     }
 
     /// [`SpaceFloor::shortfall`] that also records the start and end of a pause at `now`
@@ -367,5 +415,56 @@ mod tests {
         assert_eq!(woken.load(Ordering::SeqCst), 2, "one per resume edge");
         assert!(met.observe(9_000).unwrap().is_none());
         assert_eq!(woken.load(Ordering::SeqCst), 2);
+    }
+
+    // Value (#257, R5): reads staged up to 64 MiB of disk each with no regard for the floor, so
+    // serving reads through a pause could spend the reserve the store's own flush and
+    // compaction need. Protects: above the floor a read stages what it asked for; while paused
+    // all reads together stage at most PAUSED_READ_STAGING_BYTES, and none so much that free
+    // space falls below half the floor.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn paused_reads_stage_a_bounded_share_and_leave_half_the_floor_alone() {
+        const MIB: u64 = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let floor = SpaceFloor::new(dir.path(), 1024 * MIB);
+        floor.set_free_for_tests(Some(2048 * MIB));
+        assert_eq!(
+            floor.read_staging_allowance(64 * MIB, 500 * MIB).unwrap(),
+            64 * MIB
+        );
+        floor.set_free_for_tests(Some(1024 * MIB - 1));
+        assert_eq!(floor.read_staging_allowance(64 * MIB, 0).unwrap(), 32 * MIB);
+        assert_eq!(
+            floor.read_staging_allowance(64 * MIB, 30 * MIB).unwrap(),
+            2 * MIB
+        );
+        assert_eq!(floor.read_staging_allowance(64 * MIB, 32 * MIB).unwrap(), 0);
+        floor.set_free_for_tests(Some(513 * MIB));
+        assert_eq!(floor.read_staging_allowance(64 * MIB, 0).unwrap(), MIB);
+        floor.set_free_for_tests(Some(100 * MIB));
+        assert_eq!(floor.read_staging_allowance(64 * MIB, 0).unwrap(), 0);
+    }
+
+    // Value (#257): the daemon must tell a floor refusal from budget pressure without parsing
+    // prose at every caller. Protects: check() marks exactly its own refusal, keeping the
+    // code STORAGE_PRESSURE that older callers hold and retry.
+    #[test]
+    fn only_the_floor_check_labels_its_refusal_as_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let low = SpaceFloor::new(dir.path(), u64::MAX / 4);
+        let refused = low.check().unwrap_err();
+        assert_eq!(refused.code, "STORAGE_PRESSURE");
+        assert!(refused.is_free_space_floor(), "{refused}");
+        assert!(
+            !Error::new(
+                "STORAGE_PRESSURE",
+                "write would cross the maintenance reserve"
+            )
+            .is_free_space_floor()
+        );
+        assert!(
+            !Error::new("RESOURCE_LIMIT", format!("{FLOOR_REFUSAL_PREFIX}x")).is_free_space_floor()
+        );
     }
 }

@@ -105,6 +105,8 @@ pub struct Rpc {
     admin: Option<String>,
     /// Whether this daemon takes online backups, and where (#156).
     backup: crate::backup::Backup,
+    /// The free-space pause's counters (#257), shared with the daemon's accept loops.
+    pause: crate::floor_pause::FloorPause,
 }
 
 /// The full typed service and the ingest socket run no CHAP; only anonymous TCP does.
@@ -180,6 +182,7 @@ impl Rpc {
         Self {
             connection: Default::default(),
             syslog: crate::syslog_listener::SyslogRegistry::default(),
+            pause: crate::floor_pause::FloorPause::new(store.space_floor()),
             store,
             admission: crate::admission::Admission::new(requests),
             connections: None,
@@ -192,6 +195,17 @@ impl Rpc {
             admin: None,
             backup: crate::backup::Backup::Unconfigured,
         }
+    }
+
+    /// The store's one free-space floor, which the accept loop observes.
+    pub(crate) fn store_floor(&self) -> &sparrow_core::SpaceFloor {
+        self.store.space_floor()
+    }
+
+    /// The pause counters the accept loops and `status` share.
+    #[must_use]
+    pub fn floor_pause(&self) -> &crate::floor_pause::FloorPause {
+        &self.pause
     }
 
     /// Use the daemon's one admission, which shutdown closes to interrupt waiting writers.
@@ -395,7 +409,11 @@ impl Rpc {
         operation: impl FnOnce(Store, u64) -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Error> {
         let permit = self.admission.writer().await.map_err(refusal)?;
-        self.run(permit, operation).await
+        let result = self.run(permit, operation).await;
+        if let Err(error) = &result {
+            self.pause.write_refused(error);
+        }
+        result
     }
 
     /// As [`Rpc::work`], waiting for a permit no later than `deadline`.
@@ -409,7 +427,11 @@ impl Rpc {
             .writer_until(deadline)
             .await
             .map_err(refusal)?;
-        self.run(permit, operation).await
+        let result = self.run(permit, operation).await;
+        if let Err(error) = &result {
+            self.pause.write_refused(error);
+        }
+        result
     }
 
     /// Run a `status` read, which takes no operation permit (see `Admission::diagnostic`).
@@ -418,7 +440,10 @@ impl Rpc {
         operation: impl FnOnce(Store, u64) -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Error> {
         let permit = self.admission.diagnostic().map_err(refusal)?;
-        self.run(permit, operation).await
+        let paused = self.pause.paused();
+        let result = self.run(permit, operation).await;
+        self.pause.read_finished(paused, &result);
+        result
     }
 
     /// Run a read: it takes a reader slot and a permit only if both are free now.
@@ -427,7 +452,10 @@ impl Rpc {
         operation: impl FnOnce(Store, u64) -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Error> {
         let permit = self.admission.reader().map_err(refusal)?;
-        self.run(permit, operation).await
+        let paused = self.pause.paused();
+        let result = self.run(permit, operation).await;
+        self.pause.read_finished(paused, &result);
+        result
     }
 
     async fn run<T: Send + 'static>(
@@ -950,6 +978,12 @@ pub(crate) fn failure<T: capnp::traits::Owned + 'static>(
         error.code,
         "STORAGE_PRESSURE" | "RESOURCE_LIMIT" | "SHUTTING_DOWN"
     ));
+    // Additive label (#257): the code and the retryable flag stay what older clients read.
+    out.set_class(if error.is_free_space_floor() {
+        wire::FailureClass::FreeSpaceFloor
+    } else {
+        wire::FailureClass::Unclassified
+    });
 }
 
 pub(crate) use sparrow_client::{format_label as format, parse_format as stored_format};
@@ -2989,10 +3023,12 @@ impl wire::sparrow::Server for Rpc {
         _: wire::sparrow::DiscoverParams,
         mut results: wire::sparrow::DiscoverResults,
     ) -> capnp::Result<()> {
-        match self
+        let paused = self.pause.paused();
+        let discovered = self
             .work(|store, _| Ok((store.properties()?, store.durability_status()?)))
-            .await
-        {
+            .await;
+        self.pause.read_finished(paused, &discovered);
+        match discovered {
             Err(error) => failure(results.get().init_result(), error),
             Ok((value, durability)) => {
                 let mut out = results.get().init_result().init_ok();
@@ -3120,6 +3156,7 @@ impl wire::sparrow::Server for Rpc {
                     .encode(out.reborrow().init_backup(), &self.store.backup_status());
                 self.admission
                     .encode(out.reborrow().init_admission(), self.connections.as_deref());
+                self.pause.encode(out.reborrow().init_floor_pause());
                 match &self.ingest_socket {
                     Some(socket) => socket.encode(out.reborrow().init_ingest_socket().init_value()),
                     None => out.reborrow().init_ingest_socket().set_absent(()),

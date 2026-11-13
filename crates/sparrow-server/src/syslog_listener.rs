@@ -751,9 +751,9 @@ async fn listen(
             let connections = Arc::new(Semaphore::new(definition.max_connections));
             let roster = Arc::new(Roster::default());
             let mut tasks = JoinSet::new();
-            // Below the free-space floor every write is refused: accept no connections.
-            let mut space = tokio::time::interval(std::time::Duration::from_secs(1));
-            let mut space_ok = true;
+            // The free-space floor does not stop accepting (#257): a frame the store refuses under
+            // it is held unread past (#243), whatever the accept state, so the sender's window
+            // closes and it holds, and the connection ceiling below bounds the connections.
             // At the ceiling one arrival is held while the longest-idle connection is closed
             // at a frame boundary for it; it is never refused.
             let mut pending: Option<tokio::net::TcpStream> = None;
@@ -762,10 +762,9 @@ async fn listen(
             loop {
                 if *stop.borrow() { break; }
                 tokio::select! {
-                    _ = space.tick() => { space_ok = store.space_floor().shortfall().map_err(io::Error::other)?.is_none(); },
                     changed = stop.changed() => { changed.map_err(io::Error::other)?; if *stop.borrow() { break; } },
                     result = tasks.join_next(), if !tasks.is_empty() => { if let Some(result) = result { result.map_err(io::Error::other)??; } },
-                    accepted = listener.accept(), if space_ok && pending.is_none() => {
+                    accepted = listener.accept(), if pending.is_none() => {
                         pending = Some(accepted?.0);
                         evicting = false;
                     }
@@ -1819,6 +1818,44 @@ mod tests {
         assert_eq!(idle.read(&mut byte).await.unwrap(), 0);
         until(&fixture.metrics, |status| status.counts.accepted == 1).await;
         assert_eq!(fixture.metrics.snapshot().unwrap().counts.timed_out, 0);
+        stop.send_replace(true);
+        task.await.unwrap().unwrap();
+    }
+
+    /// Value (#257): below the free-space floor the accept loop stopped accepting, so a sender
+    /// connecting then sat in the kernel backlog with nothing said. Protects: a connection made
+    /// while the floor is paused is accepted, its frame is taken off the wire and held (#243),
+    /// and the frame is stored when free space returns, with the connection ceiling unchanged.
+    /// Fails on the old accept pause: the connection is never counted active.
+    #[tokio::test]
+    async fn a_connection_made_while_the_floor_is_paused_is_accepted_and_its_frame_held_then_stored()
+     {
+        let fixture = listener(SyslogTransport::Tcp, 2, 60_000);
+        let floor = fixture.store.space_floor();
+        floor.set_free_for_tests(Some(0));
+        floor.set_resume_waker(Some(fixture.wake.resume_waker(|| {})));
+        assert!(floor.observe(1).unwrap().is_some());
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        let (stop, task) = serve(Socket::Tcp(tcp), &fixture).await;
+        // The loop has run its first turn, so an accept pause would already be in force.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let mut sender = tokio::net::TcpStream::connect(address).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>a")
+            .await
+            .unwrap();
+        until(&fixture.metrics, |status| {
+            status.active_connections == 1 && frame_taken(status)
+        })
+        .await;
+        assert_eq!(fixture.metrics.snapshot().unwrap().counts.accepted, 0);
+        floor.set_free_for_tests(None);
+        assert!(floor.observe(2).unwrap().is_none());
+        until(&fixture.metrics, |status| status.counts.accepted == 1).await;
+        assert_eq!(stored_lengths(&fixture.store), [5]);
+        drop(sender);
         stop.send_replace(true);
         task.await.unwrap().unwrap();
     }
