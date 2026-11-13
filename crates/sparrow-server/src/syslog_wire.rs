@@ -40,6 +40,14 @@ pub(crate) fn listener(
         wire::optional_text::Absent(()) => Value::Null,
         wire::optional_text::Value(value) => Value::from(value?.to_str()?),
     };
+    let counter_reason = match listener.get_kernel_counter_reason()?.which()? {
+        wire::optional_text::Absent(()) => Value::Null,
+        wire::optional_text::Value(value) => Value::from(value?.to_str()?),
+    };
+    let enlarge_error = match listener.get_rcvbuf_enlarge_error()?.which()? {
+        wire::optional_text::Absent(()) => Value::Null,
+        wire::optional_text::Value(value) => Value::from(value?.to_str()?),
+    };
     Ok(Value::from(
         Object::new()
             .with("id", listener.get_id()?.to_str()?)
@@ -106,6 +114,30 @@ pub(crate) fn listener(
             )
             .with("continuity_unknown", listener.get_continuity_unknown())
             .with("kernel_drops_unknown", listener.get_kernel_drops_unknown())
+            .with(
+                "rcvbuf_requested_bytes",
+                listener.get_rcvbuf_requested_bytes().to_string(),
+            )
+            .with(
+                "rcvbuf_granted_bytes",
+                listener.get_rcvbuf_granted_bytes().to_string(),
+            )
+            .with("kernel_drops", listener.get_kernel_drops().to_string())
+            .with(
+                "kernel_counter_state",
+                match listener.get_kernel_counter_state()? {
+                    wire::KernelCounterState::NotApplicable => "not_applicable",
+                    wire::KernelCounterState::Available => "available",
+                    wire::KernelCounterState::Unavailable => "unavailable",
+                },
+            )
+            .with("kernel_counter_reason", counter_reason)
+            .with("kernel_counter_final", listener.get_kernel_counter_final())
+            .with("rcvbuf_enlarge_error", enlarge_error)
+            .with(
+                "rcvbuf_enlarge_failures",
+                listener.get_rcvbuf_enlarge_failures().to_string(),
+            )
             .with("failure", failure),
     ))
 }

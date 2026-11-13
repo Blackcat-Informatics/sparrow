@@ -136,6 +136,14 @@ still fails with durability uncertain, for example because another program
 filled the disk between checks, the daemon exits with an error and
 `Restart=on-failure` reopens the store.
 
+Each UDP syslog socket asks for an 8 MiB receive buffer. The kernel clamps the
+request to `net.core.rmem_max` (stock 212992) and stores twice the result; the
+unit cannot force more, so raise the sysctl on the host if status shows a small
+grant. The unit sets `ProcSubset=pid`, which hides `/proc/sys`, so the daemon
+cannot read `rmem_max`: status reports the granted size read back from the
+socket. The daemon reads the socket's kernel drop count from
+`/proc/self/net/udp`, which stays visible under that setting.
+
 Public TCP requires `rpc_tcp_secret_file`. Generate a random secret with mode
 0600, for example `sudo sh -c 'umask 077; head -c 32 /dev/urandom > /etc/sparrow/tcp.secret'`,
 and do not use a passphrase: an observer of one CHAP exchange can test guesses
