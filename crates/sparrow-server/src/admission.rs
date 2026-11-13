@@ -223,7 +223,7 @@ const SHUTTING_DOWN: Refusal = Refusal {
 
 /// Permits held for the duration of one storage operation. Dropping releases both.
 pub struct Admitted {
-    _operation: OwnedSemaphorePermit,
+    _operation: Option<OwnedSemaphorePermit>,
     _reader: Option<OwnedSemaphorePermit>,
 }
 
@@ -241,6 +241,8 @@ pub struct Admitted {
 pub struct Admission {
     operations: Arc<Semaphore>,
     readers: Arc<Semaphore>,
+    /// The one status read at a time that takes no operation permit.
+    diagnostics: Arc<Semaphore>,
     reader_slots: u32,
     reserve: u32,
     writer_waits: Arc<Waits>,
@@ -279,6 +281,7 @@ impl Admission {
         Arc::new(Self {
             operations,
             readers: Arc::new(Semaphore::new(reader_slots as usize)),
+            diagnostics: Arc::new(Semaphore::new(1)),
             reader_slots,
             reserve,
             writer_waits: Waits::new("writer operation permit"),
@@ -334,13 +337,15 @@ impl Admission {
     /// Run `attempt` (a begin-import) and, while it is refused for want of an import journal
     /// slot (`full`), wait for [`Admission::import_slot_freed`], shutdown or the bound
     /// [`IMPORT_SLOT_WAIT`], then run it again. The attempt holds nothing while this waits.
-    /// At the bound, or at shutdown, the last refusal is the answer.
+    /// At the bound, or at shutdown, the last refusal is the answer. The bound covers the whole
+    /// call: the attempt receives the deadline and must not wait past it (a writer permit wait
+    /// uses [`Admission::writer_until`]), and no attempt starts once the deadline has passed.
     ///
     /// # Errors
     /// What the attempt last returned.
     pub async fn import_slot<T, E, F>(
         &self,
-        mut attempt: impl FnMut() -> F,
+        mut attempt: impl FnMut(Instant) -> F,
         full: impl Fn(&E) -> bool,
     ) -> Result<T, E>
     where
@@ -354,14 +359,20 @@ impl Admission {
             let freed = self.import_freed.notified();
             tokio::pin!(freed);
             freed.as_mut().enable();
-            let refused = match attempt().await {
+            let refused = match attempt(deadline).await {
                 Err(error) if full(&error) => error,
                 done => return done,
             };
             let waiter = waiter.get_or_insert_with(|| self.import_waits.enter());
             tokio::select! {
                 biased;
-                () = &mut freed => {}
+                () = &mut freed => {
+                    // A slot freed with the bound spent is answered, not retried.
+                    if Instant::now() >= deadline {
+                        waiter.timed_out();
+                        return Err(refused);
+                    }
+                }
                 _ = closing.wait_for(|closing| *closing) => return Err(refused),
                 () = tokio::time::sleep_until(deadline) => {
                     waiter.timed_out();
@@ -390,6 +401,15 @@ impl Admission {
     /// # Errors
     /// The refusal to answer the caller with.
     pub async fn writer(&self) -> Result<Admitted, Refusal> {
+        self.writer_until(Instant::now() + self.wait).await
+    }
+
+    /// As [`Admission::writer`], waiting no later than `deadline`. A begin-import that waits
+    /// for a journal slot passes its own deadline, so the whole call stays inside one bound.
+    ///
+    /// # Errors
+    /// The refusal to answer the caller with.
+    pub async fn writer_until(&self, deadline: Instant) -> Result<Admitted, Refusal> {
         match self.operations.clone().try_acquire_owned() {
             Ok(permit) => return Ok(Admitted::writer(permit)),
             Err(TryAcquireError::Closed) => return Err(SHUTTING_DOWN),
@@ -403,7 +423,7 @@ impl Admission {
                 permit.map(Admitted::writer).map_err(|_| SHUTTING_DOWN)
             }
             _ = closing.wait_for(|closing| *closing) => Err(SHUTTING_DOWN),
-            () = tokio::time::sleep(self.wait) => {
+            () = tokio::time::sleep_until(deadline) => {
                 waiter.timed_out();
                 Err(Refusal {
                     code: "RESOURCE_LIMIT",
@@ -434,7 +454,7 @@ impl Admission {
         };
         match self.operations.clone().try_acquire_owned() {
             Ok(operation) => Ok(Admitted {
-                _operation: operation,
+                _operation: Some(operation),
                 _reader: Some(slot),
             }),
             Err(TryAcquireError::NoPermits) => Err(busy()),
@@ -443,10 +463,34 @@ impl Admission {
     }
 }
 
+impl Admission {
+    /// The permit for a `status` read, which takes no operation permit: status carries the
+    /// counters that explain a saturated budget, so a budget saturated by writers must not
+    /// refuse it. One status read runs at a time; another at once is refused and counted.
+    ///
+    /// # Errors
+    /// The refusal to answer the caller with.
+    pub fn diagnostic(&self) -> Result<Admitted, Refusal> {
+        match self.diagnostics.clone().try_acquire_owned() {
+            Ok(slot) => Ok(Admitted {
+                _operation: None,
+                _reader: Some(slot),
+            }),
+            Err(_) => {
+                self.reader_refusals.fetch_add(1, Ordering::Relaxed);
+                Err(Refusal {
+                    code: "RESOURCE_LIMIT",
+                    message: "another status read is in progress",
+                })
+            }
+        }
+    }
+}
+
 impl Admitted {
     const fn writer(operation: OwnedSemaphorePermit) -> Self {
         Self {
-            _operation: operation,
+            _operation: Some(operation),
             _reader: None,
         }
     }
@@ -698,7 +742,7 @@ mod tests {
         let admission = Admission::new(Arc::new(Semaphore::new(2)));
         let attempts = AtomicU32::new(0);
         let begun = admission.import_slot(
-            || async {
+            |_| async {
                 if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                     Err("full")
                 } else {
@@ -728,7 +772,7 @@ mod tests {
         let admission = Admission::new(Arc::new(Semaphore::new(2)));
         let started = Instant::now();
         let refused = admission
-            .import_slot(|| async { Err::<u8, _>("full") }, |error| *error == "full")
+            .import_slot(|_| async { Err::<u8, _>("full") }, |error| *error == "full")
             .await;
         assert_eq!(refused, Err("full"));
         assert_eq!(started.elapsed(), IMPORT_SLOT_WAIT);
@@ -738,7 +782,7 @@ mod tests {
         );
         assert_eq!(admission.import_waits().snapshot().timeouts, 1);
         let pending =
-            admission.import_slot(|| async { Err::<u8, _>("full") }, |error| *error == "full");
+            admission.import_slot(|_| async { Err::<u8, _>("full") }, |error| *error == "full");
         tokio::pin!(pending);
         tokio::select! {
             biased;
@@ -750,5 +794,74 @@ mod tests {
         assert_eq!(pending.await, Err("full"));
         assert_eq!(before.elapsed(), Duration::ZERO);
         assert_eq!(admission.import_waits().snapshot().timeouts, 1);
+    }
+
+    /// INVARIANT (#246): the writer reserve is a quarter of the budget rounded up, and never
+    /// leaves readers without a slot, so a budget of one is shared.
+    #[test]
+    fn the_writer_reserve_is_a_quarter_of_the_budget_and_never_all_of_it() {
+        for (budget, reserve) in [(1, 0), (2, 1), (3, 1), (4, 1), (5, 2), (64, 16)] {
+            assert_eq!(writer_reserve(budget), reserve, "budget {budget}");
+            let admission = Admission::new(Arc::new(Semaphore::new(budget as usize)));
+            assert_eq!(admission.writer_reserve(), reserve);
+            assert_eq!(admission.reader_slots(), budget - reserve);
+        }
+    }
+
+    /// INVARIANT (#246): a begin-import is answered inside its one bound even when the
+    /// operation permit budget is saturated too: the permit wait is capped at the time left, and
+    /// a slot that frees with the bound spent is answered, not retried. Both cases answer by
+    /// the bound, which is shorter than the client's `rpc_timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn a_begin_import_with_permits_and_slots_both_saturated_answers_by_one_bound() {
+        let operations = Arc::new(Semaphore::new(1));
+        let admission = Admission::new(operations.clone());
+        let attempt = |deadline| {
+            let admission = admission.clone();
+            async move {
+                match admission.writer_until(deadline).await {
+                    Ok(_permit) => Err::<(), _>("full"),
+                    Err(refusal) => Err(refusal.code),
+                }
+            }
+        };
+        let held = operations.clone().acquire_owned().await.unwrap();
+        let started = Instant::now();
+        let refused: Result<(), &str> = admission
+            .import_slot(attempt, |error| *error == "full")
+            .await;
+        assert_eq!(refused, Err("RESOURCE_LIMIT"));
+        assert_eq!(started.elapsed(), IMPORT_SLOT_WAIT);
+        drop(held);
+        // The permit is free but the slot never is; a slot signal at 2.95 s finds 50 ms left.
+        let started = Instant::now();
+        let call = admission.import_slot(attempt, |error| *error == "full");
+        tokio::pin!(call);
+        tokio::select! { biased; _ = &mut call => panic!("answered without a bound"), () = tokio::time::sleep(Duration::from_millis(2950)) => {} }
+        admission.import_slot_freed();
+        assert_eq!(call.await, Err("full"));
+        assert_eq!(started.elapsed(), IMPORT_SLOT_WAIT);
+        assert!(
+            started.elapsed()
+                < sparrow_client::DeliveryConfig::new("rpc.sock", "client").rpc_timeout
+        );
+    }
+
+    /// INVARIANT (#246): a status read takes no operation permit, so a budget saturated by
+    /// writers does not refuse it; a second status read at once is refused and counted.
+    #[test]
+    fn status_is_served_while_writers_hold_every_permit() {
+        let operations = Arc::new(Semaphore::new(2));
+        let admission = Admission::new(operations.clone());
+        let _writers = operations.clone().try_acquire_many_owned(2).unwrap();
+        assert!(admission.reader().is_err());
+        let status = admission.diagnostic().unwrap();
+        assert_eq!(
+            admission.diagnostic().err().map(|r| r.code),
+            Some("RESOURCE_LIMIT")
+        );
+        drop(status);
+        assert!(admission.diagnostic().is_ok());
+        assert_eq!(admission.reader_refusals(), 2);
     }
 }

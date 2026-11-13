@@ -984,6 +984,7 @@ impl Store {
             .ok_or_else(|| Error::new("STORAGE_FAILURE", "payload family missing"))?;
         let mut batch = WriteBatch::default();
         let mut removed = 0;
+        let mut journals_freed = 0u64;
         let manifests = writer.imports()?;
         let mut remaining_manifests = manifests.len() as u64;
         for mut manifest in manifests {
@@ -1038,12 +1039,18 @@ impl Store {
                 && preparation_done
             {
                 batch.delete(&manifest.id);
+                journals_freed += 1;
             } else {
                 put(&mut batch, &manifest.id, &manifest);
             }
         }
         if batch.size_in_bytes() != 0 {
             writer.commit(batch)?;
+        }
+        drop(writer);
+        // The slot is free only once the commit that deleted its journal has landed.
+        if journals_freed != 0 {
+            self.wake_import_slot();
         }
         Ok(removed)
     }

@@ -206,6 +206,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store_id = store.store_id()?;
     let operations = Arc::new(Semaphore::new(config.max_concurrent_requests));
     let admission = sparrow_server::admission::Admission::new(operations.clone());
+    // A begin-import waiting for a journal slot is told when a reclamation commit frees one.
+    store.set_import_slot_waker(Some(Arc::new({
+        let admission = admission.clone();
+        move || admission.import_slot_freed()
+    })));
     let operation_slots = u32::try_from(config.max_concurrent_requests)?;
     // A query-only or no-intake daemon owns no watch root: it reports the stored catalog and
     // claims nothing.
@@ -358,7 +363,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let local = tokio::task::LocalSet::new();
     local.run_until(async {
         // Expiry, eviction and the table rewrite all write; a query-only daemon runs none of them.
-        let mut maintenance = (!config.query_only).then(|| maintenance::Worker::start(store.clone(), std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms)), pressure_wake.clone(), admission.clone()));
+        let mut maintenance = (!config.query_only).then(|| maintenance::Worker::start(store.clone(), std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms)), pressure_wake.clone()));
         let serving = async {
         // Pinned once, so its waits and any worker shutdown it starts survive every turn.
         let health = worker_health(&mut consumer, &mut syslog, maintenance.as_mut());

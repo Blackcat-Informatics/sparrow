@@ -398,6 +398,29 @@ impl Rpc {
         self.run(permit, operation).await
     }
 
+    /// As [`Rpc::work`], waiting for a permit no later than `deadline`.
+    async fn work_until<T: Send + 'static>(
+        &self,
+        deadline: tokio::time::Instant,
+        operation: impl FnOnce(Store, u64) -> Result<T, Error> + Send + 'static,
+    ) -> Result<T, Error> {
+        let permit = self
+            .admission
+            .writer_until(deadline)
+            .await
+            .map_err(refusal)?;
+        self.run(permit, operation).await
+    }
+
+    /// Run a `status` read, which takes no operation permit (see `Admission::diagnostic`).
+    async fn diagnostic<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(Store, u64) -> Result<T, Error> + Send + 'static,
+    ) -> Result<T, Error> {
+        let permit = self.admission.diagnostic().map_err(refusal)?;
+        self.run(permit, operation).await
+    }
+
     /// Run a read: it takes a reader slot and a permit only if both are free now.
     async fn lookup<T: Send + 'static>(
         &self,
@@ -2173,10 +2196,10 @@ impl wire::sparrow::Server for Rpc {
         let admission = self.admission.clone();
         match admission
             .import_slot(
-                || {
+                |deadline| {
                     let (request, source, payload) =
                         (request.clone(), source.clone(), payload.clone());
-                    self.work(move |store, now| {
+                    self.work_until(deadline, move |store, now| {
                         Ok((
                             store.import_start_with_intake(
                                 &request, &source, kind, length, &payload, intake, now,
@@ -3005,7 +3028,7 @@ impl wire::sparrow::Server for Rpc {
             }
         };
         match self
-            .lookup(|store, now| {
+            .diagnostic(|store, now| {
                 let (status, migrations) = store.status_report(now)?;
                 Ok((
                     status,

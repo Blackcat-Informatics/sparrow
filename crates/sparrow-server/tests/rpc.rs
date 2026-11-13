@@ -2128,6 +2128,24 @@ async fn an_ingest_peer_over_the_ceiling_waits_and_is_served_when_a_slot_frees()
         .await;
 }
 
+/// Read `status` round trips on `client` until `wanted` holds of its admission section. Each turn
+/// is a real status request, so this waits on the daemon's own state, not on a clock; it fails
+/// after a bounded number of turns.
+async fn status_until(
+    client: &wire::sparrow::Client,
+    wanted: impl Fn(wire::admission_status::Reader<'_>) -> bool,
+) {
+    for _ in 0..2000 {
+        let response = client.status_request().send().promise.await.unwrap();
+        let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+        if wanted(status.get_admission().unwrap()) {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("status never reached the expected admission state");
+}
+
 /// Begin one staged import of `name`'s bytes; its import id, or the error code.
 async fn begin_numbered_import(
     client: &wire::sparrow::Client,
@@ -2200,19 +2218,17 @@ async fn a_seventeenth_import_waits_for_a_slot_and_begins_when_one_is_reclaimed(
                 let client = client.clone();
                 async move { begin_numbered_import(&client, "slot-16").await }
             });
-            tokio::task::yield_now().await;
-            let response = client.status_request().send().promise.await.unwrap();
-            let status = rpc_ok(response.get().unwrap().get_result().unwrap());
-            let waiting = status
-                .get_admission()
-                .unwrap()
-                .get_import_slot_wait()
-                .unwrap();
-            assert_eq!((waiting.get_waits(), waiting.get_waiting()), (1, 1));
+            status_until(&client, |admission| {
+                let waiting = admission.get_import_slot_wait().unwrap();
+                (waiting.get_waits(), waiting.get_waiting()) == (1, 1)
+            })
+            .await;
             assert!(
                 !seventeenth.is_finished(),
                 "the seventeenth import was refused instead of waiting"
             );
+            let response = client.status_request().send().promise.await.unwrap();
+            let status = rpc_ok(response.get().unwrap().get_result().unwrap());
             let store = status.get_store_id().unwrap().to_str().unwrap().to_owned();
             let mut request = client.import_cancel_request();
             upload_ref(request.get().init_import(), &store, &ids[0]);
@@ -2697,19 +2713,59 @@ async fn idle_rpc_connections_share_a_finite_transport_budget_independent_of_sto
                 .await
                 .unwrap();
             rpc_ok(response.get().unwrap().get_result().unwrap());
-            // Unix and TCP share six transport leases: a seventh peer is not admitted; it waits
-            // in the kernel backlog (#246) and is served when the sixth peer's slot frees.
-            let seventh = tokio::task::spawn_local({
-                let socket = socket.clone();
-                async move { sparrow_client::Client::connect(&socket).await }
-            });
-            tokio::task::yield_now().await;
+            // Unix and TCP share six transport leases. The sixth peer took the last slot: status
+            // shows six active connections and the accept loop held at the ceiling, and a TCP
+            // seventh peer waits in the backlog (#246) instead of being admitted or reset.
+            let status_client = idle[0].capability().clone();
+            let tcp_seventh = tokio::task::spawn_local(tcp_client(address));
+            status_until(&status_client, |admission| {
+                let ceiling = match admission.get_rpc_connections().unwrap().which().unwrap() {
+                    wire::optional_connection_ceiling_status::Value(ceiling) => ceiling.unwrap(),
+                    wire::optional_connection_ceiling_status::Absent(()) => {
+                        panic!("no ceiling reported")
+                    }
+                };
+                assert!(
+                    ceiling.get_active_connections() <= 6,
+                    "the ceiling was exceeded"
+                );
+                ceiling.get_max_connections() == 6
+                    && ceiling.get_active_connections() == 6
+                    && ceiling.get_ceiling_wait().unwrap().get_waiting() == 1
+            })
+            .await;
             assert!(
-                !seventh.is_finished(),
+                !tcp_seventh.is_finished(),
                 "a seventh peer was over-admitted or reset"
             );
             drop(sixth);
-            let recovered = seventh.await.unwrap().expect("the waiting peer was reset");
+            let tcp_seventh = tcp_seventh
+                .await
+                .unwrap()
+                .expect("the waiting TCP peer was reset");
+            // The slot went to the TCP peer; a Unix peer now waits for the shared ceiling too.
+            let unix_seventh = tokio::task::spawn_local({
+                let socket = socket.clone();
+                async move { sparrow_client::Client::connect(&socket).await }
+            });
+            status_until(&status_client, |admission| {
+                let wire::optional_connection_ceiling_status::Value(ceiling) =
+                    admission.get_rpc_connections().unwrap().which().unwrap()
+                else {
+                    panic!("no ceiling reported");
+                };
+                ceiling.unwrap().get_active_connections() == 6
+            })
+            .await;
+            assert!(
+                !unix_seventh.is_finished(),
+                "a seventh peer was over-admitted or reset"
+            );
+            drop(tcp_seventh);
+            let recovered = unix_seventh
+                .await
+                .unwrap()
+                .expect("the waiting Unix peer was reset");
             let receipt = recovered
                 .ingest(
                     "idle-budget",

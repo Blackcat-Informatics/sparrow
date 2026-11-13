@@ -2447,7 +2447,10 @@ Three limits that used to refuse at once now wait, and every wait is counted.
   free and is first limited to the budget minus the writer reserve, a quarter of it
   rounded up and never so much that no reader can run, so a query storm cannot take
   the last permits. A reader never waits, because it would queue ahead of a later
-  writer; beyond its share it is refused at once and counted. The UDP syslog
+  writer; beyond its share it is refused at once and counted. `status` is the exception
+  to the permit rule: it takes no operation permit (one status read runs at a time,
+  another at once is refused and counted), so a budget saturated by writers still
+  answers the counters that explain it. The UDP syslog
   listener keeps its instant try, which it counts as a refusal, because it must keep
   reading its socket: a wait there lets the kernel drop datagrams uncounted. The
   MCP four-call limit is a per-session cap of that adapter, not this budget, and is
@@ -2455,10 +2458,14 @@ Three limits that used to refuse at once now wait, and every wait is counted.
   work, on shutdown beginning, or on the budget closing (`SHUTTING_DOWN`, retryable);
   the only timer is the 3-second bound, which exists because the client stops
   reading after its own deadline.
-- Import journal slots. A begin-import that finds all 16 occupied waits up to 3
-  seconds. A slot frees when the reclamation pass retires a published, cancelled or
-  expired journal, so the wait ends when a pass ends, at shutdown, or at its bound,
-  then answers the same `RESOURCE_LIMIT`. It holds no permit while it waits.
+- Import journal slots. A begin-import that finds all 16 occupied waits for a slot to
+  free, under one bound of 3 seconds that covers the whole call, including any wait for
+  an operation permit (which is capped at the time left); no attempt starts once the
+  bound has passed. A slot frees when a reclamation commit deletes a journal (a
+  published, cancelled or expired import), and that commit signals the waiters; a pass
+  that deletes nothing signals nobody, and nothing retries on a clock. The wait also
+  ends at shutdown, or at the bound, and then answers the same `RESOURCE_LIMIT`. It
+  holds no permit while it waits.
 - Connection ceilings. The daemon takes a connection slot before it accepts, for the
   private socket and public TCP (one shared ceiling) and for the ingest socket. A
   peer over the ceiling waits in the kernel listen backlog and is served when a slot
