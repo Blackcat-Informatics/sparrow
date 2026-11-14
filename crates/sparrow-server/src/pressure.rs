@@ -43,6 +43,10 @@ pub(crate) fn encode(
     out.set_forced_compaction_ms(status.forced_compaction_ms);
     out.set_forced_failures(status.forced_failures);
     out.set_native_errors(status.native_errors);
+    out.set_floor_requests(status.floor_requests);
+    out.set_floor_requested_bytes(status.floor_requested_bytes);
+    out.set_floor_passes(status.floor_passes);
+    out.set_floor_freed_bytes(status.floor_freed_bytes);
     let mut families = out
         .reborrow()
         .init_forced_compaction_families(status.forced_compaction_families.len() as u32);
@@ -210,7 +214,14 @@ pub(crate) fn decode(value: wire::pressure_status::Reader<'_>) -> capnp::Result<
                 .with(
                     "refused_writes",
                     value.get_floor_refused_writes().to_string(),
-                ),
+                )
+                .with("reclaim_requests", value.get_floor_requests().to_string())
+                .with(
+                    "requested_bytes",
+                    value.get_floor_requested_bytes().to_string(),
+                )
+                .with("passes", value.get_floor_passes().to_string())
+                .with("freed_bytes", value.get_floor_freed_bytes().to_string()),
         )
         .with("last_pass", pass)
         .with("failure", failure)
@@ -297,6 +308,10 @@ mod tests {
             stalled_passes: 9,
             refused_writes: 31,
             waiting_on: Some("a forced compaction is running".into()),
+            floor_requests: 4,
+            floor_requested_bytes: 2_048,
+            floor_passes: 6,
+            floor_freed_bytes: 1_536,
             floor: sparrow_core::FloorStatus {
                 paused_since: 99_000,
                 pauses: 3,
@@ -337,6 +352,11 @@ mod tests {
         assert_eq!(floor["pauses"].as_str(), Some("3"));
         assert_eq!(floor["resumes"].as_str(), Some("2"));
         assert_eq!(floor["refused_writes"].as_str(), Some("5"));
+        // #267: what the floor asked of reclaim, next to the floor's own counters.
+        assert_eq!(floor["reclaim_requests"].as_str(), Some("4"));
+        assert_eq!(floor["requested_bytes"].as_str(), Some("2048"));
+        assert_eq!(floor["passes"].as_str(), Some("6"));
+        assert_eq!(floor["freed_bytes"].as_str(), Some("1536"));
         let mut message = capnp::message::Builder::new_default();
         encode(message.init_root(), &PressureStatus::default()).unwrap();
         let quiet = decode(message.get_root_as_reader().unwrap()).unwrap();

@@ -447,6 +447,11 @@ struct PressureStatus {
   forcedCompactionFamilies @27 :List(CompactionFamily); # table and blob bytes per family around it
   forcedFailures @28 :UInt64;      # forced compactions that ended in a panic or native error
   nativeErrors @29 :UInt64;        # new RocksDB background errors the pressure passes saw
+  # #267, additive (SCHEMA_VERSION unchanged; an older reader ignores these).
+  floorRequests @30 :UInt64;       # free-space-floor episodes in which a refused write asked for reclaim
+  floorRequestedBytes @31 :UInt64; # bytes below the floor at the last pass; 0 when none
+  floorPasses @32 :UInt64;         # retirement passes run while the floor was the reason
+  floorFreedBytes @33 :UInt64;     # linked bytes the current or last floor episode freed
 }
 struct CompactionFamily { family @0 :Text; beforeBytes @1 :UInt64; afterBytes @2 :UInt64; }
 

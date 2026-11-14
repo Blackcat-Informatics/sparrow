@@ -28,6 +28,10 @@ pub(crate) const BASE_DELAY: Duration = Duration::from_secs(1);
 pub(crate) const BACKOFF_CEILING: Duration = Duration::from_secs(30);
 /// Least time between journal lines about passes that made no progress.
 const QUIET_REPORT_MS: u64 = 60_000;
+/// Least time between journal lines about free-space-floor episodes (#267). One limiter
+/// serves the begin, bound and end lines, so a volume hovering at the floor cannot flood the
+/// journal, and a line is never written per refused write.
+const FLOOR_LINE_MS: u64 = 60_000;
 
 /// What the worker does after a pass.
 #[derive(Debug, PartialEq, Eq)]
@@ -44,6 +48,7 @@ struct Signature {
     phase: PressurePhase,
     linked_bytes: u64,
     passes: u64,
+    evicted: u64,
     forced_compactions: u64,
     forced_failures: u64,
     waits_released: u64,
@@ -56,7 +61,16 @@ impl Signature {
         Self {
             phase: status.phase,
             linked_bytes: status.linked_bytes,
-            passes: status.passes,
+            // In a floor episode a pass that retired nothing (blocked on a pin or the archive
+            // watermark) is not progress: only what it retired is.
+            passes: if status.floor_requested_bytes > 0 {
+                0
+            } else {
+                status.passes
+            },
+            evicted: status
+                .evicted_records
+                .saturating_add(status.evicted_recordless_artifacts),
             forced_compactions: status.forced_compactions,
             forced_failures: status.forced_failures,
             waits_released: status.waits_released,
@@ -82,6 +96,14 @@ pub(crate) struct Duty {
     native_reported: u64,
     /// Failed passes whose status could not be read, this session.
     unreadable_statuses: u64,
+    /// A pass has measured the floor episode that is still open.
+    floor_active: bool,
+    /// The open episode's bound-reached line was already due.
+    floor_bound_seen: bool,
+    /// Clock reading of the last floor line.
+    floor_line_at: Option<u64>,
+    /// Floor lines held back by the limiter since the last one written.
+    floor_suppressed: u64,
 }
 
 impl Default for Duty {
@@ -96,6 +118,10 @@ impl Default for Duty {
             failures_reported: 0,
             native_reported: 0,
             unreadable_statuses: 0,
+            floor_active: false,
+            floor_bound_seen: false,
+            floor_line_at: None,
+            floor_suppressed: 0,
         }
     }
 }
@@ -116,7 +142,7 @@ fn seconds(ms: u64) -> String {
 
 fn detail(status: &PressureStatus) -> String {
     format!(
-        "requested_bytes={} linked_bytes={} wait_before_bytes={} wait_age={} episode_age={} passes={} evicted_records={} forced_compactions={} waits_released={} stalled_passes={} refused_writes={} forced_compaction_ms={} forced_failures={} native_errors={} waiting_on={}",
+        "requested_bytes={} linked_bytes={} wait_before_bytes={} wait_age={} episode_age={} passes={} evicted_records={} forced_compactions={} waits_released={} stalled_passes={} refused_writes={} forced_compaction_ms={} forced_failures={} native_errors={} floor_requests={} floor_requested_bytes={} floor_passes={} floor_freed_bytes={} waiting_on={}",
         status.requested_bytes,
         status.linked_bytes,
         status.wait_before_bytes,
@@ -131,11 +157,68 @@ fn detail(status: &PressureStatus) -> String {
         status.forced_compaction_ms,
         status.forced_failures,
         status.native_errors,
+        status.floor_requests,
+        status.floor_requested_bytes,
+        status.floor_passes,
+        status.floor_freed_bytes,
         status.waiting_on.as_deref().unwrap_or("nothing"),
     )
 }
 
 impl Duty {
+    /// The journal lines for the edges of a free-space-floor episode: it begins, it reaches
+    /// its bound, it ends. All three pass through one limiter; a line held back is counted
+    /// into the next one written.
+    fn floor_lines(&mut self, status: &PressureStatus) -> Vec<String> {
+        let active = status.floor_requested_bytes > 0;
+        let mut events = Vec::new();
+        if active && !self.floor_active {
+            events.push(format!(
+                "episode begins: free space is {} bytes below the floor and a refused write asked for reclamation",
+                status.floor_requested_bytes
+            ));
+        }
+        if active && status.floor_bound_reached && !self.floor_bound_seen {
+            self.floor_bound_seen = true;
+            events.push(format!(
+                "episode bound reached: {} bytes freed, free space is still {} bytes short; nothing more is retired for this episode",
+                status.floor_freed_bytes, status.floor_requested_bytes
+            ));
+        }
+        if !active && self.floor_active {
+            events.push(format!(
+                "episode ends: free space is back at the floor after {} bytes freed",
+                status.floor_freed_bytes
+            ));
+        }
+        if !active {
+            self.floor_bound_seen = false;
+        }
+        self.floor_active = active;
+        let mut lines = Vec::new();
+        for event in events {
+            let due = self
+                .floor_line_at
+                .is_none_or(|at| status.observed_at.saturating_sub(at) >= FLOOR_LINE_MS);
+            if !due {
+                self.floor_suppressed += 1;
+                continue;
+            }
+            let held = std::mem::take(&mut self.floor_suppressed);
+            let note = if held == 0 {
+                String::new()
+            } else {
+                format!(" ({held} floor events were not journaled since the last floor line)")
+            };
+            lines.push(format!(
+                "sparrowd: free-space floor {event}{note}: {}",
+                detail(status)
+            ));
+            self.floor_line_at = Some(status.observed_at);
+        }
+        lines
+    }
+
     /// Account for one completed pass.
     pub(crate) fn observe(&mut self, status: &PressureStatus) -> Verdict {
         let mut lines = Vec::new();
@@ -168,6 +251,7 @@ impl Duty {
                 ));
             }
         }
+        lines.extend(self.floor_lines(status));
         if status.phase != self.phase {
             let from = self.phase;
             if status.phase == PressurePhase::Ready {
@@ -288,6 +372,106 @@ mod tests {
             waiting_on: Some("a forced compaction is running".into()),
             ..PressureStatus::default()
         }
+    }
+
+    fn floor_episode(at: u64, short: u64) -> PressureStatus {
+        PressureStatus {
+            phase: PressurePhase::Requested,
+            observed_at: at,
+            episode_since: 1_000,
+            floor_requests: 1,
+            floor_requested_bytes: short,
+            ..PressureStatus::default()
+        }
+    }
+
+    fn floor_lines(verdict: &Verdict) -> Vec<&String> {
+        verdict
+            .lines
+            .iter()
+            .filter(|line| line.contains("free-space floor"))
+            .collect()
+    }
+
+    // Value: #267 (the PR 244 lesson): a floor that refuses writes for hours, or a volume
+    // hovering at it, must never write a journal line per refusal or per episode.
+    // Protects: the begin, bound and end lines share one 60-second limiter; a passes' worth
+    // of an open episode adds none; lines held back are counted into the next one written.
+    #[test]
+    fn floor_episode_lines_share_one_limiter_and_count_what_it_held_back() {
+        let mut duty = Duty::default();
+        let began = duty.observe(&floor_episode(1_000, 2_048));
+        assert_eq!(floor_lines(&began).len(), 1);
+        assert!(floor_lines(&began)[0].contains("episode begins"));
+        assert!(floor_lines(&began)[0].contains("2048 bytes below the floor"));
+        assert!(floor_lines(&began)[0].contains("floor_requests=1"));
+        // An open episode, pass after pass, journals nothing about the floor.
+        for second in 2..=9 {
+            let open = duty.observe(&floor_episode(second * 1_000, 2_048));
+            assert!(floor_lines(&open).is_empty(), "second {second}");
+        }
+        // It ends and another begins inside the minute: both held back.
+        let ended = duty.observe(&PressureStatus {
+            observed_at: 10_000,
+            floor_requests: 1,
+            floor_freed_bytes: 512,
+            ..PressureStatus::default()
+        });
+        assert!(floor_lines(&ended).is_empty());
+        assert!(floor_lines(&duty.observe(&floor_episode(20_000, 2_048))).is_empty());
+        // Past the minute the bound edge is written and says what was held back.
+        let bound = duty.observe(&PressureStatus {
+            floor_bound_reached: true,
+            floor_freed_bytes: 4_096,
+            ..floor_episode(61_000, 2_048)
+        });
+        assert_eq!(floor_lines(&bound).len(), 1);
+        assert!(floor_lines(&bound)[0].contains("episode bound reached"));
+        assert!(floor_lines(&bound)[0].contains("2 floor events were not journaled"));
+        // The bound line is written once per episode.
+        let again = duty.observe(&PressureStatus {
+            floor_bound_reached: true,
+            floor_freed_bytes: 4_096,
+            ..floor_episode(130_000, 2_048)
+        });
+        assert!(floor_lines(&again).is_empty());
+    }
+
+    // Value: #267 review: a floor episode on an archive store blocked on a pin or the archive
+    // watermark ran a pass a second, and the pass counter read as progress, so the journal
+    // stayed silent for as long as it lasted. Protects: in a floor episode a pass that retired
+    // nothing is no progress, so the quiet report is journaled at its bounded rate with the
+    // pass count it stands for.
+    #[test]
+    fn a_floor_episode_that_retires_nothing_is_journaled_as_no_progress() {
+        let blocked = |at: u64, passes: u64| PressureStatus {
+            phase: PressurePhase::Blocked,
+            passes,
+            stalled_passes: passes,
+            waiting_on: Some("reclamation tried: the archive watermark has not reached".into()),
+            ..floor_episode(at, 2_048)
+        };
+        let mut duty = Duty::default();
+        assert!(!duty.observe(&blocked(0, 1)).lines.is_empty());
+        for second in 1..=59 {
+            let quiet = duty.observe(&blocked(second * 1_000, 1 + second));
+            assert!(
+                !quiet
+                    .lines
+                    .iter()
+                    .any(|line| line.contains("pressure still")),
+                "second {second}"
+            );
+        }
+        let report = duty.observe(&blocked(60_000, 61));
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|line| line.contains("pressure still blocked; 60 passes made no progress")),
+            "{:?}",
+            report.lines
+        );
     }
 
     // Value: the old duty discarded the status, so a wait that never ended left no trace.

@@ -109,6 +109,20 @@ pub struct PressureStatus {
     /// New RocksDB background errors this session's pressure passes saw. Each is reported
     /// once as a failed pass and then counted here; none latches the worker.
     pub native_errors: u64,
+    /// Free-space-floor episodes in which a refused write asked for reclamation (#267).
+    pub floor_requests: u64,
+    /// Bytes of free space missing below the floor at the last pass of an episode; zero
+    /// when no floor episode is open or no pass has measured it yet.
+    pub floor_requested_bytes: u64,
+    /// Retirement passes run while the floor, not the disk budget, was the reason.
+    pub floor_passes: u64,
+    /// Linked store bytes the current or last floor episode saw leave; kept until the next
+    /// episode starts.
+    pub floor_freed_bytes: u64,
+    /// The current floor episode freed as much as its bound allows (the first measured
+    /// deficit plus the maintenance reserve) and retires no more. The daemon journals the
+    /// edge; the status text says it in words.
+    pub floor_bound_reached: bool,
 }
 
 impl PressureStatus {
@@ -151,10 +165,49 @@ enum Step {
     Measured,
 }
 
+/// What a free-space-floor episode keeps between passes. Session-local: a reopened store
+/// starts with none, and nothing of it is durable.
+#[derive(Default)]
+struct FloorEpisode {
+    /// A write refused at the floor asked for reclamation in this episode.
+    asked: bool,
+    /// Bytes below the floor at the last pass of the episode; zero when the floor is not
+    /// the reason for this pass.
+    deficit: u64,
+    /// Retirement passes this episode has run.
+    passes: u64,
+    /// Retirement batches this episode has made durable.
+    batches: u64,
+    /// Set by the first pass of the episode.
+    start: Option<FloorStart>,
+}
+
+/// The measures a floor episode is bounded by.
+#[derive(Clone, Copy)]
+struct FloorStart {
+    /// Linked store bytes at the first pass.
+    linked: u64,
+    /// Most linked bytes the episode may retire: the first deficit plus the maintenance
+    /// reserve.
+    bound: u64,
+}
+
+/// Most retirement batches one floor episode may make durable, whatever bytes they free.
+/// The byte bound counts measured linked-byte reduction, which lags retirement until native
+/// compaction runs, so batches that free nothing yet must be capped too. A batch retires at
+/// most `EvictionLimits::max_records` units (32 by default), so the cap is 256 units there.
+const FLOOR_EPISODE_BATCHES: u64 = 8;
+
+/// Durable wait marker value of a floor-only retirement. It is the value a reopened store
+/// already above its allowance uses, never the deficit: a deficit is a free-space measure and
+/// the marker's request is compared with the disk budget.
+const FLOOR_MARKER_BYTES: u64 = 65536;
+
 #[derive(Default)]
 pub(super) struct State {
     pub(super) status: PressureStatus,
     wait: Option<Wait>,
+    floor: FloorEpisode,
     /// The cumulative native background-error count already reported; only a higher count
     /// fails a pass (the same baseline as the table rewrite's).
     background_errors: u64,
@@ -220,6 +273,7 @@ impl State {
                 before: physical,
                 step: Step::Native,
             }),
+            floor: FloorEpisode::default(),
             background_errors,
             phase_seen: None,
         })
@@ -263,6 +317,15 @@ impl State {
         self.status.wait_before_bytes = 0;
         self.phase_seen = None;
         self.wait = None;
+        self.end_floor_episode();
+    }
+
+    /// The measured deficit reached zero (or the store is ready): the floor episode ends.
+    /// What it freed and how many passes it ran stay in the status until the next one.
+    fn end_floor_episode(&mut self) {
+        self.floor = FloorEpisode::default();
+        self.status.floor_requested_bytes = 0;
+        self.status.floor_bound_reached = false;
     }
 
     /// End the wait without ending the episode.
@@ -273,9 +336,31 @@ impl State {
     }
 
     /// A pass that could do nothing more, and why.
+    /// While the floor is the reason for the pass, the text leads with how far below it the
+    /// store's filesystem is.
     fn stalled(&mut self, reason: impl Into<String>) {
         self.status.stalled_passes = self.status.stalled_passes.saturating_add(1);
-        self.status.waiting_on = Some(reason.into());
+        let reason = reason.into();
+        self.status.waiting_on = Some(self.floor_text(&reason));
+    }
+
+    /// `reason`, led by the floor deficit when the floor is the reason for this pass.
+    fn floor_text(&self, reason: &str) -> String {
+        match self.floor.deficit {
+            0 => reason.to_owned(),
+            deficit => format!("free space is below the floor by {deficit} bytes; {reason}"),
+        }
+    }
+
+    /// The reason a floor pass retired nothing more, saying what the episode has done.
+    fn floor_tried(&self, reason: &str) -> String {
+        if self.floor.deficit == 0 {
+            return reason.to_owned();
+        }
+        format!(
+            "reclamation tried ({} passes, {} bytes freed): {reason}",
+            self.floor.passes, self.status.floor_freed_bytes
+        )
     }
 }
 
@@ -353,27 +438,22 @@ impl Writer {
             return Ok(());
         }
         let mut pressure = self.pressure.borrow_mut();
+        // The first request of a budget episode is the one with nothing requested yet. The
+        // phase cannot tell: a floor episode may already hold it at Requested (#267).
+        let first = pressure.status.requested_bytes == 0;
         let requested = &mut pressure.status.requested_bytes;
         *requested = if *requested == 0 {
             estimate
         } else {
             (*requested).min(estimate)
         };
-        let first = pressure.status.phase == PressurePhase::Ready;
         if first {
             pressure.status.phase = PressurePhase::Requested;
         }
         pressure.status.refused_writes = pressure.status.refused_writes.saturating_add(1);
         drop(pressure);
         if first {
-            let waker = self
-                .pressure_request_waker
-                .lock()
-                .ok()
-                .and_then(|slot| slot.clone());
-            if let Some(waker) = waker {
-                waker();
-            }
+            self.wake_pressure_pass();
         }
         Err(Error::new(
             "STORAGE_PRESSURE",
@@ -402,9 +482,16 @@ impl Writer {
 
     /// The admission check of a commit: the floor for ordinary writes, the maintenance
     /// reserve for reclamation.
+    ///
+    /// A refusal at the floor also asks for reclamation (#267): the refusal itself stays
+    /// immediate and typed, and it now always leaves a pass in motion.
     pub(super) fn admit_space(&self) -> Result<(), Error> {
         if !self.reclaiming.get() {
-            return self.space.check();
+            return self.space.check().inspect_err(|error| {
+                if error.is_free_space_floor() {
+                    self.request_floor_reclaim();
+                }
+            });
         }
         match self
             .space
@@ -412,6 +499,47 @@ impl Writer {
         {
             Some(shortfall) => Err(Error::new("STORAGE_PRESSURE", shortfall)),
             None => Ok(()),
+        }
+    }
+
+    /// Record that a write was refused at the floor and wake the pass once per episode.
+    /// Every later refusal of the episode costs one borrow and a flag read. The pass
+    /// measures the deficit itself; this only says that someone was turned away.
+    fn request_floor_reclaim(&self) {
+        let first = {
+            let mut state = self.pressure.borrow_mut();
+            let first = !state.floor.asked;
+            state.floor.asked = true;
+            if first {
+                state.status.floor_requests = state.status.floor_requests.saturating_add(1);
+                state.status.floor_freed_bytes = 0;
+                state.floor.start = None;
+                state.floor.passes = 0;
+                state.floor.batches = 0;
+            }
+            if state.status.phase == PressurePhase::Ready {
+                state.status.phase = PressurePhase::Requested;
+                state.status.waiting_on = Some(
+                    "free space is below the floor and a write was refused; reclamation requested, not yet attempted"
+                        .to_owned(),
+                );
+            }
+            first
+        };
+        if first {
+            self.wake_pressure_pass();
+        }
+    }
+
+    /// Tell the maintenance worker a pass should run now instead of at its scheduled time.
+    fn wake_pressure_pass(&self) {
+        let waker = self
+            .pressure_request_waker
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(waker) = waker {
+            waker();
         }
     }
 
@@ -520,17 +648,43 @@ impl Writer {
         let physical = self.physical_bytes()?;
         let linked = self.linked_physical_bytes()?;
         let limit = self.config.disk_budget - self.config.maintenance_reserve;
+        // The floor is measured here, in the pass, and never put into `requested_bytes`: that
+        // field is a store-footprint quantity compared with the disk budget, a deficit is a
+        // free-space quantity of the filesystem (#267).
+        let deficit = self.space.deficit()?;
         let mut state = self.pressure.borrow_mut();
         state.status.observed_at = now;
         state.status.linked_bytes = linked;
-        if state.status.requested_bytes == 0 && physical <= limit {
+        let floor_ended = state.floor.asked && deficit == 0;
+        if floor_ended {
+            state.end_floor_episode();
+        }
+        let floor_on = state.floor.asked && deficit > 0;
+        state.floor.deficit = if floor_on { deficit } else { 0 };
+        if floor_on {
+            state.status.floor_requested_bytes = deficit;
+            let start = *state.floor.start.get_or_insert(FloorStart {
+                linked,
+                bound: deficit.saturating_add(self.config.maintenance_reserve),
+            });
+            state.status.floor_freed_bytes = start.linked.saturating_sub(linked);
+            if state.status.phase == PressurePhase::Ready {
+                state.status.phase = PressurePhase::Requested;
+            }
+        }
+        if state.status.requested_bytes == 0
+            && physical <= limit
+            && !floor_on
+            && !floor_ended
+            && state.wait.is_none()
+        {
             // No episode is active, but a RocksDB background error is still news: surface it
             // now instead of at the next episode's first pass.
             self.surface_native_errors(&mut state, None)?;
             return Ok(state.status.clone());
         }
         // A reopened store already above its data allowance needs maintenance too.
-        if state.status.requested_bytes == 0 {
+        if state.status.requested_bytes == 0 && physical > limit {
             state.status.requested_bytes = 65536.min(limit);
             state.status.phase = PressurePhase::Requested;
         }
@@ -563,7 +717,8 @@ impl Writer {
         (physical, linked, limit): (u64, u64, u64),
         forced_failure: Option<String>,
     ) -> Result<PressureStatus, Error> {
-        if physical.saturating_add(state.status.requested_bytes) <= limit {
+        let floor_on = state.floor.deficit > 0;
+        if physical.saturating_add(state.status.requested_bytes) <= limit && !floor_on {
             if state.wait.is_some() {
                 let mut batch = rocksdb::WriteBatch::default();
                 batch.delete(WAIT_KEY);
@@ -578,9 +733,23 @@ impl Writer {
             self.surface_native_errors(state, forced_failure.as_deref())?;
             return Ok(state.status.clone());
         }
-        if linked.saturating_add(state.status.requested_bytes) <= limit {
+        if linked.saturating_add(state.status.requested_bytes) <= limit && !floor_on {
             // Temporary query reservations alone are not authority to retire evidence.
             state.stalled("only temporary query reservations hold the data allowance");
+            self.surface_native_errors(state, forced_failure.as_deref())?;
+            return Ok(state.status.clone());
+        }
+        // The floor alone (the store's own linked footprint is inside its budget) is authority
+        // to retire only evidence an archive holds a copy of. A store with no archive policy
+        // has no copy of anything, so the floor retires nothing early there and the status
+        // says so. This is judged on linked bytes, as the reservation stall above is: query
+        // reservations are in `physical` but are no authority, so judging on `physical` would
+        // let a floor episode with reservations skip the guard and the bound below. Every path
+        // to the retirement with the floor on and no budget authority passes through both.
+        let floor_only = floor_on && linked.saturating_add(state.status.requested_bytes) <= limit;
+        if floor_only && self.archive.is_none() {
+            state.enter(PressurePhase::Blocked, now);
+            state.stalled("this store has no archive policy, so nothing is retired early");
             self.surface_native_errors(state, forced_failure.as_deref())?;
             return Ok(state.status.clone());
         }
@@ -703,7 +872,35 @@ impl Writer {
                 }
             }
         }
+        if floor_only && let Some(start) = state.floor.start {
+            let freed = start.linked.saturating_sub(linked);
+            let batches = state.floor.batches;
+            if freed >= start.bound || batches >= FLOOR_EPISODE_BATCHES {
+                // The episode has retired as much as it may for an outside cause: the
+                // rest of the shortfall is held outside Sparrow. Nothing more is retired
+                // until the deficit ends the episode or a new one begins.
+                state.status.floor_bound_reached = true;
+                state.enter(PressurePhase::Blocked, now);
+                let reason = if freed >= start.bound {
+                    format!(
+                        "the store freed {freed} bytes for this floor episode (bound {}) and free space is still short; the rest is held outside Sparrow",
+                        start.bound
+                    )
+                } else {
+                    format!(
+                        "the store retired {batches} batches for this floor episode (cap {FLOOR_EPISODE_BATCHES}) and free space is still short; the rest is held outside Sparrow"
+                    )
+                };
+                state.stalled(reason);
+                self.surface_native_errors(state, forced_failure.as_deref())?;
+                return Ok(state.status.clone());
+            }
+        }
         state.status.passes = state.status.passes.saturating_add(1);
+        if floor_on {
+            state.status.floor_passes = state.status.floor_passes.saturating_add(1);
+            state.floor.passes = state.floor.passes.saturating_add(1);
+        }
         #[cfg(feature = "test-support")]
         if self.forced.retirement_refused() {
             return Err(Error::new(
@@ -711,9 +908,13 @@ impl Writer {
                 "retirement refused by a test",
             ));
         }
-        let requested = state.status.requested_bytes;
-        let report =
-            self.reclaiming(|| self.evict_oldest(now, limits, Some((linked, requested))))?;
+        // The durable wait marker carries a budget request, never a deficit: a floor-only
+        // retirement writes the value a store reopened above its allowance already uses.
+        let marker = match state.status.requested_bytes {
+            0 => FLOOR_MARKER_BYTES,
+            requested => requested,
+        };
+        let report = self.reclaiming(|| self.evict_oldest(now, limits, Some((linked, marker))))?;
         state.status.evicted_records = state
             .status
             .evicted_records
@@ -735,6 +936,9 @@ impl Writer {
         // A forced compaction's failure stays visible for the pass that ended its wait.
         state.status.failure = forced_failure;
         if changed {
+            if floor_on {
+                state.floor.batches = state.floor.batches.saturating_add(1);
+            }
             state.wait = Some(Wait {
                 before: linked,
                 step: Step::Native,
@@ -743,6 +947,12 @@ impl Writer {
             state.status.wait_since = now.max(1);
             state.status.waiting_on = None;
             state.enter(PressurePhase::AwaitingReclamation, now);
+            if floor_on {
+                let text = state.floor_text(
+                    "reclamation in progress: evidence was retired and the store waits for native work to return its bytes",
+                );
+                state.status.waiting_on = Some(text);
+            }
             // Schedule native flushes without holding the writer through disk I/O.
             // Automatic native compaction/blob GC remains limited to the background jobs.
             let mut options = FlushOptions::default();
@@ -751,15 +961,25 @@ impl Writer {
                 .flush_cfs_opt(&super::family_handles(&self.db)?, &options)?;
         } else if archive_lag {
             state.enter(PressurePhase::AwaitingArchive, now);
-            state.stalled("the archive watermark has not reached the oldest evidence");
+            let reason =
+                state.floor_tried("the archive watermark has not reached the oldest evidence");
+            state.stalled(reason);
         } else if continuing {
             state.status.waiting_on = None;
             state.enter(PressurePhase::Requested, now);
+            if floor_on {
+                let text =
+                    state.floor_text("reclamation in progress: more evidence remains to retire");
+                state.status.waiting_on = Some(text);
+            }
         } else {
             state.enter(PressurePhase::Blocked, now);
-            state.stalled(format!(
-                "no evidence could be retired: {protected} entries are protected by a pin"
-            ));
+            let reason = state.floor_tried(&if protected == 0 {
+                "no evidence is left to retire".to_owned()
+            } else {
+                format!("no evidence could be retired: {protected} entries are protected by a pin")
+            });
+            state.stalled(reason);
         }
         Ok(state.status.clone())
     }

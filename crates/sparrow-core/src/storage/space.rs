@@ -310,6 +310,12 @@ impl SpaceFloor {
         }))
     }
 
+    /// Bytes of free space missing below the floor; zero at or above it. A failed
+    /// measurement is an error, never a zero.
+    pub(super) fn deficit(&self) -> Result<u64, Error> {
+        Ok(self.min_free.saturating_sub(self.free()?))
+    }
+
     /// Describe a free-space shortfall, if any. A failed measurement is an error,
     /// never a shortfall, so callers that pause on low space cannot hide it.
     pub fn shortfall(&self) -> Result<Option<String>, Error> {
