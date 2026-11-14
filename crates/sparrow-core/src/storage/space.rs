@@ -102,7 +102,29 @@ fn floor_refusal(detail: &str) -> Error {
     )
 }
 
+/// The text every maintenance-reserve refusal message starts with: free space is under the
+/// reserve that reclamation commits are admitted against. It keeps the code
+/// `STORAGE_PRESSURE`; the prefix is how [`Error::is_reserve_refusal`] tells it from the
+/// store's own budget pressure, which an inner commit can also raise.
+pub const RESERVE_REFUSAL_PREFIX: &str = "maintenance reserve: ";
+
+/// The refusal of a reclamation commit, or of ageing out below the floor, when free space is
+/// under the maintenance reserve; `shortfall` is [`SpaceFloor::shortfall_below`]'s text.
+pub(super) fn reserve_refusal(shortfall: &str) -> Error {
+    Error::new(
+        "STORAGE_PRESSURE",
+        format!("{RESERVE_REFUSAL_PREFIX}{shortfall}"),
+    )
+}
+
 impl Error {
+    /// Whether this is a `STORAGE_PRESSURE` refusal made because free space is under the
+    /// maintenance reserve, as opposed to the floor or the store's own budget pressure.
+    #[must_use]
+    pub fn is_reserve_refusal(&self) -> bool {
+        self.code == "STORAGE_PRESSURE" && self.message.starts_with(RESERVE_REFUSAL_PREFIX)
+    }
+
     /// Whether this is a retryable `STORAGE_PRESSURE` refusal made by the free-space floor,
     /// as opposed to the store's own budget pressure.
     #[must_use]

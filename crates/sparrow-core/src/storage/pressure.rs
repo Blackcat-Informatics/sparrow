@@ -153,8 +153,9 @@ struct Wait {
     before: u64,
     step: Step,
     /// A retirement pass staged a durable marker for this wait. Ageing out below the floor
-    /// (#267) opens a wait with none: ending it must not write, because a delete of the
-    /// marker key would stage the pressure writer fence on a store that never had one.
+    /// (#267) opens a wait with none. Nothing was stored, so ending it needs no commit: a
+    /// commit would be one more write admitted against the maintenance reserve, which could
+    /// be refused for no reason the wait has.
     durable: bool,
 }
 
@@ -184,10 +185,16 @@ struct FloorEpisode {
     batches: u64,
     /// Set by the first pass of the episode.
     start: Option<FloorStart>,
-    /// Ageing out ran (or failed, or was refused at the reserve) since this episode asked.
-    /// Early retirement of archived evidence waits for it: ageing out is normal retention
-    /// that was only delayed, early retirement is the policy-sensitive avenue.
+    /// Ageing out ran (or failed) since this episode asked. A refusal
+    /// at the maintenance reserve is not a run: nothing was attempted. Early retirement of
+    /// archived evidence waits for it: ageing out is normal retention that was only delayed,
+    /// early retirement is the policy-sensitive avenue.
     expiry_tried: bool,
+    /// Ageing out has been asked to run and has not been refused at the reserve since. The
+    /// refusal clears it, and the first pass that finds free space back above the reserve
+    /// asks again, so a rise that stops short of the floor still runs ageing out, by an
+    /// event and without a clock.
+    expiry_asked: bool,
 }
 
 /// The measures a floor episode is bounded by.
@@ -506,7 +513,7 @@ impl Writer {
             .space
             .shortfall_below(self.config.maintenance_reserve)?
         {
-            Some(shortfall) => Err(Error::new("STORAGE_PRESSURE", shortfall)),
+            Some(shortfall) => Err(super::space::reserve_refusal(&shortfall)),
             None => Ok(()),
         }
     }
@@ -526,6 +533,8 @@ impl Writer {
                 state.floor.passes = 0;
                 state.floor.batches = 0;
                 state.floor.expiry_tried = false;
+                // The wake below asks ageing out to run.
+                state.floor.expiry_asked = true;
             }
             if state.status.phase == PressurePhase::Ready {
                 state.status.phase = PressurePhase::Requested;
@@ -705,11 +714,42 @@ impl Writer {
         Ok(())
     }
 
-    /// Ageing out ran below the floor (#267), or was refused or failed: the floor episode may
-    /// go on to early retirement. When it retired evidence for a floor episode that asked,
-    /// open an in-memory wait (no durable marker, so no format fence) so the pass measures
-    /// whether linked bytes fell and forces a compaction if they did not. `linked_before` is
-    /// the linked store bytes measured before the retirement; `None` means nothing retired.
+    /// Ageing out was refused because free space is under the maintenance reserve: nothing
+    /// was attempted, so the episode's early retirement still waits for it. It is asked
+    /// again when free space next clears the reserve (see `ask_expiry`).
+    pub(super) fn expiry_refused_at_reserve(&self) {
+        self.pressure.borrow_mut().floor.expiry_asked = false;
+    }
+
+    /// Wake ageing out the first time free space clears the maintenance reserve after a
+    /// refusal at it (the ask is outstanding until a refusal clears it): the daemon's resume
+    /// edge fires only at the floor, and a rise that stops between the reserve and the floor
+    /// is the range ageing out is admitted in. This holds whether or not an earlier pass of
+    /// the episode ran, because a backlog can be refused part way. The pass is the observer
+    /// (it runs on its own backoff and is itself woken by every event that matters); no
+    /// timer is added.
+    fn ask_expiry(&self, state: &mut State) -> Result<(), Error> {
+        if state.floor.expiry_asked {
+            return Ok(());
+        }
+        if self
+            .space
+            .shortfall_below(self.config.maintenance_reserve)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        state.floor.expiry_asked = true;
+        self.wake_pressure_pass();
+        Ok(())
+    }
+
+    /// Ageing out ran below the floor (#267), or failed: the floor
+    /// episode may go on to early retirement. When it retired evidence for a floor episode
+    /// that asked, open an in-memory wait (nothing is stored, so ending it needs no commit)
+    /// so the pass measures whether linked bytes fell and forces a compaction if they did
+    /// not. `linked_before` is the linked store bytes measured before the retirement; `None`
+    /// means nothing retired.
     pub(super) fn expiry_ran_below_floor(
         &self,
         now: u64,
@@ -835,6 +875,9 @@ impl Writer {
         // let a floor episode with reservations skip the guard and the bound below. Every path
         // to the retirement with the floor on and no budget authority passes through both.
         let floor_only = floor_on && linked.saturating_add(state.status.requested_bytes) <= limit;
+        if floor_only {
+            self.ask_expiry(state)?;
+        }
         // With no archive policy ageing out is the only avenue, and its retirement can leave a
         // wait open that only this pass measures and ends (forced compaction included), so a
         // store with such a wait goes on through the gates and refuses after them.

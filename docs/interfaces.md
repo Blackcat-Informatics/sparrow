@@ -186,8 +186,9 @@ that stepped forward, since the sleep itself is monotonic. A pin release, a pin
 commit and an archive commit wake the worker at once. Below the free-space floor the
 pass runs under the maintenance reserve (#267, below); when free space is under the
 reserve it is refused before it reads anything, and it then waits for the floor's resume,
-which wakes it at once (#247), with no retry clock and no journal line per attempt; the
-one-hour ceiling is only its backstop. A pass that failed for any other reason retries
+which wakes it at once (#247), or for the pressure pass, which wakes it the first time it
+finds free space back above the reserve while a floor episode is open, with no retry clock
+and no journal line per attempt; the one-hour ceiling is only its backstop. A pass that failed for any other reason retries
 after 60 seconds, for want of any event that says it would now succeed. Retry rows
 (`request:`) have no time index; one pass scans them once per hour, and their
 logical expiry is exact at read time regardless. The purge of expired read
@@ -278,8 +279,16 @@ reserve. It frees bytes only after native flush and compaction, so when it retir
 evidence for a floor episode that asked for reclamation it opens an in-memory pressure wait
 (no stored marker, no format change) that the pass measures and ends, forcing a compaction
 if linked bytes do not fall. Within one floor episode ageing out goes first: the pass waits
-("waiting for ageing out to run first") until expiry has run, been refused at the reserve or
-failed, and only then retires archived evidence early. On a store with no archive policy
+("waiting for ageing out to run first") until expiry has run or failed (a refusal at the
+reserve is not a run; ageing out is asked again when free space clears the reserve), and
+only then retires archived evidence early. Ageing out has no per-episode cap: evidence past
+retention is not a policy risk, and a cap would leave aged-out data on disk and writes
+refused while an honest avenue remains. What protects the reserve headroom the pass's own
+flush and compaction need is the batch size (the ordinary 32 units) and that every batch is
+admitted against the reserve, so a batch that would find free space under it is refused;
+the duty continues a backlog by its continuation flag (an event) until nothing is due or the
+reserve refuses, and a refusal parks it until the pass finds free space above the reserve
+again. On a store with no archive policy
 ageing out is the only avenue. The lease purge writes nothing and ends the read snapshots a
 pass stalls on ("open read snapshots"), so it runs below the floor and wakes the pass.
 Import reclamation and online migration write more than they free (a migration page
@@ -384,9 +393,8 @@ allowed up to a bound: the first measured deficit plus `maintenance_reserve`, co
 linked store bytes freed. Past the bound the pass retires nothing more for that episode and
 says the rest is held outside Sparrow. Freed bytes lag retirement until native compaction
 runs, so the episode is also capped at 8 retirement batches, whatever they have freed so far. A store with no archive policy retires nothing early
-for the floor: nothing there is marked archived, so "archived" protects nothing. Ageing out
-below the floor is a separate change (#267, part C); until it ships a floor episode uses only
-the avenues in this paragraph.
+for the floor: nothing there is marked archived, so "archived" protects nothing. There a
+floor episode uses ageing out only, described below.
 
 The honest state of a store with no archive policy and nothing expired: at the floor it has
 no avenue left and refuses writes until space returns from outside. The counters that show
@@ -2755,7 +2763,9 @@ stream or discards a frame:
 
   The one-second observation is the cadence at which the daemon measures the floor; it
   is one tick for every held frame, never a timer per frame. The same table governs the
-  other waits: expiry and online migration skipped below the floor wake on its resume;
+  other waits: online migration skipped below the floor wakes on its resume, and expiry
+  refused under the maintenance reserve wakes on it too, or when the pressure pass finds free
+  space back above the reserve while a floor episode is open (an event, never a timer);
   the pressure pass's one-to-30-second delay is the observer of native state above.
 
   A held connection is not idle. The read timeout does not run while it holds,

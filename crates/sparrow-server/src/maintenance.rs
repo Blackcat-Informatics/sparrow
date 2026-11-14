@@ -264,14 +264,16 @@ struct ExpiryRetry {
     journal: bool,
 }
 
-/// What follows a failed expiry pass. Below the free-space floor, a `STORAGE_PRESSURE`
-/// refusal is free space under the maintenance reserve: not a failure, and it has an event,
-/// the floor's resume edge that wakes expiry. It takes no retry clock and no journal line
-/// per attempt (the pressure duty's stall text reports the reserve); `EXPIRY_CEILING` is only
-/// the wall-clock bound every idle expiry sleep already has. Any other failure has no event
-/// and retries on [`EXPIRY_RETRY`], journaled.
+/// What follows a failed expiry pass. Below the free-space floor, a refusal typed as the
+/// maintenance reserve's ([`Error::is_reserve_refusal`]; a budget `STORAGE_PRESSURE` from an
+/// inner commit is not one) is free space under the reserve: not a failure, and it has
+/// events: the floor's resume edge, and the pressure pass asking again when free space clears
+/// the reserve. It takes no retry clock and no journal line per attempt (the pressure duty's
+/// stall text reports the reserve); `EXPIRY_CEILING` is only the wall-clock bound every idle
+/// expiry sleep already has. Any other failure has no event and retries on [`EXPIRY_RETRY`],
+/// journaled.
 fn expiry_retry(paused: bool, error: &Error) -> ExpiryRetry {
-    if paused && error.code == "STORAGE_PRESSURE" {
+    if paused && error.is_reserve_refusal() {
         ExpiryRetry {
             after: EXPIRY_CEILING,
             journal: false,
@@ -771,11 +773,17 @@ mod tests {
     // Value (#267): a full disk used to put expiry on a 60 second retry clock with a journal
     // line per attempt, though its refusal below the reserve ends by an event (free space
     // returning, which wakes expiry). Protects: below the floor, a reserve refusal waits for the
-    // wall-clock ceiling and is not journaled; any other failure, and any failure with the
-    // floor not crossed, keeps the retry clock and the journal line.
+    // wall-clock ceiling and is not journaled; any other failure, any failure with the
+    // floor not crossed, and a budget `STORAGE_PRESSURE` raised by an inner commit (which has
+    // no resume event) keep the retry clock and the journal line, told apart by the typed
+    // reserve label and not by the code alone.
     #[test]
     fn an_expiry_refusal_at_the_reserve_has_no_retry_clock_and_no_journal_line() {
-        let refused = Error::new("STORAGE_PRESSURE", "only 1 bytes free");
+        let refused = Error::new(
+            "STORAGE_PRESSURE",
+            format!("{}only 1 bytes free", sparrow_core::RESERVE_REFUSAL_PREFIX),
+        );
+        assert!(refused.is_reserve_refusal());
         let quiet = expiry_retry(true, &refused);
         assert_eq!((quiet.after, quiet.journal), (EXPIRY_CEILING, false));
         let floor_clear = expiry_retry(false, &refused);
@@ -785,6 +793,23 @@ mod tests {
         );
         let failed = expiry_retry(true, &Error::new("STORAGE_FAILURE", "native failure"));
         assert_eq!((failed.after, failed.journal), (EXPIRY_RETRY, true));
+        for other in [
+            Error::new(
+                "STORAGE_PRESSURE",
+                "write would cross the maintenance reserve; bounded pressure maintenance requested",
+            ),
+            Error::new(
+                "STORAGE_PRESSURE",
+                format!("{}only 1 bytes free", sparrow_core::FLOOR_REFUSAL_PREFIX),
+            ),
+        ] {
+            let retry = expiry_retry(true, &other);
+            assert_eq!(
+                (retry.after, retry.journal),
+                (EXPIRY_RETRY, true),
+                "{other}"
+            );
+        }
     }
 
     /// A daemon-config store whose floor (32 MiB) is above its maintenance reserve (8 MiB), so

@@ -83,15 +83,27 @@ Ageing out is the first avenue of a floor episode and runs below the floor (#267
 A floor refusal wakes it with the pass. It runs through `Store::expire_below_floor`: the
 same bounded pass as ordinary expiry, but its commits are admitted against the maintenance
 reserve like the pass's own, it does not run import reclamation, and when free space is
-under the reserve it is refused before it reads anything and waits for the floor's resume.
-It never deletes unarchived or pinned evidence (the archive gate and the pins are the same
-code as the pass's). Retired evidence returns its bytes only after native work, so when
-ageing out retires evidence for an episode that asked for reclamation it opens an in-memory
-wait, with no stored marker: a delete of the marker key would stage the pressure writer
-fence on a store that never had one, so ending such a wait writes nothing. The pass measures
-it as it measures its own, forcing one compaction when linked bytes do not fall. The pass
-retires archived evidence early only after ageing out has had its turn, so retention that was
-only delayed goes before the policy-sensitive avenue. On a store with no archive policy the
+under the reserve it is refused before it reads anything. That refusal is not ageing out's
+turn: the episode does not count it, and ageing out is asked again by the floor's resume or
+by the pressure pass, which wakes it the first time it finds free space back above the
+reserve (and again if free space falls under it and clears it again), so a rise that stops
+short of the floor still runs ageing out, with no clock. It never deletes unarchived or
+pinned evidence (the archive gate and the pins are the same code as the pass's). It has no
+per-episode cap, unlike early retirement: early retirement of archived evidence is a policy
+choice that must be bounded, while evidence past retention is not, and a cap would leave
+aged-out data on disk and writes refused while an honest avenue remains. The reserve
+headroom the pass's own flush and compaction need is protected by the batch size (the
+ordinary 32 units) and by the reserve admission of every batch, which refuses when free
+space is under the reserve, so no further cap is needed. A backlog continues by the
+duty's continuation flag, an event, until nothing is due or the reserve refuses; a refusal
+parks it until the pass finds free space back above the reserve.
+Retired evidence returns its bytes only after native work, so when ageing out retires
+evidence for an episode that asked for reclamation it opens an in-memory wait, with no
+stored marker. Nothing was stored, so ending such a wait needs no commit; a commit would be
+one more write admitted against the reserve, which could be refused for no reason the wait
+has. The pass measures it as it measures its own, forcing one compaction when linked bytes
+do not fall. The pass retires archived evidence early only after ageing out has had its
+turn, so retention that was only delayed goes before the policy-sensitive avenue. On a store with no archive policy the
 pass still measures and ends ageing out's wait, then says nothing is retired early. The
 lease purge writes nothing and also runs below the floor: the pass stalls on open read
 snapshots, which only the purge ends, and it wakes the pass. Import reclamation and online
