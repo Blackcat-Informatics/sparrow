@@ -178,6 +178,61 @@ impl Store {
         self.lock()?.expire_bounded(now, limits)
     }
 
+    /// One finite expiry pass that runs while free space is below the floor (#267).
+    ///
+    /// Its commits are reclamation: they run under the maintenance reserve instead of the
+    /// floor, like the pressure pass's retirement batch, and are the same class and size
+    /// (`limits` bound them; pass the pressure pass's). A free-space reading below the reserve
+    /// refuses before anything is read, with the reserve's `STORAGE_PRESSURE` error
+    /// ([`Error::is_reserve_refusal`]); nothing was attempted, so the floor episode does not
+    /// count it as ageing out's turn and the pass asks again when free space clears the
+    /// reserve. Import reclamation is not run: it is the other duty skipped below the floor.
+    ///
+    /// Evidence past retention is retired, not policy-sensitive, so a floor episode has no
+    /// cap on it. What protects the reserve headroom is the batch size (`limits`, 32 units by
+    /// default) and that every commit is admitted against the reserve: a batch that would
+    /// find free space under it is refused, and the daemon continues the backlog by the
+    /// report's `continuation` until nothing is due or the reserve refuses. Once a pass ran or
+    /// failed, the episode is told ageing out had its turn, so early retirement of archived
+    /// evidence may follow. Retiring any unit opens an in-memory pressure wait (nothing is
+    /// stored, so no format changes) so the pass measures the freed bytes and forces a
+    /// compaction when they do not come.
+    pub fn expire_below_floor(
+        &self,
+        now: u64,
+        limits: EvictionLimits,
+    ) -> Result<ExpiryReport, Error> {
+        limits.validate()?;
+        let writer = self.lock()?;
+        let outcome: Result<(u64, ExpiryReport), Error> = (|| {
+            if let Some(shortfall) = writer
+                .space
+                .shortfall_below(writer.config.maintenance_reserve)?
+            {
+                return Err(super::space::reserve_refusal(&shortfall));
+            }
+            let linked = writer.linked_physical_bytes()?;
+            let report = writer.reclaiming(|| writer.expire_bounded(now, limits))?;
+            Ok((linked, report))
+        })();
+        if outcome.as_ref().is_err_and(Error::is_reserve_refusal) {
+            writer.expiry_refused_at_reserve();
+            return outcome.map(|(_, report)| report);
+        }
+        let retired_from = match &outcome {
+            Ok((linked, report))
+                if report.records != 0 || report.artifacts != 0 || report.payload_refs != 0 =>
+            {
+                Some(*linked)
+            }
+            _ => None,
+        };
+        let told = writer.expiry_ran_below_floor(now, retired_from);
+        let (_, report) = outcome?;
+        told?;
+        Ok(report)
+    }
+
     /// Default bounded expiry pass; returns dependency retirement units, not freed bytes.
     /// Callers requiring complete traversal inspect `expire_bounded` continuation.
     pub fn expire(&self, now: u64) -> Result<u64, Error> {

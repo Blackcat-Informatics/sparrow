@@ -111,7 +111,8 @@ pub use storage::source_time::{
     EventPlacement, EventTime, EventTimeBasis, SourceTimeProfile, TimeRepresentation,
 };
 pub use storage::space::{
-    FLOOR_REFUSAL_PREFIX, FloorStatus, PAUSED_READ_STAGING_BYTES, ResumeSubscription, SpaceFloor,
+    FLOOR_REFUSAL_PREFIX, FloorStatus, PAUSED_READ_STAGING_BYTES, RESERVE_REFUSAL_PREFIX,
+    ResumeSubscription, SpaceFloor,
 };
 #[cfg(feature = "test-support")]
 pub use storage::store_event_fallback_rdf_for_legacy_fixture;

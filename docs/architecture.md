@@ -244,6 +244,11 @@ survives eviction of its parent file. If reclamation lags, maintenance reserve i
 insufficient, or pinned data occupies the available capacity, stop admitting
 further writes and report storage pressure. Pins are never silently broken.
 
+Below the free-space floor the maintenance worker still runs the duties that free space
+or add nothing: buffered synchronization, the table rewrite step, the pressure pass,
+ageing out (under the maintenance reserve, in the pass's own small batches) and the
+read-lease purge. Import reclamation and online migration wait for the floor.
+
 Recordless artifacts participate through a separate chronological catalog index.
 Eviction merges it with the record timeline by receipt time and evidence identity
 using native bounded cursors; queries retain their record-only timeline. Whole
