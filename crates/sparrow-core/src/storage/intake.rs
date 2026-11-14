@@ -88,7 +88,7 @@ pub(super) fn fence(writer: &super::Writer) -> Result<(), Error> {
     if super::writer_format::has_intake(&format) {
         return Ok(());
     }
-    writer.space.check()?;
+    writer.admit_space()?;
     let mut batch = rocksdb::WriteBatch::default();
     batch.put(
         "store_format",

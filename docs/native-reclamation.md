@@ -53,6 +53,34 @@ wait is released and the next pass retires more. The pass needs the maintenance 
 free on the filesystem and otherwise does nothing that writes; its retirement and wait-clear commits are admitted against that reserve, not the free-space floor, which ordinary writes keep. The interface
 document has the status fields and the states that cannot end in process.
 
+## A floor refusal requests reclamation (#267)
+
+The free-space floor used to refuse writes without asking any reclaim avenue to run, and
+the pressure pass ignored the floor: with the store inside its budget it returned at once,
+and the status read `ready` while writes were refused. Now a write refused at the floor
+requests a pass once per episode, and the pass measures the floor itself.
+
+The deficit is a free-space quantity and stays out of `requested_bytes`, which is compared
+with the disk budget: put there it would make `physical + requested <= limit` true on any
+under-budget store, so the pass would declare itself ready and retire nothing, and a stored
+marker would restore it as a budget request at the next open. The pass keeps its own floor
+fields instead, and the two branches that would declare the pass ready or stalled on
+reservations are guarded while the floor is the reason.
+
+Retirement for the floor is the budget path's own: oldest first, archived and unpinned
+entries only, stopping at the first unarchived entry. It applies only where an archive
+policy exists, and is bounded per episode by the first measured deficit plus the
+maintenance reserve. A store with no archive policy retires nothing early, and its status
+says so. The durable wait marker of a floor-only retirement carries the fixed 65536 bytes a
+reopened over-allowance store already uses, never the deficit, so a reopen restores a wait
+whose first pass clears it through the ready branch. When the measured deficit reaches zero
+the episode ends and the ordinary ready path removes the marker.
+
+With no archive policy and nothing expired, a store at the floor has no avenue left and
+refuses writes until space returns. `floorPause.writesRefused`, the pressure status
+`floorRefusedWrites` and the `floor*` fields show it. A client that does not retry loses
+what it was refused, and the store cannot count that loss; it counts only the refusals.
+
 ## A failed native compaction does not latch the pressure state (#218)
 
 The binding's compaction call is `void` all the way down: the C function

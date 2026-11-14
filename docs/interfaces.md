@@ -337,6 +337,64 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
   kernel buffer or on an unclean daemon exit (see the UDP hold section); every other source holds at the producer (client queue, ship queue, source
   file, sender socket).
 
+### A floor refusal requests reclamation (#267)
+
+The refusal stays immediate and typed; it now also leaves a pass in motion. A write
+refused at the floor (every commit path, and the intake fence) records that someone was
+turned away, moves the pressure phase from `ready` to `requested` and wakes the pressure
+pass through the same waker a budget refusal uses, once per episode: later refusals cost a
+flag read and wake nothing. The episode ends when a pass measures the deficit at zero. The
+pass measures the deficit itself (`min_free_bytes` less the free space of the store's
+filesystem) and keeps it apart from `requestedBytes`: that field is a store-footprint
+quantity compared with the disk budget, and a free-space deficit added to it would make an
+under-budget store look ready. The pass acts on the floor only after a write was refused;
+the pause edge itself requests nothing.
+
+What the pass may retire for the floor is limited. It uses the same oldest-first avenue as
+the budget path, so it never deletes unarchived evidence and never deletes pinned evidence,
+and it applies only to a store with an archive policy. Archived evidence has its copy, so
+retiring some of it earlier than the budget would, to take the log being offered now, is
+allowed up to a bound: the first measured deficit plus `maintenance_reserve`, counted in
+linked store bytes freed. Past the bound the pass retires nothing more for that episode and
+says the rest is held outside Sparrow. A store with no archive policy retires nothing early
+for the floor: nothing there is marked archived, so "archived" protects nothing. Ageing out
+below the floor is a separate change (#267, part C); until it ships a floor episode uses only
+the avenues in this paragraph.
+
+The honest state of a store with no archive policy and nothing expired: at the floor it has
+no avenue left and refuses writes until space returns from outside. The counters that show
+it are `floorPause.writesRefused` (RPC writes answered with the floor class), the pressure
+status `floorRefusedWrites` (every refusal at the store) and the new floor fields below, with
+`waitingOn` saying in words that free space is below the floor by N bytes and that the store
+has no archive policy, so nothing is retired early.
+
+The status says which of three states the floor is in:
+
+- Reclaim not yet attempted. Phase `requested`, `floorRequests` counts the episode and
+  `waitingOn` says a write was refused and reclamation is requested but not yet attempted.
+  This lasts until the woken pass has run.
+- Attempted and in progress. Phase `requested` or `awaitingReclamation`; `waitingOn` says
+  how far below the floor the store is and what it waits on: a native flush or compaction, a
+  forced compaction, open read snapshots, or the free space the pass itself needs (the
+  maintenance reserve).
+- Attempted and nothing reclaimable. Phase `blocked` or `awaitingArchive`; `waitingOn`
+  says free space is below the floor by N bytes and that reclamation was tried (passes and
+  bytes freed), then why nothing more can go: entries are protected by a pin, the archive
+  watermark has not reached the oldest evidence, the store has no archive policy, or the
+  episode's bound was reached and the rest is held outside Sparrow.
+
+A client that does not retry is a loss the store cannot count. Sparrow counts the refusal,
+not what the producer then does with the data it was refused: the producer's discard is not
+visible to the store. The counters that show the refusals are `floorPause.writesRefused`
+and the pressure status `floorRefusedWrites`; a producer that holds and retries (the Rust
+client, syslog TCP, the UDP hold) is not a loss, and its own counters say how much it held.
+
+The daemon journals the edges of an episode (it begins, it reaches its bound, it ends)
+through one limiter of at most one line a minute; a line held back is counted into the next
+one, so a volume hovering at the floor cannot flood the journal and a long episode is still
+reported by the quiet-pass line each minute with the same counters. No line is written per
+refusal.
+
 The status `pressureStatus` extends additively (schema 71, no version change; an older
 reader ignores the fields and an older server leaves them zero): `observedAt` (the last
 pass's clock), `linkedBytes`, `episodeSince` (intake refused since), `phaseSince`,
@@ -348,7 +406,13 @@ do no more), and for the free-space floor `floorPausedSince`, `floorPauses`,
 last forced compaction), `forcedCompactionFamilies` (a list of `family`, `beforeBytes` and
 `afterBytes`, the table and blob file bytes of each family around it), `forcedFailures` (forced
 compactions that ended in a panic or a raised native error) and `nativeErrors` (new RocksDB
-background errors the pressure passes saw); again no version change. CLI and MCP render ages as `wait_age_ms`,
+background errors the pressure passes saw); again no version change. #267 adds
+`floorRequests` (episodes in which a refused write asked for reclamation),
+`floorRequestedBytes` (bytes below the floor at the last pass, zero when none),
+`floorPasses` (retirement passes run while the floor was the reason) and
+`floorFreedBytes` (linked bytes the current or last episode freed), at ordinals 30 to 33;
+CLI and MCP render them under `free_space_floor` as `reclaim_requests`, `requested_bytes`,
+`passes` and `freed_bytes`. CLI and MCP render ages as `wait_age_ms`,
 `episode_age_ms` and `phase_age_ms`, measured to `observedAt`. Counters are session-local
 and the clocks of an episode or wait restored at open start at the first pass; the
 stored wait marker is unchanged.

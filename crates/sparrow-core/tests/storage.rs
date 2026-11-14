@@ -6081,6 +6081,428 @@ fn retirement_and_wait_clear_commit_with_the_floor_unmet() {
     );
 }
 
+/// Free space the #267 tests report while the floor is crossed: the floor is 8 MiB and the
+/// maintenance reserve 4 MiB, so 6 MiB is above the reserve (the pass can write) and 2 MiB
+/// below the floor (ordinary writes are refused).
+const FLOOR_SHORT_FREE: u64 = 6 * 1024 * 1024;
+/// The deficit that free space leaves, as the status reports it.
+const FLOOR_SHORT_BY: u64 = 2 * 1024 * 1024;
+/// Free space that never limits anything.
+const FLOOR_PLENTY: u64 = 1 << 40;
+
+/// A store whose floor (8 MiB) is above its maintenance reserve (4 MiB) inside a 16 MiB
+/// budget, so free space alone, moved with the override, decides what is refused.
+fn floor_settings(archive: bool) -> Config {
+    let mut settings = if archive {
+        archiving_config()
+    } else {
+        config()
+    };
+    settings.disk_budget = 16 * 1024 * 1024;
+    settings.maintenance_reserve = 4 * 1024 * 1024;
+    settings.min_free_bytes = 8 * 1024 * 1024;
+    settings
+}
+
+/// Four small records received at 1..=4, the first three covered by one archive segment.
+fn archived_prefix_store(dir: &std::path::Path) -> (Store, Vec<sparrow_core::Artifact>) {
+    let store = Store::open(dir, floor_settings(true)).unwrap();
+    let artifacts = (1..=4_u64)
+        .map(|at| {
+            store
+                .ingest(
+                    &format!("floor-{at}"),
+                    "source",
+                    "log",
+                    format!("record {at}\n").as_bytes(),
+                    at,
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let covered = artifacts[..3]
+        .iter()
+        .zip(1_u64..)
+        .map(|(artifact, at)| archive_position(at, &artifact.record_ids[0]))
+        .collect::<Vec<_>>();
+    archive_records(&store, 1, &covered);
+    (store, artifacts)
+}
+
+// Value (#267, D1): a floor refusal used to leave nothing in motion, so a store under its
+// budget stayed refused with the pressure status `ready`. Protects: a write refused at the
+// floor requests a pass through the waker once per episode, however many writes follow;
+// the status shows `requested` with the not-yet-attempted reason; the episode ends when the
+// measured deficit reaches zero; and the next refusal is a new episode that wakes again.
+#[test]
+fn a_floor_refusal_requests_the_pass_once_per_episode() {
+    use sparrow_core::{EvictionLimits, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), floor_settings(false)).unwrap();
+    store
+        .ingest("floor-ask-old", "source", "log", b"old\n", 1)
+        .unwrap();
+    let requests = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    store.set_pressure_request_waker(Some(std::sync::Arc::new({
+        let requests = std::sync::Arc::clone(&requests);
+        move || {
+            requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    })));
+    let floor = store.space_floor();
+    floor.set_free_for_tests(Some(FLOOR_SHORT_FREE));
+    for attempt in ["floor-ask-1", "floor-ask-2"] {
+        let refused = store
+            .ingest(attempt, "source", "log", b"later\n", 2)
+            .unwrap_err();
+        assert!(refused.is_free_space_floor(), "{refused}");
+    }
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let asked = store.pressure_status().unwrap();
+    assert_eq!(asked.phase, PressurePhase::Requested);
+    assert_eq!((asked.floor_requests, asked.passes), (1, 0));
+    // The budget request is untouched: the deficit is not a footprint quantity.
+    assert_eq!(asked.requested_bytes, 0);
+    assert!(
+        asked
+            .waiting_on
+            .as_deref()
+            .unwrap()
+            .contains("not yet attempted"),
+        "{:?}",
+        asked.waiting_on
+    );
+    floor.set_free_for_tests(Some(FLOOR_PLENTY));
+    let ready = store
+        .pressure_maintain(10, EvictionLimits::default())
+        .unwrap();
+    assert_eq!(ready.phase, PressurePhase::Ready);
+    assert_eq!(ready.floor_requested_bytes, 0);
+    assert!(ready.waiting_on.is_none());
+    floor.set_free_for_tests(Some(FLOOR_SHORT_FREE));
+    store
+        .ingest("floor-ask-3", "source", "log", b"later\n", 11)
+        .unwrap_err();
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(store.pressure_status().unwrap().floor_requests, 2);
+}
+
+// Value (#267, D1): with the store under its budget the pass used to return at once, so
+// archived evidence a full disk could spare stayed. Protects: a floor refusal makes the pass
+// retire archived evidence although the store is inside its budget, it measures the deficit
+// itself, it stops at the first unarchived entry (nothing unarchived is ever deleted), and
+// it then reports the archive watermark as what it waits on, with what it already tried.
+#[test]
+fn a_floor_refusal_below_budget_retires_archived_evidence_and_stops_at_the_archive_gate() {
+    use sparrow_core::{EvictionLimits, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let (store, artifacts) = archived_prefix_store(dir.path());
+    store
+        .space_floor()
+        .set_free_for_tests(Some(FLOOR_SHORT_FREE));
+    assert!(
+        store
+            .ingest("floor-refused", "source", "log", b"later\n", 5)
+            .unwrap_err()
+            .is_free_space_floor()
+    );
+    let limits = EvictionLimits::default();
+    let first = store.pressure_maintain(10, limits).unwrap();
+    assert!(first.failure.is_none(), "{:?}", first.failure);
+    assert_eq!(first.phase, PressurePhase::AwaitingReclamation);
+    assert_eq!(first.evicted_records, 3);
+    assert_eq!(first.floor_requested_bytes, FLOOR_SHORT_BY);
+    assert_eq!((first.floor_passes, first.requested_bytes), (1, 0));
+    // The wait runs on native work; each step is an event, never a time.
+    let mut state = first;
+    for step in 0..16 {
+        if state.phase == PressurePhase::AwaitingArchive {
+            break;
+        }
+        store.await_native_quiet().unwrap();
+        state = store.pressure_maintain(11 + step, limits).unwrap();
+    }
+    assert_eq!(state.phase, PressurePhase::AwaitingArchive, "{state:?}");
+    let waiting = state.waiting_on.as_deref().unwrap();
+    assert!(
+        waiting.contains("the archive watermark has not reached"),
+        "{waiting}"
+    );
+    assert!(waiting.contains("reclamation tried"), "{waiting}");
+    assert_eq!(state.evicted_records, 3);
+    for artifact in &artifacts[..3] {
+        assert_eq!(
+            store.bytes(&artifact.id, 0, 1, 40).unwrap_err().code,
+            "EVIDENCE_UNAVAILABLE"
+        );
+    }
+    assert_eq!(
+        store.bytes(&artifacts[3].id, 0, 9, 40).unwrap(),
+        b"record 4\n"
+    );
+}
+
+// Value (#267): the floor is no reason to delete what is pinned, and, by the coordination
+// ruling, no reason to retire anything early on a store with no archive policy, where
+// "archived" protects nothing. Protects: (a) a pinned archived entry is skipped and the pass
+// is Blocked with the floor facts; (b) a store with no archive policy retires nothing at the
+// floor and says so in plain words, while the budget path stays as it was.
+#[test]
+fn floor_retirement_respects_pins_and_a_store_without_an_archive_policy() {
+    use sparrow_core::{EvictionLimits, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    // Every record is archived and every one is pinned: the pass reaches no unarchived entry,
+    // so the only thing that stops it is the pin.
+    let store = Store::open(dir.path(), floor_settings(true)).unwrap();
+    let artifacts = (1..=2_u64)
+        .map(|at| {
+            store
+                .ingest(
+                    &format!("floor-pinned-{at}"),
+                    "source",
+                    "log",
+                    format!("record {at}\n").as_bytes(),
+                    at,
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let covered = artifacts
+        .iter()
+        .zip(1_u64..)
+        .map(|(artifact, at)| archive_position(at, &artifact.record_ids[0]))
+        .collect::<Vec<_>>();
+    archive_records(&store, 1, &covered);
+    let targets = artifacts
+        .iter()
+        .map(|artifact| artifact.id.clone())
+        .collect::<Vec<_>>();
+    store
+        .pin("floor-pin", "case", &targets, 1_000_000, 4)
+        .unwrap();
+    store
+        .space_floor()
+        .set_free_for_tests(Some(FLOOR_SHORT_FREE));
+    store
+        .ingest("floor-refused", "source", "log", b"later\n", 5)
+        .unwrap_err();
+    let pinned = store
+        .pressure_maintain(10, EvictionLimits::default())
+        .unwrap();
+    assert_eq!(pinned.phase, PressurePhase::Blocked);
+    assert_eq!(pinned.evicted_records, 0);
+    let waiting = pinned.waiting_on.as_deref().unwrap();
+    assert!(
+        waiting.starts_with("free space is below the floor by 2097152 bytes; reclamation tried (1 passes, 0 bytes freed)"),
+        "{waiting}"
+    );
+    assert!(waiting.contains("protected by a pin"), "{waiting}");
+    assert_eq!(
+        store.bytes(&artifacts[0].id, 0, 9, 11).unwrap(),
+        b"record 1\n"
+    );
+    drop(store);
+
+    let plain = tempfile::tempdir().unwrap();
+    let store = Store::open(plain.path(), floor_settings(false)).unwrap();
+    let old = store
+        .ingest("floor-plain-old", "source", "log", b"old\n", 1)
+        .unwrap();
+    store
+        .space_floor()
+        .set_free_for_tests(Some(FLOOR_SHORT_FREE));
+    store
+        .ingest("floor-refused", "source", "log", b"later\n", 2)
+        .unwrap_err();
+    let state = store
+        .pressure_maintain(10, EvictionLimits::default())
+        .unwrap();
+    assert_eq!(state.phase, PressurePhase::Blocked);
+    assert_eq!((state.passes, state.evicted_records), (0, 0));
+    assert_eq!(
+        state.waiting_on.as_deref(),
+        Some(
+            "free space is below the floor by 2097152 bytes; this store has no archive policy, so nothing is retired early"
+        )
+    );
+    assert_eq!(store.bytes(&old.id, 0, 4, 11).unwrap(), b"old\n");
+}
+
+// Value (#267, coordination ruling): evidence is retired early for a floor that something
+// outside Sparrow crossed only up to the first deficit plus the maintenance reserve. Protects:
+// once an episode has freed that much, the next pass retires nothing more, is Blocked with
+// the "held outside Sparrow" reason, says the bound was reached, and unretired archived
+// evidence stays readable.
+#[test]
+fn floor_retirement_stops_at_the_bound() {
+    use sparrow_core::{EvictionLimits, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = floor_settings(true);
+    settings.maintenance_reserve = 1024 * 1024;
+    let store = Store::open(dir.path(), settings).unwrap();
+    // Dense letters in one line: text the projection accepts and compression cannot shrink,
+    // so each record owns about 256 KiB of payload bytes and a few of them make the bound below.
+    let artifacts = (1..=8_u64)
+        .map(|at| {
+            let line = (0..256 * 1024_u64)
+                .map(|index| {
+                    let hashed = index.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        ^ at.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+                    b'a' + ((hashed >> 33) % 26) as u8
+                })
+                .chain(std::iter::once(b'\n'))
+                .collect::<Vec<u8>>();
+            store
+                .ingest(&format!("bound-{at}"), "source", "log", &line, at)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let covered = artifacts
+        .iter()
+        .zip(1_u64..)
+        .map(|(artifact, at)| archive_position(at, &artifact.record_ids[0]))
+        .collect::<Vec<_>>();
+    archive_records(&store, 1, &covered);
+    // 1 KiB short: the bound is that plus the 1 MiB reserve, a few records' worth.
+    store
+        .space_floor()
+        .set_free_for_tests(Some(8 * 1024 * 1024 - 1024));
+    store
+        .ingest("bound-refused", "source", "log", b"later\n", 9)
+        .unwrap_err();
+    let limits = EvictionLimits {
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    let mut state = store.pressure_maintain(10, limits).unwrap();
+    for step in 0..24 {
+        if state.floor_bound_reached {
+            break;
+        }
+        store.await_native_quiet().unwrap();
+        state = store.pressure_maintain(11 + step, limits).unwrap();
+    }
+    assert!(state.floor_bound_reached, "{state:?}");
+    assert_eq!(state.phase, PressurePhase::Blocked);
+    assert!(state.floor_freed_bytes >= 1024 + 1024 * 1024, "{state:?}");
+    assert!(
+        state
+            .waiting_on
+            .as_deref()
+            .unwrap()
+            .contains("the rest is held outside Sparrow"),
+        "{:?}",
+        state.waiting_on
+    );
+    let retired = state.evicted_records;
+    assert!((1..8).contains(&retired), "{retired}");
+    // Later passes retire nothing more while the shortfall stands.
+    for step in 0..3 {
+        store.await_native_quiet().unwrap();
+        let later = store.pressure_maintain(100 + step, limits).unwrap();
+        assert_eq!(later.evicted_records, retired);
+        assert_eq!(later.phase, PressurePhase::Blocked);
+    }
+    let kept = artifacts
+        .iter()
+        .find(|artifact| store.bytes(&artifact.id, 0, 1, 200).is_ok());
+    assert!(kept.is_some(), "an unretired record must stay readable");
+}
+
+// Value (#267): a floor-only retirement writes the durable wait marker, and its episode must
+// end cleanly. Protects: the marker carries the fixed 65536-byte request and never the
+// deficit; restoring free space lets the next pass reach Ready and delete the marker; and a
+// reopen after a retirement restores a wait whose first pass clears it through the Ready
+// branch without retiring anything more.
+#[test]
+fn the_floor_episode_clears_when_space_returns_and_a_durable_wait_is_cleaned_up() {
+    use sparrow_core::{EvictionLimits, PressurePhase};
+    let limits = EvictionLimits::default();
+    let marker = |path: &std::path::Path| {
+        let db = catalog_db(path).unwrap();
+        db.get("pressure-reclamation-wait").unwrap()
+    };
+    // Space returns after a floor-only retirement.
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = archived_prefix_store(dir.path());
+    let floor = store.space_floor();
+    floor.set_free_for_tests(Some(FLOOR_SHORT_FREE));
+    store
+        .ingest("floor-refused", "source", "log", b"later\n", 5)
+        .unwrap_err();
+    let retired = store.pressure_maintain(10, limits).unwrap();
+    assert_eq!(retired.phase, PressurePhase::AwaitingReclamation);
+    floor.set_free_for_tests(Some(FLOOR_PLENTY));
+    let ready = store.pressure_maintain(20, limits).unwrap();
+    assert_eq!(ready.phase, PressurePhase::Ready);
+    assert_eq!(ready.floor_requested_bytes, 0);
+    assert_eq!(ready.floor_passes, 1);
+    drop(store);
+    assert!(marker(dir.path()).is_none());
+
+    // A reopen after the retirement restores the wait; its first pass clears it.
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = archived_prefix_store(dir.path());
+    store
+        .space_floor()
+        .set_free_for_tests(Some(FLOOR_SHORT_FREE));
+    store
+        .ingest("floor-refused", "source", "log", b"later\n", 5)
+        .unwrap_err();
+    store.pressure_maintain(10, limits).unwrap();
+    drop(store);
+    let stored = marker(dir.path()).unwrap();
+    let text = String::from_utf8_lossy(&stored);
+    assert!(text.contains("\"requested_bytes\":\"65536\""), "{text}");
+    assert!(!text.contains(&FLOOR_SHORT_BY.to_string()), "{text}");
+    let store = Store::open(dir.path(), floor_settings(true)).unwrap();
+    assert_eq!(
+        store.pressure_status().unwrap().phase,
+        PressurePhase::AwaitingReclamation
+    );
+    let cleared = store.pressure_maintain(30, limits).unwrap();
+    assert_eq!(cleared.phase, PressurePhase::Ready);
+    assert_eq!(cleared.evicted_records, 0);
+    drop(store);
+    assert!(marker(dir.path()).is_none());
+}
+
+// Value (#267): the budget path's first request is keyed on the request itself, not the
+// phase, because a floor episode may already hold the phase at Requested. Protects: an
+// ordinary budget refusal after a floor refusal still wakes the pass and records its bytes.
+#[test]
+fn an_ordinary_budget_refusal_after_a_floor_episode_still_wakes_the_pass() {
+    use sparrow_core::PressurePhase;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), floor_settings(false)).unwrap();
+    let requests = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    store.set_pressure_request_waker(Some(std::sync::Arc::new({
+        let requests = std::sync::Arc::clone(&requests);
+        move || {
+            requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    })));
+    let floor = store.space_floor();
+    floor.set_free_for_tests(Some(FLOOR_SHORT_FREE));
+    store
+        .ingest("floor-then-budget-1", "source", "log", b"later\n", 1)
+        .unwrap_err();
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    floor.set_free_for_tests(Some(FLOOR_PLENTY));
+    let ballast = dir.path().join("test-owned-pressure-ballast");
+    std::fs::write(&ballast, vec![0_u8; 13 * 1024 * 1024]).unwrap();
+    let refused = store
+        .ingest("floor-then-budget-2", "source", "log", b"later\n", 2)
+        .unwrap_err();
+    assert_eq!(refused.code, "STORAGE_PRESSURE");
+    assert!(!refused.is_free_space_floor(), "{refused}");
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let status = store.pressure_status().unwrap();
+    assert_eq!(status.phase, PressurePhase::Requested);
+    assert!(status.requested_bytes > 0);
+    assert_eq!((status.refused_writes, status.floor_requests), (1, 1));
+}
+
 // Value: review of #211 found a forced compaction counted for a later wait while none
 // ran. Protects: a wait that ended by linked bytes falling, after its forced compaction
 // finished, leaves the next stuck wait able to force and count its own compaction.
