@@ -3515,6 +3515,7 @@ fn admission_properties_share_status_metadata_without_evidence_catalog_scans() {
         "maintenance_reserve",
         "max_inline_artifact_bytes",
         "max_records_per_artifact",
+        "max_import_bytes",
         "max_pin_members",
     ] {
         assert_eq!(properties[key], status[key], "{key}");
@@ -10173,12 +10174,17 @@ fn import_ceiling_artifact_drains_through_expiry_and_eviction_and_one_chunk_more
             0,
         )
         .unwrap_err();
-    assert_eq!(refused.code, "RESOURCE_LIMIT");
+    // Permanent, not retryable: the message names the bound in bytes and the remedy.
+    assert_eq!(refused.code, "INVALID_ARGUMENT");
     assert!(
-        refused.message.contains("split the input"),
+        refused.message.contains(&format!("at most {bound} bytes")),
         "{}",
         refused.message
     );
+    // Discovery's bound is the enforced bound, and the refusal was counted once.
+    let properties = store.properties().unwrap();
+    assert_eq!(properties["max_import_bytes"], bound.to_string());
+    assert_eq!(properties["import_over_bound_refusals"], "1");
     // At the ceiling every chunk is its own record, the costliest admitted row.
     let input = log_lines(bound, chunk);
     let artifact = publish_staged(&store, "at-ceiling", &input).unwrap();
@@ -10350,7 +10356,7 @@ fn split_raw_document_reads_back_exactly_and_both_expires_and_evicts() {
             1,
         )
         .unwrap_err();
-    assert_eq!(refused.code, "RESOURCE_LIMIT");
+    assert_eq!(refused.code, "INVALID_ARGUMENT");
     assert!(refused.message.contains("split the input"));
     let mut expired = 0;
     let drained = (0..64).any(|_| {
