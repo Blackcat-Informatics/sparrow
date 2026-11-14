@@ -3102,8 +3102,8 @@ impl wire::sparrow::Server for Rpc {
                     state.set_publish_hold(watch.definition.publish_hold);
                     state.set_held_claims(watch.held_claims);
                     crate::watch_admin::encode_clock(
-                        state.reborrow().init_held_since(),
-                        watch.held_since,
+                        state.reborrow().init_oldest_held_first_seen(),
+                        watch.oldest_held_first_seen,
                     );
                     state.set_tail_read_bytes(watch.tail_read_bytes);
                     state.set_tail_descriptors(watch.tail_descriptors);

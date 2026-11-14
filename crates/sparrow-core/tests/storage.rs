@@ -1813,6 +1813,13 @@ fn completed_tail_claim_preserves_original_publication_after_checkpoint_expiry()
     assert_eq!(published.published_id(), Some(generation.id.as_str()));
     assert!(published.published_artifact.is_none());
     assert_eq!(published.tail, Some(terminal));
+    // #280, design 16d tail row: a published tail claim has no artifact receipt by design and
+    // is never the lost-publication case.
+    assert!(
+        !store
+            .consumption_publication_lost(&claim.import_id)
+            .unwrap()
+    );
     let selector = sparrow_core::IngestSelector::Handoff(intent.request_id.clone());
     let progress = store
         .ingest_status(&selector, Default::default(), 32 * DAY)
@@ -25682,6 +25689,75 @@ fn lapsed_reclaimed_part_begins_again_under_the_same_request_id() {
         store.bytes(&first.id, 0, input.len(), later).unwrap(),
         input
     );
+}
+
+/// KNOWN LIMIT (#280, C3), pinned so the reader's view is stated and not assumed: a part that
+/// is published again after its receipt lapsed (a set whose manifest was not accepted within
+/// the two-day retry window) leaves the first artifact stored and unnamed by any manifest.
+/// The store has no supersede mark, so a records query over the source returns the part's
+/// bytes twice, once per artifact; the manifest names only the second. Within the window a
+/// cut that differs under the same part id is refused CONFLICT and nothing is published.
+#[test]
+fn a_part_sent_again_after_its_receipt_lapsed_is_read_twice_and_a_changed_cut_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let request = format!(
+        "{}{}.part{:010}",
+        sparrow_core::SET_PREFIX,
+        "b".repeat(64),
+        0
+    );
+    let digest_of = |bytes: &[u8]| {
+        format!(
+            "blake3:{}",
+            purrdf_hash::hex::encode(purrdf_hash::blake3::hash(bytes).as_bytes())
+        )
+    };
+    let input = b"part bytes\n";
+    let publish = |now: u64| {
+        let manifest = store
+            .import_begin(
+                &request,
+                "source",
+                "log",
+                input.len() as u64,
+                &digest_of(input),
+                now,
+            )
+            .unwrap();
+        store.import_append(&manifest.id, 0, input, now).unwrap();
+        store.import_seal(&manifest.id, now).unwrap();
+        store.import_prepare_layout(&manifest.id, now).unwrap();
+        store.import_prepare_record(&manifest.id, 0, now).unwrap();
+        store.import_publish(&manifest.id, now).unwrap()
+    };
+    let first = publish(1_000);
+    assert_eq!(store.records(1_000).unwrap().len(), 1);
+
+    // Inside the window a different cut under the same part id is refused, and publishes nothing.
+    let longer = b"part bytes\nmore\n";
+    let refused = store
+        .import_begin(
+            &request,
+            "source",
+            "log",
+            longer.len() as u64,
+            &digest_of(longer),
+            2_000,
+        )
+        .unwrap_err();
+    assert_eq!(refused.code, "CONFLICT");
+    assert_eq!(store.records(2_000).unwrap().len(), 1);
+
+    // After the receipt lapses the part is published again: the reader sees its bytes twice.
+    let later = 1_000 + 3 * DAY;
+    for _ in 0..4 {
+        store.expire(later).unwrap();
+        store.import_reclaim(later).unwrap();
+    }
+    let again = publish(later);
+    assert_ne!(again.id, first.id);
+    assert_eq!(store.records(later).unwrap().len(), 2);
 }
 
 /// INVARIANT (#280, ruling A): a claim that began single staging and was then recorded as a

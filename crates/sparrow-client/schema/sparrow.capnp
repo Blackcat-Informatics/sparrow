@@ -494,7 +494,7 @@ struct ConsumeWatchStatus {
   # Additive (#280, ordinals 20 to 22): the watch's publish hold, how many of its pending claims
   # the hold holds, and the first-seen time of the oldest of them. A reader that does not know
   # these sees no hold.
-  publishHold @20 :Bool; heldClaims @21 :UInt32; heldSince @22 :OptionalInstant;
+  publishHold @20 :Bool; heldClaims @21 :UInt32; oldestHeldFirstSeen @22 :OptionalInstant;
 }
 
 # A claim retired unrecoverable by watchClaimRetire: claimed, its private source missing and

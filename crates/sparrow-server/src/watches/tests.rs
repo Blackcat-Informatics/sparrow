@@ -1424,7 +1424,7 @@ fn a_claim_made_under_a_publish_hold_stays_journaled_and_publishes_when_the_hold
 #[test]
 fn a_publish_hold_is_named_by_status_with_its_count_and_since_when() {
     // INVARIANT (issue 280, publish hold): status names the held watch, how many of its
-    // pending claims the hold holds, and since when (the oldest claim's first-seen time).
+    // pending claims the hold holds, and the oldest held claim first-seen time (not the time the hold began).
     let directory = tempfile::tempdir().unwrap();
     let producer = directory.path().join("producer");
     std::fs::create_dir(&producer).unwrap();
@@ -1451,7 +1451,7 @@ fn a_publish_hold_is_named_by_status_with_its_count_and_since_when() {
     assert_eq!(status.len(), 1);
     assert!(status[0].definition.publish_hold);
     assert_eq!(status[0].held_claims, 2);
-    assert_eq!(status[0].held_since, since);
+    assert_eq!(status[0].oldest_held_first_seen, since);
     assert!(since.is_some());
 
     // Clearing the hold names nothing: the held count returns to zero.
@@ -1461,7 +1461,10 @@ fn a_publish_hold_is_named_by_status_with_its_count_and_since_when() {
         .unwrap();
     let status = registry.snapshot().unwrap();
     assert!(!status[0].definition.publish_hold);
-    assert_eq!((status[0].held_claims, status[0].held_since), (0, None));
+    assert_eq!(
+        (status[0].held_claims, status[0].oldest_held_first_seen),
+        (0, None)
+    );
 }
 
 #[test]
@@ -1521,4 +1524,116 @@ fn the_publish_hold_warning_is_written_by_the_update_that_decides_it_once_per_ho
             .len(),
         1
     );
+}
+
+/// Reserve file `name` (written here) under `producer` for `detector`, as the claim pass does.
+fn reserve_file(detector: &mut Detector, producer: &Path, name: &str) -> String {
+    let path = producer.join(name);
+    std::fs::write(&path, name.as_bytes()).unwrap();
+    let identity = CompletedFileIdentity::capture(&path.metadata().unwrap());
+    detector
+        .owner
+        .claim()
+        .unwrap()
+        .reserve(Path::new(name), identity, &detector.config.source, "opaque")
+        .unwrap()
+        .import_id
+}
+
+/// Reserve files for `detector` the way the worker's claim pass does for one watch: only while
+/// `held_may_claim` allows (for a held watch), from `files` ready files, in order. Returns how
+/// many it claimed.
+fn claim_while_allowed(
+    store: &Store,
+    detector: &mut Detector,
+    producer: &Path,
+    files: u32,
+) -> usize {
+    let mut claimed = 0;
+    for index in 0..files {
+        let pending = store.consumption_pending().unwrap();
+        if detector.config.publish_hold && !held_may_claim(&detector.config.id, &pending) {
+            break;
+        }
+        reserve_file(detector, producer, &format!("file-{index}.bin"));
+        claimed += 1;
+    }
+    claimed
+}
+
+#[test]
+fn a_held_watch_takes_only_its_share_and_other_watches_and_tails_still_claim() {
+    // INVARIANT (issue 280, publish hold): a hold on one watch never stops another watch or a
+    // tail generation. A held watch claims at most `HELD_CLAIMS_PER_WATCH` files and, with
+    // every held watch together, leaves `HELD_RESERVED_SLOTS` journal slots free; its further
+    // files stay in the producer's directory. Another watch's file is claimed and is the one
+    // publishable claim, and a tail can still begin a generation while the holds are set.
+    let (directory, store, mut tail) = tail_detector();
+    let mut taken = Vec::new();
+    let mut detectors = Vec::new();
+    for index in 0..4 {
+        let producer = directory.path().join(format!("held-{index}"));
+        std::fs::create_dir(&producer).unwrap();
+        let mut held = held_detector(store.clone(), &producer, &format!("held-{index}"), true);
+        taken.push(claim_while_allowed(&store, &mut held, &producer, 10));
+        detectors.push(held);
+    }
+    // 4 and 4 and 4, then the reserve keeps four slots free for everyone else.
+    assert_eq!(
+        taken,
+        vec![
+            HELD_CLAIMS_PER_WATCH,
+            HELD_CLAIMS_PER_WATCH,
+            HELD_CLAIMS_PER_WATCH,
+            0
+        ]
+    );
+    let pending = store.consumption_pending().unwrap();
+    assert_eq!(
+        pending.len(),
+        sparrow_core::MAX_CONSUMPTION_JOURNALS - HELD_RESERVED_SLOTS
+    );
+
+    // A second, unheld watch still claims, and its claim is the only one the worker publishes.
+    let open = directory.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    let mut unheld = held_detector(store.clone(), &open, "open", false);
+    let id = reserve_file(&mut unheld, &open, "ready.bin");
+    let pending = store.consumption_pending().unwrap();
+    detectors.push(unheld);
+    let publishable = publishable(&pending, &detectors, |_| true)
+        .map(|journal| journal.import_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(publishable, vec![id]);
+
+    // A tail still begins its generation while the holds are set.
+    tail.scan_step().unwrap();
+    tail.drain().unwrap();
+    assert!(tail.failure.is_none(), "{:?}", tail.failure);
+    assert_eq!(store.tail_generations("tail-fence").unwrap().len(), 1);
+}
+
+#[test]
+fn a_held_claim_that_cannot_move_records_one_attempt_until_its_failure_changes() {
+    // INVARIANT (issue 280, publish hold): a failed move of a held claim is recorded in the
+    // journal and logged once per change of its text. The worker retries the move on every
+    // pass, so a permanent failure must not rewrite the journal each time.
+    let directory = tempfile::tempdir().unwrap();
+    let producer = directory.path().join("producer");
+    std::fs::create_dir(&producer).unwrap();
+    let data = directory.path().join("store");
+    let config_path =
+        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
+    let store = crate::ServerConfig::read(&config_path)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let mut detector = held_detector(store.clone(), &producer, "held-missing", true);
+    let id = reserve_file(&mut detector, &producer, "gone.bin");
+    std::fs::remove_file(producer.join("gone.bin")).unwrap();
+    for _ in 0..5 {
+        detector.move_held_claim(&store, &id).unwrap();
+    }
+    assert_eq!(store.consumption_get(&id).unwrap().history.attempts, 1);
+    assert!(detector.status_failure().is_some());
 }

@@ -1062,6 +1062,45 @@ Recovery for a recorded set claim whose manifest receipt is gone:
    naming the state. Clear it with `watch clear-set <claim>` once issue 283 is
    built.
 
+### Publish hold
+
+A watch definition carries `publish_hold`, false unless an operator sets it with a
+watch put. A held finished-file watch still detects and claims files: each claim is
+journaled and moved into the root's `.sparrow-inflight/` as an interrupted claim is,
+and then it waits. Nothing is published, dropped or cancelled, and the wait has no
+deadline. Clearing the hold with another watch put (a put that omits the field clears
+it) lets the claims publish in pending order. A tail watch cannot be held.
+
+The hold exists for two uses: the rollback rehearsal in `deploy/verify-backup.sh`,
+which needs a claim in flight when the daemon halts, and an operator's deliberate
+pause of one watch. It is not a way to refuse input: held files are still taken
+from the producer, and a held claim keeps one of the sixteen pending-claim slots
+(`MAX_CONSUMPTION_JOURNALS`) until the hold clears.
+
+A hold never stops another watch or a tail. A held watch reserves at most four
+files; further ready files stay in the producer's directory, unclaimed and
+untouched, and are claimed in order once the hold clears and slots free. All held
+watches together leave at least four slots free for unheld watches and tail
+generations. Status names the state: `publish_hold`, `held_claims` (the watch's
+pending finished-file claims) and `oldest_held_first_seen`, which is the
+reservation time of the oldest of those claims. It is not the time the hold was
+set, so a claim that waited before the hold shows its own age. The daemon writes
+one `WARNING` line per hold at start and when a hold is set.
+
+A catalog that carries a hold is refused by older builds, which name the
+`publish_hold` field: clear every hold before an older build runs.
+
+A held claim whose move into `.sparrow-inflight/` fails is recorded as a pending
+attempt and logged once, and again only when the failure text changes.
+
+A part of a set that was published, whose receipt then lapsed (two days) before the
+manifest was accepted, is sent again when the claim resumes and is stored as another
+artifact. The manifest names only the new one; the earlier artifact is an ordinary
+artifact under the same source, so a records query over the source returns those
+bytes twice. A resumed set whose advertised limits changed is refused `CONFLICT` for
+the same part id until the earlier part receipts lapse. No supersede mark exists
+yet.
+
 ### Claims after a rollback
 
 The schema 69 to 68 rollback of 2026-11-07 found two kinds of claim the

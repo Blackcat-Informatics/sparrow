@@ -2648,6 +2648,11 @@ no missing prefix is invented. Status exposes finite `tail_generation_ids`,
 `tail_checkpoint_records`; the latter
 counts accepted occurrences across currently known checkpoints rather than live
 retention membership. Kernel coverage and producer continuity remain separate.
+A watch's status also carries `publish_hold`, `held_claims` and
+`oldest_held_first_seen` (additive, ordinals 20 to 22): the hold flag, how many
+pending finished-file claims it holds, and the reservation time of the oldest of
+them, which is not when the hold was set. See "Publish hold" in the deployment
+guide.
 Active generations bind their watch revision and refuse definition changes or
 removal until resolved. Schema 39 provides explicit retained-generation
 completion as above. Schema 41 adds the separately admitted completed-tail

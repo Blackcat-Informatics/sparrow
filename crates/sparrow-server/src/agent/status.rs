@@ -103,8 +103,8 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             .with("publish_hold", watch.get_publish_hold())
             .with("held_claims", u64::from(watch.get_held_claims()))
             .with(
-                "held_since",
-                super::watch::clock_text(watch.get_held_since()?)?,
+                "oldest_held_first_seen",
+                super::watch::clock_text(watch.get_oldest_held_first_seen()?)?,
             )
             .with("tail_read_bytes", watch.get_tail_read_bytes().to_string())
             .with("tail_descriptors", u64::from(watch.get_tail_descriptors()))

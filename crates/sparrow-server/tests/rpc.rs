@@ -15508,6 +15508,9 @@ async fn set_harness(dir: &Path) -> SetHarness {
     assert_eq!(bounds.import_bytes, 20 * 65_536);
     let producer = dir.join("producer");
     std::fs::create_dir_all(&producer).unwrap();
+    if socket.exists() {
+        std::fs::remove_file(&socket).unwrap();
+    }
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let capability: wire::sparrow::Client = capnp_rpc::new_client(Rpc::new(
         store.clone(),
@@ -15672,6 +15675,93 @@ async fn over_bound_non_line_consume_file_is_taken_as_opaque_parts() {
                     .remove(&claim, sparrow_server::now().unwrap())
                     .unwrap();
             }
+        })
+        .await;
+}
+
+/// INVARIANT (#280, design 19b, RS4 and RS3): a recorded set claim whose manifest receipt is
+/// gone is not planned again: publish fails STORAGE_FAILURE, ingests no manifest and leaves
+/// the claim recorded, so no part is sent again. A recorded single-path claim is not stopped:
+/// it returns its saved receipt. The part uploads themselves are not counted (the client has
+/// no call hook); the guard's visible effect is that no manifest is ingested and the call
+/// fails, which a re-plan would not do (each part would answer its saved receipt and the
+/// manifest would be accepted again).
+#[tokio::test]
+async fn recorded_set_claim_with_a_missing_manifest_receipt_plans_uploads_and_begins_nothing() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let harness = set_harness(dir.path()).await;
+            let line = |index: usize| {
+                let mut line = format!("{{\"line\":{index},\"pad\":\"").into_bytes();
+                line.resize(65_536 - 3, b'p');
+                line.extend_from_slice(b"\"}\n");
+                line
+            };
+            let input: Vec<u8> = (0..50).flat_map(line).collect();
+            let (_, set_claim) = harness.publish("big.jsonl", "jsonl", &input).await;
+            let (single_id, single_claim) = harness.publish("small.log", "log", b"one\n").await;
+            let (set, single) = (
+                set_claim.journal().clone(),
+                single_claim.journal().import_id.clone(),
+            );
+            let SetHarness {
+                store,
+                client,
+                root,
+                _serving,
+                ..
+            } = harness;
+            drop((set_claim, single_claim, client, root));
+            _serving.abort();
+            let _ = _serving.await;
+            drop(store);
+            let db = sparrow_test_support::catalog_db(&dir.path().join("store")).unwrap();
+            db.delete(format!(
+                "request:ingest:{}.manifest",
+                set.request_id
+                    .replacen("consume:", sparrow_core::SET_PREFIX, 1)
+            ))
+            .unwrap();
+            drop(db);
+
+            let harness = set_harness(dir.path()).await;
+            let now = sparrow_server::now().unwrap();
+            let sparrow_server::consumption::Recovery::Claimed(mut claim) =
+                harness.root.recover(&set.import_id, now).unwrap()
+            else {
+                panic!("a recorded set claim is not removed");
+            };
+            for _ in 0..2 {
+                let failure = harness
+                    .root
+                    .publish(&harness.client, &mut claim, &Default::default())
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&failure, sparrow_server::consumption::Error::Storage(error)
+                        if error.code == "STORAGE_FAILURE"),
+                    "{failure:?}"
+                );
+            }
+            assert!(matches!(
+                harness
+                    .store
+                    .consumption_set_manifest(&set.import_id)
+                    .unwrap(),
+                sparrow_core::SetManifest::Absent
+            ));
+            let sparrow_server::consumption::Recovery::Claimed(mut claim) =
+                harness.root.recover(&single, now).unwrap()
+            else {
+                panic!("a recorded single claim is not removed");
+            };
+            let again = harness
+                .root
+                .publish(&harness.client, &mut claim, &Default::default())
+                .await
+                .unwrap();
+            assert_eq!(again, single_id);
         })
         .await;
 }

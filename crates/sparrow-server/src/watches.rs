@@ -196,7 +196,7 @@ pub struct WatchStatus {
     /// Pending finished-file claims the publish hold holds; zero unless the hold is set.
     pub held_claims: u32,
     /// First-seen time of the oldest held claim, when the hold holds any.
-    pub held_since: Option<u64>,
+    pub oldest_held_first_seen: Option<u64>,
 }
 
 /// The pending claims the worker may publish now, in pending order. A claim whose watch holds
@@ -217,8 +217,31 @@ fn publishable<'a>(
     })
 }
 
-/// How many pending finished-file claims of watch `id` a publish hold holds, and since when
-/// (the oldest first-seen time). Zero and none unless `hold` is set; a tail is never held.
+/// Most pending finished-file claims one publish-held watch may take. Held claims never
+/// complete, so each occupies one of the store's sixteen journal slots until the hold clears.
+/// Four is enough to park a rollback rehearsal's in-flight claims or an operator's pause, and
+/// no more than a quarter of the store, so one watch's pause never uses the whole table.
+const HELD_CLAIMS_PER_WATCH: usize = 4;
+
+/// Journal slots a publish-held watch never takes: it claims only while at least this many
+/// slots stay free, so unheld watches and tail generations can always reserve, however many
+/// watches are held (eight held watches at the per-watch share would otherwise take all).
+const HELD_RESERVED_SLOTS: usize = 4;
+
+/// Whether a publish-held watch `id` may reserve another finished file. Files it may not
+/// reserve stay unclaimed in the producer's directory and are claimed, in order, once the hold
+/// clears and slots free.
+fn held_may_claim(id: &str, pending: &[sparrow_core::ConsumptionJournal]) -> bool {
+    let own = pending
+        .iter()
+        .filter(|journal| journal.watch == id && journal.tail.is_none())
+        .count();
+    own < HELD_CLAIMS_PER_WATCH
+        && pending.len() + HELD_RESERVED_SLOTS < sparrow_core::MAX_CONSUMPTION_JOURNALS
+}
+
+/// How many pending finished-file claims of watch `id` a publish hold holds, and the first-seen
+/// (reservation) time of the oldest. Zero and none unless `hold` is set; a tail is never held.
 fn held_summary(
     hold: bool,
     id: &str,
@@ -264,7 +287,7 @@ impl WatchRegistry {
             .watches()
             .iter()
             .map(|watch| {
-                let (held_claims, held_since) = held_summary(
+                let (held_claims, oldest_held_first_seen) = held_summary(
                     watch.definition.publish_hold,
                     &watch.definition.id,
                     &pending,
@@ -293,7 +316,7 @@ impl WatchRegistry {
                     tail_checkpoint_records: 0,
                     tail_admission_waiting: false,
                     held_claims,
-                    held_since,
+                    oldest_held_first_seen,
                 }
             })
             .collect();
@@ -322,7 +345,7 @@ impl WatchRegistry {
                     Owner::Consume(_) => (Vec::new(), 0, 0, 0),
                     Owner::Tail(owner) => owner.status(&detector.config.id)?,
                 };
-                let (held_claims, held_since) =
+                let (held_claims, oldest_held_first_seen) =
                     held_summary(detector.config.publish_hold, &detector.config.id, pending);
                 Ok(WatchStatus {
                     id: detector.config.id.clone(),
@@ -348,7 +371,7 @@ impl WatchRegistry {
                     tail_checkpoint_records,
                     tail_admission_waiting: detector.tail_admission_waiting,
                     held_claims,
-                    held_since,
+                    oldest_held_first_seen,
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
@@ -362,11 +385,11 @@ impl WatchRegistry {
             held.push(state.id.clone());
             if !announced.contains(&state.id) {
                 lines.push(format!(
-                    "sparrowd: WARNING watch={} publish_hold is set: {} pending claims are held since unix_millis {}; clear every hold before an older build runs",
+                    "sparrowd: WARNING watch={} publish_hold is set: {} pending claims are held; the oldest was first seen at unix_millis {}; clear every hold before an older build runs",
                     state.id,
                     state.held_claims,
                     state
-                        .held_since
+                        .oldest_held_first_seen
                         .map_or_else(|| "unknown".to_owned(), |at| at.to_string()),
                 ));
             }
@@ -455,6 +478,12 @@ struct Detector {
     /// (`clear_failure_of`), never another claim's success or a claim-less failure.
     claim_failure: Option<ClaimFailure>,
     tail_admission_waiting: bool,
+    /// Set by each worker pass: this publish-held watch may not reserve another file now
+    /// (`held_may_claim`), so its ready files wait for the hold and need no wake of their own.
+    claim_capped: bool,
+    /// The text of the last failed move of each held claim, so a move that fails the same way
+    /// on every pass is recorded and logged once per change of its text.
+    held_move_failures: BTreeMap<String, String>,
 }
 
 /// A watch failure caused by one claim's recovery.
@@ -479,22 +508,30 @@ impl Detector {
             .and_then(|claim| claim.recover(id, now))
             .map(drop)
         else {
+            self.held_move_failures.remove(id);
             return Ok(());
         };
-        // The journal keeps the reason, as a failed attempt's does, so `watch claims` shows it.
+        let text = error.to_string();
+        // The status failure is memory only and is set every pass; the durable attempt record
+        // and the log line are written once per change of the text, so a permanent failure
+        // does not rewrite the journal on every pass.
         self.fail_claim(id, format!("claim {id}: {error}"));
+        if self.held_move_failures.get(id) == Some(&text) {
+            return Ok(());
+        }
         eprintln!(
             "sparrowd: watch={} claim={id} held and not moved: {error}",
             self.config.id
         );
         if let Some(record) =
-            pending_attempt_outcome(store.consumption_attempt_pending(id, &error.to_string(), now))?
+            pending_attempt_outcome(store.consumption_attempt_pending(id, &text, now))?
         {
             self.fail_claim(
                 id,
                 format!("claim {id}: {error}; attempt not recorded: {record}"),
             );
         }
+        self.held_move_failures.insert(id.to_owned(), text);
         Ok(())
     }
 
@@ -577,6 +614,8 @@ impl Detector {
             failure: None,
             claim_failure: None,
             tail_admission_waiting: false,
+            claim_capped: false,
+            held_move_failures: BTreeMap::new(),
         };
         detector.reconcile("startup")?;
         if !detector.enabled {
@@ -951,6 +990,7 @@ impl Detector {
     /// rescan and, when CLAIMS admits new reservations, the end of its first candidate's
     /// quiet interval, or now when candidate capacity freed for deferred inputs.
     fn due(&self, claims: bool) -> Option<Instant> {
+        let claims = claims && !self.claim_capped;
         if !self.enabled || !self.covered || !self.todo.is_empty() || self.scan.is_some() {
             return None;
         }
@@ -1781,6 +1821,9 @@ async fn run(
                 .filter(|journal| journal.watch == detector.config.id && journal.tail.is_none())
                 .map(|journal| journal.import_id.clone())
                 .collect::<Vec<_>>();
+            detector
+                .held_move_failures
+                .retain(|id, _| held.contains(id));
             for id in held {
                 detector.move_held_claim(&store, &id)?;
             }
@@ -1803,6 +1846,13 @@ async fn run(
         if claims {
             for detector in &mut detectors {
                 if !detector.enabled {
+                    continue;
+                }
+                // A held watch past its share stays unclaimed, and the next watch is tried:
+                // one watch's pause never stops another watch or a tail generation.
+                detector.claim_capped =
+                    detector.config.publish_hold && !held_may_claim(&detector.config.id, &pending);
+                if detector.claim_capped {
                     continue;
                 }
                 if let Some((path, identity)) = detector.ready()? {
