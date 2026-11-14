@@ -22,8 +22,8 @@ const EXPIRY_CEILING: Duration = Duration::from_millis(EXPIRY_CEILING_MS);
 /// Retry interval of an expiry pass that failed. The failure's cause has no event: the pass
 /// ran and the native layer refused it, and nothing signals that it would now succeed. Its
 /// observer is this loop's expiry arm; 60 seconds keeps a persistent failure to one journal
-/// line a minute. A pass skipped below the free-space floor does not use it: the floor's
-/// resume edge wakes the pass (#247).
+/// line a minute. A pass refused below the maintenance reserve does not use it: the floor's
+/// resume edge wakes the pass (#247, #267).
 const EXPIRY_RETRY: Duration = Duration::from_secs(60);
 /// Interval of the read-lease purge: expired read handles hold snapshots until it runs.
 const LEASE_INTERVAL: Duration = Duration::from_secs(60);
@@ -126,8 +126,10 @@ impl Job {
     }
 
     /// Only expiry and online migration change their schedule; a migration reports
-    /// its page. Other duties cannot lose that work.
-    fn execute(self, store: &Store) -> Result<Outcome, Error> {
+    /// its page. Other duties cannot lose that work. `paused` says the free-space floor is
+    /// crossed: expiry then runs under the maintenance reserve and without import
+    /// reclamation (#267).
+    fn execute(self, store: &Store, paused: bool) -> Result<Outcome, Error> {
         let done = Outcome::Continue;
         match self {
             Self::Flush => store.flush_buffered().map(|_| done),
@@ -138,9 +140,13 @@ impl Job {
             Self::Reclaim => store.import_reclaim(sparrow_server::now()?).map(|_| done),
             Self::Expiry => {
                 let now = sparrow_server::now()?;
-                store
-                    .expire_bounded(now, EvictionLimits::default())
-                    .map(|report| Outcome::Expired(report, now))
+                let limits = EvictionLimits::default();
+                if paused {
+                    store.expire_below_floor(now, limits)
+                } else {
+                    store.expire_bounded(now, limits)
+                }
+                .map(|report| Outcome::Expired(report, now))
             }
             Self::Leases => store
                 .purge_read_leases(sparrow_server::now()?)
@@ -164,10 +170,17 @@ impl Job {
 }
 
 /// Duties that still run below the free-space floor. Synchronization accepts nothing new,
-/// the table rewrite step only turns native rewriting off, and pressure maintenance is what
-/// frees space. Every other duty writes more than it frees, so it waits for the floor.
+/// the table rewrite step only turns native rewriting off, pressure maintenance is what
+/// frees space, expiry (ageing out) retires evidence past retention in the same small bounded
+/// batches under the maintenance reserve, and the lease purge writes nothing and ends the read
+/// snapshots a pressure pass stalls on (#267). Import reclamation and online migration still
+/// wait for the floor: a migration page rewrites data and writes more than it frees, and
+/// import reclamation is not scoped into this change.
 const fn runs_below_floor(job: Job) -> bool {
-    matches!(job, Job::Flush | Job::Recompress | Job::Pressure)
+    matches!(
+        job,
+        Job::Flush | Job::Recompress | Job::Pressure | Job::Expiry | Job::Leases
+    )
 }
 
 /// Wait for the deferral before the next page. Polling it is cancel-safe: a duty that wins
@@ -241,6 +254,32 @@ impl MigrationJournal {
                 total(),
                 page.watermark.as_deref().unwrap_or("none")
             );
+        }
+    }
+}
+
+/// When a failed expiry pass is tried again, and whether the failure is journaled.
+struct ExpiryRetry {
+    after: Duration,
+    journal: bool,
+}
+
+/// What follows a failed expiry pass. Below the free-space floor, a `STORAGE_PRESSURE`
+/// refusal is free space under the maintenance reserve: not a failure, and it has an event,
+/// the floor's resume edge that wakes expiry. It takes no retry clock and no journal line
+/// per attempt (the pressure duty's stall text reports the reserve); `EXPIRY_CEILING` is only
+/// the wall-clock bound every idle expiry sleep already has. Any other failure has no event
+/// and retries on [`EXPIRY_RETRY`], journaled.
+fn expiry_retry(paused: bool, error: &Error) -> ExpiryRetry {
+    if paused && error.code == "STORAGE_PRESSURE" {
+        ExpiryRetry {
+            after: EXPIRY_CEILING,
+            journal: false,
+        }
+    } else {
+        ExpiryRetry {
+            after: EXPIRY_RETRY,
+            journal: true,
         }
     }
 }
@@ -457,9 +496,15 @@ async fn run(
             migrate_wake.notify_one();
         }
     }));
+    // A floor refusal also asks ageing out to run: it is the first avenue of a floor episode
+    // (#267), so the refusal wakes expiry as well as the pass.
     store.set_pressure_request_waker(Some(Arc::new({
         let pressure_wake = Arc::clone(&pressure_wake);
-        move || pressure_wake.notify_one()
+        let wake = Arc::clone(&wake);
+        move || {
+            wake.notify_one();
+            pressure_wake.notify_one();
+        }
     })));
     store.set_retention_waker(Some(Arc::new({
         let wake = Arc::clone(&wake);
@@ -555,11 +600,6 @@ async fn run(
             continuation = false;
             migrating = false;
             deferral = None;
-            // Expiry waits for the floor's resume edge, which wakes it; the ceiling is only the
-            // wall-clock bound every idle expiry sleep already has.
-            if matches!(job, Job::Expiry) {
-                expiry_at = tokio::time::Instant::now() + EXPIRY_CEILING;
-            }
             #[cfg(test)]
             skips::note(job);
             continue;
@@ -567,7 +607,7 @@ async fn run(
         let owner = store.clone();
         // Await this complete bounded native job before admitting another duty.
         let (result, latched) = tokio::task::spawn_blocking(move || {
-            let result = job.execute(&owner);
+            let result = job.execute(&owner, paused);
             let latched = match &result {
                 Ok(_) => Ok(None),
                 Err(_) => owner.durability_status().map(|status| status.failure),
@@ -611,10 +651,21 @@ async fn run(
                     } else {
                         expiry_delay(&report, now)
                     };
+                if paused {
+                    // The floor episode waits for ageing out before it retires archived
+                    // evidence early, and measures what ageing out retired.
+                    pressure_wake.notify_one();
+                }
                 #[cfg(test)]
                 skips::expired_pass();
             }
-            Ok(Outcome::Continue) => {}
+            Ok(Outcome::Continue) => {
+                if paused && matches!(job, Job::Leases) {
+                    // Ended lease snapshots are what a pressure pass stalled on open
+                    // snapshots waits for.
+                    pressure_wake.notify_one();
+                }
+            }
             Ok(Outcome::Pressured(status)) => {
                 held.wake();
                 let verdict = pressure_duty.observe(&status);
@@ -641,12 +692,23 @@ async fn run(
                     + pressure_failed(store, &mut pressure_duty, &held, &error);
             }
             Err(error) => {
-                eprintln!("sparrowd: {} failed: {error}", job.name());
+                let retry = expiry_retry(paused, &error);
+                if !matches!(job, Job::Expiry) || retry.journal {
+                    eprintln!("sparrowd: {} failed: {error}", job.name());
+                }
                 // Retry a refused pass or page on the ordinary tick, never a busy loop.
                 match job {
                     Job::Expiry => {
                         continuation = false;
-                        expiry_at = tokio::time::Instant::now() + EXPIRY_RETRY;
+                        expiry_at = tokio::time::Instant::now() + retry.after;
+                        if paused {
+                            // The floor episode waits for ageing out to have had its turn.
+                            pressure_wake.notify_one();
+                        }
+                        #[cfg(test)]
+                        if !retry.journal {
+                            skips::note(job);
+                        }
                     }
                     Job::Migrate { .. } => {
                         migrating = false;
@@ -681,24 +743,160 @@ mod tests {
     }
 
     // Value: below the free-space floor the daemon used to freeze the whole pressure state
-    // machine exactly when the disk was nearly full (#211). Protects: pressure maintenance
-    // is a duty that runs below the floor, beside the two that never add data, while
-    // every duty that writes more than it frees (expiry, import reclamation, leases,
-    // online migration) still waits for the floor.
+    // machine exactly when the disk was nearly full (#211), and later skipped ageing out and
+    // the lease purge too (#267). Protects: pressure maintenance, ageing out (under the
+    // maintenance reserve) and the lease purge (which writes nothing) are duties that run below
+    // the floor, beside the two that never add data, while the duties that write more than
+    // they free (import reclamation, online migration) still wait for the floor.
     #[test]
     fn only_duties_that_free_space_or_add_nothing_run_below_the_floor() {
-        assert!(runs_below_floor(Job::Pressure));
-        assert!(runs_below_floor(Job::Flush));
-        assert!(runs_below_floor(Job::Recompress));
         for job in [
-            Job::Reclaim,
+            Job::Pressure,
+            Job::Flush,
+            Job::Recompress,
             Job::Expiry,
             Job::Leases,
+        ] {
+            assert!(runs_below_floor(job), "{}", job.name());
+        }
+        for job in [
+            Job::Reclaim,
             Job::Migrate { defer: false },
             Job::Migrate { defer: true },
         ] {
             assert!(!runs_below_floor(job), "{}", job.name());
         }
+    }
+
+    // Value (#267): a full disk used to put expiry on a 60 second retry clock with a journal
+    // line per attempt, though its refusal below the reserve ends by an event (free space
+    // returning, which wakes expiry). Protects: below the floor, a reserve refusal waits for the
+    // wall-clock ceiling and is not journaled; any other failure, and any failure with the
+    // floor not crossed, keeps the retry clock and the journal line.
+    #[test]
+    fn an_expiry_refusal_at_the_reserve_has_no_retry_clock_and_no_journal_line() {
+        let refused = Error::new("STORAGE_PRESSURE", "only 1 bytes free");
+        let quiet = expiry_retry(true, &refused);
+        assert_eq!((quiet.after, quiet.journal), (EXPIRY_CEILING, false));
+        let floor_clear = expiry_retry(false, &refused);
+        assert_eq!(
+            (floor_clear.after, floor_clear.journal),
+            (EXPIRY_RETRY, true)
+        );
+        let failed = expiry_retry(true, &Error::new("STORAGE_FAILURE", "native failure"));
+        assert_eq!((failed.after, failed.journal), (EXPIRY_RETRY, true));
+    }
+
+    /// A daemon-config store whose floor (32 MiB) is above its maintenance reserve (8 MiB), so
+    /// free space moved with the override lands between them: ageing out and the pressure pass
+    /// can write, ordinary writes cannot.
+    fn floor_store(dir: &std::path::Path) -> Store {
+        let data = dir.join("store");
+        let path = sparrow_test_support::write_server_config(dir, &data, &data.join("rpc.sock"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let raised = text.replace("min_free_bytes = 1048576", "min_free_bytes = 33554432");
+        assert_ne!(raised, text);
+        std::fs::write(&path, raised).unwrap();
+        sparrow_server::ServerConfig::read(&path)
+            .unwrap()
+            .open_store()
+            .unwrap()
+    }
+
+    /// Free space above the 8 MiB reserve and below the 32 MiB floor.
+    const BETWEEN_RESERVE_AND_FLOOR: u64 = 16 * 1024 * 1024;
+
+    // Value (#267): expiry was skipped below the floor, so a store under its budget kept
+    // evidence past retention while it refused every write. Protects: with free space between
+    // the reserve and the floor, the worker ages out evidence past retention while the floor
+    // stays crossed (it never resumes in this test), and an ordinary write is still refused.
+    #[tokio::test]
+    async fn expiry_below_the_floor_retires_aged_out_evidence_under_the_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = floor_store(dir.path());
+        let now = sparrow_server::now().unwrap();
+        let old = now - 31 * 86_400_000;
+        let artifact = store
+            .ingest("aged-below-floor", "source", "log", b"old\n", old)
+            .unwrap();
+        let floor = store.space_floor();
+        floor.set_free_for_tests(Some(BETWEEN_RESERVE_AND_FLOOR));
+        assert!(floor.observe(now).unwrap().is_some());
+        let worker = Worker::start(store.clone(), Duration::from_millis(1), Default::default());
+        until("aged out evidence to retire below the floor", || {
+            store.artifact(&artifact.id).is_err()
+        })
+        .await;
+        assert!(
+            floor
+                .observe(sparrow_server::now().unwrap())
+                .unwrap()
+                .is_some(),
+            "the floor must still be crossed"
+        );
+        assert!(
+            store
+                .ingest("refused-below-floor", "source", "log", b"new\n", now)
+                .unwrap_err()
+                .is_free_space_floor()
+        );
+        worker.shutdown().await.unwrap();
+    }
+
+    // Value (#267): the lease purge writes nothing, but it was skipped below the floor, and a
+    // pressure pass stalls on read snapshots that only the purge ends. Protects: with the floor
+    // crossed, the worker purges an expired read lease and its query reservation is released.
+    #[tokio::test]
+    async fn lease_purge_runs_below_the_floor_and_releases_an_expired_lease() {
+        use sparrow_core::{QueryScope, RecordOperation, RecordQuery, RecordRead};
+        let dir = tempfile::tempdir().unwrap();
+        let store = floor_store(dir.path());
+        store
+            .ingest(
+                "leased-below-floor",
+                "pages",
+                "jsonl",
+                b"{}\n".repeat(8).as_slice(),
+                1,
+            )
+            .unwrap();
+        let footprint = || {
+            store.status(2).unwrap()["physical_bytes"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        };
+        let before = footprint();
+        // A lease taken at clock 2 has long ended by the worker's real clock.
+        let page = store
+            .records_read(
+                &RecordRead {
+                    operation: RecordOperation::Records,
+                    scope: sparrow_test_support::record_scope!(QueryScope, "pages", 2),
+                    query: RecordQuery::default(),
+                    cursor: None,
+                },
+                2,
+            )
+            .unwrap();
+        assert!(page.next_cursor.is_some());
+        let charge = footprint() - before;
+        assert!(charge > 0, "a leased page must charge the footprint");
+        let floor = store.space_floor();
+        floor.set_free_for_tests(Some(BETWEEN_RESERVE_AND_FLOOR));
+        assert!(
+            floor
+                .observe(sparrow_server::now().unwrap())
+                .unwrap()
+                .is_some()
+        );
+        let worker = Worker::start(store.clone(), Duration::from_millis(1), Default::default());
+        until("the expired lease to be purged below the floor", || {
+            footprint() < before + charge / 2
+        })
+        .await;
+        worker.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1066,8 +1264,9 @@ mod tests {
         floor.set_free_for_tests(Some(0));
         assert!(floor.observe(now).unwrap().is_some());
         let worker = Worker::start(store.clone(), Duration::from_millis(1), Default::default());
-        // The first expiry pass runs at once and is skipped below the floor.
-        until("the first expiry pass to be skipped", || {
+        // The first expiry pass runs at once; free space of 0 is below the maintenance reserve,
+        // so it is refused (and counted by the skip counter) with nothing retired.
+        until("the first expiry pass to be refused", || {
             skips::expiry() > 0
         })
         .await;

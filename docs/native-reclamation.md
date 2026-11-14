@@ -79,6 +79,24 @@ reopened over-allowance store already uses, never the deficit, so a reopen resto
 whose first pass clears it through the ready branch. When the measured deficit reaches zero
 the episode ends and the ordinary ready path removes the marker.
 
+Ageing out is the first avenue of a floor episode and runs below the floor (#267 part C).
+A floor refusal wakes it with the pass. It runs through `Store::expire_below_floor`: the
+same bounded pass as ordinary expiry, but its commits are admitted against the maintenance
+reserve like the pass's own, it does not run import reclamation, and when free space is
+under the reserve it is refused before it reads anything and waits for the floor's resume.
+It never deletes unarchived or pinned evidence (the archive gate and the pins are the same
+code as the pass's). Retired evidence returns its bytes only after native work, so when
+ageing out retires evidence for an episode that asked for reclamation it opens an in-memory
+wait, with no stored marker: a delete of the marker key would stage the pressure writer
+fence on a store that never had one, so ending such a wait writes nothing. The pass measures
+it as it measures its own, forcing one compaction when linked bytes do not fall. The pass
+retires archived evidence early only after ageing out has had its turn, so retention that was
+only delayed goes before the policy-sensitive avenue. On a store with no archive policy the
+pass still measures and ends ageing out's wait, then says nothing is retired early. The
+lease purge writes nothing and also runs below the floor: the pass stalls on open read
+snapshots, which only the purge ends, and it wakes the pass. Import reclamation and online
+migration stay skipped below the floor.
+
 With no archive policy and nothing expired, a store at the floor has no avenue left and
 refuses writes until space returns. `floorPause.writesRefused`, the pressure status
 `floorRefusedWrites` and the `floor*` fields show it. A client that does not retry loses

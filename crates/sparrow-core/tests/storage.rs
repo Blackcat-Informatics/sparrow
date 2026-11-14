@@ -6090,6 +6090,16 @@ const FLOOR_SHORT_BY: u64 = 2 * 1024 * 1024;
 /// Free space that never limits anything.
 const FLOOR_PLENTY: u64 = 1 << 40;
 
+/// Let ageing out have its turn in the open floor episode, as the daemon's expiry duty does
+/// when the refusal wakes it. Nothing here is past retention, so it retires nothing; early
+/// retirement of archived evidence waits for this turn (#267 part C).
+fn expiry_has_its_turn(store: &Store) {
+    let report = store
+        .expire_below_floor(10, sparrow_core::EvictionLimits::default())
+        .unwrap();
+    assert_eq!((report.records, report.artifacts), (0, 0));
+}
+
 /// A store whose floor (8 MiB) is above its maintenance reserve (4 MiB) inside a 16 MiB
 /// budget, so free space alone, moved with the override, decides what is refused.
 fn floor_settings(archive: bool) -> Config {
@@ -6206,6 +6216,7 @@ fn a_floor_refusal_below_budget_retires_archived_evidence_and_stops_at_the_archi
             .unwrap_err()
             .is_free_space_floor()
     );
+    expiry_has_its_turn(&store);
     let limits = EvictionLimits::default();
     let first = store.pressure_maintain(10, limits).unwrap();
     assert!(first.failure.is_none(), "{:?}", first.failure);
@@ -6286,6 +6297,7 @@ fn floor_retirement_respects_pins_and_a_store_without_an_archive_policy() {
     store
         .ingest("floor-refused", "source", "log", b"later\n", 5)
         .unwrap_err();
+    expiry_has_its_turn(&store);
     let pinned = store
         .pressure_maintain(10, EvictionLimits::default())
         .unwrap();
@@ -6370,6 +6382,7 @@ fn floor_retirement_stops_at_the_bound() {
     store
         .ingest("bound-refused", "source", "log", b"later\n", 9)
         .unwrap_err();
+    expiry_has_its_turn(&store);
     let limits = EvictionLimits {
         max_records: 1,
         ..EvictionLimits::default()
@@ -6531,6 +6544,7 @@ fn a_floor_episode_with_query_reservations_keeps_its_cap_on_a_store_with_an_arch
     store
         .ingest("floor-cap-refused", "source", "log", b"later\n", 13)
         .unwrap_err();
+    expiry_has_its_turn(&store);
     let limits = EvictionLimits {
         max_records: 1,
         ..EvictionLimits::default()
@@ -6593,6 +6607,7 @@ fn a_floor_episode_with_nothing_left_to_retire_says_so() {
     store
         .ingest("floor-left-refused", "source", "log", b"later\n", 3)
         .unwrap_err();
+    expiry_has_its_turn(&store);
     let limits = EvictionLimits::default();
     let mut state = store.pressure_maintain(4, limits).unwrap();
     for step in 0..32 {
@@ -6632,6 +6647,7 @@ fn the_floor_episode_clears_when_space_returns_and_a_durable_wait_is_cleaned_up(
     store
         .ingest("floor-refused", "source", "log", b"later\n", 5)
         .unwrap_err();
+    expiry_has_its_turn(&store);
     let retired = store.pressure_maintain(10, limits).unwrap();
     assert_eq!(retired.phase, PressurePhase::AwaitingReclamation);
     floor.set_free_for_tests(Some(FLOOR_PLENTY));
@@ -6651,6 +6667,7 @@ fn the_floor_episode_clears_when_space_returns_and_a_durable_wait_is_cleaned_up(
     store
         .ingest("floor-refused", "source", "log", b"later\n", 5)
         .unwrap_err();
+    expiry_has_its_turn(&store);
     store.pressure_maintain(10, limits).unwrap();
     drop(store);
     let stored = marker(dir.path()).unwrap();
@@ -6667,6 +6684,159 @@ fn the_floor_episode_clears_when_space_returns_and_a_durable_wait_is_cleaned_up(
     assert_eq!(cleared.evicted_records, 0);
     drop(store);
     assert!(marker(dir.path()).is_none());
+}
+
+/// A clock reading past the retention of everything these tests receive at 1..=14.
+const FLOOR_AGED_NOW: u64 = 31 * 86_400_000;
+
+// Value (#267 part C): a floor episode retires archived evidence early only after ageing out
+// has had its turn, because ageing out is retention that was merely delayed and early
+// retirement is the policy-sensitive avenue. Protects: with an archive policy and the floor
+// crossed, the pass waits for ageing out and retires nothing; once ageing out has run (here it
+// finds nothing aged) the same pass retires the archived prefix and still keeps the unarchived
+// entry.
+#[test]
+fn a_floor_episode_waits_for_expiry_before_retiring_archived_evidence() {
+    use sparrow_core::{EvictionLimits, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let (store, artifacts) = archived_prefix_store(dir.path());
+    store
+        .space_floor()
+        .set_free_for_tests(Some(FLOOR_SHORT_FREE));
+    store
+        .ingest("floor-order-refused", "source", "log", b"later\n", 5)
+        .unwrap_err();
+    let limits = EvictionLimits::default();
+    let waiting = store.pressure_maintain(10, limits).unwrap();
+    assert_eq!(waiting.phase, PressurePhase::Requested);
+    assert_eq!((waiting.evicted_records, waiting.floor_passes), (0, 0));
+    assert!(
+        waiting
+            .waiting_on
+            .as_deref()
+            .unwrap()
+            .contains("waiting for ageing out to run first"),
+        "{:?}",
+        waiting.waiting_on
+    );
+    for artifact in &artifacts {
+        assert!(store.bytes(&artifact.id, 0, 1, 11).is_ok());
+    }
+    expiry_has_its_turn(&store);
+    let retiring = store.pressure_maintain(12, limits).unwrap();
+    assert_eq!(retiring.phase, PressurePhase::AwaitingReclamation);
+    assert_eq!(retiring.evicted_records, 3);
+    assert!(store.bytes(&artifacts[3].id, 0, 1, 13).is_ok());
+}
+
+// Value (#267 part C): expiry below the floor must hand its retirement to the pressure wait,
+// since it never flushes or compacts, and the hand-over must not write a durable marker (that
+// would fence the store's format). Protects: after ageing out retires a record the status is
+// AwaitingReclamation with ageing out named; the wait ends by event (a forced compaction at
+// worst) and then the no-archive store says it retires nothing early; nothing of this is
+// stored; and if free space returns first, the next pass is Ready.
+#[test]
+fn expiry_below_the_floor_hands_its_retirement_to_the_pressure_wait() {
+    use sparrow_core::{EvictionLimits, PressurePhase};
+    let limits = EvictionLimits::default();
+    let marker = |path: &std::path::Path| {
+        let db = catalog_db(path).unwrap();
+        db.get("pressure-reclamation-wait").unwrap()
+    };
+    let aged_out = |dir: &std::path::Path| {
+        let store = Store::open(dir, floor_settings(false)).unwrap();
+        store
+            .ingest("floor-aged-old", "source", "log", b"old\n", 1)
+            .unwrap();
+        store
+            .space_floor()
+            .set_free_for_tests(Some(FLOOR_SHORT_FREE));
+        store
+            .ingest("floor-aged-refused", "source", "log", b"later\n", 2)
+            .unwrap_err();
+        let report = store.expire_below_floor(FLOOR_AGED_NOW, limits).unwrap();
+        assert_eq!(report.records, 1, "{report:?}");
+        store
+    };
+
+    // The wait is measured and ended by the pass; the no-archive store then retires nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let store = aged_out(dir.path());
+    let handed = store.pressure_status().unwrap();
+    assert_eq!(handed.phase, PressurePhase::AwaitingReclamation);
+    assert!(
+        handed
+            .waiting_on
+            .as_deref()
+            .unwrap()
+            .contains("ageing out retired evidence"),
+        "{:?}",
+        handed.waiting_on
+    );
+    let mut state = handed;
+    for step in 0..16 {
+        if state.phase == PressurePhase::Blocked {
+            break;
+        }
+        store.await_native_quiet().unwrap();
+        state = store
+            .pressure_maintain(FLOOR_AGED_NOW + step, limits)
+            .unwrap();
+    }
+    assert_eq!(state.phase, PressurePhase::Blocked, "{state:?}");
+    assert_eq!(state.evicted_records, 0);
+    assert!(
+        state
+            .waiting_on
+            .as_deref()
+            .unwrap()
+            .contains("no archive policy"),
+        "{:?}",
+        state.waiting_on
+    );
+    assert_eq!(state.wait_age_ms(), 0);
+    drop(store);
+    assert!(marker(dir.path()).is_none());
+
+    // Free space returns before the wait is measured: the next pass is Ready, writes nothing
+    // and leaves no marker.
+    let dir = tempfile::tempdir().unwrap();
+    let store = aged_out(dir.path());
+    store.space_floor().set_free_for_tests(Some(FLOOR_PLENTY));
+    let ready = store.pressure_maintain(FLOOR_AGED_NOW, limits).unwrap();
+    assert_eq!(ready.phase, PressurePhase::Ready);
+    assert_eq!(ready.floor_requested_bytes, 0);
+    drop(store);
+    assert!(marker(dir.path()).is_none());
+}
+
+// Value (#267 part C): ageing out below the floor runs under the maintenance reserve, and
+// below the reserve it must refuse before it reads anything. Protects: with free space under
+// the reserve the call fails with the reserve's refusal and has read no row; with free space
+// back between the reserve and the floor, it retires the aged-out record (the pass the floor
+// refused before).
+#[test]
+fn expiry_below_the_reserve_is_refused_before_it_reads_and_runs_above_it() {
+    use sparrow_core::EvictionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), floor_settings(false)).unwrap();
+    let old = store
+        .ingest("reserve-aged-old", "source", "log", b"old\n", 1)
+        .unwrap();
+    let floor = store.space_floor();
+    floor.set_free_for_tests(Some(2 * 1024 * 1024));
+    let limits = EvictionLimits::default();
+    let refused = store
+        .expire_below_floor(FLOOR_AGED_NOW, limits)
+        .unwrap_err();
+    assert_eq!(refused.code, "STORAGE_PRESSURE");
+    assert!(!refused.is_free_space_floor(), "{refused}");
+    assert!(refused.message.contains("resumes at"), "{refused}");
+    assert_eq!(store.expiry_reads_for_tests().unwrap(), 0);
+    assert!(store.bytes(&old.id, 0, 4, 2).is_ok());
+    floor.set_free_for_tests(Some(FLOOR_SHORT_FREE));
+    let report = store.expire_below_floor(FLOOR_AGED_NOW, limits).unwrap();
+    assert_eq!(report.records, 1, "{report:?}");
 }
 
 // Value (#267): the budget path's first request is keyed on the request itself, not the

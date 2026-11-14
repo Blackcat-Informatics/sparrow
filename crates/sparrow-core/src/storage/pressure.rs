@@ -152,6 +152,10 @@ impl PressureStatus {
 struct Wait {
     before: u64,
     step: Step,
+    /// A retirement pass staged a durable marker for this wait. Ageing out below the floor
+    /// (#267) opens a wait with none: ending it must not write, because a delete of the
+    /// marker key would stage the pressure writer fence on a store that never had one.
+    durable: bool,
 }
 
 /// How far the one forced compaction of a wait has come.
@@ -180,6 +184,10 @@ struct FloorEpisode {
     batches: u64,
     /// Set by the first pass of the episode.
     start: Option<FloorStart>,
+    /// Ageing out ran (or failed, or was refused at the reserve) since this episode asked.
+    /// Early retirement of archived evidence waits for it: ageing out is normal retention
+    /// that was only delayed, early retirement is the policy-sensitive avenue.
+    expiry_tried: bool,
 }
 
 /// The measures a floor episode is bounded by.
@@ -272,6 +280,7 @@ impl State {
             wait: Some(Wait {
                 before: physical,
                 step: Step::Native,
+                durable: true,
             }),
             floor: FloorEpisode::default(),
             background_errors,
@@ -516,6 +525,7 @@ impl Writer {
                 state.floor.start = None;
                 state.floor.passes = 0;
                 state.floor.batches = 0;
+                state.floor.expiry_tried = false;
             }
             if state.status.phase == PressurePhase::Ready {
                 state.status.phase = PressurePhase::Requested;
@@ -565,6 +575,11 @@ impl Writer {
     /// says so plainly, and the caller leaves its baseline alone so the next pass reports
     /// it again for as long as it lasts.
     fn end_wait(&self, state: &mut State) -> Result<(), Error> {
+        if state.wait.is_some_and(|wait| !wait.durable) {
+            // Ageing out opened this wait in memory only; there is no marker to delete.
+            state.end_wait();
+            return Ok(());
+        }
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete(WAIT_KEY);
         #[cfg(feature = "test-support")]
@@ -644,6 +659,79 @@ impl Writer {
         Ok(())
     }
 
+    /// The floor episode of a store with no archive policy: nothing is retired early, and the
+    /// status says so. Ageing out is the only avenue there.
+    fn no_archive_floor(
+        &self,
+        state: &mut State,
+        now: u64,
+        forced_failure: Option<&str>,
+    ) -> Result<PressureStatus, Error> {
+        state.enter(PressurePhase::Blocked, now);
+        state.stalled("this store has no archive policy, so nothing is retired early");
+        self.surface_native_errors(state, forced_failure)?;
+        Ok(state.status.clone())
+    }
+
+    /// Open the wait that follows a retirement: it ends when linked bytes fall below `linked`,
+    /// and a forced compaction is started if they do not. `durable` says a marker was staged
+    /// with the retirement batch. Native flushes are scheduled without holding the writer
+    /// through disk I/O; automatic compaction and blob GC stay with the background jobs.
+    fn begin_wait(
+        &self,
+        state: &mut State,
+        linked: u64,
+        now: u64,
+        durable: bool,
+        progress: &str,
+    ) -> Result<(), Error> {
+        state.wait = Some(Wait {
+            before: linked,
+            step: Step::Native,
+            durable,
+        });
+        state.status.wait_before_bytes = linked;
+        state.status.wait_since = now.max(1);
+        state.status.waiting_on = None;
+        state.enter(PressurePhase::AwaitingReclamation, now);
+        if state.floor.asked {
+            let text = state.floor_text(progress);
+            state.status.waiting_on = Some(text);
+        }
+        let mut options = FlushOptions::default();
+        options.set_wait(false);
+        self.db
+            .flush_cfs_opt(&super::family_handles(&self.db)?, &options)?;
+        Ok(())
+    }
+
+    /// Ageing out ran below the floor (#267), or was refused or failed: the floor episode may
+    /// go on to early retirement. When it retired evidence for a floor episode that asked,
+    /// open an in-memory wait (no durable marker, so no format fence) so the pass measures
+    /// whether linked bytes fell and forces a compaction if they did not. `linked_before` is
+    /// the linked store bytes measured before the retirement; `None` means nothing retired.
+    pub(super) fn expiry_ran_below_floor(
+        &self,
+        now: u64,
+        linked_before: Option<u64>,
+    ) -> Result<(), Error> {
+        let mut state = self.pressure.borrow_mut();
+        state.floor.expiry_tried = true;
+        if let Some(linked) = linked_before
+            && state.floor.asked
+            && state.wait.is_none()
+        {
+            self.begin_wait(
+                &mut state,
+                linked,
+                now,
+                false,
+                "ageing out retired evidence and the store waits for native work to return its bytes",
+            )?;
+        }
+        Ok(())
+    }
+
     fn maintain_pressure(&self, now: u64, limits: EvictionLimits) -> Result<PressureStatus, Error> {
         let physical = self.physical_bytes()?;
         let linked = self.linked_physical_bytes()?;
@@ -719,7 +807,7 @@ impl Writer {
     ) -> Result<PressureStatus, Error> {
         let floor_on = state.floor.deficit > 0;
         if physical.saturating_add(state.status.requested_bytes) <= limit && !floor_on {
-            if state.wait.is_some() {
+            if state.wait.is_some_and(|wait| wait.durable) {
                 let mut batch = rocksdb::WriteBatch::default();
                 batch.delete(WAIT_KEY);
                 self.reclaiming(|| self.commit(batch))?;
@@ -747,11 +835,12 @@ impl Writer {
         // let a floor episode with reservations skip the guard and the bound below. Every path
         // to the retirement with the floor on and no budget authority passes through both.
         let floor_only = floor_on && linked.saturating_add(state.status.requested_bytes) <= limit;
-        if floor_only && self.archive.is_none() {
-            state.enter(PressurePhase::Blocked, now);
-            state.stalled("this store has no archive policy, so nothing is retired early");
-            self.surface_native_errors(state, forced_failure.as_deref())?;
-            return Ok(state.status.clone());
+        // With no archive policy ageing out is the only avenue, and its retirement can leave a
+        // wait open that only this pass measures and ends (forced compaction included), so a
+        // store with such a wait goes on through the gates and refuses after them.
+        let no_archive = floor_only && self.archive.is_none();
+        if no_archive && state.wait.is_none() {
+            return self.no_archive_floor(state, now, forced_failure.as_deref());
         }
         state.status.pending_flushes = 0;
         state.status.pending_compactions = 0;
@@ -872,6 +961,18 @@ impl Writer {
                 }
             }
         }
+        if no_archive {
+            return self.no_archive_floor(state, now, forced_failure.as_deref());
+        }
+        if floor_only && !state.floor.expiry_tried {
+            // Ageing out is normal retention that was only delayed; early retirement of
+            // archived evidence is the policy-sensitive avenue and goes second. Expiry's
+            // arrival (success, refusal or failure) wakes the pass.
+            state.enter(PressurePhase::Requested, now);
+            state.stalled("waiting for ageing out to run first");
+            self.surface_native_errors(state, forced_failure.as_deref())?;
+            return Ok(state.status.clone());
+        }
         if floor_only && let Some(start) = state.floor.start {
             let freed = start.linked.saturating_sub(linked);
             let batches = state.floor.batches;
@@ -939,26 +1040,13 @@ impl Writer {
             if floor_on {
                 state.floor.batches = state.floor.batches.saturating_add(1);
             }
-            state.wait = Some(Wait {
-                before: linked,
-                step: Step::Native,
-            });
-            state.status.wait_before_bytes = linked;
-            state.status.wait_since = now.max(1);
-            state.status.waiting_on = None;
-            state.enter(PressurePhase::AwaitingReclamation, now);
-            if floor_on {
-                let text = state.floor_text(
-                    "reclamation in progress: evidence was retired and the store waits for native work to return its bytes",
-                );
-                state.status.waiting_on = Some(text);
-            }
-            // Schedule native flushes without holding the writer through disk I/O.
-            // Automatic native compaction/blob GC remains limited to the background jobs.
-            let mut options = FlushOptions::default();
-            options.set_wait(false);
-            self.db
-                .flush_cfs_opt(&super::family_handles(&self.db)?, &options)?;
+            self.begin_wait(
+                state,
+                linked,
+                now,
+                true,
+                "reclamation in progress: evidence was retired and the store waits for native work to return its bytes",
+            )?;
         } else if archive_lag {
             state.enter(PressurePhase::AwaitingArchive, now);
             let reason =

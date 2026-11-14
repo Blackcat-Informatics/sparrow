@@ -183,10 +183,12 @@ work with no external event: the next retirement or deletion deadline or the
 earliest live pin deadline. The worker sleeps until then, never less than one
 second and never more than one hour. The ceiling protects against a wall clock
 that stepped forward, since the sleep itself is monotonic. A pin release, a pin
-commit and an archive commit wake the worker at once. A pass skipped below the
-free-space floor waits for the floor's resume, which wakes it at once (#247); the
-one-hour ceiling is only its backstop. A pass that failed retries after 60 seconds,
-for want of any event that says it would now succeed. Retry rows
+commit and an archive commit wake the worker at once. Below the free-space floor the
+pass runs under the maintenance reserve (#267, below); when free space is under the
+reserve it is refused before it reads anything, and it then waits for the floor's resume,
+which wakes it at once (#247), with no retry clock and no journal line per attempt; the
+one-hour ceiling is only its backstop. A pass that failed for any other reason retries
+after 60 seconds, for want of any event that says it would now succeed. Retry rows
 (`request:`) have no time index; one pass scans them once per hour, and their
 logical expiry is exact at read time regardless. The purge of expired read
 leases runs on its own 60-second tick, not inside expiry. Expiry honours each row's
@@ -265,9 +267,32 @@ until a restart.
 The pressure pass writes a retirement batch, a flush and the forced compaction. All are
 small beside the maintenance reserve the budget withholds for them, so the pass runs
 below the free-space floor, where it is what frees space, but needs the reserve itself
-free on the filesystem; with less it does nothing that writes and reports why. Its two commits, the retirement batch and the clearing of the wait marker (and only those), are admitted against that reserve instead of the floor; every ordinary write keeps the floor. Expiry,
-import reclamation, leases and online migration write more than they free and still wait
-for the floor.
+free on the filesystem; with less it does nothing that writes and reports why. Its two commits, the retirement batch and the clearing of the wait marker (and only those), are admitted against that reserve instead of the floor; every ordinary write keeps the floor.
+
+Ageing out and the read-lease purge also run below the floor (#267). Ageing out is
+retention that was only delayed: it retires evidence past its deadline in the same small
+bounded batches as the pressure retirement, so its commits run under the same reserve
+admission, and it never retires an unarchived entry or a pinned one. It does not run
+import reclamation, and it refuses before reading anything when free space is under the
+reserve. It frees bytes only after native flush and compaction, so when it retires
+evidence for a floor episode that asked for reclamation it opens an in-memory pressure wait
+(no stored marker, no format change) that the pass measures and ends, forcing a compaction
+if linked bytes do not fall. Within one floor episode ageing out goes first: the pass waits
+("waiting for ageing out to run first") until expiry has run, been refused at the reserve or
+failed, and only then retires archived evidence early. On a store with no archive policy
+ageing out is the only avenue. The lease purge writes nothing and ends the read snapshots a
+pass stalls on ("open read snapshots"), so it runs below the floor and wakes the pass.
+Import reclamation and online migration write more than they free (a migration page
+rewrites data) and still wait for the floor; import reclamation deletes staged chunks and is
+a candidate for a follow-up.
+
+The pressure status names the three floor states: reclamation not yet attempted (phase
+`requested`, "reclamation requested, not yet attempted"); attempted and in progress
+(`requested` while ageing out has not run, `awaitingReclamation` while a retirement of
+ageing out or of the pass waits for native work, with what it waits on); attempted and
+nothing reclaimable (`blocked` or `awaitingArchive`, "reclamation tried"). Ageing out
+that retired evidence shows as in progress, and one that found nothing aged leaves the
+episode's other avenues to say what is left.
 
 The worker no longer retries every second and discards the result. After a pass that
 made progress it looks again after a second; each pass that made none doubles the delay
@@ -290,8 +315,9 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
   its own hold (below): datagrams queue in the daemon up to `hold_bytes`, then in the
   kernel buffer. Three things stay paused, because they are the writes
   themselves: configured consume and tail watches (their source files are the spool;
-  they observe and claim nothing), the daemon's non-synchronizing maintenance, and
-  opening the store at startup (nothing can answer before the store opens). A paused
+  they observe and claim nothing), the daemon's maintenance that writes more than it
+  frees (import reclamation and online migration; ageing out, the lease purge and the
+  pressure pass run, under the maintenance reserve), and opening the store at startup (nothing can answer before the store opens). A paused
   watch worker owns no timer: it observes the floor through the floor's ledger and
   blocks on the floor's resume edge, which any number of duties subscribe to. The edge
   is fired by whichever observation sees free space return, including the daemon's
