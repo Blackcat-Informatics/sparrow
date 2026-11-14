@@ -131,3 +131,6 @@ rules in this file or a direct word from Patrick.
   raise one: no deletion by glob or variable, no path outside the repository, no long compound
   command. If a call is refused, do not send it again in another form; use the plain small
   version or report it.
+- Scratch files, probes, logs and temporary data go under the repository's `.stage` directory,
+  one subdirectory per task, never `/tmp` or `/var/tmp`. Those are reaped automatically and sit
+  outside the repository; nothing worth keeping is stored there.
