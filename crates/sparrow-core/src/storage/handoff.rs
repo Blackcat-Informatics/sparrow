@@ -294,6 +294,18 @@ impl Writer {
                 .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
             return Ok(self.consumption(id)?.is_some());
         }
+        // A claim's set manifest receipt is its publication proof (#280): it is kept while the
+        // claim's active or completed journal exists, never only for the retry window.
+        if let Some(hash) = key
+            .strip_prefix(b"request:ingest:")
+            .and_then(|rest| rest.strip_prefix(super::consumption::SET_PREFIX.as_bytes()))
+            .and_then(|rest| rest.strip_suffix(b".manifest"))
+        {
+            let hash = std::str::from_utf8(hash)
+                .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
+            let claim = super::import::import_id(&format!("consume:{hash}"));
+            return Ok(self.consumption(&claim)?.is_some());
+        }
         if key.starts_with(PREFIX.as_bytes()) {
             let binding = Binding::decode(value)?;
             if key != binding.intent.key().as_bytes() {

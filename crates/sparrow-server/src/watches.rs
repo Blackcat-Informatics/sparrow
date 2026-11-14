@@ -13,7 +13,7 @@ use rustix::fs::{
     self,
     inotify::{self, CreateFlags, ReadFlags, WatchFlags},
 };
-use sparrow_client::{Client, CompletedFileIdentity};
+use sparrow_client::{Client, CompletedFileIdentity, parts::ProgressMark};
 use sparrow_core::Store;
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -193,11 +193,58 @@ pub struct WatchStatus {
     pub tail_checkpoint_records: u64,
     /// Publication is waiting for the shared daemon operation budget.
     pub tail_admission_waiting: bool,
+    /// Pending finished-file claims the publish hold holds; zero unless the hold is set.
+    pub held_claims: u32,
+    /// First-seen time of the oldest held claim, when the hold holds any.
+    pub held_since: Option<u64>,
 }
 
-/// One shared bounded snapshot owner for worker updates and typed RPC status.
+/// The pending claims the worker may publish now, in pending order. A claim whose watch holds
+/// publication is skipped: it stays journaled and in flight, and the wait has no deadline for
+/// it, so a hold never spins the worker. Clearing the hold (a watch put) wakes the wait as any
+/// command does. A tail is never held; `due` says whether a claim's retry time has come.
+fn publishable<'a>(
+    pending: &'a [sparrow_core::ConsumptionJournal],
+    detectors: &'a [Detector],
+    due: impl Fn(&str) -> bool + 'a,
+) -> impl Iterator<Item = &'a sparrow_core::ConsumptionJournal> + 'a {
+    pending.iter().filter(move |journal| {
+        due(&journal.import_id)
+            && (journal.tail.is_some()
+                || !detectors.iter().any(|detector| {
+                    detector.config.id == journal.watch && detector.config.publish_hold
+                }))
+    })
+}
+
+/// How many pending finished-file claims of watch `id` a publish hold holds, and since when
+/// (the oldest first-seen time). Zero and none unless `hold` is set; a tail is never held.
+fn held_summary(
+    hold: bool,
+    id: &str,
+    pending: &[sparrow_core::ConsumptionJournal],
+) -> (u32, Option<u64>) {
+    if !hold {
+        return (0, None);
+    }
+    pending
+        .iter()
+        .filter(|journal| journal.watch == id && journal.tail.is_none())
+        .fold((0, None), |(count, since), journal| {
+            let seen = journal.history.first_seen;
+            let since = match (since, seen) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            (count + 1, since)
+        })
+}
+
+/// One shared bounded snapshot owner for worker updates and typed RPC status. The second
+/// field names the watches whose publish hold the last update announced, so a warning is
+/// written once per hold per daemon start (and again after the hold clears and is set).
 #[derive(Clone, Default)]
-pub struct WatchRegistry(Arc<Mutex<Vec<WatchStatus>>>);
+pub struct WatchRegistry(Arc<Mutex<Vec<WatchStatus>>>, Arc<Mutex<Vec<String>>>);
 
 impl WatchRegistry {
     /// Capture at most eight configured roots; poisoning is an actionable failure.
@@ -216,39 +263,53 @@ impl WatchRegistry {
         let states = catalog
             .watches()
             .iter()
-            .map(|watch| WatchStatus {
-                id: watch.definition.id.clone(),
-                root: watch.definition.root.to_string_lossy().into_owned(),
-                definition: watch.definition.clone(),
-                revision: watch.revision,
-                enabled: watch.enabled,
-                covered: false,
-                directories: 0,
-                candidates: 0,
-                deferred: false,
-                pending: pending
-                    .iter()
-                    .filter(|journal| journal.watch == watch.definition.id)
-                    .count() as u32,
-                completed: 0,
-                reconciliations: 0,
-                coverage_losses: 0,
-                failure: None,
-                tail_generation_ids: Vec::new(),
-                tail_read_bytes: 0,
-                tail_descriptors: 0,
-                tail_checkpoint_records: 0,
-                tail_admission_waiting: false,
+            .map(|watch| {
+                let (held_claims, held_since) = held_summary(
+                    watch.definition.publish_hold,
+                    &watch.definition.id,
+                    &pending,
+                );
+                WatchStatus {
+                    id: watch.definition.id.clone(),
+                    root: watch.definition.root.to_string_lossy().into_owned(),
+                    definition: watch.definition.clone(),
+                    revision: watch.revision,
+                    enabled: watch.enabled,
+                    covered: false,
+                    directories: 0,
+                    candidates: 0,
+                    deferred: false,
+                    pending: pending
+                        .iter()
+                        .filter(|journal| journal.watch == watch.definition.id)
+                        .count() as u32,
+                    completed: 0,
+                    reconciliations: 0,
+                    coverage_losses: 0,
+                    failure: None,
+                    tail_generation_ids: Vec::new(),
+                    tail_read_bytes: 0,
+                    tail_descriptors: 0,
+                    tail_checkpoint_records: 0,
+                    tail_admission_waiting: false,
+                    held_claims,
+                    held_since,
+                }
             })
             .collect();
-        Ok(Self(Arc::new(Mutex::new(states))))
+        Ok(Self(
+            Arc::new(Mutex::new(states)),
+            Arc::new(Mutex::new(Vec::new())),
+        ))
     }
 
+    /// Publish the registry snapshot and write the publish-hold warnings this update announces
+    /// (a watch whose hold was not announced since the last clear). Returns the lines written.
     fn update(
         &self,
         detectors: &[Detector],
         pending: &[sparrow_core::ConsumptionJournal],
-    ) -> Result<(), Error> {
+    ) -> Result<Vec<String>, Error> {
         let states = detectors
             .iter()
             .map(|detector| {
@@ -261,6 +322,8 @@ impl WatchRegistry {
                     Owner::Consume(_) => (Vec::new(), 0, 0, 0),
                     Owner::Tail(owner) => owner.status(&detector.config.id)?,
                 };
+                let (held_claims, held_since) =
+                    held_summary(detector.config.publish_hold, &detector.config.id, pending);
                 Ok(WatchStatus {
                     id: detector.config.id.clone(),
                     root: detector.config.root.to_string_lossy().into_owned(),
@@ -284,14 +347,39 @@ impl WatchRegistry {
                     tail_descriptors,
                     tail_checkpoint_records,
                     tail_admission_waiting: detector.tail_admission_waiting,
+                    held_claims,
+                    held_since,
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
+        let mut announced = self
+            .1
+            .lock()
+            .map_err(|_| Error::State("publish hold announcements poisoned"))?;
+        let mut lines = Vec::new();
+        let mut held = Vec::new();
+        for state in states.iter().filter(|state| state.definition.publish_hold) {
+            held.push(state.id.clone());
+            if !announced.contains(&state.id) {
+                lines.push(format!(
+                    "sparrowd: WARNING watch={} publish_hold is set: {} pending claims are held since unix_millis {}; clear every hold before an older build runs",
+                    state.id,
+                    state.held_claims,
+                    state
+                        .held_since
+                        .map_or_else(|| "unknown".to_owned(), |at| at.to_string()),
+                ));
+            }
+        }
+        for line in &lines {
+            eprintln!("{line}");
+        }
+        *announced = held;
         *self
             .0
             .lock()
             .map_err(|_| Error::State("consume status registry poisoned"))? = states;
-        Ok(())
+        Ok(lines)
     }
 }
 
@@ -380,6 +468,36 @@ struct ClaimFailure {
 const FAILURE_CHARS: usize = 1024;
 
 impl Detector {
+    /// Move one claim of this publish-held watch into the private in-flight directory, exactly
+    /// as an interrupted claim is, and stop there: publication waits for the hold to clear. The
+    /// move is idempotent once recorded. A move that fails is recorded on the watch.
+    fn move_held_claim(&mut self, store: &Store, id: &str) -> Result<(), Error> {
+        let now = crate::now()?;
+        let Err(error) = self
+            .owner
+            .claim()
+            .and_then(|claim| claim.recover(id, now))
+            .map(drop)
+        else {
+            return Ok(());
+        };
+        // The journal keeps the reason, as a failed attempt's does, so `watch claims` shows it.
+        self.fail_claim(id, format!("claim {id}: {error}"));
+        eprintln!(
+            "sparrowd: watch={} claim={id} held and not moved: {error}",
+            self.config.id
+        );
+        if let Some(record) =
+            pending_attempt_outcome(store.consumption_attempt_pending(id, &error.to_string(), now))?
+        {
+            self.fail_claim(
+                id,
+                format!("claim {id}: {error}; attempt not recorded: {record}"),
+            );
+        }
+        Ok(())
+    }
+
     /// Record the failure of `claim`'s recovery. A failure that names no claim stays beside it.
     fn fail_claim(&mut self, claim: &str, text: String) {
         self.claim_failure = Some(ClaimFailure {
@@ -1478,8 +1596,8 @@ async fn run(
 ) -> Result<(), Error> {
     // The consume connection and when it was opened; the daemon's lease runs from there.
     let mut client: Option<(Client, Instant)> = None;
-    // Next attempt and consecutive failures per pending claim.
-    let mut retry = BTreeMap::<String, (Instant, u32)>::new();
+    // Next attempt, consecutive failures, best progress and shared parts per pending claim.
+    let mut retry = BTreeMap::<String, ClaimRetry>::new();
     let mut connect_after = Instant::now();
     // A command or a permit the last wait received, for this pass.
     let mut received = None;
@@ -1652,24 +1770,36 @@ async fn run(
             continue;
         }
         retry.retain(|id, _| pending.iter().any(|journal| journal.import_id == *id));
-        let mut work = pending
-            .iter()
-            .filter(|journal| {
-                retry
-                    .get(&journal.import_id)
-                    .is_none_or(|(at, _)| *at <= Instant::now())
-            })
-            // A failed ordinary upload connection must not block checkpoint
-            // acknowledgement, which has no transport dependency.
-            .min_by_key(|journal| journal.tail.is_none())
-            .map(|journal| {
-                (
-                    journal.watch.clone(),
-                    journal.import_id.clone(),
-                    journal.tail.is_some(),
-                )
-            });
+        // Claims that a publish hold holds are kept in flight, as an interrupted claim is; the
+        // publish pick below skips them until the hold clears.
+        for detector in detectors
+            .iter_mut()
+            .filter(|detector| detector.config.publish_hold)
+        {
+            let held = pending
+                .iter()
+                .filter(|journal| journal.watch == detector.config.id && journal.tail.is_none())
+                .map(|journal| journal.import_id.clone())
+                .collect::<Vec<_>>();
+            for id in held {
+                detector.move_held_claim(&store, &id)?;
+            }
+        }
+        let mut work = publishable(&pending, &detectors, |id| {
+            retry.get(id).is_none_or(|entry| entry.at <= Instant::now())
+        })
+        // A failed ordinary upload connection must not block checkpoint
+        // acknowledgement, which has no transport dependency.
+        .min_by_key(|journal| journal.tail.is_none())
+        .map(|journal| {
+            (
+                journal.watch.clone(),
+                journal.import_id.clone(),
+                journal.tail.is_some(),
+            )
+        });
         let claims = work.is_none() && pending.len() < sparrow_core::MAX_CONSUMPTION_JOURNALS;
+        let (mut floor_wait, mut floor_ended) = (false, false);
         if claims {
             for detector in &mut detectors {
                 if !detector.enabled {
@@ -1687,9 +1817,24 @@ async fn run(
                     ) {
                         Ok(journal) => {
                             detector.candidates.remove(&path);
-                            work = Some((detector.config.id.clone(), journal.import_id, false));
+                            // Under a publish hold the claim is moved in flight now and not published.
+                            if detector.config.publish_hold {
+                                detector.move_held_claim(&store, &journal.import_id)?;
+                            } else {
+                                work = Some((detector.config.id.clone(), journal.import_id, false));
+                            }
                         }
                         Err(error) => {
+                            // A floor refusal records the pause now, so this pass waits on its
+                            // resume edge; an edge that already fired runs the next pass at once.
+                            if let crate::consumption::Error::Storage(storage) = &error
+                                && storage.is_free_space_floor()
+                            {
+                                match store.space_floor().observe(crate::now()?)? {
+                                    Some(_) => floor_wait = true,
+                                    None => floor_ended = true,
+                                }
+                            }
                             detector.failure =
                                 Some(error.to_string().chars().take(FAILURE_CHARS).collect());
                             eprintln!(
@@ -1715,6 +1860,14 @@ async fn run(
             }
         }
         if let Some((watch, id, is_tail)) = work {
+            // The entry exists before the first attempt, so the attempt has a cache and a mark.
+            let attempt = Arc::clone(
+                &retry
+                    .entry(id.clone())
+                    .or_insert_with(ClaimRetry::due)
+                    .attempt,
+            );
+            attempt.progress.restart();
             if !is_tail {
                 // A permit the last wait acquired for a tail drain is not held through an
                 // ordinary connection or publication.
@@ -1788,6 +1941,7 @@ async fn run(
                                     .ok_or(Error::State("consume RPC connection absent"))?
                                     .0,
                                 &mut claimed,
+                                &attempt,
                             )
                             .await?;
                     }
@@ -1800,13 +1954,20 @@ async fn run(
                 result = tokio::time::timeout(PUBLICATION_DEADLINE, operation) => result.unwrap_or(Err(Error::State("consume publication deadline expired; retain the original journal and retry"))),
             };
             if let Err(error) = result {
+                // The counts lead the text, which the journal keeps by prefix; the deadline
+                // text cannot carry them, because the dropped attempt cannot add them.
+                let text = if is_tail {
+                    error.to_string()
+                } else {
+                    format!("{}: {error}", attempt.progress.summary())
+                };
                 // Name the claim, so an operator can act on it (retire-claim takes its ID).
-                detector.fail_claim(&id, format!("claim {id}: {error}"));
-                eprintln!("sparrowd: watch={watch} claim={id} pending: {error}");
+                detector.fail_claim(&id, format!("claim {id}: {text}"));
+                eprintln!("sparrowd: watch={watch} claim={id} pending: {text}");
                 // The claim's durable history answers `watch claims` after any restart.
                 if let Some(record) = pending_attempt_outcome(store.consumption_attempt_pending(
                     &id,
-                    &error.to_string(),
+                    &text,
                     crate::now()?,
                 ))? {
                     eprintln!(
@@ -1814,14 +1975,13 @@ async fn run(
                     );
                     detector.fail_claim(
                         &id,
-                        format!("claim {id}: {error}; attempt not recorded: {record}"),
+                        format!("claim {id}: {text}; attempt not recorded: {record}"),
                     );
                 }
-                let failures = retry
-                    .get(&id)
-                    .map_or(0, |(_, failures)| *failures)
-                    .saturating_add(1);
-                retry.insert(id, (Instant::now() + retry_delay(failures), failures));
+                let floor =
+                    floor_class(&error) && store.space_floor().observe(crate::now()?)?.is_some();
+                let entry = retry.entry(id).or_insert_with(ClaimRetry::due);
+                entry.failed(attempt.progress.mark(), floor);
                 if !is_tail {
                     client = None;
                 }
@@ -1838,8 +1998,13 @@ async fn run(
             tokio::task::yield_now().await;
             continue;
         }
-        for (at, _) in retry.values() {
-            wake.by(*at);
+        if floor_ended {
+            // The floor ended between the refusal and its observation: run again at once.
+            continue;
+        }
+        wake.resume |= floor_wait;
+        for entry in retry.values() {
+            wake.by(entry.at);
         }
         pause(waiting, &mut detectors, space_ok, busy, claims, wake).await?;
     }
@@ -1847,9 +2012,61 @@ async fn run(
 }
 
 /// Wake for the retries still to come while the due claim waits.
-fn blocked(retry: &BTreeMap<String, (Instant, u32)>, wake: &mut Wake) {
+fn blocked(retry: &BTreeMap<String, ClaimRetry>, wake: &mut Wake) {
     let now = Instant::now();
-    for (at, _) in retry.values().filter(|(at, _)| *at > now) {
-        wake.by(*at);
+    for entry in retry.values().filter(|entry| entry.at > now) {
+        wake.by(entry.at);
+    }
+}
+
+/// One pending claim's retry state (#280). It is created when the claim is first chosen, kept
+/// through failures of every class and pruned once the claim is no longer pending.
+#[derive(Debug)]
+struct ClaimRetry {
+    /// When the claim is next due.
+    at: Instant,
+    /// Consecutive failures without progress.
+    failures: u32,
+    /// The highest progress any attempt reached.
+    best: ProgressMark,
+    /// Progress and planned parts shared with each attempt.
+    attempt: Arc<crate::consumption::ClaimAttempt>,
+}
+
+impl ClaimRetry {
+    /// A claim due now, before its first attempt.
+    fn due() -> Self {
+        Self {
+            at: Instant::now(),
+            failures: 0,
+            best: ProgressMark::default(),
+            attempt: Arc::default(),
+        }
+    }
+
+    /// Back off after a failed attempt that reached `mark`. Only progress past the best mark
+    /// resets the failure count; a bare retry keeps growing the delay. A failure under a
+    /// recorded floor pause keeps the claim due, so the first pass after the resume edge takes
+    /// it with its cache and mark, and does not grow the delay.
+    fn failed(&mut self, mark: ProgressMark, floor: bool) {
+        if mark > self.best {
+            self.failures = 0;
+            self.best = mark;
+        }
+        if floor {
+            self.at = Instant::now();
+            return;
+        }
+        self.failures = self.failures.saturating_add(1);
+        self.at = Instant::now() + retry_delay(self.failures);
+    }
+}
+
+/// Whether a claim attempt failed because the free-space floor paused writes.
+fn floor_class(error: &Error) -> bool {
+    match error {
+        Error::Upload(error) => error.is_free_space_floor(),
+        Error::Storage(error) => error.is_free_space_floor(),
+        _ => false,
     }
 }

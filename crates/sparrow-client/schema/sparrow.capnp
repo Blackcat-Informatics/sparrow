@@ -415,6 +415,17 @@ struct Discovery {
   # Additive (#280): the largest declared import; a larger declaration is refused
   # INVALID_ARGUMENT, so split into parts of at most this many bytes. 0 from an older daemon.
   maxImportBytes @11 :UInt64;
+  # Additive (#280): the longest record a staged layout keeps whole; a longer record is laid
+  # out as raw pieces. 0 from an older daemon, which a client treats as "no split".
+  rawRecordBytes @12 :UInt64;
+  # Additive (#280): the joint retirement bound one artifact must fit. A staged artifact of
+  # `chunks` chunks (the sum over its records of ceil(record bytes / 65536)) and `records`
+  # records is refused RESOURCE_LIMIT exactly when
+  # retireChunkCharge * chunks + retireRecordCharge * records > retireRowBudget.
+  # 0 from an older daemon.
+  retireRowBudget @13 :UInt64;
+  retireChunkCharge @14 :UInt64;
+  retireRecordCharge @15 :UInt64;
 }
 
 enum PressurePhase { ready @0; requested @1; awaitingReclamation @2; blocked @3; awaitingArchive @4; }
@@ -480,6 +491,10 @@ struct ConsumeWatchStatus {
   tailGenerationIds @14 :List(Text); tailReadBytes @15 :UInt64; tailDescriptors @16 :UInt32; tailCheckpointRecords @17 :UInt64; tailAdmissionWaiting @18 :Bool;
   # Schema 70: claims an administrator retired as unrecoverable; never counted as pending.
   retiredClaims @19 :List(RetiredClaim);
+  # Additive (#280, ordinals 20 to 22): the watch's publish hold, how many of its pending claims
+  # the hold holds, and the first-seen time of the oldest of them. A reader that does not know
+  # these sees no hold.
+  publishHold @20 :Bool; heldClaims @21 :UInt32; heldSince @22 :OptionalInstant;
 }
 
 # A claim retired unrecoverable by watchClaimRetire: claimed, its private source missing and
@@ -516,6 +531,10 @@ struct WatchDefinition {
   quietMs @4 :UInt32 = 30000; maxDirectories @5 :UInt32 = 1024;
   maxCandidates @6 :UInt32 = 4096; recursive @7 :Bool = true;
   mode @8 :WatchMode; readiness @9 :WatchReadiness; authority @10 :WatchAuthority;
+  # Additive (#280, ordinal 11): holds publication of this finished-file watch's claims while
+  # true; claims stay journaled and in flight. An older reader refuses a stored catalog that
+  # carries it, by name. False is omitted from the stored form.
+  publishHold @11 :Bool = false;
 }
 struct WatchInfo {
   storeId @0 :Text; definition @1 :WatchDefinition; revision @2 :UInt64; enabled @3 :Bool;

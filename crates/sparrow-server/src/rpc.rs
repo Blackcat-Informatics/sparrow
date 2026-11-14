@@ -3037,6 +3037,10 @@ impl wire::sparrow::Server for Rpc {
                 out.set_max_inline_artifact_bytes(number(&value, "max_inline_artifact_bytes")?);
                 out.set_max_records_per_artifact(number(&value, "max_records_per_artifact")?);
                 out.set_max_import_bytes(number(&value, "max_import_bytes")?);
+                out.set_raw_record_bytes(number(&value, "max_raw_record_bytes")?);
+                out.set_retire_row_budget(number(&value, "retire_row_budget")?);
+                out.set_retire_chunk_charge(number(&value, "retire_chunk_charge")?);
+                out.set_retire_record_charge(number(&value, "retire_record_charge")?);
                 out.set_text_analyzer(field::<String>(&value, "text_analyzer")?);
                 out.set_text_profile(field::<String>(&value, "text_profile")?);
                 out.set_rdf_profile(field::<String>(&value, "rdf_profile")?);
@@ -3095,6 +3099,12 @@ impl wire::sparrow::Server for Rpc {
                 for (index, watch) in watches.into_iter().enumerate() {
                     let mut state = states.reborrow().get(index as u32);
                     state.set_tail_admission_waiting(watch.tail_admission_waiting);
+                    state.set_publish_hold(watch.definition.publish_hold);
+                    state.set_held_claims(watch.held_claims);
+                    crate::watch_admin::encode_clock(
+                        state.reborrow().init_held_since(),
+                        watch.held_since,
+                    );
                     state.set_tail_read_bytes(watch.tail_read_bytes);
                     state.set_tail_descriptors(watch.tail_descriptors);
                     state.set_tail_checkpoint_records(watch.tail_checkpoint_records);

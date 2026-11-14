@@ -4706,3 +4706,17 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(closed_store_backup|stop_for_backup|backup_under_writer_lock|flush_before_backup)$']
+
+[[job]]
+id = "part-set-cut-rule"
+summary = "One cut rule plans every part of a consume-root file above the import bound: the byte bound, the record limit and the joint retirement bound, read from discovery and charged per line as the layout charges."
+home = "sparrow_client::parts::next_cut"
+entry_points = ["sparrow_client::parts::upload_parts", "sparrow_client::parts::is_one_part"]
+spec = "docs/interfaces.md: Part sets for consume roots (#280)"
+vectors = ["crates/sparrow-client/src/parts.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(cut_parts|plan_parts|split_parts)$']

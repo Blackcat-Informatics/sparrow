@@ -223,6 +223,17 @@ pub struct ConsumeWatch {
     /// Maximum simultaneously tracked readiness candidates.
     #[serde(default = "default_candidates")]
     pub max_candidates: usize,
+    /// Holds publication of this watch's finished-file claims while set. A claim made during
+    /// the hold is reserved and stays journaled and in flight, exactly as an interrupted claim
+    /// would, and publishes in order when the hold clears. It is an operator's deliberate pause
+    /// (and the rollback rehearsal's way to keep a claim in flight), never a way to refuse input.
+    /// Omitted from the stored form when false, so an unheld catalog is what older builds read.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub publish_hold: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn default_quiet() -> u32 {
@@ -540,6 +551,13 @@ impl ConsumeWatch {
             {
                 return Err(
                     "tail requires log/jsonl and max_candidates <= 64 retained descriptors".into(),
+                );
+            }
+            if watch.publish_hold && watch.producer_contract == ProducerContract::ActiveFilesRetain
+            {
+                return Err(
+                    "publish_hold applies to finished-file watches only; a tail is never held"
+                        .into(),
                 );
             }
             sparrow_client::parse_format(&watch.format)?;

@@ -190,10 +190,26 @@ impl Store {
             ownership = Some(claim.journal);
             retired = true;
         }
-        let published =
-            publication::published_admitted(&writer, &import_id, now, Some(&mut remaining))?;
+        // A claim recorded as a part set is accepted as its manifest (#280). It has no import
+        // publication, and any `consume:` row it left is not its staging: both reads are
+        // skipped, so `staging` stays empty.
+        let set = match &ownership {
+            Some(journal) if journal.published_artifact.is_some() && journal.tail.is_none() => {
+                match writer.set_manifest(journal)? {
+                    super::consumption::SetManifest::Recorded(manifest) => Some(manifest),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let published = match set {
+            Some(_) => None,
+            None => {
+                publication::published_admitted(&writer, &import_id, now, Some(&mut remaining))?
+            }
+        };
         let mut staging = published.as_ref().map(|(manifest, _)| manifest.clone());
-        if staging.is_none() {
+        if staging.is_none() && set.is_none() {
             staging = writer
                 .optional_catalog_value(&import_id, &mut remaining)?
                 .as_ref()
@@ -248,6 +264,7 @@ impl Store {
         }
         let accepted = direct
             .or_else(|| published.map(|(_, artifact)| artifact))
+            .or(set)
             .map(|a| writer.receipt(a, super::durability::Durability::Buffered))
             .transpose()?;
         if let (Some(manifest), Some(artifact)) = (&staging, &accepted)

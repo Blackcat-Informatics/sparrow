@@ -355,6 +355,45 @@ fn completed_key(id: &str) -> String {
     format!("request:consumption-complete:{id}")
 }
 
+/// Request-id prefix of a claim's part set: parts are `consumeset:{H}.part{k:010}` and the
+/// manifest is `consumeset:{H}.manifest`, for the claim `consume:{H}` (#280).
+pub const SET_PREFIX: &str = "consumeset:";
+pub(super) const SET_INTAKE_REFUSAL: &str =
+    "set parts and manifests belong to the daemon's watches, not to an ingest-socket caller";
+
+/// The ingest receipt key under which claim `request_id` (`consume:{H}`) records its set
+/// manifest, `request:ingest:consumeset:{H}.manifest`; none for a request outside the
+/// consumption namespace.
+pub(super) fn manifest_receipt_key(request_id: &str) -> Option<String> {
+    request_id
+        .strip_prefix("consume:")
+        .map(|hash| format!("request:ingest:{SET_PREFIX}{hash}.manifest"))
+}
+
+/// What a claim's set manifest receipt says about its publication (#280).
+#[derive(Clone, Debug)]
+pub enum SetManifest {
+    /// No set manifest receipt: the claim never published a set, or it is a single-path claim.
+    Absent,
+    /// The manifest is accepted and the claim has not recorded it yet.
+    Receipt(Artifact),
+    /// The claim recorded this manifest as its publication.
+    Recorded(Artifact),
+}
+
+/// Whether claim `id` is recorded as a part set: its journal names a published artifact and
+/// its set manifest receipt names the same one. Read on the held writer, so a caller that
+/// holds the lock (reclamation) never takes it again.
+pub(super) fn recorded_as_set(writer: &Writer, id: &str) -> Result<bool, Error> {
+    let Some(journal) = writer.consumption(id)? else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        writer.set_manifest(&journal)?,
+        SetManifest::Recorded(_)
+    ))
+}
+
 impl Catalog for ConsumptionJournal {
     fn encode(&self) -> Value {
         Object::new()
@@ -753,6 +792,39 @@ impl Writer {
         Ok(true)
     }
 
+    /// The set manifest state of `journal`, from a raw read of its manifest receipt with no
+    /// expiry test: the receipt is managed while the claim exists (#280).
+    pub(super) fn set_manifest(&self, journal: &ConsumptionJournal) -> Result<SetManifest, Error> {
+        let key = manifest_receipt_key(&journal.request_id).ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "consumption journal has no claim request",
+            )
+        })?;
+        let Some(bytes) = self.db.get_pinned(key)? else {
+            return Ok(SetManifest::Absent);
+        };
+        let receipt = Artifact::decode(super::field(&parse(&bytes)?, "receipt")?)?;
+        if receipt.source != journal.source || receipt.format != "json" || receipt.intake.is_some()
+        {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                format!(
+                    "set manifest receipt of claim {} is not the daemon's json manifest under the claim's source",
+                    journal.import_id
+                ),
+            ));
+        }
+        match journal.published_id() {
+            None => Ok(SetManifest::Receipt(receipt)),
+            Some(id) if id == receipt.id => Ok(SetManifest::Recorded(receipt)),
+            Some(_) => Err(Error::new(
+                "CONFLICT",
+                "recorded part set names another manifest",
+            )),
+        }
+    }
+
     pub(super) fn publish_consumption(
         &self,
         batch: &mut WriteBatch,
@@ -923,6 +995,71 @@ impl Store {
         writer.admit_import_batch(&batch)?;
         writer.commit(batch)?;
         Ok(journal)
+    }
+
+    /// The set manifest state of claim `id` (#280), read without an expiry test. A
+    /// single-path claim has no manifest receipt and answers [`SetManifest::Absent`]. A receipt
+    /// that is not the daemon's json manifest under the claim's source refuses with
+    /// `STORAGE_FAILURE`; a recorded claim whose receipt names another artifact refuses with
+    /// `CONFLICT`. An unknown claim is `NOT_FOUND`.
+    pub fn consumption_set_manifest(&self, id: &str) -> Result<SetManifest, Error> {
+        let writer = self.lock()?;
+        let journal = writer
+            .consumption(id)?
+            .ok_or_else(|| Error::new("NOT_FOUND", "unknown consumption journal"))?;
+        writer.set_manifest(&journal)
+    }
+
+    /// Record claim `id`'s accepted set manifest as its publication (#280). A claim that
+    /// already recorded it returns its journal unchanged. With no manifest receipt it refuses
+    /// `CONFLICT`: the set is not yet published. Callers ask
+    /// [`Store::consumption_set_manifest`] first and never infer absence from this refusal.
+    pub fn consumption_publish_set(&self, id: &str) -> Result<ConsumptionJournal, Error> {
+        let writer = self.lock()?;
+        let mut journal = writer
+            .consumption(id)?
+            .ok_or_else(|| Error::new("NOT_FOUND", "unknown consumption journal"))?;
+        let manifest = match writer.set_manifest(&journal)? {
+            SetManifest::Recorded(_) => return Ok(journal),
+            SetManifest::Absent => {
+                return Err(Error::new(
+                    "CONFLICT",
+                    "manifest receipt absent; the set is not yet published",
+                ));
+            }
+            SetManifest::Receipt(manifest) => manifest,
+        };
+        if journal.claimed.is_none() || journal.tail.is_some() || journal.removed_at.is_some() {
+            return Err(Error::new(
+                "CONFLICT",
+                "a part set is recorded only for an active claimed file claim",
+            ));
+        }
+        journal.published_artifact = Some(manifest.id);
+        journal.validate()?;
+        let mut batch = WriteBatch::default();
+        put(&mut batch, &key(id), &journal);
+        writer.admit_import_batch(&batch)?;
+        writer.commit(batch)?;
+        Ok(journal)
+    }
+
+    /// Whether claim `id` is recorded with no proof left to read (#280): a published artifact,
+    /// no tail, no set manifest receipt and no single-path publication receipt. Either a
+    /// single claim whose receipt vanished or a set claim whose manifest receipt an older
+    /// build swept; the two cannot be told apart, and neither may be uploaded again.
+    pub fn consumption_publication_lost(&self, id: &str) -> Result<bool, Error> {
+        let writer = self.lock()?;
+        let journal = writer
+            .consumption(id)?
+            .ok_or_else(|| Error::new("NOT_FOUND", "unknown consumption journal"))?;
+        Ok(journal.published_artifact.is_some()
+            && journal.tail.is_none()
+            && matches!(writer.set_manifest(&journal)?, SetManifest::Absent)
+            && writer
+                .db
+                .get_pinned(super::publication::receipt_key(id))?
+                .is_none())
     }
 
     /// Enumerate the bounded active recovery set, including unpublished claims

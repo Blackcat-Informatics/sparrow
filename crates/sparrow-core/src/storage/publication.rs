@@ -155,7 +155,7 @@ fn preparation_key(id: &str) -> String {
 pub(super) fn record_key(id: &str, index: u64) -> String {
     format!("import-record:{id}:{index:020}")
 }
-fn receipt_key(id: &str) -> String {
+pub(super) fn receipt_key(id: &str) -> String {
     format!("request:import-publication:{id}")
 }
 
@@ -201,6 +201,32 @@ pub(super) fn published(
     published_admitted(writer, id, now, None)
 }
 
+/// The refusal for a recorded claim with no single-path publication receipt (#280). A claim
+/// recorded as a part set is published, but not as an import: `CONFLICT` names its manifest.
+/// Otherwise the proof is gone and the code stays `STORAGE_FAILURE`, naming the claim.
+fn missing_publication_receipt(
+    writer: &Writer,
+    journal: &super::consumption::ConsumptionJournal,
+) -> Result<Error, Error> {
+    let artifact = journal.published_artifact.as_deref().unwrap_or_default();
+    Ok(match writer.set_manifest(journal)? {
+        super::consumption::SetManifest::Recorded(manifest) => Error::new(
+            "CONFLICT",
+            format!(
+                "claim published as a part set; its manifest is {}",
+                manifest.id
+            ),
+        ),
+        _ => Error::new(
+            "STORAGE_FAILURE",
+            format!(
+                "claim {} is recorded as published as {artifact}, but its publication receipt is missing; the source is still held; see docs/deployment.md for the recovery steps; no shipped command clears this claim yet (issue 283); the stored bytes remain; the claim holds one of the 16 pending slots",
+                journal.import_id
+            ),
+        ),
+    })
+}
+
 pub(super) fn published_admitted(
     writer: &Writer,
     id: &str,
@@ -208,13 +234,13 @@ pub(super) fn published_admitted(
     mut remaining: Option<&mut usize>,
 ) -> Result<Option<(ImportManifest, Artifact)>, Error> {
     let managed = writer.consumption_admitted(id, remaining.as_deref_mut())?;
-    let saved = if managed
+    let saved = if let Some(journal) = managed
         .as_ref()
-        .is_some_and(|journal| journal.published_artifact.is_some())
+        .filter(|journal| journal.published_artifact.is_some())
     {
-        let bytes = writer.db.get_pinned(receipt_key(id))?.ok_or_else(|| {
-            Error::new("STORAGE_FAILURE", "consumption publication receipt missing")
-        })?;
+        let Some(bytes) = writer.db.get_pinned(receipt_key(id))? else {
+            return Err(missing_publication_receipt(writer, journal)?);
+        };
         if let Some(remaining) = remaining.as_deref_mut() {
             Writer::charge_catalog_shape(remaining, &bytes)?;
         }

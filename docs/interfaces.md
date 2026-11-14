@@ -659,6 +659,80 @@ exceed the batch. An inline `ingest` is held to the same retirement check.
 Format #5 replaces the whole-row read and the single batch, and with them this
 bound.
 
+### Part sets for consume roots (#280)
+
+A consume-root file above what one artifact can hold is published as a part set
+instead of being refused. Discovery advertises everything the cut needs, all
+additive, with no schema version change: `maxImportBytes @11`, `rawRecordBytes @12`
+(the longest record a layout keeps whole), and the joint retirement bound
+`retireRowBudget @13`, `retireChunkCharge @14` and `retireRecordCharge @15`. A staged
+artifact of `chunks` chunks (the sum over its records of the record length over
+65536, rounded up) and `records` records is refused `RESOURCE_LIMIT` at layout
+exactly when `retireChunkCharge * chunks + retireRecordCharge * records` exceeds
+`retireRowBudget`. Each value comes from the store's own properties
+(`max_raw_record_bytes`, `retire_row_budget`, `retire_chunk_charge`,
+`retire_record_charge`), so what is advertised is what is enforced, test hooks
+included. An older daemon sends 0 for each; the client then keeps the single path
+and plans no split.
+
+The cut lives in `sparrow_client::parts` (`next_cut`). A `jsonl` or `log` part
+holds whole lines while the byte bound, the record limit and the joint bound all
+hold, counting each line as the layout does, terminator included. A line too
+large to fit alone is cut raw, and the pieces that begin or end inside it are
+stored `opaque`. Every other format (`json`, `markdown`, `syslog`, `opaque`) is cut
+into raw parts stored `opaque`, so nothing parses a fragment. Part `k` of claim
+`consume:{H}` is the ordinary staged import `consumeset:{H}.part{k:010}` under the
+claim's source; its records are readable as soon as it publishes. The manifest,
+ingested last and durably as `consumeset:{H}.manifest` in format `json`, is
+`{"schema":"sparrow.parts/1","set","source","format","byte_length","parts":[{"index","start","length","format","artifact"}]}`
+with the original format and each part's range, stored format and artifact id in
+order. The manifest alone defines the set: a reader that needs the file reads the
+listed artifacts in order and concatenates their bytes.
+
+For a part-set claim, the journal's `published_artifact`, a handoff receipt's
+`artifact_id` and `watch claims` all name the manifest. Ingestion status by
+import, request or handoff reports the manifest as the accepted artifact with no
+staging. Every other reader of the claim's import identity (begin, get, admit,
+cancel, publish) refuses with `CONFLICT` naming the manifest. The manifest's
+receipt is kept while the claim's active or completed journal exists, not only
+for the retry window. A `consumeset:` request id is refused `INVALID_ARGUMENT` to
+an ingest-socket caller, and a manifest receipt that carries an intake is refused
+as proof.
+
+`Client::import_open_file_with_progress` uploads as `Client::import_open_file`
+does and reports each durable progress raise to a sink, so a caller that drops the
+upload at a deadline still knows how far it got.
+
+Limits of the part path:
+
+- On a daemon without the retirement numbers, a dense file within the byte bound
+  is uploaded whole before layout refuses it; the worker names the missing values
+  in the attempt text. A file above a known `maxImportBytes` whose other values are
+  missing is held, named and never uploaded.
+- A part whose staging lease lapsed answers `IMPORT_EXPIRED`; it is never
+  permanent. Once reclamation deletes its row, the part begins again from byte zero
+  under the same request id and publishes under a new artifact id; the manifest
+  lists the ids finally published. While the worker runs, published parts are kept
+  in memory and are never read, hashed or begun again. After a restart that
+  follows a stall of more than two days, lapsed parts are uploaded again and their
+  records appear twice until retention.
+- Parts age from their own publication, so the earliest can be evicted before the
+  manifest. Removal checks the manifest proof, not that each listed part is still
+  stored.
+- The choice between the single path and a split is not durable for a claim with
+  no recorded state; a claim whose manifest is accepted or recorded never plans
+  again, and a recorded single-path claim returns its saved receipt.
+- A part holds one of the 16 import slots until reclaimed, so a fast set can meet
+  "journals occupied", which the worker retries.
+- A claim that began single-path staging and is later recorded as a set has that
+  staging row released by the next reclaim pass.
+- Retiring an unrecorded set claim whose source is gone leaves its parts as
+  ordinary artifacts with no manifest; after the two-day receipt window their
+  order is lost. The retirement reason should name the parts left behind.
+- An operator who raises `max_records` far enough can meet the 128 MiB publish
+  batch refusal after a whole part was uploaded; it is retryable, so the worker
+  repeats it.
+
 Every expiry and eviction pass also reads every pin row, expired rows included,
 before any artifact. That capture has its own 64 MiB budget, apart from the
 artifact's share, so pins cannot crowd out an artifact row. To keep the capture

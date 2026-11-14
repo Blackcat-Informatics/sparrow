@@ -3516,6 +3516,10 @@ fn admission_properties_share_status_metadata_without_evidence_catalog_scans() {
         "max_inline_artifact_bytes",
         "max_records_per_artifact",
         "max_import_bytes",
+        "max_raw_record_bytes",
+        "retire_row_budget",
+        "retire_chunk_charge",
+        "retire_record_charge",
         "max_pin_members",
     ] {
         assert_eq!(properties[key], status[key], "{key}");
@@ -10066,6 +10070,11 @@ fn json_document(
 fn split_document(dir: &std::path::Path) -> (Store, sparrow_core::Artifact, Vec<u8>) {
     let ceiling = 32 * 1024 * 1024 + sparrow_core::IMPORT_CHUNK_BYTES as u64;
     let (store, artifact, input) = json_document(dir, Some(ceiling), 50 * 1024 * 1024);
+    // What the store advertises is the split the layout below enforced (#280, OR-C).
+    assert_eq!(
+        store.properties().unwrap()["max_raw_record_bytes"],
+        ceiling.to_string()
+    );
     let piece = ceiling - 16 * 1024 * 1024;
     let bounds: Vec<_> = artifact
         .record_ids
@@ -25208,4 +25217,526 @@ fn archive_advance_below_the_reserve_is_refused_with_the_reserve_text_and_keeps_
     let state = store.archive_state().unwrap().unwrap();
     assert!(state.through.is_none());
     assert!(state.intent.is_some());
+}
+
+/// A claimed file claim of `content` under source "source", format "log", reserved at 1000.
+fn set_claim(store: &Store, path: &[u8], content: &[u8]) -> sparrow_core::ConsumptionJournal {
+    let observation = sparrow_core::ConsumptionGeneration {
+        device: 1,
+        inode: 9,
+        byte_length: content.len() as u64,
+        modified: (0, 0),
+        changed: (0, 0),
+    };
+    let journal = store
+        .consumption_reserve(
+            "set-watch",
+            path,
+            "source",
+            "log",
+            observation.clone(),
+            CONSUMPTION_DIRECTORIES,
+            1_000,
+        )
+        .unwrap();
+    store
+        .consumption_claimed(&journal.import_id, observation)
+        .unwrap()
+}
+
+/// Ingest the claim's set manifest as the daemon does: json, the claim's source, no intake.
+fn set_manifest_for(
+    store: &Store,
+    journal: &sparrow_core::ConsumptionJournal,
+    source: &str,
+    format: &str,
+    now: u64,
+) -> Result<sparrow_core::Artifact, sparrow_core::Error> {
+    let set = journal
+        .request_id
+        .replacen("consume:", sparrow_core::SET_PREFIX, 1);
+    let body = format!(r#"{{"schema":"sparrow.parts/1","set":"{set}","parts":[]}}"#);
+    store.ingest(
+        &format!("{set}.manifest"),
+        source,
+        format,
+        body.as_bytes(),
+        now,
+    )
+}
+
+fn manifest_key(journal: &sparrow_core::ConsumptionJournal) -> String {
+    format!(
+        "request:ingest:{}.manifest",
+        journal
+            .request_id
+            .replacen("consume:", sparrow_core::SET_PREFIX, 1)
+    )
+}
+
+/// Begin the claim's own single-path staging and append its bytes, unpublished.
+fn single_staging(store: &Store, journal: &sparrow_core::ConsumptionJournal, content: &[u8]) {
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(content).as_bytes())
+    );
+    store
+        .import_begin(
+            &journal.request_id,
+            "source",
+            "log",
+            content.len() as u64,
+            &digest,
+            1_000,
+        )
+        .unwrap();
+    store
+        .import_append(&journal.import_id, 0, content, 1_000)
+        .unwrap();
+}
+
+fn import_row_present(dir: &std::path::Path, id: &str) -> bool {
+    catalog_db(dir).unwrap().get(id).unwrap().is_some()
+}
+
+/// INVARIANT (#280): the set manifest receipt answers a claim's resume question in three
+/// states, read with no expiry test, and only the daemon's own json manifest under the
+/// claim's source is taken as proof.
+#[test]
+fn consumption_set_manifest_reports_absent_receipt_and_recorded() {
+    use sparrow_core::SetManifest;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let journal = set_claim(&store, b"set", b"one\n");
+    assert!(matches!(
+        store.consumption_set_manifest(&journal.import_id).unwrap(),
+        SetManifest::Absent
+    ));
+    let manifest = set_manifest_for(&store, &journal, "source", "json", 2_000).unwrap();
+    // Past the retry window the receipt still answers: no expiry test.
+    match store.consumption_set_manifest(&journal.import_id).unwrap() {
+        SetManifest::Receipt(receipt) => assert_eq!(receipt.id, manifest.id),
+        other => panic!("{other:?}"),
+    }
+    store.consumption_publish_set(&journal.import_id).unwrap();
+    match store.consumption_set_manifest(&journal.import_id).unwrap() {
+        SetManifest::Recorded(receipt) => assert_eq!(receipt.id, manifest.id),
+        other => panic!("{other:?}"),
+    }
+    for (path, source, format) in [
+        (&b"other-source"[..], "elsewhere", "json"),
+        (b"not-json", "source", "log"),
+    ] {
+        let foreign = set_claim(&store, path, b"one\n");
+        set_manifest_for(&store, &foreign, source, format, 2_000).unwrap();
+        assert_eq!(
+            store
+                .consumption_set_manifest(&foreign.import_id)
+                .unwrap_err()
+                .code,
+            "STORAGE_FAILURE"
+        );
+    }
+    assert_eq!(
+        store
+            .consumption_set_manifest(&format!("import:{}", "0".repeat(64)))
+            .unwrap_err()
+            .code,
+        "NOT_FOUND"
+    );
+}
+
+/// INVARIANT (#280): a set is recorded once; a repeat returns the journal unchanged, and a
+/// claim with no manifest receipt is refused rather than recorded.
+#[test]
+fn consumption_publish_set_records_the_manifest_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let journal = set_claim(&store, b"set", b"one\n");
+    assert_eq!(
+        store
+            .consumption_publish_set(&journal.import_id)
+            .unwrap_err()
+            .code,
+        "CONFLICT"
+    );
+    let manifest = set_manifest_for(&store, &journal, "source", "json", 2_000).unwrap();
+    let recorded = store.consumption_publish_set(&journal.import_id).unwrap();
+    assert_eq!(recorded.published_artifact, Some(manifest.id.clone()));
+    let again = store.consumption_publish_set(&journal.import_id).unwrap();
+    assert_eq!(again, recorded);
+    assert_eq!(store.consumption_get(&journal.import_id).unwrap(), recorded);
+}
+
+/// INVARIANT (#280): the expiry sweep keeps a set manifest receipt while its claim's
+/// journal exists, past the two-day retry window, and deletes it once the completed
+/// journal row has expired.
+#[test]
+fn recorded_set_manifest_survives_the_retry_window_while_its_claim_is_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let journal = set_claim(&store, b"set", b"one\n");
+    let manifest = set_manifest_for(&store, &journal, "source", "json", 2_000).unwrap();
+    store.consumption_publish_set(&journal.import_id).unwrap();
+    for _ in 0..4 {
+        store.expire(3 * DAY).unwrap();
+    }
+    assert!(matches!(
+        store.consumption_set_manifest(&journal.import_id).unwrap(),
+        sparrow_core::SetManifest::Recorded(_)
+    ));
+    let claimed = journal.claimed.clone().unwrap();
+    store
+        .consumption_removed(&journal.import_id, &manifest.id, &claimed, 4 * DAY)
+        .unwrap();
+    for _ in 0..4 {
+        store.expire(5 * DAY).unwrap();
+    }
+    assert!(matches!(
+        store.consumption_set_manifest(&journal.import_id).unwrap(),
+        sparrow_core::SetManifest::Recorded(_)
+    ));
+    // The sweep that deletes the completed row sees it still present; the next one does not.
+    for now in [7 * DAY, 8 * DAY] {
+        store.expire(now).unwrap();
+    }
+    drop(store);
+    assert!(
+        catalog_db(dir.path())
+            .unwrap()
+            .get(manifest_key(&journal))
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// INVARIANT (#280): every stray reader of a recorded set claim's import identity is refused
+/// with a typed CONFLICT naming the manifest, never STORAGE_FAILURE, and creates no row;
+/// status reports the manifest as the accepted artifact.
+#[test]
+fn stray_readers_of_a_recorded_set_claim_are_refused_typed() {
+    use sparrow_core::{IngestDeletion, IngestSelector};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let content = b"one\n";
+    let journal = set_claim(&store, b"set", content);
+    let manifest = set_manifest_for(&store, &journal, "source", "json", 2_000).unwrap();
+    store.consumption_publish_set(&journal.import_id).unwrap();
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(content).as_bytes())
+    );
+    let id = &journal.import_id;
+    for refused in [
+        store
+            .import_begin(&journal.request_id, "source", "log", 4, &digest, 3_000)
+            .map(|_| ()),
+        store.import_get(id, 3_000).map(|_| ()),
+        store.import_admit(id, None, 3_000),
+        store.import_cancel(id, 3_000),
+        store.import_publish(id, 3_000).map(|_| ()),
+    ] {
+        let error = refused.unwrap_err();
+        assert_eq!(error.code, "CONFLICT", "{error:?}");
+        assert!(error.message.contains(&manifest.id), "{error:?}");
+    }
+    for selector in [
+        IngestSelector::Import(id.clone()),
+        IngestSelector::Request(journal.request_id.clone()),
+    ] {
+        let status = store
+            .ingest_status(&selector, Default::default(), 3_000)
+            .unwrap();
+        assert_eq!(status.accepted.as_ref().unwrap().id, manifest.id);
+        assert!(status.staging.is_none());
+        assert_eq!(status.deletion, IngestDeletion::Published);
+    }
+    drop(store);
+    assert!(!import_row_present(dir.path(), &journal.import_id));
+}
+
+/// INVARIANT (#280): an ingest-socket caller cannot write a set part or manifest id, so it
+/// cannot forge a claim's proof or squat a part; the daemon's own connection, which has no
+/// intake, can. A manifest receipt that carries an intake is refused as proof.
+#[test]
+fn ingest_socket_callers_are_refused_consumeset_ids() {
+    use sparrow_core::{Durability, Intake, PeerCredential};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let journal = set_claim(&store, b"set", b"one\n");
+    let set = journal
+        .request_id
+        .replacen("consume:", sparrow_core::SET_PREFIX, 1);
+    let intake = Some(Intake::IngestSocket(PeerCredential {
+        uid: 1,
+        gid: 1,
+        pid: 1,
+    }));
+    let manifest = format!("{set}.manifest");
+    let part = format!("{set}.part{:010}", 0);
+    let refused = store
+        .ingest_with_intake(
+            &manifest,
+            "source",
+            "json",
+            b"{}",
+            intake,
+            2_000,
+            Durability::Durable,
+        )
+        .unwrap_err();
+    assert_eq!(refused.code, "INVALID_ARGUMENT");
+    let digest = format!("blake3:{}", "0".repeat(64));
+    let refused = store
+        .import_start_with_intake(&part, "source", "opaque", 4, &digest, intake, 2_000)
+        .unwrap_err();
+    assert_eq!(refused.code, "INVALID_ARGUMENT");
+    assert!(matches!(
+        store.consumption_set_manifest(&journal.import_id).unwrap(),
+        sparrow_core::SetManifest::Absent
+    ));
+    store
+        .import_begin(&part, "source", "opaque", 4, &digest, 2_000)
+        .unwrap();
+    set_manifest_for(&store, &journal, "source", "json", 2_000).unwrap();
+    // A receipt an older build let an ingest-socket caller write is refused as proof.
+    let other = set_claim(&store, b"older-build", b"one\n");
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    let forged = db.get(manifest_key(&journal)).unwrap().unwrap();
+    let forged = String::from_utf8(forged).unwrap().replacen(
+        r#""receipt":{"#,
+        r#""receipt":{"intake":{"endpoint":"ingest-socket","uid":"1","gid":"1","pid":"1"},"#,
+        1,
+    );
+    db.put(manifest_key(&other), forged).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let refused = store
+        .consumption_set_manifest(&other.import_id)
+        .unwrap_err();
+    assert_eq!(refused.code, "STORAGE_FAILURE");
+    assert!(
+        refused.message.contains("not the daemon's json manifest"),
+        "{refused:?}"
+    );
+}
+
+/// INVARIANT (#280): a recorded set claim that left its own single-path staging row reports
+/// the manifest by every selector with no staging, and its removal is confirmed by the
+/// manifest id; the leftover row is never compared with the manifest.
+#[test]
+fn recorded_set_claim_with_a_leftover_consume_row_reports_the_manifest() {
+    use sparrow_core::IngestSelector;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let content = b"one\n";
+    let journal = set_claim(&store, b"set", content);
+    single_staging(&store, &journal, content);
+    let manifest = set_manifest_for(&store, &journal, "source", "json", 2_000).unwrap();
+    store.consumption_publish_set(&journal.import_id).unwrap();
+    for selector in [
+        IngestSelector::Import(journal.import_id.clone()),
+        IngestSelector::Request(journal.request_id.clone()),
+    ] {
+        let status = store
+            .ingest_status(&selector, Default::default(), 3_000)
+            .unwrap();
+        assert_eq!(status.accepted.as_ref().unwrap().id, manifest.id);
+        assert!(status.staging.is_none(), "{status:?}");
+    }
+    let claimed = journal.claimed.clone().unwrap();
+    let removed = store
+        .consumption_removed(&journal.import_id, &manifest.id, &claimed, 3_000)
+        .unwrap();
+    assert!(removed.removed_at.is_some());
+}
+
+/// INVARIANT (#280, F4): a recorded set claim whose manifest receipt was swept fails by name
+/// in status: STORAGE_FAILURE naming the claim and the missing receipt, never "published".
+#[test]
+fn recorded_set_claim_with_a_swept_manifest_receipt_is_named_by_status() {
+    use sparrow_core::IngestSelector;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let journal = set_claim(&store, b"set", b"one\n");
+    set_manifest_for(&store, &journal, "source", "json", 2_000).unwrap();
+    store.consumption_publish_set(&journal.import_id).unwrap();
+    drop(store);
+    catalog_db(dir.path())
+        .unwrap()
+        .delete(manifest_key(&journal))
+        .unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    for selector in [
+        IngestSelector::Import(journal.import_id.clone()),
+        IngestSelector::Request(journal.request_id.clone()),
+    ] {
+        let error = store
+            .ingest_status(&selector, Default::default(), 3_000)
+            .unwrap_err();
+        assert_eq!(error.code, "STORAGE_FAILURE");
+        assert!(error.message.contains(&journal.import_id), "{error:?}");
+        assert!(
+            error.message.contains("publication receipt is missing"),
+            "{error:?}"
+        );
+    }
+    let error = store.import_publish(&journal.import_id, 3_000).unwrap_err();
+    assert_eq!(error.code, "STORAGE_FAILURE");
+    // The claim keeps its row and its pending slot: it is named, never removed or dropped.
+    let kept = store.consumption_get(&journal.import_id).unwrap();
+    assert!(kept.removed_at.is_none());
+    assert!(
+        store
+            .consumption_pending()
+            .unwrap()
+            .iter()
+            .any(|pending| pending.import_id == journal.import_id)
+    );
+}
+
+/// INVARIANT (#280): the no-proof predicate holds for a recorded claim with neither receipt,
+/// and never for a recorded single claim with its receipt, an unrecorded claim or a tail.
+#[test]
+fn lost_manifest_receipt_is_told_apart_from_a_single_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let content = b"one\n";
+    let set = set_claim(&store, b"set", content);
+    set_manifest_for(&store, &set, "source", "json", 2_000).unwrap();
+    store.consumption_publish_set(&set.import_id).unwrap();
+    let unrecorded = set_claim(&store, b"unrecorded", content);
+    let single = set_claim(&store, b"single", content);
+    single_staging(&store, &single, content);
+    store.import_seal(&single.import_id, 1_000).unwrap();
+    store
+        .import_prepare_layout(&single.import_id, 1_000)
+        .unwrap();
+    store
+        .import_prepare_record(&single.import_id, 0, 1_000)
+        .unwrap();
+    store.import_publish(&single.import_id, 1_000).unwrap();
+    assert!(!store.consumption_publication_lost(&set.import_id).unwrap());
+    assert!(
+        !store
+            .consumption_publication_lost(&single.import_id)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .consumption_publication_lost(&unrecorded.import_id)
+            .unwrap()
+    );
+    drop(store);
+    catalog_db(dir.path())
+        .unwrap()
+        .delete(manifest_key(&set))
+        .unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert!(store.consumption_publication_lost(&set.import_id).unwrap());
+    // The recorded single claim keeps its receipt, so it is not lost and takes the single path.
+    assert!(
+        !store
+            .consumption_publication_lost(&single.import_id)
+            .unwrap()
+    );
+}
+
+/// INVARIANT (#280, OR-G): a part whose receipt lapsed and whose row was reclaimed begins
+/// afresh under the same request id and publishes under a new artifact id.
+#[test]
+fn lapsed_reclaimed_part_begins_again_under_the_same_request_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let request = format!(
+        "{}{}.part{:010}",
+        sparrow_core::SET_PREFIX,
+        "a".repeat(64),
+        0
+    );
+    let input = b"part bytes\n";
+    let digest = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(input).as_bytes())
+    );
+    let publish = |now: u64| {
+        let manifest = store
+            .import_begin(&request, "source", "log", input.len() as u64, &digest, now)
+            .unwrap();
+        store.import_append(&manifest.id, 0, input, now).unwrap();
+        store.import_seal(&manifest.id, now).unwrap();
+        store.import_prepare_layout(&manifest.id, now).unwrap();
+        store.import_prepare_record(&manifest.id, 0, now).unwrap();
+        store.import_publish(&manifest.id, now).unwrap()
+    };
+    let first = publish(1_000);
+    let later = 1_000 + 3 * DAY;
+    for _ in 0..4 {
+        store.expire(later).unwrap();
+        store.import_reclaim(later).unwrap();
+    }
+    let again = publish(later);
+    assert_ne!(again.id, first.id);
+    assert_eq!(
+        store.bytes(&first.id, 0, input.len(), later).unwrap(),
+        input
+    );
+}
+
+/// INVARIANT (#280, ruling A): a claim that began single staging and was then recorded as a
+/// set and removed has its unpublished staging row, and so its import slot, released by the
+/// next reclaim pass.
+#[test]
+fn reclaim_releases_the_staging_row_of_a_claim_recorded_as_a_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let content = b"one\n";
+    let journal = set_claim(&store, b"set", content);
+    single_staging(&store, &journal, content);
+    let manifest = set_manifest_for(&store, &journal, "source", "json", 2_000).unwrap();
+    store.consumption_publish_set(&journal.import_id).unwrap();
+    let claimed = journal.claimed.clone().unwrap();
+    store
+        .consumption_removed(&journal.import_id, &manifest.id, &claimed, 2_000)
+        .unwrap();
+    assert_eq!(store.import_reclaim(2_000).unwrap(), 1);
+    drop(store);
+    assert!(!import_row_present(dir.path(), &journal.import_id));
+}
+
+/// INVARIANT (#280, ruling A): a single-path claim's unpublished staging row is kept by
+/// reclamation as before, whatever the clock says, while the claim may still publish.
+#[test]
+fn reclaim_keeps_the_unpublished_staging_row_of_a_single_path_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let content = b"one\n";
+    let journal = set_claim(&store, b"single", content);
+    single_staging(&store, &journal, content);
+    assert_eq!(store.import_reclaim(10 * DAY).unwrap(), 0);
+    let kept = store.import_get(&journal.import_id, 10 * DAY).unwrap();
+    assert_eq!(kept.received_bytes, content.len() as u64);
+}
+
+/// INVARIANT (#280, ruling A; issue 283): a set claim whose manifest receipt is gone is not
+/// provably a set, so reclamation keeps its unpublished staging row.
+#[test]
+fn reclaim_keeps_the_staging_row_of_a_set_claim_without_its_manifest_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let content = b"one\n";
+    let journal = set_claim(&store, b"set", content);
+    single_staging(&store, &journal, content);
+    set_manifest_for(&store, &journal, "source", "json", 2_000).unwrap();
+    store.consumption_publish_set(&journal.import_id).unwrap();
+    drop(store);
+    catalog_db(dir.path())
+        .unwrap()
+        .delete(manifest_key(&journal))
+        .unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(store.import_reclaim(10 * DAY).unwrap(), 0);
+    drop(store);
+    assert!(import_row_present(dir.path(), &journal.import_id));
 }

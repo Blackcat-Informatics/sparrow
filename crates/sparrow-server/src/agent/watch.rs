@@ -357,7 +357,7 @@ fn mutation(result: wire::result::Reader<'_, wire::watch_mutation::Owned>) -> Re
 }
 
 /// An optional instant as RFC 3339 text through the shared [`super::instant`], or null.
-fn clock_text(value: wire::optional_instant::Reader<'_>) -> Result<Value> {
+pub(super) fn clock_text(value: wire::optional_instant::Reader<'_>) -> Result<Value> {
     Ok(match value.which()? {
         wire::optional_instant::Value(at) => super::instant(at?)?.into(),
         wire::optional_instant::Absent(()) => Value::Null,
@@ -476,6 +476,7 @@ pub(super) fn definition(value: wire::watch_definition::Reader<'_>) -> Result<Va
         .with("quiet_ms", u64::from(definition.quiet_ms))
         .with("max_directories", definition.max_directories as u64)
         .with("max_candidates", definition.max_candidates as u64)
+        .with("publish_hold", definition.publish_hold)
         .with("recursive", true)
         .with(
             "mode",

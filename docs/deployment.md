@@ -1020,6 +1020,48 @@ into an empty `chattr +C` directory with an image that has the restore option:
 started. After `--no-backup` there is none: go forward. A rollback must then
 reconcile the consume claims, as below.
 
+### Part sets and older builds
+
+A consume root that holds a file above the import bound is split into parts and a
+manifest by this build. An older build that meets an unrecorded set claim stalls on
+that claim only, loudly: the claim stays pending, the source file stays in place,
+and the failure is logged and recorded; run this build to finish it. A set claim
+that this build has recorded but not yet removed cannot be finished by any build
+once an older build has run the expiry sweep on the store more than two days after
+the manifest was accepted: the sweep deletes the manifest's receipt, which this
+build needs to prove the publication before it removes the source. Do not run an
+older build on a store that holds recorded set claims that are not removed. If it
+has happened, follow the recovery steps below. No shipped command clears such a
+claim yet (issue 283 builds the tool that does); until then the claim stays
+pending, the source stays in place, the stored manifest and parts remain, and the
+claim holds one of the sixteen pending-claim slots (`MAX_CONSUMPTION_JOURNALS` =
+16), so sixteen such claims stop all new claims on that daemon. One stuck claim
+does not block the others, because the worker takes any due claim; each failed
+attempt does drop the shared consume connection, so every retry costs a
+reconnect. This build does not upload a stuck claim again: on each retry it records
+the named failure and nothing else. An older build also lets an ingest-socket
+producer write a `consumeset:` request id; this build refuses such a manifest
+receipt by name. There is no stored-format fence. Clear every publish hold
+(`publish_hold`, see "Publish hold") before any older build runs: an older build
+refuses a catalog that carries a hold, by naming the field.
+
+Recovery for a recorded set claim whose manifest receipt is gone:
+
+1. Stop the older build and run this build. It protects every receipt still
+   present; it does not restore a deleted one.
+2. List the affected claims with `watch claims` or by ingestion status. A claim is
+   affected when its pending reason or status names the missing publication
+   receipt.
+3. Confirm the data is published: compare the artifact ids the manifest lists
+   (the manifest is the claim's `published_artifact`) with the artifacts present
+   in the store. Keep the source in place under the claim's private name in the
+   root's `.sparrow-inflight/`.
+4. Do not delete the source by hand. A hand deletion does not clear the claim:
+   recovery of a missing source still needs the proof and fails the same way.
+5. Leave the claim pending. It holds a journal slot and its attempt text keeps
+   naming the state. Clear it with `watch clear-set <claim>` once issue 283 is
+   built.
+
 ### Claims after a rollback
 
 The schema 69 to 68 rollback of 2026-11-07 found two kinds of claim the
