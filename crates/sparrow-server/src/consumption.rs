@@ -5,14 +5,17 @@
 
 use crate::source_file::{BENEATH, open};
 use rustix::fs::{self, AtFlags, FlockOperation, Mode, OFlags, RenameFlags};
-use sparrow_client::{ArtifactReceipt, Client, CompletedFileIdentity};
+use sparrow_client::parts::{ClaimParts, MissingLimits, PartLimits, PartsProgress};
+use sparrow_client::{Client, CompletedFileIdentity};
 use sparrow_core::{
-    ConsumptionDirectories, ConsumptionGeneration, ConsumptionJournal, RetiredConsumption, Store,
+    ConsumptionDirectories, ConsumptionGeneration, ConsumptionJournal, RetiredConsumption,
+    SetManifest, Store,
 };
 use std::{
     fs::File,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::Path,
+    sync::Arc,
 };
 
 /// A recoverable filesystem or publication failure; no error certifies removal.
@@ -84,6 +87,68 @@ impl From<rustix::io::Errno> for Error {
 }
 
 const INFLIGHT: &str = ".sparrow-inflight";
+
+/// What one claim's attempts share across retries (#280): its progress, which survives an
+/// attempt dropped at the deadline, and its planned parts, digests and receipts.
+#[derive(Debug, Default)]
+pub struct ClaimAttempt {
+    /// Durable progress of the current attempt.
+    pub progress: Arc<PartsProgress>,
+    /// Planned parts and their receipts.
+    pub parts: Arc<ClaimParts>,
+}
+
+/// The neutral failure of a recorded claim whose publication proof is gone: neither its set
+/// manifest receipt nor its single-path publication receipt exists. Nothing is uploaded.
+fn lost_publication(journal: &ConsumptionJournal) -> sparrow_core::Error {
+    sparrow_core::Error::new(
+        "STORAGE_FAILURE",
+        format!(
+            "publication receipt of recorded claim {} is missing (published as {}); the source is held and no upload was attempted; see docs/deployment.md",
+            journal.import_id,
+            journal.published_artifact.as_deref().unwrap_or_default()
+        ),
+    )
+}
+
+/// Name the advertised values a daemon did not send when the single path meets a refusal a
+/// split would have avoided: the over-bound refusal, or the retirement refusal at layout.
+fn name_missing_limits(
+    error: sparrow_client::Error,
+    missing: MissingLimits,
+) -> sparrow_client::Error {
+    match error {
+        sparrow_client::Error::Domain {
+            code,
+            message,
+            retryable,
+            class,
+        } if (code == "INVALID_ARGUMENT" && message.contains("exceeds the import bound"))
+            || (code == "RESOURCE_LIMIT"
+                && missing.retirement
+                && message.contains("exceeds what one retirement pass can read")) =>
+        {
+            let message = if code == "INVALID_ARGUMENT" {
+                format!(
+                    "{message}; declared input exceeds the daemon's import bound and the daemon did not advertise {}; the file cannot be split",
+                    missing.names()
+                )
+            } else {
+                format!(
+                    "{message}; the daemon did not advertise {}; the file cannot be split",
+                    missing.names()
+                )
+            };
+            sparrow_client::Error::Domain {
+                code,
+                message,
+                retryable,
+                class,
+            }
+        }
+        error => error,
+    }
+}
 
 /// Whether a watch root is the one its stored claims were bound to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -601,12 +666,20 @@ impl ClaimRoot {
             .consumption_retire(id, &self.watch, caller, reason, now)?)
     }
 
-    /// Upload through the production typed SDK's sole descriptor uploader.
+    /// Publish a claimed file and return the artifact id that proves it: the import's
+    /// artifact on the single path, the manifest's for a part set (#280).
+    ///
+    /// What the claim has recorded decides its path before any size rule: a claim whose set
+    /// manifest is accepted records it, a recorded set returns its manifest, a recorded claim
+    /// with no proof left fails without uploading, and a recorded single-path claim takes the
+    /// single path. Only a claim with no recorded state is measured against the import bound,
+    /// held when it cannot be split, and planned.
     pub async fn publish(
         &self,
         client: &Client,
         claim: &mut ClaimedFile,
-    ) -> Result<ArtifactReceipt, Error> {
+        attempt: &ClaimAttempt,
+    ) -> Result<String, Error> {
         self.validate_claim(claim)?;
         if claim.journal.tail.is_some() {
             return Err(Error::State(
@@ -618,15 +691,79 @@ impl ClaimRoot {
                 "producer connection belongs to a different store",
             ));
         }
+        let id = claim.journal.import_id.clone();
+        match self.store.consumption_set_manifest(&id)? {
+            // Parts are never sent again once the manifest is accepted.
+            SetManifest::Receipt(manifest) => {
+                claim.journal = self.store.consumption_publish_set(&id)?;
+                #[cfg(test)]
+                sparrow_test_support::crash::checkpoint("set_recorded");
+                return Ok(manifest.id);
+            }
+            // A recorded set is not planned again.
+            SetManifest::Recorded(manifest) => return Ok(manifest.id),
+            SetManifest::Absent => {}
+        }
+        if self.store.consumption_publication_lost(&id)? {
+            return Err(Error::Storage(lost_publication(&claim.journal)));
+        }
+        let format = sparrow_client::parse_format(&claim.journal.format)
+            .map_err(sparrow_client::Error::from)?;
+        // A recorded single-path claim returns its saved receipt; it is never measured.
+        if claim.journal.published_artifact.is_some() {
+            return self
+                .publish_single(client, claim, attempt, format, None)
+                .await;
+        }
+        let length = claim.journal.observed.byte_length;
+        let limits = match PartLimits::from_discovery(client.discovery()) {
+            Ok(limits) => limits,
+            Err(missing) => {
+                let bound = client.discovery().max_import_bytes;
+                if bound != 0 && length > bound {
+                    return Err(Error::Storage(sparrow_core::Error::new(
+                        "RESOURCE_LIMIT",
+                        format!(
+                            "declared input of {length} bytes exceeds the daemon's import bound of {bound} bytes and the daemon did not advertise {}; the file cannot be split; the source is held",
+                            missing.names()
+                        ),
+                    )));
+                }
+                return self
+                    .publish_single(client, claim, attempt, format, Some(missing))
+                    .await;
+            }
+        };
+        if sparrow_client::parts::is_one_part(&claim.file, length, format, &limits)? {
+            return self
+                .publish_single(client, claim, attempt, format, None)
+                .await;
+        }
+        self.publish_set(client, claim, attempt, format, &limits)
+            .await
+    }
+
+    async fn publish_single(
+        &self,
+        client: &Client,
+        claim: &mut ClaimedFile,
+        attempt: &ClaimAttempt,
+        format: sparrow_client::Format,
+        missing: Option<MissingLimits>,
+    ) -> Result<String, Error> {
         let receipt = client
-            .import_open_file(
+            .import_open_file_with_progress(
                 &claim.journal.request_id,
                 &claim.journal.source,
-                sparrow_client::parse_format(&claim.journal.format)
-                    .map_err(sparrow_client::Error::from)?,
+                format,
                 &mut claim.file,
+                Some(Arc::clone(&attempt.progress)),
             )
-            .await?;
+            .await
+            .map_err(|error| match missing {
+                Some(missing) => name_missing_limits(error, missing),
+                None => error,
+            })?;
         let saved = self.store.consumption_get(&claim.journal.import_id)?;
         if saved.published_artifact.as_deref() != Some(&receipt.id) {
             return Err(Error::State(
@@ -636,7 +773,54 @@ impl ClaimRoot {
         claim.journal = saved;
         #[cfg(test)]
         sparrow_test_support::crash::checkpoint("claim_published");
-        Ok(receipt)
+        Ok(receipt.id)
+    }
+
+    async fn publish_set(
+        &self,
+        client: &Client,
+        claim: &mut ClaimedFile,
+        attempt: &ClaimAttempt,
+        format: sparrow_client::Format,
+        limits: &PartLimits,
+    ) -> Result<String, Error> {
+        let journal = &claim.journal;
+        let parts = sparrow_client::parts::upload_parts(
+            client,
+            &journal.request_id,
+            &journal.source,
+            format,
+            &claim.file,
+            limits,
+            &attempt.parts,
+            &attempt.progress,
+        )
+        .await?;
+        #[cfg(test)]
+        sparrow_test_support::crash::checkpoint("set_parts_published");
+        let manifest = sparrow_client::parts::ingest_manifest(
+            client,
+            &journal.request_id,
+            &journal.source,
+            format,
+            journal.observed.byte_length,
+            &parts,
+        )
+        .await?;
+        #[cfg(test)]
+        sparrow_test_support::crash::checkpoint("set_manifest_published");
+        let saved = self
+            .store
+            .consumption_publish_set(&claim.journal.import_id)?;
+        if saved.published_artifact.as_deref() != Some(&manifest.id) {
+            return Err(Error::State(
+                "part set manifest contradicts source ownership",
+            ));
+        }
+        claim.journal = saved;
+        #[cfg(test)]
+        sparrow_test_support::crash::checkpoint("set_recorded");
+        Ok(manifest.id)
     }
 
     fn validate_claim(&self, claim: &ClaimedFile) -> Result<(), Error> {
@@ -667,12 +851,25 @@ impl ClaimRoot {
         Ok(saved)
     }
 
+    /// The artifact id that proves `journal`'s publication, read in recorded-state order:
+    /// the recorded id, then the tail, then the set manifest, then the single-path receipt.
     fn publication(&self, journal: &ConsumptionJournal, now: u64) -> Result<String, Error> {
         let original = journal.published_id().ok_or(Error::State(
             "source has no durable publication; unlink refused",
         ))?;
         if journal.tail.is_some() {
             return Ok(original.to_owned());
+        }
+        match self.store.consumption_set_manifest(&journal.import_id)? {
+            SetManifest::Recorded(manifest) if manifest.id == original => {
+                return Ok(original.to_owned());
+            }
+            SetManifest::Recorded(_) | SetManifest::Receipt(_) => {
+                return Err(Error::State(
+                    "publication proof contradicts the source journal",
+                ));
+            }
+            SetManifest::Absent => {}
         }
         let receipt = self.store.import_publish(&journal.import_id, now)?;
         if receipt.id != original {

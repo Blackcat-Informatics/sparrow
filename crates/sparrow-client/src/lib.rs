@@ -40,6 +40,9 @@ pub use receipt::{ArtifactReceipt, Discovery, DurabilityWatermark, flush_through
 mod imports;
 pub use imports::{CompletedFileIdentity, import_file, import_open_file, open_completed_file};
 mod import_progress;
+/// Part sets: a completed file above the import bound, cut and uploaded as ordered parts and
+/// a manifest (#280).
+pub mod parts;
 pub use import_progress::{ImportProgress, get_import_progress};
 mod ingest_status;
 mod retention_metrics;
@@ -329,6 +332,21 @@ impl Client {
         format: Format,
         file: &mut std::fs::File,
     ) -> Result<ArtifactReceipt, Error> {
+        self.import_open_file_with_progress(request_id, source, format, file, None)
+            .await
+    }
+
+    /// Upload as [`Client::import_open_file`] does, reporting each durable progress raise to
+    /// `progress`, so a caller that drops this future at a deadline still knows how far the
+    /// upload got (#280).
+    pub async fn import_open_file_with_progress(
+        &self,
+        request_id: &str,
+        source: &str,
+        format: Format,
+        file: &mut std::fs::File,
+        progress: Option<std::sync::Arc<parts::PartsProgress>>,
+    ) -> Result<ArtifactReceipt, Error> {
         imports::upload(
             self.capability(),
             &self.discovery,
@@ -336,7 +354,7 @@ impl Client {
             source,
             format,
             &imports::CompletedInput::capture(file)?,
-            &mut imports::Checkpoint::default(),
+            &mut imports::Checkpoint::reporting(progress, 0),
         )
         .await
     }

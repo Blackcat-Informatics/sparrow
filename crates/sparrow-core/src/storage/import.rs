@@ -18,10 +18,17 @@ const MAX_IMPORTS: usize = 16;
 /// The import bound a store advertises and the over-bound refusals it has counted. One
 /// instance is shared by the writer, which enforces the bound, and `Store::properties`,
 /// which reports both without taking the writer lock. The count lives for the process (#280).
+///
+/// It also holds the two values a part cut needs and the layout enforces (#280): the raw
+/// split, above which a record is laid out as raw pieces, and the retirement row budget of
+/// [`retire_row_budget`]. The layout reads the split here, so what is advertised is what is
+/// enforced, test hooks included.
 #[derive(Debug)]
 pub(super) struct ImportLedger {
     bound: std::sync::atomic::AtomicU64,
     refusals: std::sync::atomic::AtomicU64,
+    raw_split: std::sync::atomic::AtomicU64,
+    row_budget: std::sync::atomic::AtomicU64,
 }
 
 impl Default for ImportLedger {
@@ -29,6 +36,10 @@ impl Default for ImportLedger {
         Self {
             bound: std::sync::atomic::AtomicU64::new(MAX_IMPORT_BYTES),
             refusals: std::sync::atomic::AtomicU64::new(0),
+            raw_split: std::sync::atomic::AtomicU64::new(RAW_RECORD_BYTES),
+            row_budget: std::sync::atomic::AtomicU64::new(retire_row_budget(
+                RetirementShare::DEFAULT,
+            ) as u64),
         }
     }
 }
@@ -38,10 +49,32 @@ impl ImportLedger {
         self.bound.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Longest record a layout keeps whole; a longer one is laid out as raw pieces.
+    pub(super) fn raw_split(&self) -> u64 {
+        self.raw_split.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// What one artifact's chunk and record charges may sum to; see [`retire_row_budget`].
+    pub(super) fn row_budget(&self) -> u64 {
+        self.row_budget.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     #[cfg(feature = "test-support")]
     fn set_bound(&self, bound: u64) {
         self.bound
             .store(bound, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "test-support")]
+    fn set_raw_split(&self, bytes: u64) {
+        self.raw_split
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "test-support")]
+    fn set_row_budget(&self, budget: u64) {
+        self.row_budget
+            .store(budget, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(super) fn refusals(&self) -> u64 {
@@ -85,6 +118,24 @@ pub(super) const fn envelope_chunks(share: RetirementShare) -> usize {
     } else {
         (budget - fixed) / (2 * (ROW_CHUNK_BYTES + ROW_RECORD_BYTES))
     }
+}
+
+/// Charge of one chunk identity against [`retire_row_budget`]: the artifact row holds it
+/// once and a retirement pass reserves the row twice.
+pub(super) const RETIRE_CHUNK_CHARGE: u64 = 2 * super::manifest_retire::ROW_CHUNK_BYTES as u64;
+/// Charge of one record identity against [`retire_row_budget`].
+pub(super) const RETIRE_RECORD_CHARGE: u64 = 2 * super::manifest_retire::ROW_RECORD_BYTES as u64;
+
+/// What the chunk and record charges of one artifact may sum to under `share`.
+/// [`Writer::require_retirable`] refuses exactly when
+/// `RETIRE_CHUNK_CHARGE * chunks + RETIRE_RECORD_CHARGE * records` exceeds it, because the
+/// envelope charge is affine in both counts; zero when the fixed charge alone fills the
+/// envelope, as [`envelope_chunks`] treats it.
+pub(super) const fn retire_row_budget(share: RetirementShare) -> usize {
+    use super::manifest_retire::envelope_charge;
+    let budget = share.envelope_budget();
+    let fixed = envelope_charge(0, 0, share.limits.max_payload_refs);
+    budget.saturating_sub(fixed)
 }
 
 /// Chunks an import may declare: the smaller of the publication batch and the
@@ -601,7 +652,8 @@ impl Store {
                 "raw record ceiling must be whole chunks above twice the projected record bound",
             ));
         }
-        self.lock()?.raw_record_bytes.set(bytes);
+        // The ledger is what the layout enforces and what the store advertises.
+        self.lock()?.import_ledger.set_raw_split(bytes);
         Ok(())
     }
 
@@ -629,6 +681,9 @@ impl Store {
         };
         writer.retirement.set(share);
         writer.import_ledger.set_bound(writer.import_bytes_bound());
+        writer
+            .import_ledger
+            .set_row_budget(retire_row_budget(share) as u64);
         Ok(super::eviction::RetirementBounds {
             import_bytes: writer.import_bytes_bound(),
             pins: share.max_pins(),
@@ -926,7 +981,7 @@ impl Store {
         if manifest.layout_complete {
             return Ok(manifest);
         }
-        let split = writer.raw_record_bytes.get();
+        let split = writer.import_ledger.raw_split();
         let mut layout = Layout {
             writer: &writer,
             rows: Vec::with_capacity(IMPORT_LAYOUT_PAGE_RECORDS),
@@ -1067,10 +1122,17 @@ impl Store {
             // An unpublished consumption import is kept while its claim may still publish.
             // Once an administrator retires the claim, the retirement record is the durable
             // mark that releases it, through this same path, as an expired lease (D118).
-            if (!published && manifest.expires_at > now)
-                || (manifest.consumption
-                    && !published
-                    && !super::consumption::retired(&writer, &manifest.id)?)
+            // A claim recorded as a part set publishes through its manifest, never through
+            // this row, so the row a single-path attempt began is released at once (#280).
+            // A claim whose set manifest receipt is gone is not provably a set and keeps it.
+            let set_leftover = manifest.consumption
+                && !published
+                && super::consumption::recorded_as_set(&writer, &manifest.id)?;
+            if !set_leftover
+                && ((!published && manifest.expires_at > now)
+                    || (manifest.consumption
+                        && !published
+                        && !super::consumption::retired(&writer, &manifest.id)?))
             {
                 continue;
             }
@@ -1185,6 +1247,13 @@ impl Writer {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
                 "consumption imports belong to the daemon's watches, not to an ingest-socket caller",
+            ));
+        }
+        // A set part is the daemon's too: a squatted part would block or forge a set (#280).
+        if request_id.starts_with(super::consumption::SET_PREFIX) && intake.is_some() {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                super::consumption::SET_INTAKE_REFUSAL,
             ));
         }
         let id = import_id(request_id);

@@ -145,6 +145,7 @@ pub(crate) fn decode_definition(
             quiet_ms: value.get_quiet_ms(),
             max_directories: value.get_max_directories() as usize,
             max_candidates: value.get_max_candidates() as usize,
+            publish_hold: value.get_publish_hold(),
         })
     };
     let definition = decode().map_err(|error| failure("INVALID_ARGUMENT", error))?;
@@ -166,6 +167,7 @@ pub(crate) fn encode_definition(
     out.set_quiet_ms(value.quiet_ms);
     out.set_max_directories(value.max_directories as u32);
     out.set_max_candidates(value.max_candidates as u32);
+    out.set_publish_hold(value.publish_hold);
     out.set_recursive(true);
     out.set_readiness(crate::sparrow_capnp::WatchReadiness::CloseOrIdle);
     match value.producer_contract {
@@ -633,7 +635,10 @@ impl Catalog {
     }
 }
 
-fn encode_clock(mut out: crate::sparrow_capnp::optional_instant::Builder<'_>, clock: Option<u64>) {
+pub(crate) fn encode_clock(
+    mut out: crate::sparrow_capnp::optional_instant::Builder<'_>,
+    clock: Option<u64>,
+) {
     match clock {
         Some(at) => out.init_value().set_unix_millis(at),
         None => out.set_absent(()),
@@ -678,5 +683,87 @@ pub(crate) fn encode_claims(
             None => row.reborrow().init_last_pending_reason().set_absent(()),
         }
         encode_clock(row.init_finished_at(), claim.finished_at);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stored watch shape an older build reads: the same fields, without `publish_hold`.
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct OldConsumeWatch {
+        id: String,
+        root: std::path::PathBuf,
+        producer_contract: crate::ProducerContract,
+        source: String,
+        format: String,
+        quiet_ms: u32,
+        max_directories: usize,
+        max_candidates: usize,
+    }
+
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct OldManagedWatch {
+        definition: OldConsumeWatch,
+        revision: u64,
+        enabled: bool,
+    }
+
+    fn managed(publish_hold: bool) -> ManagedWatch {
+        ManagedWatch {
+            definition: ConsumeWatch {
+                id: "stored".into(),
+                root: "/srv/producer".into(),
+                producer_contract: crate::ProducerContract::FinishedFiles,
+                source: "stored".into(),
+                format: "jsonl".into(),
+                quiet_ms: 1000,
+                max_directories: 16,
+                max_candidates: 64,
+                publish_hold,
+            },
+            revision: 3,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn an_unheld_watch_is_stored_as_older_builds_read_it_and_a_held_one_is_refused_by_them() {
+        // INVARIANT (issue 280, publish hold): with the hold off the stored catalog is the old
+        // bytes; with it on, an older build refuses the catalog by naming the field.
+        let unheld = toml::to_string(&managed(false)).unwrap();
+        assert!(!unheld.contains("publish_hold"));
+        let old = OldManagedWatch {
+            definition: OldConsumeWatch {
+                id: "stored".into(),
+                root: "/srv/producer".into(),
+                producer_contract: crate::ProducerContract::FinishedFiles,
+                source: "stored".into(),
+                format: "jsonl".into(),
+                quiet_ms: 1000,
+                max_directories: 16,
+                max_candidates: 64,
+            },
+            revision: 3,
+            enabled: true,
+        };
+        assert_eq!(toml::to_string(&old).unwrap(), unheld);
+        assert!(
+            !toml::from_str::<ManagedWatch>(&unheld)
+                .unwrap()
+                .definition
+                .publish_hold
+        );
+
+        let held = toml::to_string(&managed(true)).unwrap();
+        assert!(held.contains("publish_hold = true"));
+        let refused = toml::from_str::<OldManagedWatch>(&held)
+            .err()
+            .expect("an older shape refuses a held catalog")
+            .to_string();
+        assert!(refused.contains("publish_hold"), "{refused}");
     }
 }

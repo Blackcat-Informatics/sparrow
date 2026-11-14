@@ -675,12 +675,54 @@ await_inflight() {
     done
     return 1
 }
+# The rehearsal watch's coverage and claim state as the daemon on SOCKET reports it, for a failure.
+rehearsal_watch() {
+    "$cli" "$1" status 2>&1 | python3 -I -c 'import json,sys
+print([{k: w.get(k) for k in ("coverage", "reconciliations", "coverage_losses", "directories", "candidates", "deferred", "pending", "failure", "enabled")}
+       for w in json.load(sys.stdin)["consume_watches"] if w["id"] == "measure-rehearsal"])' 2>&1
+}
 # Write LINES one-line JSON records to NAME in ROOT by a rename, as the shipper feeds a root.
 place_batch() {
     local root=$1 name=$2 lines=$3 line
     for ((line = 1; line <= lines; line++)); do printf '{"rehearsal":"%s","line":%d}\n' "$name" "$line"; done \
         >"$SCRATCH/rehearsal/$name"
-    mv -- "$SCRATCH/rehearsal/$name" "$root/$name"
+    mv -- "$SCRATCH/rehearsal/$name" "$root/$name" || fail rehearsal "cannot place $name in $root"
+}
+# The rehearsal watch's definition on stdout, its publish hold set to HOLD (true or false).
+rehearsal_definition() {
+    printf '%s\n' 'id = "measure-rehearsal"' "root = \"$SCRATCH/rehearsal/configured/measure-rehearsal\"" \
+        'producer_contract = "finished_files"' 'source = "measure-rehearsal"' 'format = "jsonl"' \
+        'quiet_ms = 1000' 'max_directories = 16' 'max_candidates = 64' "publish_hold = $1"
+}
+# Set the rehearsal watch's publish hold to HOLD (true or false) on the daemon at SOCKET, as a
+# watch put at the watch's current revision.
+set_rehearsal_hold() {
+    local socket=$1 hold=$2 revision out file
+    revision=$("$cli" "$socket" status 2>&1 | python3 -I -c 'import json,sys
+print(next(int(w["revision"]) for w in json.load(sys.stdin)["consume_watches"] if w["id"] == "measure-rehearsal"))') \
+        || return 1
+    file=$SCRATCH/rehearsal/hold-$hold.toml
+    rehearsal_definition "$hold" >"$file" || return 1
+    out=$("$cli" "$socket" watch put "measure-rehearsal-hold-$hold-$revision" "$revision" "$file" 2>&1) \
+        || { printf '%s' "$out"; return 1; }
+}
+# The state the rollback rehearsal needs from a held claim before its daemon halts: journaled
+# and pending, its file in ROOT/.sparrow-inflight/, unpublished (still pending), and named by the
+# watch as held. Prints the name of the first state that is not met and returns 1; returns 0 when
+# every state holds.
+held_claim_state() {
+    local socket=$1 claim=$2 root=$3 claims status_out
+    claims=$("$cli" "$socket" watch claims 2>&1) \
+        || { printf 'journaled (watch claims refused: %s)' "$claims"; return 1; }
+    python3 -I -c 'import json,sys
+sys.exit(not any(c["claim_id"] == sys.argv[1] and c["state"] == "pending" for c in json.load(sys.stdin)["claims"]))' \
+        "$claim" <<<"$claims" || { printf 'journaled as pending'; return 1; }
+    [[ -e $root/.sparrow-inflight/$claim ]] || { printf 'in .sparrow-inflight/'; return 1; }
+    status_out=$("$cli" "$socket" status 2>&1) || { printf 'held (status refused: %s)' "$status_out"; return 1; }
+    python3 -I -c 'import json,sys
+w=[w for w in json.load(sys.stdin)["consume_watches"] if w["id"]=="measure-rehearsal"][0]
+sys.exit(not (w["publish_hold"] is True and int(w["held_claims"]) >= 1))' <<<"$status_out" \
+        || { printf 'held by the publish hold'; return 1; }
 }
 # Rehearse the rollback's claim reconciliation (docs/deployment.md, "Claims after a rollback")
 # on the measured copy, restored from the set, with the measured image in every role and
@@ -714,13 +756,14 @@ for w in json.load(sys.stdin)["consume_watches"]: print(os.path.basename(w["root
         || fail rehearsal "daemon A did not answer: $(tail -n 3 -- "$rehearsal/a.log")"
     # The put names a configured root outside the private directory, as every catalog root
     # is; the daemon rebinds it to $root.
-    printf '%s\n' 'id = "measure-rehearsal"' "root = \"$rehearsal/configured/measure-rehearsal\"" 'producer_contract = "finished_files"' \
-        'source = "measure-rehearsal"' 'format = "jsonl"' 'quiet_ms = 1000' 'max_directories = 16' \
-        'max_candidates = 64' >"$rehearsal/watch.toml"
+    # The hold keeps daemon A's claim journaled and in flight, unpublished, while daemon A stops.
+    rehearsal_definition true >"$rehearsal/watch.toml"
     out=$("$cli" "$DATA/r.sock" watch put measure-rehearsal-put 0 "$rehearsal/watch.toml" 2>&1) \
         || fail rehearsal "watch put refused: $out"
     place_batch "$root" batch-1.jsonl 3
-    claimed=$(await_inflight "$root" '' 300) || fail rehearsal "daemon A never claimed batch-1.jsonl"
+    claimed=$(await_inflight "$root" '' 300) || fail rehearsal "daemon A never claimed batch-1.jsonl; log: $(tail -n 8 -- "$rehearsal/a.log"); root: $(ls -la -- "$root" 2>&1 | tr '\n' ' '); inflight: $(ls -la -- "$root/.sparrow-inflight" 2>&1 | tr '\n' ' '); watch: $(rehearsal_watch "$DATA/r.sock")"
+    state=$(held_claim_state "$DATA/r.sock" "$claimed" "$root") \
+        || fail rehearsal "daemon A's publish hold did not keep $claimed in flight; the unmet state is: $state"
     halt "$pid" || fail rehearsal "daemon A exited non-zero after SIGINT"
 
     restored=$rehearsal/backup
@@ -733,13 +776,19 @@ for w in json.load(sys.stdin)["consume_watches"]: print(os.path.basename(w["root
     pid=$STARTED_PID
     await_status "$pid" "$rehearsal/b.log" "$DATA/r.sock" 600 >/dev/null \
         || fail rehearsal "the newer daemon did not answer: $(tail -n 3 -- "$rehearsal/b.log")"
+    # The newer daemon shares daemon A's catalog, so the hold is set when it starts. Clearing it
+    # lets B publish batch-1 in order; setting it again holds batch-2 as A held batch-1.
+    out=$(set_rehearsal_hold "$DATA/r.sock" false) || fail rehearsal "cannot clear the publish hold on the newer daemon: $out"
     for ((name = 0; name < 300; name++)); do
         [[ -e $root/.sparrow-inflight/$claimed ]] || break
         sleep 1
     done
     [[ ! -e $root/.sparrow-inflight/$claimed ]] || fail rehearsal "the newer daemon never published $claimed"
+    out=$(set_rehearsal_hold "$DATA/r.sock" true) || fail rehearsal "cannot set the publish hold on the newer daemon: $out"
     place_batch "$root" batch-2.jsonl 5
-    newer_claim=$(await_inflight "$root" "$claimed" 300) || fail rehearsal "the newer daemon never claimed batch-2.jsonl"
+    newer_claim=$(await_inflight "$root" "$claimed" 300) || fail rehearsal "the newer daemon never claimed batch-2.jsonl; log: $(tail -n 8 -- "$rehearsal/b.log"); watch: $(rehearsal_watch "$DATA/r.sock")"
+    state=$(held_claim_state "$DATA/r.sock" "$newer_claim" "$root") \
+        || fail rehearsal "the newer daemon's publish hold did not keep $newer_claim in flight; the unmet state is: $state"
     halt "$pid" || fail rehearsal "the newer daemon exited non-zero after SIGINT"
     newer=$DATA
 

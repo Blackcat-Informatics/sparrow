@@ -58,11 +58,14 @@ fn finish(config_path: &Path, import: &str) -> Snapshot {
                 } else {
                     fs::write(&original, REPLACEMENT).unwrap();
                 }
-                let receipt = root.publish(&client, &mut claim).await.unwrap();
+                let receipt = root
+                    .publish(&client, &mut claim, &Default::default())
+                    .await
+                    .unwrap();
                 let removed = root.remove(&claim, crate::now().unwrap()).unwrap();
                 assert_eq!(
                     removed.published_artifact.as_deref(),
-                    Some(receipt.id.as_str())
+                    Some(receipt.as_str())
                 );
             }
             Recovery::Removed(journal) => assert!(journal.removed_at.is_some()),

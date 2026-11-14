@@ -1020,6 +1020,88 @@ into an empty `chattr +C` directory with an image that has the restore option:
 started. After `--no-backup` there is none: go forward. A rollback must then
 reconcile the consume claims, as below.
 
+### Part sets and older builds
+
+A consume root that holds a file above the import bound is split into parts and a
+manifest by this build. An older build that meets an unrecorded set claim stalls on
+that claim only, loudly: the claim stays pending, the source file stays in place,
+and the failure is logged and recorded; run this build to finish it. A set claim
+that this build has recorded but not yet removed cannot be finished by any build
+once an older build has run the expiry sweep on the store more than two days after
+the manifest was accepted: the sweep deletes the manifest's receipt, which this
+build needs to prove the publication before it removes the source. Do not run an
+older build on a store that holds recorded set claims that are not removed. If it
+has happened, follow the recovery steps below. No shipped command clears such a
+claim yet (issue 283 builds the tool that does); until then the claim stays
+pending, the source stays in place, the stored manifest and parts remain, and the
+claim holds one of the sixteen pending-claim slots (`MAX_CONSUMPTION_JOURNALS` =
+16), so sixteen such claims stop all new claims on that daemon. One stuck claim
+does not block the others, because the worker takes any due claim; each failed
+attempt does drop the shared consume connection, so every retry costs a
+reconnect. This build does not upload a stuck claim again: on each retry it records
+the named failure and nothing else. An older build also lets an ingest-socket
+producer write a `consumeset:` request id; this build refuses such a manifest
+receipt by name. There is no stored-format fence. Clear every publish hold
+(`publish_hold`, see "Publish hold") before any older build runs: an older build
+refuses a catalog that carries a hold, by naming the field.
+
+Recovery for a recorded set claim whose manifest receipt is gone:
+
+1. Stop the older build and run this build. It protects every receipt still
+   present; it does not restore a deleted one.
+2. List the affected claims with `watch claims` or by ingestion status. A claim is
+   affected when its pending reason or status names the missing publication
+   receipt.
+3. Confirm the data is published: compare the artifact ids the manifest lists
+   (the manifest is the claim's `published_artifact`) with the artifacts present
+   in the store. Keep the source in place under the claim's private name in the
+   root's `.sparrow-inflight/`.
+4. Do not delete the source by hand. A hand deletion does not clear the claim:
+   recovery of a missing source still needs the proof and fails the same way.
+5. Leave the claim pending. It holds a journal slot and its attempt text keeps
+   naming the state. Clear it with `watch clear-set <claim>` once issue 283 is
+   built.
+
+### Publish hold
+
+A watch definition carries `publish_hold`, false unless an operator sets it with a
+watch put. A held finished-file watch still detects and claims files: each claim is
+journaled and moved into the root's `.sparrow-inflight/` as an interrupted claim is,
+and then it waits. Nothing is published, dropped or cancelled, and the wait has no
+deadline. Clearing the hold with another watch put (a put that omits the field clears
+it) lets the claims publish in pending order. A tail watch cannot be held.
+
+The hold exists for two uses: the rollback rehearsal in `deploy/verify-backup.sh`,
+which needs a claim in flight when the daemon halts, and an operator's deliberate
+pause of one watch. It is not a way to refuse input: held files are still taken
+from the producer, and a held claim keeps one of the sixteen pending-claim slots
+(`MAX_CONSUMPTION_JOURNALS`) until the hold clears.
+
+A hold never stops another watch or a tail. A held watch reserves at most four
+files; further ready files stay in the producer's directory, unclaimed and
+untouched, and are claimed in order once the hold clears and slots free. All held
+watches together hold at most twelve pending claims (the sixteen slots less four), so
+at least four slots stay free for unheld watches and tail generations; a held claim
+that would take the total past twelve waits instead. Status names the state: `publish_hold`, `held_claims` (the watch's
+pending finished-file claims) and `oldest_held_first_seen`, which is the
+reservation time of the oldest of those claims. It is not the time the hold was
+set, so a claim that waited before the hold shows its own age. The daemon writes
+one `WARNING` line per hold at start and when a hold is set.
+
+A catalog that carries a hold is refused by older builds, which name the
+`publish_hold` field: clear every hold before an older build runs.
+
+A held claim whose move into `.sparrow-inflight/` fails is recorded as a pending
+attempt and logged once, and again only when the failure text changes.
+
+A part of a set that was published, whose receipt then lapsed (two days) before the
+manifest was accepted, is sent again when the claim resumes and is stored as another
+artifact. The manifest names only the new one; the earlier artifact is an ordinary
+artifact under the same source, so a records query over the source returns those
+bytes twice (tracked in issue 285, "Close the duplicate-part read"). A resumed set whose advertised limits changed is refused `CONFLICT` for
+the same part id until the earlier part receipts lapse. No supersede mark exists
+yet.
+
 ### Claims after a rollback
 
 The schema 69 to 68 rollback of 2026-11-07 found two kinds of claim the

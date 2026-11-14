@@ -4055,6 +4055,7 @@ fn watch_definition(
         quiet_ms,
         max_directories: directories,
         max_candidates: candidates,
+        publish_hold: false,
     }
 }
 
@@ -7644,10 +7645,13 @@ async fn anchored_claim_recovery_publishes_exact_generation_and_never_deletes_re
             std::fs::rename(producer.join("nested"), producer.join("old-nested")).unwrap();
             std::fs::create_dir(producer.join("nested")).unwrap();
             std::fs::write(&original, b"replacement generation\n").unwrap();
-            let receipt = root.publish(&client, &mut claim).await.unwrap();
+            let receipt = root
+                .publish(&client, &mut claim, &Default::default())
+                .await
+                .unwrap();
             assert_eq!(
                 store
-                    .bytes(&receipt.id, 0, input.len(), sparrow_server::now().unwrap())
+                    .bytes(&receipt, 0, input.len(), sparrow_server::now().unwrap())
                     .unwrap(),
                 input
             );
@@ -7661,7 +7665,12 @@ async fn anchored_claim_recovery_publishes_exact_generation_and_never_deletes_re
                 Recovery::Claimed(value) => value,
                 Recovery::Removed(_) => panic!("claim still exists"),
             };
-            assert_eq!(root.publish(&client, &mut claim).await.unwrap(), receipt);
+            assert_eq!(
+                root.publish(&client, &mut claim, &Default::default())
+                    .await
+                    .unwrap(),
+                receipt
+            );
             let removed = root.remove(&claim, sparrow_server::now().unwrap()).unwrap();
             assert!(removed.removed_at.is_some());
             assert!(!private.exists());
@@ -7702,7 +7711,10 @@ async fn anchored_claim_recovery_publishes_exact_generation_and_never_deletes_re
                 Recovery::Removed(_) => panic!("unpublished moved source"),
             };
             assert!(claim.journal().claimed.is_some());
-            let accepted = root.publish(&client, &mut claim).await.unwrap();
+            let accepted = root
+                .publish(&client, &mut claim, &Default::default())
+                .await
+                .unwrap();
             std::fs::remove_file(&renamed_private).unwrap(); // Interrupted after unlink, before sync/confirmation.
             std::fs::write(&before, b"new renamed generation\n").unwrap();
             drop(claim);
@@ -7713,7 +7725,7 @@ async fn anchored_claim_recovery_publishes_exact_generation_and_never_deletes_re
                 .unwrap()
             {
                 Recovery::Removed(saved) => {
-                    assert_eq!(saved.published_artifact, Some(accepted.id));
+                    assert_eq!(saved.published_artifact, Some(accepted));
                     assert!(saved.removed_at.is_some());
                 }
                 Recovery::Claimed(_) => {
@@ -7744,7 +7756,9 @@ async fn anchored_claim_recovery_publishes_exact_generation_and_never_deletes_re
                 Recovery::Claimed(value) => value,
                 Recovery::Removed(_) => panic!("new claim"),
             };
-            root.publish(&client, &mut claim).await.unwrap();
+            root.publish(&client, &mut claim, &Default::default())
+                .await
+                .unwrap();
             let path = producer.join(".sparrow-inflight").join(&journal.import_id);
             std::fs::write(&path, b"changed\n").unwrap();
             assert!(root.remove(&claim, sparrow_server::now().unwrap()).is_err());
@@ -15460,6 +15474,576 @@ async fn an_over_bound_declaration_is_permanent_named_advertised_and_counted() {
             assert_eq!(status.get_import_over_bound_refusals(), 1);
             drop(connection);
             drop(daemon);
+        })
+        .await;
+}
+
+/// An in-process daemon whose import bound is 20 chunks (1,310,720 bytes) and whose
+/// retirement row budget is 20 one-chunk records, with a claim root over `producer`.
+struct SetHarness {
+    store: sparrow_core::Store,
+    client: sparrow_client::Client,
+    root: sparrow_server::consumption::ClaimRoot,
+    producer: std::path::PathBuf,
+    _serving: tokio::task::JoinHandle<()>,
+}
+
+/// One chunk and one record charge 2 x (67 + 42) bytes of the row budget.
+const SET_ROW_BUDGET: usize = 20 * 218;
+
+async fn set_harness(dir: &Path) -> SetHarness {
+    use sparrow_server::{Rpc, ServerConfig, consumption::ClaimRoot};
+    let data = dir.join("store");
+    let socket = data.join("rpc.sock");
+    let config = ServerConfig::read(&write_server_config(dir, &data, &socket)).unwrap();
+    let store = config.open_store().unwrap();
+    // The fixed envelope charge at one payload reference, then 20 units of row budget.
+    let fixed = 2 * 4096 + 8192 + 64 * 4096 + 18 * 1024 + (2 * 66 + 2 * 24);
+    let limits = sparrow_core::EvictionLimits {
+        max_payload_refs: 1,
+        max_catalog_bytes: fixed + SET_ROW_BUDGET + 1024,
+        ..sparrow_core::EvictionLimits::default()
+    };
+    let bounds = store.scale_retirement_for_tests(limits, 1024).unwrap();
+    assert_eq!(bounds.import_bytes, 20 * 65_536);
+    let producer = dir.join("producer");
+    std::fs::create_dir_all(&producer).unwrap();
+    if socket.exists() {
+        std::fs::remove_file(&socket).unwrap();
+    }
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let capability: wire::sparrow::Client = capnp_rpc::new_client(Rpc::new(
+        store.clone(),
+        std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+        config.max_pin_members,
+    ));
+    let serving = tokio::task::spawn_local(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        sparrow_server::serve_connection(stream, capability)
+            .await
+            .unwrap();
+    });
+    let client = sparrow_client::Client::connect(&socket).await.unwrap();
+    let root = ClaimRoot::open(store.clone(), "watch", &producer).unwrap();
+    SetHarness {
+        store,
+        client,
+        root,
+        producer,
+        _serving: serving,
+    }
+}
+
+impl SetHarness {
+    /// Claim `name` holding `input` and publish it through the production path.
+    async fn publish(
+        &self,
+        name: &str,
+        format: &str,
+        input: &[u8],
+    ) -> (String, sparrow_server::consumption::ClaimedFile) {
+        use sparrow_server::consumption::Recovery;
+        let path = self.producer.join(name);
+        std::fs::write(&path, input).unwrap();
+        let journal = self
+            .root
+            .reserve(
+                Path::new(name),
+                sparrow_client::CompletedFileIdentity::capture(&path.metadata().unwrap()),
+                "set-source",
+                format,
+            )
+            .unwrap();
+        let Recovery::Claimed(mut claim) = self
+            .root
+            .recover(&journal.import_id, sparrow_server::now().unwrap())
+            .unwrap()
+        else {
+            panic!("a fresh claim is not removed");
+        };
+        let published = self
+            .root
+            .publish(&self.client, &mut claim, &Default::default())
+            .await
+            .unwrap();
+        (published, claim)
+    }
+
+    fn read(&self, id: &str, length: u64) -> Vec<u8> {
+        let now = sparrow_server::now().unwrap();
+        let mut bytes = Vec::new();
+        while (bytes.len() as u64) < length {
+            let take = (length - bytes.len() as u64).min(1 << 20) as usize;
+            bytes.extend(self.store.bytes(id, bytes.len() as u64, take, now).unwrap());
+        }
+        bytes
+    }
+
+    /// The manifest's parts as (stored format, artifact), checked to cover `input` in order.
+    fn parts(&self, manifest: &str, format: &str, input: &[u8]) -> Vec<(String, String)> {
+        let receipt = self.store.artifact(manifest).unwrap();
+        assert_eq!(receipt.format, "json");
+        assert_eq!(receipt.source, "set-source");
+        let body = purrdf_lex::json::read_slice(
+            &self.read(manifest, receipt.byte_length),
+            purrdf_lex::json::Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(body["schema"].as_str(), Some("sparrow.parts/1"));
+        assert_eq!(body["format"].as_str(), Some(format));
+        assert_eq!(body["byte_length"].as_u64(), Some(input.len() as u64));
+        let mut joined = Vec::new();
+        let mut parts = Vec::new();
+        for (index, part) in body["parts"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(part["index"].as_u64(), Some(index as u64));
+            assert_eq!(part["start"].as_u64(), Some(joined.len() as u64));
+            let artifact = part["artifact"].as_str().unwrap().to_owned();
+            joined.extend(self.read(&artifact, part["length"].as_u64().unwrap()));
+            parts.push((part["format"].as_str().unwrap().to_owned(), artifact));
+        }
+        assert_eq!(
+            joined, input,
+            "the parts read by the manifest are the input"
+        );
+        parts
+    }
+}
+
+/// INVARIANT (#280, OR-A): a consume file above the import bound is published as ordered
+/// parts and a manifest, the claim records the manifest, and its source is removed through
+/// the manifest proof; the part records are ordinary readable records.
+#[tokio::test]
+async fn over_bound_consume_file_is_split_into_ordered_parts_and_removed() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let harness = set_harness(dir.path()).await;
+            // 50 lines of one chunk each: 2.5 times the 20-chunk import bound.
+            let line = |index: usize| {
+                let mut line = format!("{{\"line\":{index},\"pad\":\"").into_bytes();
+                line.resize(65_536 - 3, b'p');
+                line.extend_from_slice(b"\"}\n");
+                line
+            };
+            let input: Vec<u8> = (0..50).flat_map(line).collect();
+            let (manifest, claim) = harness.publish("big.jsonl", "jsonl", &input).await;
+            let journal = claim.journal().clone();
+            assert_eq!(
+                journal.published_artifact.as_deref(),
+                Some(manifest.as_str())
+            );
+            let parts = harness.parts(&manifest, "jsonl", &input);
+            assert_eq!(parts.len(), 3);
+            assert!(parts.iter().all(|(format, _)| format == "jsonl"));
+            let now = sparrow_server::now().unwrap();
+            assert!(harness.store.records(now).unwrap().len() >= 50);
+            let removed = harness.root.remove(&claim, now).unwrap();
+            assert!(removed.removed_at.is_some());
+            assert!(
+                !harness
+                    .producer
+                    .join(".sparrow-inflight")
+                    .join(&journal.import_id)
+                    .exists()
+            );
+        })
+        .await;
+}
+
+/// INVARIANT (#280, OR-B): a json or syslog file above the import bound is taken, never
+/// held for its format: its parts are stored opaque, so nothing parses a fragment, and the
+/// manifest keeps the original format.
+#[tokio::test]
+async fn over_bound_non_line_consume_file_is_taken_as_opaque_parts() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let harness = set_harness(dir.path()).await;
+            for (name, format) in [("big.json", "json"), ("big.syslog", "syslog")] {
+                let mut input = b"{\"document\":\"".to_vec();
+                input.resize(3 * 1024 * 1024, b'd');
+                input.extend_from_slice(b"\"}");
+                let (manifest, claim) = harness.publish(name, format, &input).await;
+                let parts = harness.parts(&manifest, format, &input);
+                assert_eq!(parts.len(), 3, "{format}");
+                for (stored, artifact) in &parts {
+                    assert_eq!(stored, "opaque");
+                    assert_eq!(harness.store.artifact(artifact).unwrap().format, "opaque");
+                }
+                harness
+                    .root
+                    .remove(&claim, sparrow_server::now().unwrap())
+                    .unwrap();
+            }
+        })
+        .await;
+}
+
+/// INVARIANT (#280, design 19b, RS4 and RS3): a recorded set claim whose manifest receipt is
+/// gone is not planned again: publish fails STORAGE_FAILURE, ingests no manifest and leaves
+/// the claim recorded, so no part is sent again. A recorded single-path claim is not stopped:
+/// it returns its saved receipt. The part uploads themselves are not counted (the client has
+/// no call hook); the guard's visible effect is that no manifest is ingested and the call
+/// fails, which a re-plan would not do (each part would answer its saved receipt and the
+/// manifest would be accepted again).
+///
+/// Not written here: the recorded single-path claim whose bound would now split the file (design
+/// r7 R1 and r6). `set_harness` fixes the bound (`SET_ROW_BUDGET`, asserted at `import_bytes`
+/// equal to `20 * 65_536`), so a second open cannot advertise a smaller one. The reason no split
+/// is reached is `consumption.rs:713`: a recorded single-path claim (`published_artifact` Some)
+/// returns `publish_single` before `PartLimits` and the bound are read (`consumption.rs:718-736`).
+/// The `again == single_id` assertion below shows the saved receipt is returned.
+#[tokio::test]
+async fn recorded_set_claim_with_a_missing_manifest_receipt_plans_uploads_and_begins_nothing() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let harness = set_harness(dir.path()).await;
+            let line = |index: usize| {
+                let mut line = format!("{{\"line\":{index},\"pad\":\"").into_bytes();
+                line.resize(65_536 - 3, b'p');
+                line.extend_from_slice(b"\"}\n");
+                line
+            };
+            let input: Vec<u8> = (0..50).flat_map(line).collect();
+            let (_, set_claim) = harness.publish("big.jsonl", "jsonl", &input).await;
+            let (single_id, single_claim) = harness.publish("small.log", "log", b"one\n").await;
+            let (set, single) = (
+                set_claim.journal().clone(),
+                single_claim.journal().import_id.clone(),
+            );
+            let SetHarness {
+                store,
+                client,
+                root,
+                _serving,
+                ..
+            } = harness;
+            drop((set_claim, single_claim, client, root));
+            _serving.abort();
+            let _ = _serving.await;
+            drop(store);
+            let db = sparrow_test_support::catalog_db(&dir.path().join("store")).unwrap();
+            db.delete(format!(
+                "request:ingest:{}.manifest",
+                set.request_id
+                    .replacen("consume:", sparrow_core::SET_PREFIX, 1)
+            ))
+            .unwrap();
+            drop(db);
+
+            let harness = set_harness(dir.path()).await;
+            let now = sparrow_server::now().unwrap();
+            let sparrow_server::consumption::Recovery::Claimed(mut claim) =
+                harness.root.recover(&set.import_id, now).unwrap()
+            else {
+                panic!("a recorded set claim is not removed");
+            };
+            // The store's own listing of the source's artifacts: a failed attempt that uploaded
+            // nothing leaves the count where it was (the parts of the first attempt stay as they were).
+            let listed = |store: &sparrow_core::Store| {
+                store
+                    .artifacts(now)
+                    .unwrap()
+                    .iter()
+                    .filter(|artifact| artifact.source == "set-source")
+                    .count()
+            };
+            let listed_before = listed(&harness.store);
+            assert!(
+                listed_before > 0,
+                "the first attempt's parts are not listed"
+            );
+            for _ in 0..2 {
+                let failure = harness
+                    .root
+                    .publish(&harness.client, &mut claim, &Default::default())
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&failure, sparrow_server::consumption::Error::Storage(error)
+                        if error.code == "STORAGE_FAILURE"),
+                    "{failure:?}"
+                );
+            }
+            assert_eq!(
+                listed(&harness.store),
+                listed_before,
+                "a failed attempt published an artifact for the source"
+            );
+            assert!(matches!(
+                harness
+                    .store
+                    .consumption_set_manifest(&set.import_id)
+                    .unwrap(),
+                sparrow_core::SetManifest::Absent
+            ));
+            let sparrow_server::consumption::Recovery::Claimed(mut claim) =
+                harness.root.recover(&single, now).unwrap()
+            else {
+                panic!("a recorded single claim is not removed");
+            };
+            let again = harness
+                .root
+                .publish(&harness.client, &mut claim, &Default::default())
+                .await
+                .unwrap();
+            assert_eq!(again, single_id);
+        })
+        .await;
+}
+
+/// What one watch's status says that the publish-hold test reads.
+#[derive(Debug)]
+struct WatchSeen {
+    id: String,
+    revision: u64,
+    held: u32,
+    pending: u32,
+    completed: u64,
+    tail_generations: usize,
+}
+
+async fn watches_seen(client: &wire::sparrow::Client) -> Vec<WatchSeen> {
+    let response = client.status_request().send().promise.await.unwrap();
+    let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+    status
+        .get_consume_watches()
+        .unwrap()
+        .iter()
+        .map(|watch| WatchSeen {
+            id: watch.get_id().unwrap().to_str().unwrap().to_owned(),
+            revision: watch.get_revision(),
+            held: watch.get_held_claims(),
+            pending: watch.get_pending_claims(),
+            completed: watch.get_completed_claims(),
+            tail_generations: watch.get_tail_generation_ids().unwrap().len() as usize,
+        })
+        .collect()
+}
+
+/// INVARIANT (#280, publish hold, design 3.7A): five held watches of six finished files each,
+/// beside one unheld watch and one tail watch, in one daemon. The pending claims of all held
+/// watches together stay below `HELD_CLAIMS_TOTAL` (the store's sixteen journal slots less the
+/// four `HELD_RESERVED_SLOTS`, so twelve), and the files past that total stay unclaimed in their
+/// producers' directories, claimed in order. The unheld watch's file is claimed and published,
+/// and the tail begins a generation, while the holds stand. Clearing each hold wakes its watch:
+/// the files that waited are claimed and published. Fails when a held claim is taken past the
+/// total, when a file past a cap is claimed out of order, or when a cleared hold does not wake
+/// its watch.
+#[tokio::test(flavor = "current_thread")]
+async fn held_watches_share_one_total_and_waiting_files_are_claimed_in_order_when_the_hold_clears()
+{
+    // The held claims may stand at most `HELD_CLAIMS_TOTAL`; each watch's share is 4 (`HELD_CLAIMS_PER_WATCH`).
+    const HELD_TOTAL: u32 = (sparrow_core::MAX_CONSUMPTION_JOURNALS - 4) as u32;
+    const PER_WATCH: u32 = 4;
+    const HELD_WATCHES: usize = 5;
+    const FILES: usize = 6;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use sparrow_server::ProducerContract::{ActiveFilesRetain, FinishedFiles};
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let watch = |id: &str, root: &Path, producer_contract, publish_hold| {
+                sparrow_server::ConsumeWatch {
+                    id: id.into(),
+                    root: root.into(),
+                    producer_contract,
+                    source: id.into(),
+                    format: "jsonl".into(),
+                    quiet_ms: 100,
+                    max_directories: 16,
+                    max_candidates: 16,
+                    publish_hold,
+                }
+            };
+            let mut held_roots = Vec::new();
+            for index in 0..HELD_WATCHES {
+                let id = format!("held-{index}");
+                let root = dir.path().join(&id);
+                std::fs::create_dir(&root).unwrap();
+                for file in 0..FILES {
+                    std::fs::write(root.join(format!("file-{file}.jsonl")), b"{}\n").unwrap();
+                }
+                append_watch_config(&config, &watch(&id, &root, FinishedFiles, true));
+                held_roots.push((id, root));
+            }
+            let open = dir.path().join("open");
+            std::fs::create_dir(&open).unwrap();
+            std::fs::write(open.join("ready.jsonl"), b"{}\n").unwrap();
+            append_watch_config(&config, &watch("open", &open, FinishedFiles, false));
+            let tail = dir.path().join("tail");
+            std::fs::create_dir(&tail).unwrap();
+            std::fs::write(tail.join("active.jsonl"), b"{}\n").unwrap();
+            append_watch_config(&config, &watch("tail", &tail, ActiveFilesRetain, false));
+
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let store_id = client.discovery().store_id.clone();
+            let is_held = |watch: &WatchSeen| watch.id.starts_with("held-");
+
+            // Until the holds have claimed all they may, and the unheld and tail watches have run.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let seen = watches_seen(client.capability()).await;
+                let held: u32 = seen.iter().filter(|w| is_held(w)).map(|w| w.held).sum();
+                let open_done = seen.iter().any(|w| w.id == "open" && w.completed == 1);
+                let tailed = seen
+                    .iter()
+                    .any(|w| w.id == "tail" && w.tail_generations != 0);
+                if held == HELD_TOTAL && open_done && tailed {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "held watches never settled: {seen:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // The total holds after the passes that follow, not only at the first moment it is met.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let seen = watches_seen(client.capability()).await;
+            let held: u32 = seen.iter().filter(|w| is_held(w)).map(|w| w.held).sum();
+            assert_eq!(held, HELD_TOTAL, "{seen:?}");
+            for (id, root) in &held_roots {
+                let claimed = seen.iter().find(|w| &w.id == id).unwrap().held;
+                assert!(claimed <= PER_WATCH, "{id} holds {claimed}");
+                // The claimed files are the first in order; the waiting ones are the rest.
+                let mut waiting: Vec<String> = std::fs::read_dir(root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                    .filter(|name| !name.starts_with('.'))
+                    .collect();
+                waiting.sort();
+                let expected: Vec<String> = (claimed as usize..FILES)
+                    .map(|file| format!("file-{file}.jsonl"))
+                    .collect();
+                assert_eq!(
+                    waiting, expected,
+                    "{id}: the waiting files are not the rest in order"
+                );
+            }
+
+            // Clearing each hold wakes its watch: the files that waited are claimed and published.
+            for (id, root) in &held_roots {
+                let revision = seen.iter().find(|w| &w.id == id).unwrap().revision;
+                let file = dir.path().join(format!("{id}-clear.toml"));
+                let definition = toml::to_string(&watch(id, root, FinishedFiles, false)).unwrap();
+                std::fs::write(&file, definition).unwrap();
+                cli(
+                    &socket,
+                    &[
+                        "watch",
+                        "put",
+                        &format!("clear-{id}"),
+                        &revision.to_string(),
+                        file.to_str().unwrap(),
+                    ],
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let seen = watches_seen(client.capability()).await;
+                let done = seen
+                    .iter()
+                    .filter(|w| is_held(w))
+                    .all(|w| w.completed == FILES as u64 && w.pending == 0);
+                if done {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cleared holds never finished: {seen:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let sources = cli(&socket, &["sources", &store_id]);
+            let expected = FILES.to_string();
+            for (id, _) in &held_roots {
+                let row = sources["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["source_id"].as_str() == Some(id.as_str()))
+                    .unwrap();
+                assert_eq!(
+                    row["complete_artifacts"].as_str(),
+                    Some(expected.as_str()),
+                    "{id}"
+                );
+            }
+        })
+        .await;
+}
+
+/// INVARIANT (#280, F2): the client's cut, built only from the daemon's advertised limits,
+/// makes parts the daemon's layout accepts, and the first part one line beyond the cut is
+/// refused RESOURCE_LIMIT by the same layout. No limit is copied into the test.
+#[tokio::test]
+async fn client_cut_parts_are_accepted_by_the_daemon_and_one_more_unit_is_refused() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use sparrow_client::{Format, parts};
+            let dir = tempfile::tempdir().unwrap();
+            let harness = set_harness(dir.path()).await;
+            let limits = parts::PartLimits::from_discovery(harness.client.discovery()).unwrap();
+            let input: Vec<u8> = (0..100)
+                .flat_map(|index| format!("dense line {index:04}\n").into_bytes())
+                .collect();
+            let length = input.len() as u64;
+            let stage = |request: &str, bytes: &[u8]| {
+                let payload = format!(
+                    "blake3:{}",
+                    purrdf_hash::hex::encode(purrdf_hash::blake3::hash(bytes).as_bytes())
+                );
+                let manifest = harness
+                    .store
+                    .import_begin(
+                        request,
+                        "set-source",
+                        "log",
+                        bytes.len() as u64,
+                        &payload,
+                        0,
+                    )
+                    .unwrap();
+                for (index, chunk) in bytes.chunks(65_536).enumerate() {
+                    harness
+                        .store
+                        .import_append(&manifest.id, (index * 65_536) as u64, chunk, 0)
+                        .unwrap();
+                }
+                harness.store.import_seal(&manifest.id, 0).unwrap();
+                harness.store.import_prepare_layout(&manifest.id, 0)
+            };
+            let (mut start, mut index, mut boundary) = (0, 0, None);
+            while start < length {
+                let span = parts::next_cut(&input[..], length, start, index, Format::Log, &limits)
+                    .unwrap();
+                let bytes = &input[span.start as usize..(span.start + span.length) as usize];
+                stage(&format!("cut-{index}"), bytes).unwrap();
+                if span.start + span.length < length {
+                    boundary = Some(span);
+                }
+                start += span.length;
+                index += 1;
+            }
+            assert!(
+                index > 1,
+                "the joint retirement bound, not the bytes, cut this file"
+            );
+            let boundary = boundary.unwrap();
+            let next_line = input[(boundary.start + boundary.length) as usize..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap() as u64
+                + 1;
+            let beyond = &input
+                [boundary.start as usize..(boundary.start + boundary.length + next_line) as usize];
+            let refused = stage("cut-beyond", beyond).unwrap_err();
+            assert_eq!(refused.code, "RESOURCE_LIMIT", "{refused:?}");
         })
         .await;
 }

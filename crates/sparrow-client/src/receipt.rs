@@ -58,6 +58,18 @@ pub struct Discovery {
     pub max_event_batch_bytes: u32,
     /// Maximum independent events in one batch.
     pub max_event_batch_events: u32,
+    /// Largest declared staged import; a larger declaration is refused. Zero from a daemon
+    /// that does not advertise it; the single path then works as before (#280).
+    pub max_import_bytes: u64,
+    /// Longest record a staged layout keeps whole; zero when not advertised.
+    pub raw_record_bytes: u64,
+    /// Joint retirement bound of one artifact, with its per-chunk and per-record charges;
+    /// zero when not advertised. See [`crate::parts::PartLimits`].
+    pub retire_row_budget: u64,
+    /// Charge of one chunk against `retire_row_budget`.
+    pub retire_chunk_charge: u64,
+    /// Charge of one record against `retire_row_budget`.
+    pub retire_record_charge: u64,
 }
 
 impl Discovery {
@@ -78,6 +90,12 @@ impl Discovery {
             rdf_profile: value.get_rdf_profile()?.to_str()?.to_owned(),
             max_event_batch_bytes: value.get_max_event_batch_bytes(),
             max_event_batch_events: value.get_max_event_batch_events(),
+            // Zero is legal for each: only a part split needs them (#280).
+            max_import_bytes: value.get_max_import_bytes(),
+            raw_record_bytes: value.get_raw_record_bytes(),
+            retire_row_budget: value.get_retire_row_budget(),
+            retire_chunk_charge: value.get_retire_chunk_charge(),
+            retire_record_charge: value.get_retire_record_charge(),
         };
         if discovery.schema_version != crate::SCHEMA_VERSION
             || !discovery.store_id.starts_with("store:")

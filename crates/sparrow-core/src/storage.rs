@@ -657,9 +657,6 @@ struct Writer {
     /// Present exactly when the store archives before deleting.
     archive: Option<std::cell::RefCell<archive::ArchiveState>>,
     query_staging: Arc<std::sync::atomic::AtomicU64>,
-    /// Longest record an import layout keeps whole; `import::RAW_RECORD_BYTES`
-    /// except where the dev-only test hook lowers it for one open store.
-    raw_record_bytes: std::cell::Cell<u64>,
     /// Retirement share the import bound and pin caps derive from: production
     /// defaults except where the dev-only test hook scales them for one open store.
     retirement: std::cell::Cell<eviction::RetirementShare>,
@@ -1092,6 +1089,16 @@ fn store_properties(
         .with("max_records_per_artifact", config.max_records.to_string())
         .with("max_import_bytes", imports.bound().to_string())
         .with("import_over_bound_refusals", imports.refusals().to_string())
+        .with("max_raw_record_bytes", imports.raw_split().to_string())
+        .with("retire_row_budget", imports.row_budget().to_string())
+        .with(
+            "retire_chunk_charge",
+            import::RETIRE_CHUNK_CHARGE.to_string(),
+        )
+        .with(
+            "retire_record_charge",
+            import::RETIRE_RECORD_CHARGE.to_string(),
+        )
         .with("max_pin_members", config.max_pin_members.to_string())
         .with(
             "maintenance_reserve",
@@ -1776,7 +1783,6 @@ impl Store {
                 page_hold: std::cell::Cell::new(None),
                 archive: archive.map(std::cell::RefCell::new),
                 query_staging,
-                raw_record_bytes: std::cell::Cell::new(import::RAW_RECORD_BYTES),
                 retirement: std::cell::Cell::new(eviction::RetirementShare::DEFAULT),
                 import_ledger,
                 unrecorded: std::cell::RefCell::new(Vec::new()),
@@ -2040,6 +2046,12 @@ impl Store {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
                 "consumption requests require the durable staged import path",
+            ));
+        }
+        if request_id.starts_with(consumption::SET_PREFIX) && intake.is_some() {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                consumption::SET_INTAKE_REFUSAL,
             ));
         }
         let writer = self.lock()?;

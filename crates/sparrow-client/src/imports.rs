@@ -68,17 +68,46 @@ pub async fn import_file(
 
 /// Highest durable import progress observed across attempts: received bytes,
 /// then seal and layout, then prepared records and raw chunks of the next one.
+///
+/// A sink, when present, receives every raise with the parts completed before this upload,
+/// so a caller whose attempt future is dropped at a deadline still sees how far it got (#280).
 #[derive(Default)]
 pub(crate) struct Checkpoint {
     import: Option<(String, String)>,
     progress: (u64, u8, u64, u64),
+    sink: Option<(std::sync::Arc<crate::parts::PartsProgress>, u32)>,
 }
 
 impl Checkpoint {
+    /// A checkpoint that reports to `sink` as part `parts_done` of a set, or as the single
+    /// upload when `parts_done` is zero.
+    pub(crate) fn reporting(
+        sink: Option<std::sync::Arc<crate::parts::PartsProgress>>,
+        parts_done: u32,
+    ) -> Self {
+        Self {
+            sink: sink.map(|sink| (sink, parts_done)),
+            ..Self::default()
+        }
+    }
+
     fn observe(&mut self, progress: &crate::ImportProgress) {
         let stage = u8::from(progress.sealed) + u8::from(progress.layout_complete);
         self.import = Some((progress.store_id.clone(), progress.id.clone()));
-        self.progress = self.progress.max((progress.received_bytes, stage, 0, 0));
+        self.raise((progress.received_bytes, stage, 0, 0));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raise_for_tests(&mut self, progress: (u64, u8, u64, u64)) {
+        self.raise(progress);
+    }
+
+    /// Raise the durable progress mark; the one place it moves.
+    fn raise(&mut self, progress: (u64, u8, u64, u64)) {
+        self.progress = self.progress.max(progress);
+        if let Some((sink, parts_done)) = &self.sink {
+            sink.raise(*parts_done, self.progress);
+        }
     }
 }
 
@@ -162,6 +191,11 @@ pub(crate) trait StagedInput {
     fn read_at(&self, buffer: &mut [u8], offset: u64) -> Result<(), Error>;
     /// Refuse an input that changed since its length was captured.
     fn unchanged(&self) -> Result<(), Error>;
+    /// The payload identity already computed for these exact bytes, so `upload` need not
+    /// read them again; `unchanged` still guards the input before begin.
+    fn payload_hint(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// A completed regular file, bound to the identity observed before upload.
@@ -228,19 +262,11 @@ pub(crate) async fn upload(
     }
     let length = staged.length();
     let mut buffer = vec![0; crate::IMPORT_CHUNK_BYTES];
-    let mut digest = purrdf_hash::blake3::Hasher::new();
-    let mut remaining = length;
-    while remaining != 0 {
-        let count = remaining.min(buffer.len() as u64) as usize;
-        staged.read_at(&mut buffer[..count], length - remaining)?;
-        digest.update(&buffer[..count]);
-        remaining -= count as u64;
-    }
+    let payload = match staged.payload_hint() {
+        Some(payload) => payload.to_owned(),
+        None => payload_id(staged, &mut buffer)?,
+    };
     staged.unchanged()?;
-    let payload = format!(
-        "blake3:{}",
-        purrdf_hash::hex::encode(digest.finalize().as_bytes())
-    );
     let acceptance = crate::receipt::ExpectedArtifact {
         discovery,
         source,
@@ -368,10 +394,7 @@ pub(crate) async fn upload(
             ));
         }
         previous = Some(progress);
-        checkpoint.progress =
-            checkpoint
-                .progress
-                .max((length, 2, expected, raw_chunks.unwrap_or(0)));
+        checkpoint.raise((length, 2, expected, raw_chunks.unwrap_or(0)));
         if expected == value.get_total_records() {
             break;
         }
@@ -388,6 +411,26 @@ pub(crate) async fn upload(
         }
         wire::result::Error(error) => Err(Error::domain(error?)),
     }
+}
+
+/// Canonical payload identity of the whole staged input, read positionally in `buffer`.
+pub(crate) fn payload_id(
+    staged: &(impl StagedInput + ?Sized),
+    buffer: &mut [u8],
+) -> Result<String, Error> {
+    let length = staged.length();
+    let mut digest = purrdf_hash::blake3::Hasher::new();
+    let mut remaining = length;
+    while remaining != 0 {
+        let count = remaining.min(buffer.len() as u64) as usize;
+        staged.read_at(&mut buffer[..count], length - remaining)?;
+        digest.update(&buffer[..count]);
+        remaining -= count as u64;
+    }
+    Ok(format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(digest.finalize().as_bytes())
+    ))
 }
 
 fn import_reference(mut out: wire::import_ref::Builder<'_>, store: &str, id: &str) {
