@@ -713,10 +713,10 @@ Limits of the part path:
   permanent. Once reclamation deletes its row, the part begins again from byte zero
   under the same request id and publishes under a new artifact id; the manifest
   lists the ids finally published. While the worker runs, published parts are kept
-  in memory and are never read, hashed or begun again. After a restart that
-  follows a stall of more than two days, lapsed parts are uploaded again and their
-  records appear twice until retention (tracked in issue 285, "Close the duplicate-part
-  read").
+  in memory and are never read, hashed or begun again. A part's receipt is kept while
+  its claim's journal exists, so a part published before a restart, even after a stall
+  of more than two days, returns its saved receipt and its records are not stored
+  twice.
 - Parts age from their own publication, so the earliest can be evicted before the
   manifest. Removal checks the manifest proof, not that each listed part is still
   stored.

@@ -284,6 +284,17 @@ impl Writer {
         Ok(())
     }
 
+    /// Whether a publication receipt names a set part whose claim has a journal. Such a
+    /// receipt is kept for the life of the claim, not for its two-day window (#285).
+    pub(super) fn set_part_retained(&self, receipt: &Value) -> Result<bool, Error> {
+        let manifest = super::field(receipt, "manifest")?;
+        let request: String = read_field(manifest, "request_id")?;
+        let Some(claim) = super::consumption::part_claim_import(&request) else {
+            return Ok(false);
+        };
+        Ok(self.consumption(&claim)?.is_some())
+    }
+
     pub(super) fn managed_consumption_request(
         &self,
         key: &[u8],
@@ -292,7 +303,7 @@ impl Writer {
         if let Some(id) = key.strip_prefix(b"request:import-publication:") {
             let id = std::str::from_utf8(id)
                 .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
-            return Ok(self.consumption(id)?.is_some());
+            return Ok(self.consumption(id)?.is_some() || self.set_part_retained(value)?);
         }
         // A claim's set manifest receipt is its publication proof (#280): it is kept while the
         // claim's active or completed journal exists, never only for the retry window.
@@ -304,6 +315,14 @@ impl Writer {
             let hash = std::str::from_utf8(hash)
                 .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
             let claim = super::import::import_id(&format!("consume:{hash}"));
+            return Ok(self.consumption(&claim)?.is_some());
+        }
+        // A set part's ingest receipt is kept with its claim, as the manifest receipt is (#285).
+        if let Some(claim) = key
+            .strip_prefix(b"request:ingest:")
+            .and_then(|request| std::str::from_utf8(request).ok())
+            .and_then(super::consumption::part_claim_import)
+        {
             return Ok(self.consumption(&claim)?.is_some());
         }
         if key.starts_with(PREFIX.as_bytes()) {

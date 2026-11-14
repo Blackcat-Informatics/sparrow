@@ -370,6 +370,14 @@ pub(super) fn manifest_receipt_key(request_id: &str) -> Option<String> {
         .map(|hash| format!("request:ingest:{SET_PREFIX}{hash}.manifest"))
 }
 
+/// The import identity of the claim `consume:{H}` that owns set part `consumeset:{H}.part{k:010}`;
+/// none for any other request id (#285).
+pub(super) fn part_claim_import(request_id: &str) -> Option<String> {
+    let (hash, index) = request_id.strip_prefix(SET_PREFIX)?.split_once(".part")?;
+    (!hash.is_empty() && index.len() == 10 && index.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| super::import::import_id(&format!("consume:{hash}")))
+}
+
 /// What a claim's set manifest receipt says about its publication (#280).
 #[derive(Clone, Debug)]
 pub enum SetManifest {

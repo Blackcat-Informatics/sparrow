@@ -1094,13 +1094,13 @@ A catalog that carries a hold is refused by older builds, which name the
 A held claim whose move into `.sparrow-inflight/` fails is recorded as a pending
 attempt and logged once, and again only when the failure text changes.
 
-A part of a set that was published, whose receipt then lapsed (two days) before the
-manifest was accepted, is sent again when the claim resumes and is stored as another
-artifact. The manifest names only the new one; the earlier artifact is an ordinary
-artifact under the same source, so a records query over the source returns those
-bytes twice (tracked in issue 285, "Close the duplicate-part read"). A resumed set whose advertised limits changed is refused `CONFLICT` for
-the same part id until the earlier part receipts lapse. No supersede mark exists
-yet.
+A part of a set keeps its receipt for as long as its claim's journal exists, as the manifest
+receipt does. A part sent again after an outage, even one longer than two days, returns its
+saved receipt and is not stored a second time, so a records query over the source returns its
+bytes once. A resumed set whose advertised limits changed is refused `CONFLICT` for a part
+whose cut changed, for as long as the claim's journal exists, because those receipts no
+longer lapse; restoring the limits the set began under lets it resume. A set's cut is not
+recorded when it begins, so a change of limits is not absorbed.
 
 ### Claims after a rollback
 

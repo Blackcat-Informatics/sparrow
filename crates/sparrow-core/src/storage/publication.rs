@@ -227,6 +227,25 @@ fn missing_publication_receipt(
     })
 }
 
+/// A publication receipt is live inside its window, or for as long as it names a set part whose
+/// claim is recorded (#285).
+fn live_receipt(
+    writer: &Writer,
+    id: &str,
+    now: u64,
+    remaining: Option<&mut usize>,
+) -> Result<Option<Value>, Error> {
+    let Some(bytes) = writer.db.get_pinned(receipt_key(id))? else {
+        return Ok(None);
+    };
+    if let Some(remaining) = remaining {
+        Writer::charge_catalog_shape(remaining, &bytes)?;
+    }
+    let value = parse(&bytes)?;
+    let live = integer(&value, "expires_at")? > now || writer.set_part_retained(&value)?;
+    Ok(live.then_some(value))
+}
+
 pub(super) fn published_admitted(
     writer: &Writer,
     id: &str,
@@ -246,7 +265,7 @@ pub(super) fn published_admitted(
         }
         Some(parse(&bytes)?)
     } else {
-        writer.retry_admitted(&receipt_key(id), now, remaining.as_deref_mut())?
+        live_receipt(writer, id, now, remaining.as_deref_mut())?
     };
     let Some(saved) = saved else {
         return Ok(None);
