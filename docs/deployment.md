@@ -95,10 +95,12 @@ are separate finite resource budgets; `status` reports each wait.
 Sparrow has no configurable per-artifact byte limit. A large artifact ingests
 through the staged import within `disk_budget` and `min_free_bytes`, up to one
 fixed bound: an import above 8515420160 bytes (about 7.93 GiB) is refused before
-upload with a non-retryable `INVALID_ARGUMENT` (advertised as `Discovery.maxImportBytes`). That is the largest artifact whose catalog row one expiry or eviction
-pass can read, and it is below what one atomic publication can carry. The v2
-store format (#5) removes the bound. A single document above 128 MiB is stored
-as consecutive raw records, so within the bound expiry and eviction retire it in
+upload with a non-retryable `INVALID_ARGUMENT` (advertised as
+`Discovery.maxImportBytes`). That is the largest artifact whose catalog row one
+expiry or eviction pass can read, and it is below what one atomic publication can
+carry. The v2 store format (#5) removes the bound. A single document above
+128 MiB is stored as consecutive raw records, so within the bound expiry and
+eviction retire it in
 bounded passes. That guarantee also needs pins to stay within their store-wide
 caps of 606 pin rows and 36594 pinned members; creating or extending a pin past
 either cap is refused with `RESOURCE_LIMIT`, and releasing a pin always succeeds. A file above the bound that something other than `sparrow-ship`

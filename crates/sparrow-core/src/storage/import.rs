@@ -438,8 +438,8 @@ impl Writer {
         admitted_chunks(self.retirement.get()) as u64 * CHUNK as u64
     }
 
-    /// Refuse a declaration above the bound, or above the whole disk budget, permanently.
-    /// This is the one place an over-bound declaration is refused and counted.
+    /// Refuse a declaration above the import bound, permanently. This is the one place
+    /// an over-bound declaration is refused and counted.
     fn require_within_import_bound(&self, byte_length: u64) -> Result<(), Error> {
         let admitted = self.import_bytes_bound();
         if byte_length > admitted {
@@ -448,11 +448,11 @@ impl Writer {
                 admitted as f64 / (1u64 << 30) as f64
             )));
         }
-        let budget = self.config.disk_budget - self.config.maintenance_reserve;
-        if byte_length > budget {
-            return Err(self.import_ledger.refuse(format!(
-                "declared input of {byte_length} bytes exceeds the entire available disk budget of {budget} bytes; split the input into parts of at most {budget} bytes, import each part as its own request, then import the manifest"
-            )));
+        if byte_length > self.config.disk_budget - self.config.maintenance_reserve {
+            return Err(Error::new(
+                "RESOURCE_LIMIT",
+                "declared input exceeds the entire available disk budget",
+            ));
         }
         Ok(())
     }

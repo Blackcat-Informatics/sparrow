@@ -645,15 +645,15 @@ which is 8515420160 bytes (129935 chunks, about 7.93 GiB), before any byte is
 uploaded. The refusal is a non-retryable `INVALID_ARGUMENT`: no retry can change
 it. Its message states the bound in bytes and the remedy: split the input into
 parts of at most that many bytes, import each part as its own request, then
-import the manifest. A declaration above the whole data allowance (disk budget
-less maintenance reserve) is refused the same way. Both are counted in
-`Status.importOverBoundRefusals` (additive, in memory, since the daemon started),
-which names a caller that does not split. A client learns the bound before it
-declares from `Discovery.maxImportBytes` (additive field `@11`; an older daemon
-sends 0). No schema version changes and no stored format changes; an older client
-reads the refusal as an ordinary non-retryable domain error. An artifact of many small records can still need more chunks or record
-identities than its size implies. Layout preparation then refuses it with
-`RESOURCE_LIMIT` when its row would exceed the retirement pass, and publication
+import the manifest. The refusal is counted in `Status.importOverBoundRefusals`
+(additive, in memory, since the daemon started), which names a caller that does
+not split. A client learns the bound before it declares from
+`Discovery.maxImportBytes` (additive field `@11`; an older daemon sends 0). No
+schema version changes and no stored format changes; an older client reads the
+refusal as an ordinary non-retryable domain error. An artifact of many small
+records can still need more chunks or record identities than its size implies.
+Layout preparation then refuses it with `RESOURCE_LIMIT` when its row would
+exceed the retirement pass, and publication
 checks again for layouts prepared earlier and refuses record rows that would
 exceed the batch. An inline `ingest` is held to the same retirement check.
 Format #5 replaces the whole-row read and the single batch, and with them this
