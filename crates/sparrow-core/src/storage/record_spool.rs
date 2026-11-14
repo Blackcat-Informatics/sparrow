@@ -266,66 +266,6 @@ impl Builder {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn anonymous_pages_fail_closed_and_last_owner_releases_allocation() {
-        let dir = tempfile::tempdir().unwrap();
-        let counter = Arc::new(AtomicU64::new(DISK_BYTES));
-        let mut builder = Builder {
-            scope: Some(Value::Null),
-            cancellation: Default::default(),
-            file: staging_file(dir.path()).unwrap(),
-            index: staging_file(dir.path()).unwrap(),
-            count: 0,
-            written: 0,
-            charge: Charge {
-                counter: counter.clone(),
-                bytes: DISK_BYTES,
-            },
-            started: Instant::now(),
-            groups: None,
-            data_bytes: DISK_BYTES - FILE_OVERHEAD,
-            order: None,
-            sort_bytes: 0,
-        };
-        builder
-            .push(
-                purrdf_lex::json::Object::new()
-                    .with("row", "original")
-                    .into(),
-                None,
-            )
-            .unwrap();
-        let rows = builder.finish().unwrap().rows;
-        let allocated = counter.load(Ordering::Relaxed);
-        assert!(allocated > 0 && allocated < DISK_BYTES);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-        let held = rows.clone();
-        drop(rows);
-        assert_eq!(counter.load(Ordering::Relaxed), allocated);
-        let page = held.page(0, 1).unwrap();
-        assert_eq!(
-            super::super::parse(&page[0]).unwrap()["row"].as_str(),
-            Some("original")
-        );
-        let length = page[0].len();
-        held.index
-            .write_all_at(&index_entry(held.written + 1, length), 0)
-            .unwrap();
-        assert_eq!(held.page(0, 1).unwrap_err().code, "STORAGE_FAILURE");
-        held.index.set_len(0).unwrap();
-        assert_eq!(held.page(0, 1).unwrap_err().code, "STORAGE_FAILURE");
-        held.index.write_all_at(&index_entry(0, length), 0).unwrap();
-        held.file.set_len(0).unwrap();
-        assert_eq!(held.page(0, 1).unwrap_err().code, "STORAGE_FAILURE");
-        drop(held);
-        assert_eq!(counter.load(Ordering::Relaxed), 0);
-    }
-}
-
 #[derive(Debug)]
 pub(super) struct Rows {
     id: String,
@@ -459,5 +399,65 @@ impl Rows {
                 Ok(bytes)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anonymous_pages_fail_closed_and_last_owner_releases_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = Arc::new(AtomicU64::new(DISK_BYTES));
+        let mut builder = Builder {
+            scope: Some(Value::Null),
+            cancellation: Default::default(),
+            file: staging_file(dir.path()).unwrap(),
+            index: staging_file(dir.path()).unwrap(),
+            count: 0,
+            written: 0,
+            charge: Charge {
+                counter: counter.clone(),
+                bytes: DISK_BYTES,
+            },
+            started: Instant::now(),
+            groups: None,
+            data_bytes: DISK_BYTES - FILE_OVERHEAD,
+            order: None,
+            sort_bytes: 0,
+        };
+        builder
+            .push(
+                purrdf_lex::json::Object::new()
+                    .with("row", "original")
+                    .into(),
+                None,
+            )
+            .unwrap();
+        let rows = builder.finish().unwrap().rows;
+        let allocated = counter.load(Ordering::Relaxed);
+        assert!(allocated > 0 && allocated < DISK_BYTES);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let held = rows.clone();
+        drop(rows);
+        assert_eq!(counter.load(Ordering::Relaxed), allocated);
+        let page = held.page(0, 1).unwrap();
+        assert_eq!(
+            super::super::parse(&page[0]).unwrap()["row"].as_str(),
+            Some("original")
+        );
+        let length = page[0].len();
+        held.index
+            .write_all_at(&index_entry(held.written + 1, length), 0)
+            .unwrap();
+        assert_eq!(held.page(0, 1).unwrap_err().code, "STORAGE_FAILURE");
+        held.index.set_len(0).unwrap();
+        assert_eq!(held.page(0, 1).unwrap_err().code, "STORAGE_FAILURE");
+        held.index.write_all_at(&index_entry(0, length), 0).unwrap();
+        held.file.set_len(0).unwrap();
+        assert_eq!(held.page(0, 1).unwrap_err().code, "STORAGE_FAILURE");
+        drop(held);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 }

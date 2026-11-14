@@ -166,26 +166,6 @@ impl Drop for ClaimLock {
     }
 }
 
-#[cfg(test)]
-mod lock_tests {
-    use super::*;
-
-    #[test]
-    fn ownership_release_is_independent_of_inherited_descriptor_lifetime() {
-        let path = tempfile::NamedTempFile::new().unwrap();
-        let owner = ClaimLock::acquire(path.reopen().unwrap()).unwrap();
-        let inherited = owner.0.try_clone().unwrap();
-        assert!(ClaimLock::acquire(path.reopen().unwrap()).is_err());
-        drop(owner);
-        let replacement = ClaimLock::acquire(path.reopen().unwrap()).unwrap();
-        assert!(ClaimLock::acquire(path.reopen().unwrap()).is_err());
-        drop(inherited);
-        assert!(ClaimLock::acquire(path.reopen().unwrap()).is_err());
-        drop(replacement);
-        assert!(ClaimLock::acquire(path.reopen().unwrap()).is_ok());
-    }
-}
-
 /// The opened claimed generation. The original pathname is never reopened for upload.
 #[derive(Debug)]
 pub struct ClaimedFile {
@@ -739,5 +719,25 @@ impl ClaimRoot {
         #[cfg(test)]
         sparrow_test_support::crash::checkpoint("remove_checkpointed");
         Ok(removed)
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn ownership_release_is_independent_of_inherited_descriptor_lifetime() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let owner = ClaimLock::acquire(path.reopen().unwrap()).unwrap();
+        let inherited = owner.0.try_clone().unwrap();
+        assert!(ClaimLock::acquire(path.reopen().unwrap()).is_err());
+        drop(owner);
+        let replacement = ClaimLock::acquire(path.reopen().unwrap()).unwrap();
+        assert!(ClaimLock::acquire(path.reopen().unwrap()).is_err());
+        drop(inherited);
+        assert!(ClaimLock::acquire(path.reopen().unwrap()).is_err());
+        drop(replacement);
+        assert!(ClaimLock::acquire(path.reopen().unwrap()).is_ok());
     }
 }

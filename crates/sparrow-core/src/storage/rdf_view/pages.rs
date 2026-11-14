@@ -462,61 +462,6 @@ impl Store {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn borrowed_graph_items_preserve_all_native_streams_and_empty_graphs() {
-        let mut builder = purrdf::ir::RdfDatasetBuilder::new();
-        let s = builder.intern_iri("urn:s").unwrap();
-        let p = builder.intern_iri("urn:p").unwrap();
-        let o = builder.intern_iri("urn:o").unwrap();
-        let r = builder
-            .intern_blank("witness", purrdf::BlankScope(42))
-            .unwrap();
-        let g = builder.intern_iri("urn:empty").unwrap();
-        builder.declare_named_graph(g).unwrap();
-        builder.push_quad(s, p, o, None).unwrap();
-        let t = builder.intern_triple(s, p, o).unwrap();
-        builder.push_reifier(r, t).unwrap();
-        builder.push_annotation(r, p, o).unwrap();
-        let graph = builder.freeze().unwrap();
-        let rows = graph_items(&graph, true).collect::<Vec<_>>();
-        assert_eq!(rows.len(), 4);
-        let expected = [
-            SparqlGraphKind::NamedGraph,
-            SparqlGraphKind::Quad,
-            SparqlGraphKind::Reifier,
-            SparqlGraphKind::Annotation,
-        ];
-        for (row, expected) in rows.into_iter().zip(expected) {
-            let SparqlItem::Graph {
-                dataset,
-                auxiliary,
-                kind,
-                terms,
-            } = row
-            else {
-                panic!("graph row expected");
-            };
-            assert!(auxiliary);
-            assert!(std::ptr::eq(dataset, &*graph));
-            assert_eq!(kind, expected);
-            if kind == SparqlGraphKind::NamedGraph {
-                assert_eq!(terms, [Some(g), None, None, None]);
-            }
-            if kind == SparqlGraphKind::Reifier {
-                assert_eq!(terms, [Some(r), Some(t), None, None]);
-            }
-        }
-        assert!(
-            term_wire_bytes(TermInput::Indexed(&graph, t)).unwrap()
-                > term_wire_bytes(TermInput::Indexed(&graph, s)).unwrap()
-        );
-    }
-}
-
 type QueryOutcome = purrdf::sparql::FallibleSparqlResult<
     ReadError,
     purrdf::sparql::GovernedEvidence<RdfReadEvidence>,
@@ -857,4 +802,59 @@ fn stage_native_page(
         bytes,
         admission,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_graph_items_preserve_all_native_streams_and_empty_graphs() {
+        let mut builder = purrdf::ir::RdfDatasetBuilder::new();
+        let s = builder.intern_iri("urn:s").unwrap();
+        let p = builder.intern_iri("urn:p").unwrap();
+        let o = builder.intern_iri("urn:o").unwrap();
+        let r = builder
+            .intern_blank("witness", purrdf::BlankScope(42))
+            .unwrap();
+        let g = builder.intern_iri("urn:empty").unwrap();
+        builder.declare_named_graph(g).unwrap();
+        builder.push_quad(s, p, o, None).unwrap();
+        let t = builder.intern_triple(s, p, o).unwrap();
+        builder.push_reifier(r, t).unwrap();
+        builder.push_annotation(r, p, o).unwrap();
+        let graph = builder.freeze().unwrap();
+        let rows = graph_items(&graph, true).collect::<Vec<_>>();
+        assert_eq!(rows.len(), 4);
+        let expected = [
+            SparqlGraphKind::NamedGraph,
+            SparqlGraphKind::Quad,
+            SparqlGraphKind::Reifier,
+            SparqlGraphKind::Annotation,
+        ];
+        for (row, expected) in rows.into_iter().zip(expected) {
+            let SparqlItem::Graph {
+                dataset,
+                auxiliary,
+                kind,
+                terms,
+            } = row
+            else {
+                panic!("graph row expected");
+            };
+            assert!(auxiliary);
+            assert!(std::ptr::eq(dataset, &*graph));
+            assert_eq!(kind, expected);
+            if kind == SparqlGraphKind::NamedGraph {
+                assert_eq!(terms, [Some(g), None, None, None]);
+            }
+            if kind == SparqlGraphKind::Reifier {
+                assert_eq!(terms, [Some(r), Some(t), None, None]);
+            }
+        }
+        assert!(
+            term_wire_bytes(TermInput::Indexed(&graph, t)).unwrap()
+                > term_wire_bytes(TermInput::Indexed(&graph, s)).unwrap()
+        );
+    }
 }
