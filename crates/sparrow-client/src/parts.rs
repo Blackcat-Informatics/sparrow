@@ -34,6 +34,10 @@ pub struct PartLimits {
     pub retire_chunk_charge: u64,
     /// Charge of one record.
     pub retire_record_charge: u64,
+    /// Largest syslog artifact the daemon stores as one packet. A syslog file above it is cut
+    /// into opaque parts of at most this many bytes. The daemon's constant, supplied by the
+    /// caller; discovery does not advertise it.
+    pub syslog_packet_bytes: u64,
 }
 
 /// Which advertised values a daemon did not send, so no split can be planned.
@@ -69,8 +73,12 @@ impl MissingLimits {
 impl PartLimits {
     /// The limits when every advertised value is nonzero; otherwise which are missing. A
     /// daemon that does not send them keeps the single path as before, and only a split is
-    /// refused.
-    pub fn from_discovery(discovery: &Discovery) -> Result<Self, MissingLimits> {
+    /// refused. `syslog_packet_bytes` is the daemon's syslog packet limit, which the caller
+    /// names because discovery does not carry it.
+    pub fn from_discovery(
+        discovery: &Discovery,
+        syslog_packet_bytes: u64,
+    ) -> Result<Self, MissingLimits> {
         let missing = MissingLimits {
             max_import_bytes: discovery.max_import_bytes == 0,
             raw_record_bytes: discovery.raw_record_bytes == 0,
@@ -88,6 +96,7 @@ impl PartLimits {
             retire_row_budget: discovery.retire_row_budget,
             retire_chunk_charge: discovery.retire_chunk_charge,
             retire_record_charge: discovery.retire_record_charge,
+            syslog_packet_bytes,
         })
     }
 
@@ -225,8 +234,9 @@ fn raw_piece(limits: &PartLimits, start: u64, cap: u64, index: u32) -> Result<Pa
 /// hold, counting each line as the daemon charges it: `records_of(line)` records and
 /// `ceil(line / 65536)` chunks, the terminator included. A line that cannot fit alone is cut
 /// raw, and the rest of that line forms the next part, stored opaque, up to its end. Every
-/// other format is cut into raw parts stored opaque. A part that fails here is never
-/// uploaded.
+/// other format is cut into raw parts stored opaque. A syslog part is also at most the syslog
+/// packet limit, since the daemon stores one syslog artifact as one packet. A part that fails
+/// here is never uploaded.
 pub fn next_cut(
     source: &(impl CutSource + ?Sized),
     length: u64,
@@ -238,7 +248,11 @@ pub fn next_cut(
     if start >= length {
         return Err(Error::InvalidArgument("a part begins inside its source"));
     }
-    let window = length.min(start.saturating_add(limits.max_bytes));
+    let reach = match format {
+        Format::Syslog => limits.max_bytes.min(limits.syslog_packet_bytes),
+        _ => limits.max_bytes,
+    };
+    let window = length.min(start.saturating_add(reach));
     let mut buffer = vec![0; crate::IMPORT_CHUNK_BYTES];
     if !line_format(format) {
         return raw_piece(limits, start, window - start, index);
@@ -298,7 +312,8 @@ pub fn next_cut(
 }
 
 /// Whether a source of `length` bytes is a single part, so it takes the single path. A
-/// source no denser than one record per byte that fits is decided without reading it.
+/// source no denser than one record per byte that fits is decided without reading it. A
+/// syslog source above the packet limit is never one part: the daemon refuses it as one packet.
 pub fn is_one_part(
     source: &(impl CutSource + ?Sized),
     length: u64,
@@ -309,6 +324,9 @@ pub fn is_one_part(
         return Ok(true);
     }
     if length > limits.max_bytes {
+        return Ok(false);
+    }
+    if format == Format::Syslog && length > limits.syslog_packet_bytes {
         return Ok(false);
     }
     if limits.fits(length, length) {
@@ -703,6 +721,7 @@ mod tests {
             retire_row_budget,
             retire_chunk_charge: 134,
             retire_record_charge: 84,
+            syslog_packet_bytes: u64::MAX,
         }
     }
 
@@ -874,13 +893,13 @@ mod tests {
             retire_record_charge: 0,
         };
         // A daemon at the previous release sends the import bound and none of the rest.
-        let missing = PartLimits::from_discovery(&discovery).unwrap_err();
+        let missing = PartLimits::from_discovery(&discovery, 65_536).unwrap_err();
         assert!(!missing.max_import_bytes && missing.raw_record_bytes && missing.retirement);
         assert!(missing.names().contains("rawRecordBytes"));
         assert!(missing.names().contains("retireRowBudget"));
         assert!(!missing.names().contains("maxImportBytes"));
         discovery.max_import_bytes = 0;
-        let missing = PartLimits::from_discovery(&discovery).unwrap_err();
+        let missing = PartLimits::from_discovery(&discovery, 65_536).unwrap_err();
         assert!(missing.names().contains("maxImportBytes"));
         (discovery.max_import_bytes, discovery.raw_record_bytes) = (1 << 33, 1 << 27);
         (
@@ -888,7 +907,7 @@ mod tests {
             discovery.retire_chunk_charge,
             discovery.retire_record_charge,
         ) = (1, 134, 84);
-        assert!(PartLimits::from_discovery(&discovery).is_ok());
+        assert!(PartLimits::from_discovery(&discovery, 65_536).is_ok());
     }
 
     /// INVARIANT (#280): a part whose staging lapsed waits for reclamation and begins again;

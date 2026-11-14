@@ -716,7 +716,8 @@ impl ClaimRoot {
                 .await;
         }
         let length = claim.journal.observed.byte_length;
-        let limits = match PartLimits::from_discovery(client.discovery()) {
+        let packet = sparrow_core::SYSLOG_MESSAGE_BYTES as u64;
+        let limits = match PartLimits::from_discovery(client.discovery(), packet) {
             Ok(limits) => limits,
             Err(missing) => {
                 let bound = client.discovery().max_import_bytes;
