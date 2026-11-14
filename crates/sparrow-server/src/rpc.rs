@@ -3036,6 +3036,7 @@ impl wire::sparrow::Server for Rpc {
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
                 out.set_max_inline_artifact_bytes(number(&value, "max_inline_artifact_bytes")?);
                 out.set_max_records_per_artifact(number(&value, "max_records_per_artifact")?);
+                out.set_max_import_bytes(number(&value, "max_import_bytes")?);
                 out.set_text_analyzer(field::<String>(&value, "text_analyzer")?);
                 out.set_text_profile(field::<String>(&value, "text_profile")?);
                 out.set_rdf_profile(field::<String>(&value, "rdf_profile")?);
@@ -3192,6 +3193,7 @@ impl wire::sparrow::Server for Rpc {
                 out.set_max_inline_artifact_bytes(number(&value, "max_inline_artifact_bytes")?);
                 out.set_max_records_per_artifact(number(&value, "max_records_per_artifact")?);
                 out.set_max_pin_members(number(&value, "max_pin_members")?);
+                out.set_import_over_bound_refusals(number(&value, "import_over_bound_refusals")?);
                 out.set_pin_read_handles(number(&value, "pin_read_handles")?);
                 out.set_pin_read_bytes(number(&value, "pin_read_bytes")?);
                 out.set_max_pin_read_handles(number(&value, "max_pin_read_handles")?);

@@ -15412,3 +15412,54 @@ async fn sources_listing_does_not_hold_the_writer_lock() {
         })
         .await;
 }
+
+/// INVARIANT (#280): a declaration above the import bound answers a non-retryable
+/// INVALID_ARGUMENT that names the bound and the remedy, Discovery advertises that same bound
+/// before any declaration, status counts the refusal, and an in-bound import begins unchanged.
+#[tokio::test(flavor = "current_thread")]
+async fn an_over_bound_declaration_is_permanent_named_advertised_and_counted() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let daemon = start(&config, &socket).await;
+            let connection = connect(&socket).await.unwrap();
+            let client = connection.client.clone();
+            let bound = sparrow_core::MAX_IMPORT_BYTES;
+            let discovered = client.discover_request().send().promise.await.unwrap();
+            let discovery = rpc_ok(discovered.get().unwrap().get_result().unwrap());
+            assert_eq!(discovery.get_max_import_bytes(), bound);
+            let mut request = client.import_begin_request();
+            let mut begin = request.get().init_request();
+            begin.set_request_id("over-bound");
+            begin.set_source("oversized");
+            begin.set_format(wire::Format::Log);
+            begin.set_byte_length(bound + 1);
+            begin.set_payload_id(format!("blake3:{}", "0".repeat(64)));
+            let response = request.send().promise.await.unwrap();
+            let result = response.get().unwrap().get_result().unwrap();
+            let wire::result::Error(error) = result.which().unwrap() else {
+                panic!("an over-bound declaration was admitted");
+            };
+            let error = error.unwrap();
+            assert_eq!(
+                error.get_code().unwrap().to_str().unwrap(),
+                "INVALID_ARGUMENT"
+            );
+            assert!(!error.get_retryable());
+            let message = error.get_message().unwrap().to_str().unwrap();
+            assert!(
+                message.contains(&format!("at most {bound} bytes")) && message.contains("split"),
+                "{message}"
+            );
+            begin_numbered_import(&client, "in-bound").await.unwrap();
+            let response = client.status_request().send().promise.await.unwrap();
+            let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+            assert_eq!(status.get_import_over_bound_refusals(), 1);
+            drop(connection);
+            drop(daemon);
+        })
+        .await;
+}

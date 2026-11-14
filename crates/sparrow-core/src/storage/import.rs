@@ -14,6 +14,47 @@ use rocksdb::WriteBatch;
 /// Fixed raw staging unit; only the final unit may be shorter.
 pub const IMPORT_CHUNK_BYTES: usize = CHUNK;
 const MAX_IMPORTS: usize = 16;
+
+/// The import bound a store advertises and the over-bound refusals it has counted. One
+/// instance is shared by the writer, which enforces the bound, and `Store::properties`,
+/// which reports both without taking the writer lock. The count lives for the process (#280).
+#[derive(Debug)]
+pub(super) struct ImportLedger {
+    bound: std::sync::atomic::AtomicU64,
+    refusals: std::sync::atomic::AtomicU64,
+}
+
+impl Default for ImportLedger {
+    fn default() -> Self {
+        Self {
+            bound: std::sync::atomic::AtomicU64::new(MAX_IMPORT_BYTES),
+            refusals: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl ImportLedger {
+    pub(super) fn bound(&self) -> u64 {
+        self.bound.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "test-support")]
+    fn set_bound(&self, bound: u64) {
+        self.bound
+            .store(bound, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(super) fn refusals(&self) -> u64 {
+        self.refusals.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Count one over-bound declaration and build its permanent refusal.
+    fn refuse(&self, message: String) -> Error {
+        self.refusals
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Error::new("INVALID_ARGUMENT", message)
+    }
+}
 /// The `RESOURCE_LIMIT` message of a begin-import that finds every journal slot occupied. The
 /// daemon waits for a slot on exactly this refusal (#246); no other refusal is one.
 pub const IMPORT_JOURNALS_OCCUPIED: &str =
@@ -397,6 +438,25 @@ impl Writer {
         admitted_chunks(self.retirement.get()) as u64 * CHUNK as u64
     }
 
+    /// Refuse a declaration above the bound, or above the whole disk budget, permanently.
+    /// This is the one place an over-bound declaration is refused and counted.
+    fn require_within_import_bound(&self, byte_length: u64) -> Result<(), Error> {
+        let admitted = self.import_bytes_bound();
+        if byte_length > admitted {
+            return Err(self.import_ledger.refuse(format!(
+                "declared input of {byte_length} bytes exceeds the import bound of {admitted} bytes (about {:.2} GiB), the most one retirement pass can read back as an artifact; split the input into parts of at most {admitted} bytes, import each part as its own request, then import the manifest",
+                admitted as f64 / (1u64 << 30) as f64
+            )));
+        }
+        let budget = self.config.disk_budget - self.config.maintenance_reserve;
+        if byte_length > budget {
+            return Err(self.import_ledger.refuse(format!(
+                "declared input of {byte_length} bytes exceeds the entire available disk budget of {budget} bytes; split the input into parts of at most {budget} bytes, import each part as its own request, then import the manifest"
+            )));
+        }
+        Ok(())
+    }
+
     /// Refuse an artifact whose catalog row one retirement pass could not read. The
     /// declared-size bound covers documents; this covers many-record artifacts.
     pub(super) fn require_retirable(&self, chunks: usize, records: usize) -> Result<(), Error> {
@@ -568,6 +628,7 @@ impl Store {
             record_reserve,
         };
         writer.retirement.set(share);
+        writer.import_ledger.set_bound(writer.import_bytes_bound());
         Ok(super::eviction::RetirementBounds {
             import_bytes: writer.import_bytes_bound(),
             pins: share.max_pins(),
@@ -1178,22 +1239,7 @@ impl Writer {
             previous.require_live(now)?;
             return Ok(previous);
         }
-        let admitted = writer.import_bytes_bound();
-        if byte_length > admitted {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                format!(
-                    "declared input of {byte_length} bytes exceeds {admitted} bytes (about {:.2} GiB), the most one retirement pass can read back as an artifact; split the input and import the parts",
-                    admitted as f64 / (1u64 << 30) as f64
-                ),
-            ));
-        }
-        if byte_length > writer.config.disk_budget - writer.config.maintenance_reserve {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                "declared input exceeds the entire available disk budget",
-            ));
-        }
+        writer.require_within_import_bound(byte_length)?;
         if writer.imports()?.len() >= MAX_IMPORTS {
             return Err(Error::new("RESOURCE_LIMIT", IMPORT_JOURNALS_OCCUPIED));
         }

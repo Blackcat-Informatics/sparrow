@@ -560,6 +560,8 @@ struct Unlocked {
     source_time_evidence: stream_evidence::Ledger,
     /// Files tailed without a stored checkpoint and registry rows retired for room (#224).
     tail_evidence: tail_evidence::Ledger,
+    /// The advertised import bound and the over-bound refusals counted (#280).
+    import_ledger: Arc<import::ImportLedger>,
 }
 
 /// A non-blocking callback that asks the retention duty to run a pass now.
@@ -661,6 +663,8 @@ struct Writer {
     /// Retirement share the import bound and pin caps derive from: production
     /// defaults except where the dev-only test hook scales them for one open store.
     retirement: std::cell::Cell<eviction::RetirementShare>,
+    /// Shared with `Unlocked`; counts every over-bound declaration this writer refuses.
+    import_ledger: Arc<import::ImportLedger>,
     /// Tail generations taken while the stored registry was full and nothing could be retired.
     /// They are never written to the registry and are lost with the process (#224).
     unrecorded: std::cell::RefCell<Vec<tail::TailGeneration>>,
@@ -1042,7 +1046,12 @@ impl Catalog for Pin {
 }
 
 /// Constant-size store and admission properties from the stored `store_format`.
-fn store_properties(format: Option<Vec<u8>>, id: &str, config: &Config) -> Result<Object, Error> {
+fn store_properties(
+    format: Option<Vec<u8>>,
+    id: &str,
+    config: &Config,
+    imports: &import::ImportLedger,
+) -> Result<Object, Error> {
     let format = format.ok_or_else(|| Error::new("STORAGE_FAILURE", "store format missing"))?;
     Ok(Object::new()
         .with("store_id", id.to_owned())
@@ -1081,6 +1090,8 @@ fn store_properties(format: Option<Vec<u8>>, id: &str, config: &Config) -> Resul
             INLINE_ARTIFACT_BYTES.to_string(),
         )
         .with("max_records_per_artifact", config.max_records.to_string())
+        .with("max_import_bytes", imports.bound().to_string())
+        .with("import_over_bound_refusals", imports.refusals().to_string())
         .with("max_pin_members", config.max_pin_members.to_string())
         .with(
             "maintenance_reserve",
@@ -1720,6 +1731,7 @@ impl Store {
         let retention_waker = Arc::new(Mutex::new(None));
         let forced = forced_compaction::Forced::new(Arc::clone(&retention_waker));
         let pressure_request_waker = Arc::new(Mutex::new(None));
+        let import_ledger = Arc::new(import::ImportLedger::default());
         let mut store = Self {
             id: Arc::from(id.as_str()),
             open_files,
@@ -1745,6 +1757,7 @@ impl Store {
                 stream_evidence: stream_evidence::Ledger::default(),
                 source_time_evidence: stream_evidence::Ledger::default(),
                 tail_evidence: tail_evidence::Ledger::default(),
+                import_ledger: Arc::clone(&import_ledger),
             }),
             inner: Arc::new(Mutex::new(Writer {
                 db,
@@ -1765,6 +1778,7 @@ impl Store {
                 query_staging,
                 raw_record_bytes: std::cell::Cell::new(import::RAW_RECORD_BYTES),
                 retirement: std::cell::Cell::new(eviction::RetirementShare::DEFAULT),
+                import_ledger,
                 unrecorded: std::cell::RefCell::new(Vec::new()),
                 source_time_full: std::cell::Cell::new(false),
                 #[cfg(feature = "test-support")]
@@ -2897,6 +2911,7 @@ impl Store {
             self.unlocked.db.get("store_format")?,
             &self.id,
             &self.unlocked.config,
+            &self.unlocked.import_ledger,
         )?
         .into())
     }
@@ -3089,6 +3104,7 @@ impl Store {
             reader.get(b"store_format")?,
             &self.id,
             &self.unlocked.config,
+            &self.unlocked.import_ledger,
         )?
         .with("source_read_handles", source_handles.to_string())
         .with("source_read_bytes", source_bytes.to_string())

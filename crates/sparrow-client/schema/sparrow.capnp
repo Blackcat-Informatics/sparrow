@@ -309,6 +309,10 @@ struct Status {
   # Schema 71 (additive, #257): what the daemon did while the free-space floor paused writes.
   # A reader that does not know this field sees no change.
   floorPause @60 :FloorPauseStatus;
+  # Additive (#280): declarations refused above the import bound since the daemon started. It
+  # names a caller that does not split its input. A reader that does not know this field sees
+  # no change.
+  importOverBoundRefusals @61 :UInt64;
 }
 # Connections the daemon kept accepting while paused, writes it answered with the floor label,
 # reads it served while paused and reads refused for staging, since it started. `pausedSince` is the
@@ -408,6 +412,9 @@ struct Discovery {
   maxEventBatchBytes @7 :UInt32; maxEventBatchEvents @8 :UInt32;
   durabilityStatus @9 :DurabilityStatus;
   producerLimits @10 :ProducerLimits;
+  # Additive (#280): the largest declared import; a larger declaration is refused
+  # INVALID_ARGUMENT, so split into parts of at most this many bytes. 0 from an older daemon.
+  maxImportBytes @11 :UInt64;
 }
 
 enum PressurePhase { ready @0; requested @1; awaitingReclamation @2; blocked @3; awaitingArchive @4; }
