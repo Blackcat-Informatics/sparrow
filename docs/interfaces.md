@@ -680,7 +680,11 @@ holds whole lines while the byte bound, the record limit and the joint bound all
 hold, counting each line as the layout does, terminator included. A line too
 large to fit alone is cut raw, and the pieces that begin or end inside it are
 stored `opaque`. Every other format (`json`, `markdown`, `syslog`, `opaque`) is cut
-into raw parts stored `opaque`, so nothing parses a fragment. Part `k` of claim
+into raw parts stored `opaque`, so nothing parses a fragment. A syslog part is at most
+the 65536-byte syslog packet limit: the daemon stores one syslog artifact as one packet,
+so a syslog file above that limit (and within the import bound) is cut at the limit, and a
+syslog file at or under it keeps the single path. The packet limit is the daemon's own
+constant, named by the consume worker; discovery does not advertise it. Part `k` of claim
 `consume:{H}` is the ordinary staged import `consumeset:{H}.part{k:010}` under the
 claim's source; its records are readable as soon as it publishes. The manifest,
 ingested last and durably as `consumeset:{H}.manifest` in format `json`, is
