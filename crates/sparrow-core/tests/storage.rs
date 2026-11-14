@@ -25651,7 +25651,9 @@ fn lost_manifest_receipt_is_told_apart_from_a_single_claim() {
 }
 
 /// INVARIANT (#280, OR-G): a part whose receipt lapsed and whose row was reclaimed begins
-/// afresh under the same request id and publishes under a new artifact id.
+/// afresh under the same request id and publishes under a new artifact id. The duplicate
+/// records this leaves in a source's reads are tracked in issue 285, "Close the duplicate-part
+/// read".
 #[test]
 fn lapsed_reclaimed_part_begins_again_under_the_same_request_id() {
     let dir = tempfile::tempdir().unwrap();

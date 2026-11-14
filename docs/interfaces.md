@@ -715,7 +715,8 @@ Limits of the part path:
   lists the ids finally published. While the worker runs, published parts are kept
   in memory and are never read, hashed or begun again. After a restart that
   follows a stall of more than two days, lapsed parts are uploaded again and their
-  records appear twice until retention.
+  records appear twice until retention (tracked in issue 285, "Close the duplicate-part
+  read").
 - Parts age from their own publication, so the earliest can be evicted before the
   manifest. Removal checks the manifest proof, not that each listed part is still
   stored.

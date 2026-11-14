@@ -15686,6 +15686,13 @@ async fn over_bound_non_line_consume_file_is_taken_as_opaque_parts() {
 /// no call hook); the guard's visible effect is that no manifest is ingested and the call
 /// fails, which a re-plan would not do (each part would answer its saved receipt and the
 /// manifest would be accepted again).
+///
+/// Not written here: the recorded single-path claim whose bound would now split the file (design
+/// r7 R1 and r6). `set_harness` fixes the bound (`SET_ROW_BUDGET`, asserted at `import_bytes`
+/// equal to `20 * 65_536`), so a second open cannot advertise a smaller one. The reason no split
+/// is reached is `consumption.rs:713`: a recorded single-path claim (`published_artifact` Some)
+/// returns `publish_single` before `PartLimits` and the bound are read (`consumption.rs:718-736`).
+/// The `again == single_id` assertion below shows the saved receipt is returned.
 #[tokio::test]
 async fn recorded_set_claim_with_a_missing_manifest_receipt_plans_uploads_and_begins_nothing() {
     tokio::task::LocalSet::new()
@@ -15732,6 +15739,21 @@ async fn recorded_set_claim_with_a_missing_manifest_receipt_plans_uploads_and_be
             else {
                 panic!("a recorded set claim is not removed");
             };
+            // The store's own listing of the source's artifacts: a failed attempt that uploaded
+            // nothing leaves the count where it was (the parts of the first attempt stay as they were).
+            let listed = |store: &sparrow_core::Store| {
+                store
+                    .artifacts(now)
+                    .unwrap()
+                    .iter()
+                    .filter(|artifact| artifact.source == "set-source")
+                    .count()
+            };
+            let listed_before = listed(&harness.store);
+            assert!(
+                listed_before > 0,
+                "the first attempt's parts are not listed"
+            );
             for _ in 0..2 {
                 let failure = harness
                     .root
@@ -15744,6 +15766,11 @@ async fn recorded_set_claim_with_a_missing_manifest_receipt_plans_uploads_and_be
                     "{failure:?}"
                 );
             }
+            assert_eq!(
+                listed(&harness.store),
+                listed_before,
+                "a failed attempt published an artifact for the source"
+            );
             assert!(matches!(
                 harness
                     .store
@@ -15762,6 +15789,191 @@ async fn recorded_set_claim_with_a_missing_manifest_receipt_plans_uploads_and_be
                 .await
                 .unwrap();
             assert_eq!(again, single_id);
+        })
+        .await;
+}
+
+/// What one watch's status says that the publish-hold test reads.
+#[derive(Debug)]
+struct WatchSeen {
+    id: String,
+    revision: u64,
+    held: u32,
+    pending: u32,
+    completed: u64,
+    tail_generations: usize,
+}
+
+async fn watches_seen(client: &wire::sparrow::Client) -> Vec<WatchSeen> {
+    let response = client.status_request().send().promise.await.unwrap();
+    let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+    status
+        .get_consume_watches()
+        .unwrap()
+        .iter()
+        .map(|watch| WatchSeen {
+            id: watch.get_id().unwrap().to_str().unwrap().to_owned(),
+            revision: watch.get_revision(),
+            held: watch.get_held_claims(),
+            pending: watch.get_pending_claims(),
+            completed: watch.get_completed_claims(),
+            tail_generations: watch.get_tail_generation_ids().unwrap().len() as usize,
+        })
+        .collect()
+}
+
+/// INVARIANT (#280, publish hold, design 3.7A): five held watches of six finished files each,
+/// beside one unheld watch and one tail watch, in one daemon. The pending claims of all held
+/// watches together stay below `HELD_CLAIMS_TOTAL` (the store's sixteen journal slots less the
+/// four `HELD_RESERVED_SLOTS`, so twelve), and the files past that total stay unclaimed in their
+/// producers' directories, claimed in order. The unheld watch's file is claimed and published,
+/// and the tail begins a generation, while the holds stand. Clearing each hold wakes its watch:
+/// the files that waited are claimed and published. Fails when a held claim is taken past the
+/// total, when a file past a cap is claimed out of order, or when a cleared hold does not wake
+/// its watch.
+#[tokio::test(flavor = "current_thread")]
+async fn held_watches_share_one_total_and_waiting_files_are_claimed_in_order_when_the_hold_clears()
+{
+    // The held claims may stand at most `HELD_CLAIMS_TOTAL`; each watch's share is 4 (`HELD_CLAIMS_PER_WATCH`).
+    const HELD_TOTAL: u32 = (sparrow_core::MAX_CONSUMPTION_JOURNALS - 4) as u32;
+    const PER_WATCH: u32 = 4;
+    const HELD_WATCHES: usize = 5;
+    const FILES: usize = 6;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use sparrow_server::ProducerContract::{ActiveFilesRetain, FinishedFiles};
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let watch = |id: &str, root: &Path, producer_contract, publish_hold| {
+                sparrow_server::ConsumeWatch {
+                    id: id.into(),
+                    root: root.into(),
+                    producer_contract,
+                    source: id.into(),
+                    format: "jsonl".into(),
+                    quiet_ms: 100,
+                    max_directories: 16,
+                    max_candidates: 16,
+                    publish_hold,
+                }
+            };
+            let mut held_roots = Vec::new();
+            for index in 0..HELD_WATCHES {
+                let id = format!("held-{index}");
+                let root = dir.path().join(&id);
+                std::fs::create_dir(&root).unwrap();
+                for file in 0..FILES {
+                    std::fs::write(root.join(format!("file-{file}.jsonl")), b"{}\n").unwrap();
+                }
+                append_watch_config(&config, &watch(&id, &root, FinishedFiles, true));
+                held_roots.push((id, root));
+            }
+            let open = dir.path().join("open");
+            std::fs::create_dir(&open).unwrap();
+            std::fs::write(open.join("ready.jsonl"), b"{}\n").unwrap();
+            append_watch_config(&config, &watch("open", &open, FinishedFiles, false));
+            let tail = dir.path().join("tail");
+            std::fs::create_dir(&tail).unwrap();
+            std::fs::write(tail.join("active.jsonl"), b"{}\n").unwrap();
+            append_watch_config(&config, &watch("tail", &tail, ActiveFilesRetain, false));
+
+            let _daemon = start(&config, &socket).await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let store_id = client.discovery().store_id.clone();
+            let is_held = |watch: &WatchSeen| watch.id.starts_with("held-");
+
+            // Until the holds have claimed all they may, and the unheld and tail watches have run.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let seen = watches_seen(client.capability()).await;
+                let held: u32 = seen.iter().filter(|w| is_held(w)).map(|w| w.held).sum();
+                let open_done = seen.iter().any(|w| w.id == "open" && w.completed == 1);
+                let tailed = seen
+                    .iter()
+                    .any(|w| w.id == "tail" && w.tail_generations != 0);
+                if held == HELD_TOTAL && open_done && tailed {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "held watches never settled: {seen:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // The total holds after the passes that follow, not only at the first moment it is met.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let seen = watches_seen(client.capability()).await;
+            let held: u32 = seen.iter().filter(|w| is_held(w)).map(|w| w.held).sum();
+            assert_eq!(held, HELD_TOTAL, "{seen:?}");
+            for (id, root) in &held_roots {
+                let claimed = seen.iter().find(|w| &w.id == id).unwrap().held;
+                assert!(claimed <= PER_WATCH, "{id} holds {claimed}");
+                // The claimed files are the first in order; the waiting ones are the rest.
+                let mut waiting: Vec<String> = std::fs::read_dir(root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                    .filter(|name| !name.starts_with('.'))
+                    .collect();
+                waiting.sort();
+                let expected: Vec<String> = (claimed as usize..FILES)
+                    .map(|file| format!("file-{file}.jsonl"))
+                    .collect();
+                assert_eq!(
+                    waiting, expected,
+                    "{id}: the waiting files are not the rest in order"
+                );
+            }
+
+            // Clearing each hold wakes its watch: the files that waited are claimed and published.
+            for (id, root) in &held_roots {
+                let revision = seen.iter().find(|w| &w.id == id).unwrap().revision;
+                let file = dir.path().join(format!("{id}-clear.toml"));
+                let definition = toml::to_string(&watch(id, root, FinishedFiles, false)).unwrap();
+                std::fs::write(&file, definition).unwrap();
+                cli(
+                    &socket,
+                    &[
+                        "watch",
+                        "put",
+                        &format!("clear-{id}"),
+                        &revision.to_string(),
+                        file.to_str().unwrap(),
+                    ],
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let seen = watches_seen(client.capability()).await;
+                let done = seen
+                    .iter()
+                    .filter(|w| is_held(w))
+                    .all(|w| w.completed == FILES as u64 && w.pending == 0);
+                if done {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cleared holds never finished: {seen:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let sources = cli(&socket, &["sources", &store_id]);
+            let expected = FILES.to_string();
+            for (id, _) in &held_roots {
+                let row = sources["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["source_id"].as_str() == Some(id.as_str()))
+                    .unwrap();
+                assert_eq!(
+                    row["complete_artifacts"].as_str(),
+                    Some(expected.as_str()),
+                    "{id}"
+                );
+            }
         })
         .await;
 }

@@ -1080,8 +1080,9 @@ from the producer, and a held claim keeps one of the sixteen pending-claim slots
 A hold never stops another watch or a tail. A held watch reserves at most four
 files; further ready files stay in the producer's directory, unclaimed and
 untouched, and are claimed in order once the hold clears and slots free. All held
-watches together leave at least four slots free for unheld watches and tail
-generations. Status names the state: `publish_hold`, `held_claims` (the watch's
+watches together hold at most twelve pending claims (the sixteen slots less four), so
+at least four slots stay free for unheld watches and tail generations; a held claim
+that would take the total past twelve waits instead. Status names the state: `publish_hold`, `held_claims` (the watch's
 pending finished-file claims) and `oldest_held_first_seen`, which is the
 reservation time of the oldest of those claims. It is not the time the hold was
 set, so a claim that waited before the hold shows its own age. The daemon writes
@@ -1097,7 +1098,7 @@ A part of a set that was published, whose receipt then lapsed (two days) before 
 manifest was accepted, is sent again when the claim resumes and is stored as another
 artifact. The manifest names only the new one; the earlier artifact is an ordinary
 artifact under the same source, so a records query over the source returns those
-bytes twice. A resumed set whose advertised limits changed is refused `CONFLICT` for
+bytes twice (tracked in issue 285, "Close the duplicate-part read"). A resumed set whose advertised limits changed is refused `CONFLICT` for
 the same part id until the earlier part receipts lapse. No supersede mark exists
 yet.
 

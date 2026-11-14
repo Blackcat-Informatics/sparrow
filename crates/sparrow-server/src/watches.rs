@@ -220,24 +220,34 @@ fn publishable<'a>(
 /// Most pending finished-file claims one publish-held watch may take. Held claims never
 /// complete, so each occupies one of the store's sixteen journal slots until the hold clears.
 /// Four is enough to park a rollback rehearsal's in-flight claims or an operator's pause, and
-/// no more than a quarter of the store, so one watch's pause never uses the whole table.
+/// no more than a quarter of the store, so one watch's pause never uses the whole table. This
+/// share keeps held watches fair to one another; the total of all held claims is
+/// `HELD_CLAIMS_TOTAL`, which binds once several watches are held.
 const HELD_CLAIMS_PER_WATCH: usize = 4;
 
-/// Journal slots a publish-held watch never takes: it claims only while at least this many
-/// slots stay free, so unheld watches and tail generations can always reserve, however many
-/// watches are held (eight held watches at the per-watch share would otherwise take all).
+/// Journal slots every publish-held watch together never takes. Unheld watches and tail
+/// generations reserve from these, so they can always reserve however many watches are held.
 const HELD_RESERVED_SLOTS: usize = 4;
 
-/// Whether a publish-held watch `id` may reserve another finished file. Files it may not
-/// reserve stay unclaimed in the producer's directory and are claimed, in order, once the hold
-/// clears and slots free.
+/// The total number of pending claims that held watches may stand, all of them together: the
+/// store's journal slots (`MAX_CONSUMPTION_JOURNALS`, 16) less `HELD_RESERVED_SLOTS`, so twelve.
+/// `pending` counts every pending claim, unheld and tail claims included, so a held claim is
+/// refused whenever it would leave fewer than four slots free for an unheld watch or a tail.
+/// Enforced in `held_may_claim`, which the claim pass consults with the count read at its start.
+/// The pass reserves at most one file before it leaves the detector loop, so that count is
+/// current for every reservation it makes.
+const HELD_CLAIMS_TOTAL: usize = sparrow_core::MAX_CONSUMPTION_JOURNALS - HELD_RESERVED_SLOTS;
+
+/// Whether a publish-held watch `id` may reserve another finished file: its own share is below
+/// `HELD_CLAIMS_PER_WATCH` (fairness among held watches), and the total of pending claims is
+/// below `HELD_CLAIMS_TOTAL`. Files it may not reserve stay unclaimed in the producer's
+/// directory and are claimed, in order, once the hold clears or a held claim leaves.
 fn held_may_claim(id: &str, pending: &[sparrow_core::ConsumptionJournal]) -> bool {
     let own = pending
         .iter()
         .filter(|journal| journal.watch == id && journal.tail.is_none())
         .count();
-    own < HELD_CLAIMS_PER_WATCH
-        && pending.len() + HELD_RESERVED_SLOTS < sparrow_core::MAX_CONSUMPTION_JOURNALS
+    own < HELD_CLAIMS_PER_WATCH && pending.len() < HELD_CLAIMS_TOTAL
 }
 
 /// How many pending finished-file claims of watch `id` a publish hold holds, and the first-seen
