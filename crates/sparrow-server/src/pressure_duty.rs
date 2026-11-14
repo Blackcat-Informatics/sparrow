@@ -48,6 +48,7 @@ struct Signature {
     phase: PressurePhase,
     linked_bytes: u64,
     passes: u64,
+    evicted: u64,
     forced_compactions: u64,
     forced_failures: u64,
     waits_released: u64,
@@ -60,7 +61,16 @@ impl Signature {
         Self {
             phase: status.phase,
             linked_bytes: status.linked_bytes,
-            passes: status.passes,
+            // In a floor episode a pass that retired nothing (blocked on a pin or the archive
+            // watermark) is not progress: only what it retired is.
+            passes: if status.floor_requested_bytes > 0 {
+                0
+            } else {
+                status.passes
+            },
+            evicted: status
+                .evicted_records
+                .saturating_add(status.evicted_recordless_artifacts),
             forced_compactions: status.forced_compactions,
             forced_failures: status.forced_failures,
             waits_released: status.waits_released,
@@ -425,6 +435,43 @@ mod tests {
             ..floor_episode(130_000, 2_048)
         });
         assert!(floor_lines(&again).is_empty());
+    }
+
+    // Value: #267 review: a floor episode on an archive store blocked on a pin or the archive
+    // watermark ran a pass a second, and the pass counter read as progress, so the journal
+    // stayed silent for as long as it lasted. Protects: in a floor episode a pass that retired
+    // nothing is no progress, so the quiet report is journaled at its bounded rate with the
+    // pass count it stands for.
+    #[test]
+    fn a_floor_episode_that_retires_nothing_is_journaled_as_no_progress() {
+        let blocked = |at: u64, passes: u64| PressureStatus {
+            phase: PressurePhase::Blocked,
+            passes,
+            stalled_passes: passes,
+            waiting_on: Some("reclamation tried: the archive watermark has not reached".into()),
+            ..floor_episode(at, 2_048)
+        };
+        let mut duty = Duty::default();
+        assert!(!duty.observe(&blocked(0, 1)).lines.is_empty());
+        for second in 1..=59 {
+            let quiet = duty.observe(&blocked(second * 1_000, 1 + second));
+            assert!(
+                !quiet
+                    .lines
+                    .iter()
+                    .any(|line| line.contains("pressure still")),
+                "second {second}"
+            );
+        }
+        let report = duty.observe(&blocked(60_000, 61));
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|line| line.contains("pressure still blocked; 60 passes made no progress")),
+            "{:?}",
+            report.lines
+        );
     }
 
     // Value: the old duty discarded the status, so a wait that never ended left no trace.

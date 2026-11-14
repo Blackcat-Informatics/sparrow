@@ -70,7 +70,10 @@ reservations are guarded while the floor is the reason.
 Retirement for the floor is the budget path's own: oldest first, archived and unpinned
 entries only, stopping at the first unarchived entry. It applies only where an archive
 policy exists, and is bounded per episode by the first measured deficit plus the
-maintenance reserve. A store with no archive policy retires nothing early, and its status
+maintenance reserve, and by 8 retirement batches, because freed bytes lag retirement
+until native compaction runs. The judgment that the floor alone is the reason uses linked
+bytes, as the reservation stall does, so query reservations never skip these limits. A store
+with no archive policy retires nothing early, and its status
 says so. The durable wait marker of a floor-only retirement carries the fixed 65536 bytes a
 reopened over-allowance store already uses, never the deficit, so a reopen restores a wait
 whose first pass clears it through the ready branch. When the measured deficit reaches zero

@@ -356,7 +356,8 @@ and it applies only to a store with an archive policy. Archived evidence has its
 retiring some of it earlier than the budget would, to take the log being offered now, is
 allowed up to a bound: the first measured deficit plus `maintenance_reserve`, counted in
 linked store bytes freed. Past the bound the pass retires nothing more for that episode and
-says the rest is held outside Sparrow. A store with no archive policy retires nothing early
+says the rest is held outside Sparrow. Freed bytes lag retirement until native compaction
+runs, so the episode is also capped at 8 retirement batches, whatever they have freed so far. A store with no archive policy retires nothing early
 for the floor: nothing there is marked archived, so "archived" protects nothing. Ageing out
 below the floor is a separate change (#267, part C); until it ships a floor episode uses only
 the avenues in this paragraph.

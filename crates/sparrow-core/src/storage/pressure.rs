@@ -176,6 +176,8 @@ struct FloorEpisode {
     deficit: u64,
     /// Retirement passes this episode has run.
     passes: u64,
+    /// Retirement batches this episode has made durable.
+    batches: u64,
     /// Set by the first pass of the episode.
     start: Option<FloorStart>,
 }
@@ -189,6 +191,12 @@ struct FloorStart {
     /// reserve.
     bound: u64,
 }
+
+/// Most retirement batches one floor episode may make durable, whatever bytes they free.
+/// The byte bound counts measured linked-byte reduction, which lags retirement until native
+/// compaction runs, so batches that free nothing yet must be capped too. A batch retires at
+/// most `EvictionLimits::max_records` units (32 by default), so the cap is 256 units there.
+const FLOOR_EPISODE_BATCHES: u64 = 8;
 
 /// Durable wait marker value of a floor-only retirement. It is the value a reopened store
 /// already above its allowance uses, never the deficit: a deficit is a free-space measure and
@@ -507,6 +515,7 @@ impl Writer {
                 state.status.floor_freed_bytes = 0;
                 state.floor.start = None;
                 state.floor.passes = 0;
+                state.floor.batches = 0;
             }
             if state.status.phase == PressurePhase::Ready {
                 state.status.phase = PressurePhase::Requested;
@@ -730,10 +739,14 @@ impl Writer {
             self.surface_native_errors(state, forced_failure.as_deref())?;
             return Ok(state.status.clone());
         }
-        // The floor alone (the store is inside its budget) is authority to retire only
-        // evidence an archive holds a copy of. A store with no archive policy has no copy of
-        // anything, so the floor retires nothing early there and the status says so.
-        let floor_only = floor_on && physical.saturating_add(state.status.requested_bytes) <= limit;
+        // The floor alone (the store's own linked footprint is inside its budget) is authority
+        // to retire only evidence an archive holds a copy of. A store with no archive policy
+        // has no copy of anything, so the floor retires nothing early there and the status
+        // says so. This is judged on linked bytes, as the reservation stall above is: query
+        // reservations are in `physical` but are no authority, so judging on `physical` would
+        // let a floor episode with reservations skip the guard and the bound below. Every path
+        // to the retirement with the floor on and no budget authority passes through both.
+        let floor_only = floor_on && linked.saturating_add(state.status.requested_bytes) <= limit;
         if floor_only && self.archive.is_none() {
             state.enter(PressurePhase::Blocked, now);
             state.stalled("this store has no archive policy, so nothing is retired early");
@@ -861,16 +874,24 @@ impl Writer {
         }
         if floor_only && let Some(start) = state.floor.start {
             let freed = start.linked.saturating_sub(linked);
-            if freed >= start.bound {
+            let batches = state.floor.batches;
+            if freed >= start.bound || batches >= FLOOR_EPISODE_BATCHES {
                 // The episode has retired as much as it may for an outside cause: the
                 // rest of the shortfall is held outside Sparrow. Nothing more is retired
                 // until the deficit ends the episode or a new one begins.
                 state.status.floor_bound_reached = true;
                 state.enter(PressurePhase::Blocked, now);
-                state.stalled(format!(
-                    "the store freed {freed} bytes for this floor episode (bound {}) and free space is still short; the rest is held outside Sparrow",
-                    start.bound
-                ));
+                let reason = if freed >= start.bound {
+                    format!(
+                        "the store freed {freed} bytes for this floor episode (bound {}) and free space is still short; the rest is held outside Sparrow",
+                        start.bound
+                    )
+                } else {
+                    format!(
+                        "the store retired {batches} batches for this floor episode (cap {FLOOR_EPISODE_BATCHES}) and free space is still short; the rest is held outside Sparrow"
+                    )
+                };
+                state.stalled(reason);
                 self.surface_native_errors(state, forced_failure.as_deref())?;
                 return Ok(state.status.clone());
             }
@@ -915,6 +936,9 @@ impl Writer {
         // A forced compaction's failure stays visible for the pass that ended its wait.
         state.status.failure = forced_failure;
         if changed {
+            if floor_on {
+                state.floor.batches = state.floor.batches.saturating_add(1);
+            }
             state.wait = Some(Wait {
                 before: linked,
                 step: Step::Native,
@@ -950,9 +974,11 @@ impl Writer {
             }
         } else {
             state.enter(PressurePhase::Blocked, now);
-            let reason = state.floor_tried(&format!(
-                "no evidence could be retired: {protected} entries are protected by a pin"
-            ));
+            let reason = state.floor_tried(&if protected == 0 {
+                "no evidence is left to retire".to_owned()
+            } else {
+                format!("no evidence could be retired: {protected} entries are protected by a pin")
+            });
             state.stalled(reason);
         }
         Ok(state.status.clone())

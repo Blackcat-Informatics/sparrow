@@ -6409,6 +6409,208 @@ fn floor_retirement_stops_at_the_bound() {
     assert!(kept.is_some(), "an unretired record must stay readable");
 }
 
+/// Leave a store whose leased page charges query staging so that its physical footprint is
+/// over the data allowance (16 MiB budget less the 4 MiB reserve) while its linked footprint
+/// stays under it, the state in which temporary reservations alone must authorize nothing.
+/// The returned ballast file keeps the footprint there.
+fn charge_reservation_over_allowance(store: &Store, dir: &std::path::Path) -> std::fs::File {
+    use sparrow_core::{RecordOperation, RecordQuery, RecordRead};
+    let footprint = |now| {
+        store.status(now).unwrap()["physical_bytes"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let linked = footprint(2);
+    // Four leased pages: one page's charge is too small to leave room for the store's own
+    // writes while the test runs.
+    for _ in 0..4 {
+        let page = store
+            .records_read(
+                &RecordRead {
+                    operation: RecordOperation::Records,
+                    scope: record_page_scope("source", 1),
+                    query: RecordQuery::default(),
+                    cursor: None,
+                },
+                2,
+            )
+            .unwrap();
+        assert!(page.next_cursor.is_some());
+    }
+    let charge = footprint(2) - linked;
+    // The pass treats a footprint over the allowance with no request as a request of 65536
+    // bytes (a reopened store above its allowance), so the linked bytes must leave room for it.
+    let sentinel = 65536;
+    assert!(
+        charge > 4 * sentinel,
+        "the page charges only {charge} bytes"
+    );
+    let limit = 12 * 1024 * 1024;
+    // Half the charge of headroom for what the store writes while the test runs.
+    let ballast = std::fs::File::create(dir.join("test-owned-floor-ballast")).unwrap();
+    ballast
+        .set_len(limit - linked - sentinel - charge / 2)
+        .unwrap();
+    let physical = footprint(4);
+    assert!(physical > limit);
+    assert!(physical - charge + sentinel <= limit);
+    ballast
+}
+
+// Value (#267, review): the floor-only judgment used the physical footprint, which includes
+// query reservations, so a floor episode on a store whose linked bytes fit the allowance but
+// whose reservations did not skipped the no-archive-policy guard and retired evidence early.
+// Protects: with the floor crossed and a leased page charge over the allowance, a store with
+// no archive policy retires nothing and says there is no archive policy.
+#[test]
+fn a_floor_episode_with_query_reservations_retires_nothing_on_a_store_without_an_archive_policy() {
+    use sparrow_core::{EvictionLimits, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), floor_settings(false)).unwrap();
+    let artifact = store
+        .ingest("floor-reserved", "source", "log", b"first\nsecond\n", 1)
+        .unwrap();
+    let _ballast = charge_reservation_over_allowance(&store, dir.path());
+    store
+        .space_floor()
+        .set_free_for_tests(Some(FLOOR_SHORT_FREE));
+    assert!(
+        store
+            .ingest("floor-reserved-refused", "source", "log", b"later\n", 3)
+            .unwrap_err()
+            .is_free_space_floor()
+    );
+    let state = store
+        .pressure_maintain(4, EvictionLimits::default())
+        .unwrap();
+    assert_eq!(state.phase, PressurePhase::Blocked);
+    assert_eq!((state.passes, state.evicted_records), (0, 0));
+    let waiting = state.waiting_on.as_deref().unwrap();
+    assert!(waiting.contains("no archive policy"), "{waiting}");
+    assert_eq!(
+        store.bytes(&artifact.id, 0, 13, 4).unwrap(),
+        b"first\nsecond\n"
+    );
+}
+
+// Value (#267, review): the same state on a store with an archive policy must keep the
+// episode's cap, since the physical judgment also skipped the bound check. Protects: with the
+// floor crossed and a reservation charge over the allowance, archived evidence retires only
+// up to the per-episode cap of 8 retirement batches (one record each here) even though the
+// freed bytes lag retirement, and the status says the rest is held outside Sparrow.
+#[test]
+fn a_floor_episode_with_query_reservations_keeps_its_cap_on_a_store_with_an_archive_policy() {
+    use sparrow_core::{EvictionLimits, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), floor_settings(true)).unwrap();
+    let artifacts = (1..=12_u64)
+        .map(|at| {
+            store
+                .ingest(
+                    &format!("floor-cap-{at}"),
+                    "source",
+                    "log",
+                    format!("record {at}\n").as_bytes(),
+                    at,
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let covered = artifacts
+        .iter()
+        .zip(1_u64..)
+        .map(|(artifact, at)| archive_position(at, &artifact.record_ids[0]))
+        .collect::<Vec<_>>();
+    archive_records(&store, 1, &covered);
+    let _ballast = charge_reservation_over_allowance(&store, dir.path());
+    store
+        .space_floor()
+        .set_free_for_tests(Some(FLOOR_SHORT_FREE));
+    store
+        .ingest("floor-cap-refused", "source", "log", b"later\n", 13)
+        .unwrap_err();
+    let limits = EvictionLimits {
+        max_records: 1,
+        ..EvictionLimits::default()
+    };
+    let mut state = store.pressure_maintain(14, limits).unwrap();
+    for step in 0..200 {
+        if state.floor_bound_reached {
+            break;
+        }
+        store.await_native_quiet().unwrap();
+        state = store.pressure_maintain(15 + step, limits).unwrap();
+    }
+    assert!(state.floor_bound_reached, "{state:?}");
+    assert_eq!(state.phase, PressurePhase::Blocked);
+    assert_eq!(state.evicted_records, 8, "{state:?}");
+    let waiting = state.waiting_on.as_deref().unwrap();
+    assert!(waiting.contains("(cap 8)"), "{waiting}");
+    assert!(waiting.contains("held outside Sparrow"), "{waiting}");
+    // Later passes retire nothing more while the shortfall stands.
+    store.await_native_quiet().unwrap();
+    assert_eq!(
+        store
+            .pressure_maintain(400, limits)
+            .unwrap()
+            .evicted_records,
+        8
+    );
+}
+
+// Value (#267, review): when nothing is left to retire the text said "0 entries are protected
+// by a pin", which reads as a fault. Protects: an exhausted frontier in a floor episode says
+// that no evidence is left to retire, and a pin is named only when pins hold something.
+#[test]
+fn a_floor_episode_with_nothing_left_to_retire_says_so() {
+    use sparrow_core::{EvictionLimits, PressurePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), floor_settings(true)).unwrap();
+    let artifacts = (1..=2_u64)
+        .map(|at| {
+            store
+                .ingest(
+                    &format!("floor-left-{at}"),
+                    "source",
+                    "log",
+                    format!("record {at}\n").as_bytes(),
+                    at,
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let covered = artifacts
+        .iter()
+        .zip(1_u64..)
+        .map(|(artifact, at)| archive_position(at, &artifact.record_ids[0]))
+        .collect::<Vec<_>>();
+    archive_records(&store, 1, &covered);
+    store
+        .space_floor()
+        .set_free_for_tests(Some(FLOOR_SHORT_FREE));
+    store
+        .ingest("floor-left-refused", "source", "log", b"later\n", 3)
+        .unwrap_err();
+    let limits = EvictionLimits::default();
+    let mut state = store.pressure_maintain(4, limits).unwrap();
+    for step in 0..32 {
+        if state.phase == PressurePhase::Blocked {
+            break;
+        }
+        store.await_native_quiet().unwrap();
+        state = store.pressure_maintain(5 + step, limits).unwrap();
+    }
+    assert_eq!(state.phase, PressurePhase::Blocked, "{state:?}");
+    let waiting = state.waiting_on.as_deref().unwrap();
+    assert!(
+        waiting.contains("no evidence is left to retire"),
+        "{waiting}"
+    );
+    assert!(!waiting.contains("0 entries"), "{waiting}");
+}
+
 // Value (#267): a floor-only retirement writes the durable wait marker, and its episode must
 // end cleanly. Protects: the marker carries the fixed 65536-byte request and never the
 // deficit; restoring free space lets the next pass reach Ready and delete the marker; and a
