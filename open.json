@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 285,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/285-close-the-duplicate-part-read-a-part",
+  "branch": "paudley/285-close-the-duplicate-part-read-a-part",
+  "slug": "close-the-duplicate-part-read-a-part",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/285-close-the-duplicate-part-read-a-part/.stage/close-the-duplicate-part-read-a-part",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "a37f4c798b6d2aaa10c1d2de67fcea08f29da644",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/285-close-the-duplicate-part-read-a-part",
+    "branch:paudley/285-close-the-duplicate-part-read-a-part",
+    "ignored:3 files (3 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow caches into /home/paudley/Active/sparrow/.worktrees/285-close-the-duplicate-part-read-a-part plus 0 dependency units from 0 other checkouts in 0.6s; 280 unchanged files keep their built mtimes; 27 other files take the seed time and rebuild; 0 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/285-close-the-duplicate-part-read-a-part/.stage/close-the-duplicate-part-read-a-part",
+    "issue:/home/paudley/Active/sparrow/.worktrees/285-close-the-duplicate-part-read-a-part/.stage/close-the-duplicate-part-read-a-part/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-14T11:16:32-0600",
+  "seed_error": ""
+}

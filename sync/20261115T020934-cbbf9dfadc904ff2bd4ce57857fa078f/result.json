@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/285-close-the-duplicate-part-read-a-part",
+  "branch": "paudley/285-close-the-duplicate-part-read-a-part",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "a3a5d67e9cd7ace4c18468af87aa13a349be77f6",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/285-close-the-duplicate-part-read-a-part/.stage/close-the-duplicate-part-read-a-part/sync/20261115T020934-cbbf9dfadc904ff2bd4ce57857fa078f",
+  "conflicts": [],
+  "status": "completed",
+  "base": "3d44a5ac39a660314c0626e10ee933ba79ab5662",
+  "merge_bases": [
+    "a37f4c798b6d2aaa10c1d2de67fcea08f29da644"
+  ],
+  "merge_index": "1e2f95c41dbe187326b10e89b8834715280b5ff864c919a949168d86fc9118da",
+  "candidate_tree": "666184c75739dd5d76ba2afb2c02bfc29e0247af",
+  "candidate_patch": "candidate-63c055a008664ab2b0dbc986aa9eefaf.patch",
+  "validation_records": [],
+  "commit": "fb7c6887262ba3469f043c6464ee5a7c6e74ff2e",
+  "tree": "666184c75739dd5d76ba2afb2c02bfc29e0247af"
+}
