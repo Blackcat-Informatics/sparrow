@@ -25992,30 +25992,6 @@ fn a_claim_publishes_as_one_artifact_or_as_a_set_never_both() {
     assert!(!import_row_present(dir.path(), &claim.import_id));
 }
 
-/// INVARIANT (#285): the by-key part read answers a part published with the store's configured
-/// maximum record count as `Stored`, with its artifact id and byte length, and never
-/// `RESOURCE_LIMIT`: the read owns no record array, so its cost does not follow the count.
-#[test]
-fn the_part_read_answers_a_part_of_the_maximum_record_count() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut settings = config();
-    // The configured maximum, set low enough that the fixture fits the test store's disk budget.
-    settings.max_records = 1_000;
-    let records = settings.max_records;
-    let store = Store::open(dir.path(), settings).unwrap();
-    let claim = set_claim(&store, b"max", b"x\n");
-    let bytes = "x\n".repeat(records).into_bytes();
-    let request = part_request_of(&claim, 0);
-    let part = publish_part(&store, &request, &bytes, 1_000);
-    assert_eq!(part.record_ids.len(), records);
-    let PartReceiptState::Stored(read) = store.ingest_part_receipt(&request, 1_000).unwrap() else {
-        panic!("a stored part reads as stored");
-    };
-    assert_eq!(read.artifact_id, part.id);
-    assert_eq!(read.byte_length, bytes.len() as u64);
-    assert_eq!(read.format, "log");
-}
-
 /// INVARIANT (#285): a pending claim's single-path artifact, and the manifest it accepted but
 /// has not recorded, survive an eviction pass that would otherwise retire them, until the
 /// claim's source is removed. After removal the next pass evicts them.

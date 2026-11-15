@@ -580,8 +580,9 @@ pub enum PartReceiptState {
 }
 
 impl Store {
-    /// Read set part `request_id`'s saved receipt by its key, with no record scan: the receipt's
-    /// scalars only, never its record or chunk arrays. A receipt is kept only for a claim whose
+    /// Read set part `request_id`'s saved receipt by its key. While the artifact is stored there is no
+    /// record scan: only the receipt's scalars are read, never its record or chunk arrays. Once the
+    /// artifact is evicted or absent, the records it names are read until one is still stored. A receipt is kept only for a claim whose
     /// journal exists (`handoff.rs`), so a part without one answers `Absent`. The receipt's age
     /// is not tested: the part walk of a pending claim reads it for the life of the claim. No
     /// append, publication or retention renewal occurs.

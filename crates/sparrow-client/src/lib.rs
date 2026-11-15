@@ -47,8 +47,8 @@ pub use import_progress::{ImportProgress, get_import_progress};
 mod ingest_status;
 mod retention_metrics;
 pub use ingest_status::{
-    IngestReadLimits, IngestSelector, IngestStatus, PartDraft, PartGate, PartRead, PartRecord,
-    get_ingest_part_receipt, get_ingest_status, get_part_gate,
+    IngestReadLimits, IngestSelector, IngestStatus, PartDraft, PartRead, PartRecord,
+    get_ingest_part_receipt, get_ingest_status,
 };
 pub use retention_metrics::{RetentionMetrics, RetentionReadLimits, get_retention_metrics};
 mod handoff;

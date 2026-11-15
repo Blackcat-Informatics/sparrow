@@ -452,7 +452,7 @@ pub async fn get_ingest_part_receipt(
 
 /// What the ingestion status of a part with no kept receipt says (#285).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PartGate {
+pub(crate) enum PartGate {
     /// No draft and no receipt: nothing of the part was begun.
     NotFound,
     /// A live draft the daemon holds for the part.
@@ -479,7 +479,7 @@ pub struct PartDraft {
 impl PartGate {
     /// The gate a status read that failed with `error` stands for: `NOT_FOUND` is no draft and
     /// `IMPORT_EXPIRED` is an unreclaimed one; any other failure stays the failure.
-    pub fn from_error(error: Error) -> Result<Self, Error> {
+    pub(crate) fn from_error(error: Error) -> Result<Self, Error> {
         match &error {
             Error::Domain { code, .. } if code == "NOT_FOUND" => Ok(Self::NotFound),
             Error::Domain { code, .. } if code == "IMPORT_EXPIRED" => Ok(Self::Expired),
@@ -489,7 +489,7 @@ impl PartGate {
 }
 
 /// Classify set part `request_id` by its ingestion status, once it has no kept receipt.
-pub async fn get_part_gate(
+pub(crate) async fn get_part_gate(
     client: &wire::sparrow::Client,
     store: &str,
     request_id: &str,

@@ -3075,7 +3075,7 @@ are bounded. Domain errors remain distinct from a broken RPC connection.
 | `watchClaimRetire` | Administration (schema 70): retire one claim that can never complete, recording the authenticated caller, time and reason; see "Retiring an unrecoverable claim". |
 | `backup` | Administration (schema 70): start an online backup of the store into the configured `backup_root`; see "Online backup". |
 | `watchClaims` | Read-only (schema 71): every pending claim and every completed or abandoned claim whose pending span overlaps a time window, with its history; see "Per-claim state listing". |
-| `ingestPartReceipt` | Read-only (schema 71, additive): one set part's receipt state by request id (absent, stored, evicted or evicting) with its artifact id, byte length and format, and no record scan; used by the part walk of a pending claim. |
+| `ingestPartReceipt` | Read-only (schema 71, additive): one set part's receipt state by request id (absent, stored, evicted or evicting) with its artifact id, byte length and format, and no record scan while the artifact is stored (once it is evicted or absent, the records it names are read until one is still stored); used by the part walk of a pending claim. |
 | `watchHandoff`, `watchHandoffGet` | Immutable store/request/watch/revision/raw-path/file-generation handoff; durable admission and explicit reserved/claimed/published/removed progress. Stable retries recover the original binding before inspecting the current source path. |
 
 Schema 23 adds `discover`: store identity, schema version, native text/RDF profile

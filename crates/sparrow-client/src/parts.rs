@@ -9,9 +9,10 @@
 //! manifest `consumeset:{H}.manifest` lists the parts in order and alone defines the set.
 
 use crate::imports::{Checkpoint, StagedInput, payload_id, upload};
+use crate::ingest_status::PartGate;
 use crate::{
-    ArtifactReceipt, Client, CompletedFileIdentity, Discovery, Error, Format, PartDraft, PartGate,
-    PartRead, PartRecord,
+    ArtifactReceipt, Client, CompletedFileIdentity, Discovery, Error, Format, PartDraft, PartRead,
+    PartRecord,
 };
 use purrdf_lex::json::{self, Object, Value};
 use std::fs::File;
@@ -346,7 +347,7 @@ pub fn next_cut(
 /// Whether `span`, cut earlier, is still admitted by `limits`: within the byte bound (and the
 /// syslog packet bound), and, counting each whole line as the daemon charges it, within the
 /// record limit and the joint retirement bound. A span stored opaque is one raw unit.
-pub fn admits(
+pub(crate) fn admits(
     source: &(impl CutSource + ?Sized),
     span: &PartSpan,
     limits: &PartLimits,
@@ -697,7 +698,7 @@ pub enum Frontier {
 
 /// Why the walk stopped at index `parts.len()`.
 #[derive(Debug)]
-pub enum WalkStop {
+pub(crate) enum WalkStop {
     /// The receipt read failed.
     Receipt(Error),
     /// The part is being evicted: some record of it is still stored.
@@ -733,7 +734,7 @@ fn read_pending(index: usize, read: &str, error: &Error) -> Error {
 /// The one decision on a walk's reads: which of the claim's paths its recorded state admits.
 /// `parts` are the non-absent receipts from index 0. Every input maps to exactly one variant,
 /// and only a clean absence at index 0 (no receipt, then no draft) maps to `Measure`.
-pub fn decide_frontier(parts: Vec<PartRead>, stop: WalkStop) -> Frontier {
+pub(crate) fn decide_frontier(parts: Vec<PartRead>, stop: WalkStop) -> Frontier {
     let index = parts.len();
     let gate = match stop {
         WalkStop::Receipt(error) => {
@@ -785,9 +786,9 @@ pub async fn recorded_prefix(client: &Client, claim_request: &str) -> Result<Fro
                 parts.push(read);
                 continue;
             }
-            Ok(PartRead::Absent) => {
-                WalkStop::Gate(crate::get_part_gate(client.capability(), &store, &request).await)
-            }
+            Ok(PartRead::Absent) => WalkStop::Gate(
+                crate::ingest_status::get_part_gate(client.capability(), &store, &request).await,
+            ),
         };
         return Ok(decide_frontier(parts, stop));
     }
