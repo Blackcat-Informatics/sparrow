@@ -450,20 +450,33 @@ CLI and MCP render them under `free_space_floor` as `reclaim_requests`, `request
 `passes` and `freed_bytes`. CLI and MCP render ages as `wait_age_ms`,
 `episode_age_ms` and `phase_age_ms`, measured to `observedAt`. Counters are session-local
 and the clocks of an episode or wait restored at open start at the first pass; the
-stored wait marker is unchanged.
+stored wait marker is unchanged. #298 adds `diskBudget`, `maintenanceReserve`,
+`archiveConfigured`, `archiveHeld` and `reserveHeadroom` at ordinals 34 to 38. CLI and MCP
+render them under `pressure` as `disk_budget`, `maintenance_reserve`, `archive_configured`,
+`archive_held` and `reserve_headroom`, with `linked_bytes` the physical bytes. `archive_held`
+is true while expiry and eviction keep evidence for want of an archive, because the store
+has no archive policy or the last pass stopped at the archive watermark; `last_pass.frontier`
+names the frontier. `reserve_headroom` is the budget less the reserve less `linked_bytes` at
+the last pass, a signed decimal string that is negative once the store is over that line.
 
 ### Archive-before-delete gate (schema 63)
 
 An optional `[archive]` server table makes the store archive evidence before it
 deletes it. The format, schedule and write protocol are in
 [the archive format](archive-format.md). Phase P1 implements the store side:
-the deletion gate, the watermark and the writer fence. The archive worker and
-its NAS thread come later. Until then an archiving store retires nothing on
-its own.
-
-Do not enable `[archive]` on a production store before the worker ships. The
-fence is permanent: with no worker to advance the watermark, retention stops,
-and under disk pressure ingestion is eventually refused.
+the deletion gate, the watermark and the writer fence. The daemon's archive
+worker (`sparrow-archive` thread) takes each prepared segment, writes its files
+under `<dir>/<store_id>/` as `<from>-<through>.gts`, never anywhere else in `dir`.
+Each file is written as `.gts.partial`, synced, renamed into place and the directory
+synced; it is then read back byte for byte, decoded with the PurRDF GTS reader (any
+diagnostic fails it) and only then does the worker advance `archive:through`. Any
+failure leaves the watermark where it was and is journaled with its cause; the next
+pass writes the segment again. `dir` must already exist and hold this store's `STORE_ID` file, the one the backup
+engine writes; the worker only reads it. A missing root, a missing `STORE_ID` (an
+unmounted mount point) or another store's id is a failure, never a directory made on the
+local disk, and nothing in `dir` outside `<store_id>/` is written. A record too large to archive stops the watermark in front of it, is never
+deleted or skipped, and is journaled on every pass with its id, bytes and position; the
+count held and the bytes waiting behind it are reported as unknown.
 
 ```toml
 [archive]
@@ -471,6 +484,7 @@ dir = "/net/synology/archives/sparrow"  # required, absolute, outside data_dir
 start_fraction = 0.75                   # 0.5..0.95
 max_segment_bytes = 67108864            # 1 MiB..256 MiB; a larger entry gets its own segment
 max_segment_records = 50000             # at least 1
+check_secs = 60                         # wait between worker passes when nothing is due
 stall_warn_secs = 120                   # 0 < stall_warn_secs < io_timeout_secs
 io_timeout_secs = 900
 ```
