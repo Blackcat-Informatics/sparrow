@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 309,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/309-idle-column-families-pin-the-wal-bound",
+  "branch": "paudley/309-idle-column-families-pin-the-wal-bound",
+  "slug": "idle-column-families-pin-the-wal-bound",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/309-idle-column-families-pin-the-wal-bound/.stage/idle-column-families-pin-the-wal-bound",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "5f6202b174a1a6da27acc593b71e4ac7dc703dd9",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/309-idle-column-families-pin-the-wal-bound",
+    "branch:paudley/309-idle-column-families-pin-the-wal-bound",
+    "ignored:3 files (3 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow/.worktrees/304-archive-prepare-read-cost-grows-with caches into /home/paudley/Active/sparrow/.worktrees/309-idle-column-families-pin-the-wal-bound plus 0 dependency units from 0 other checkouts in 13.9s; 316 unchanged files keep their built mtimes; 4 other files take the seed time and rebuild; 30 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/309-idle-column-families-pin-the-wal-bound/.stage/idle-column-families-pin-the-wal-bound",
+    "issue:/home/paudley/Active/sparrow/.worktrees/309-idle-column-families-pin-the-wal-bound/.stage/idle-column-families-pin-the-wal-bound/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-15T10:04:00-0600",
+  "seed_error": ""
+}
