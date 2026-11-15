@@ -1,0 +1,18 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: ca6cff45f4ea43cd483aa2eeaff70e1cec2f3c59
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 297
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/297
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 6d4424e14425801f8a9b73e784417e09f8363841
+GhpRsq-Head-Ref: paudley/gate-hold-unarchived
+GhpRsq-Head-OID: ca6cff45f4ea43cd483aa2eeaff70e1cec2f3c59
+GhpRsq-Result-Tree: 2ef4c8eb6a7cb05868c2cf8ef72f6a434e8fc07d
+GhpRsq-Result-Commit: 828768e0bbd12fe1a9d6e0bbdf84097b0bef3666
+GhpRsq-Parent-Hashes: ca6cff45f4ea43cd483aa2eeaff70e1cec2f3c59
+GhpRsq-Squash-Notes-SHA256: 73420ece5175d474262b979e3b47b6bc59536180c1448a957e3d5e34269f6caa
+GhpRsq-Stage-Evidence: none
