@@ -159,6 +159,25 @@ impl StoredRdfView<'_> {
         Ok(())
     }
 
+    /// Add one artifact's graph owner. An artifact with no RDF ownership marker was retired
+    /// before the store was fenced and has no graph; that is `false`, not an error.
+    pub(super) fn include_artifact_owner(&mut self, id: &str) -> Result<bool, ReadError> {
+        let marker = self.point(format!("artifact-rdf:{id}").as_bytes(), 8)?;
+        if marker.is_none() {
+            return Ok(false);
+        }
+        drop(marker);
+        let manifest = self
+            .point(format!("rdf:graph:{id}").as_bytes(), 65536)?
+            .ok_or_else(|| {
+                self.budget
+                    .fail(Error::new("STORAGE_FAILURE", "artifact RDF graph missing"))
+            })?;
+        drop(manifest);
+        self.include_owner(id)?;
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn include_artifact(
         &mut self,

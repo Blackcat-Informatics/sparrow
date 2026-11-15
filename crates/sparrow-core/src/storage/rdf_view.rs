@@ -1308,7 +1308,22 @@ impl Store {
         limits: RdfReadLimits,
         operation: impl FnOnce(&StoredRdfView<'_>) -> T,
     ) -> Result<T, ReadError> {
-        if ids.is_empty() || ids.len() > 1000 {
+        self.with_rdf_scope_ids(ids, &[], layers, now, limits, |view, _| operation(view))
+    }
+
+    /// The same capture with named artifacts' graphs added to the records'. The operation also
+    /// receives the artifact ids that have no RDF ownership (retired before the store was
+    /// fenced) and so are absent from the view.
+    pub(super) fn with_rdf_scope_ids<T>(
+        &self,
+        ids: &[String],
+        artifacts: &[String],
+        layers: RdfGraphLayers,
+        now: u64,
+        limits: RdfReadLimits,
+        operation: impl FnOnce(&StoredRdfView<'_>, &[String]) -> T,
+    ) -> Result<T, ReadError> {
+        if (ids.is_empty() && artifacts.is_empty()) || ids.len() > 1000 || artifacts.len() > 1000 {
             return Err(Arc::new(Error::new(
                 "INVALID_ARGUMENT",
                 "RDF selection requires 1..1000 record IDs",
@@ -1319,7 +1334,7 @@ impl Store {
         let db = Arc::clone(&writer.db);
         let mut view = StoredRdfView::new(&db, limits, &[])?;
         view.scoped = true;
-        let mut scope_bytes = 4096 + ids.len() as u64 * 2048;
+        let mut scope_bytes = 4096 + (ids.len() + artifacts.len()) as u64 * 2048;
         Arc::get_mut(&mut view._scope)
             .expect("scope capture precedes owned query admission")
             .resize(scope_bytes)?;
@@ -1393,7 +1408,20 @@ impl Store {
             }
             view.include_record(&record, layers, true, &mut RdfScopeCoverage::default())?;
         }
+        let mut absent = Vec::new();
+        for id in artifacts {
+            if !id.starts_with("artifact:") || id.len() > 128 {
+                return Err(view.budget.fail(Error::new(
+                    "INVALID_ARGUMENT",
+                    "RDF selection requires bounded artifact IDs",
+                )));
+            }
+            if !view.include_artifact_owner(id)? {
+                absent.push(id.clone());
+            }
+        }
         drop(writer);
-        purrdf::dataset_view::checkpointed_drain(&view, operation).map_err(|failure| failure.error)
+        purrdf::dataset_view::checkpointed_drain(&view, |view| operation(view, &absent))
+            .map_err(|failure| failure.error)
     }
 }

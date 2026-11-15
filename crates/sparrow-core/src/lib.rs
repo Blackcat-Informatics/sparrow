@@ -23,6 +23,7 @@ pub use storage::archive::{
     ARCHIVE_SEGMENT_RECORDS, ARCHIVE_START_FRACTION, ARCHIVE_WATERMARK, ArchiveIntent,
     ArchivePolicy, ArchiveState,
 };
+pub use storage::archive_segment::{ArchiveHold, HoldReason, PreparedSegment};
 pub use storage::artifact_read::{
     ArtifactOrigin, ArtifactPageBody, ArtifactRead, ArtifactReadPage, ArtifactSelector,
     ArtifactSummary,

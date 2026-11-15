@@ -13,7 +13,7 @@ later must be able to read the archive without a running Sparrow.
 
 Patrick's rulings bind this design:
 
-- The tables use PurRDF's Parquet codec (`purrdf::columnar`).
+- Segments are GTS files, written through PurRDF's GTS writer.
 - Sparrow never deletes unarchived evidence, even when the archive is down.
 - Archiving starts early, at 75% of the retention window or of the data budget.
   A record counts as archived only once its segment is written and verified.
@@ -40,13 +40,8 @@ under pressure ingest is refused with `STORAGE_PRESSURE`.
 
 ```text
 <root>/<store-hex>/STORE.nq
-<root>/<store-hex>/segments/YYYY/MM/DD/<segment-id>/terms.parquet
-<root>/<store-hex>/segments/YYYY/MM/DD/<segment-id>/quads.parquet
-<root>/<store-hex>/segments/YYYY/MM/DD/<segment-id>/reifiers.parquet
-<root>/<store-hex>/segments/YYYY/MM/DD/<segment-id>/annotations.parquet
-<root>/<store-hex>/segments/YYYY/MM/DD/<segment-id>/blobs.parquet
+<root>/<store-hex>/segments/YYYY/MM/DD/<segment-id>/<segment files, GTS>
 <root>/<store-hex>/segments/YYYY/MM/DD/<segment-id>/manifest.nq
-<root>/<store-hex>/segments/YYYY/MM/DD/<segment-id>/payloads/<n>.bin
 <root>/<store-hex>/quarantine/YYYY/MM/DD/<segment-id>/<n>.bin
 <root>/<store-hex>/.staging/<staging-id>/
 ```
@@ -55,12 +50,8 @@ under pressure ingest is refused with `STORAGE_PRESSURE`.
   One root can hold several stores.
 - `YYYY/MM/DD` is the UTC receipt date of the segment's first entry.
 - `<segment-id>` is the lowercase hexadecimal segment identity (section 3).
-- The five table files are exactly the files `purrdf::columnar::write`
-  produces, with their PurRDF file names, in columnar schema 1 with Zstandard
-  page compression.
-- `payloads/` holds the bytes of records too large for the tables (section 2).
-  `<n>` is the entry's decimal index in the segment's manifest. Most segments
-  have no `payloads/` directory.
+- The segment files are written by PurRDF's GTS writer. The encoder is the one
+  module that knows their names and layout; nothing else in Sparrow assumes it.
 - `quarantine/` holds raw bytes of quarantined entries (section 6), grouped by
   the segment that covers them. `<n>` is the entry's decimal index in that
   segment's manifest.
@@ -93,7 +84,7 @@ A segment closes at the first of these limits:
 
 | Limit | Default | Bounds |
 | --- | --- | --- |
-| Raw payload bytes | 64 MiB (`max_segment_bytes`) | At least 1 MiB, at most 192 MiB. |
+| Raw payload bytes | 64 MiB (`max_segment_bytes`) | At least 1 MiB, at most 256 MiB. |
 | Eviction entries | 50,000 (`max_segment_records`) | At least 1. |
 | UTC day | End of the first entry's receipt day | Fixed. |
 | Horizon | Section 5 | Fixed. |
@@ -103,21 +94,30 @@ an entry whose record bytes would take its payload past the target, unless the
 segment is still empty. An entry whose bytes alone exceed the target therefore
 forms a segment of its own, and the segment is never split inside a record.
 
-Such an oversized record's bytes do not go into `blobs.parquet`. The writer
-streams them from the store, one 64 KiB chunk at a time, into
-`payloads/<n>.bin`, hashing as it writes. The record's metadata graph, its
-projection graphs and its link quad go into the tables as for any other record.
-The manifest lists the file as a `PayloadFile` entry (section 9), and the
-segment identity covers its digest (section 3). The tables then hold only
-metadata for that entry, so the encoder's memory stays bounded by the segment
-target, and the payload file costs one chunk of memory at any record size. A
-record within the target is always a blob.
+Such an oversized record is a segment of its own, and its bytes stay a blob in
+the segment's GTS files like any other record's.
 
-The 192 MiB ceiling keeps one table below the codec's 256 MiB table bound. It
-will be raised after the PurRDF upgrade that streams and compresses Parquet
-optimally; Sparrow adds no local workarounds for the codec's size or memory
-limits. Encoding needs memory of roughly three to four times the segment size.
-That figure is an estimate to measure in P2.
+The GTS writer holds the whole segment in memory and costs about three times a
+record while it writes (measured at 128 MiB). A record whose bytes exceed 128 MiB
+is therefore not written. Only records from layouts before 2026-11-02 can be that
+large. The format for large payloads is undecided and with the operator, and
+nothing is built for them. Until it is decided, such a record is held: it is
+neither archived nor deleted. Selection
+stops before it, so the watermark never passes an unarchived record, and the
+writer reports it by identity and size in a structured warning.
+A record whose content projection failed at ingest is held the same way, because
+its evidence cannot be read whole. `Store::archive_held` reports the held record
+and the reason when it is the first unarchived entry. A segment that fails to
+encode is halved until the failing entry stands alone, which is then named in
+the error and in a warning. Every record and artifact a segment covers has its
+graph in the file (a record's parent artifact graph included); an artifact with
+no graph, retired before the fence, is counted in `retired_artifacts`. The count of held records and the bytes waiting behind the first are not
+scanned, because that would read every record row on each pass.
+
+The 256 MiB ceiling and the hold bound are memory limits of the GTS writer. They
+relax when PurRDF's streaming writer (issue 1257) lands.
+Encoding needs memory of roughly three to four times the segment size. That
+figure is an estimate to measure.
 
 ## 3. Segment identity
 
@@ -125,18 +125,15 @@ That figure is an estimate to measure in P2.
 segment-id = BLAKE3( frame("sparrow-archive/1")
                    ‖ frame(store-id)
                    ‖ frame(first-position) ‖ frame(last-position)
-                   ‖ frame(BLAKE3(terms.parquet)) ‖ frame(BLAKE3(quads.parquet))
-                   ‖ frame(BLAKE3(reifiers.parquet)) ‖ frame(BLAKE3(annotations.parquet))
-                   ‖ frame(BLAKE3(blobs.parquet))
+                   ‖ for each segment file in write order:
+                     frame(file-name) ‖ frame(BLAKE3(file))
                    ‖ frame(u64_le(quarantine-count))
-                   ‖ frame(BLAKE3(0.bin)) ‖ …
-                   ‖ frame(u64_le(payload-count))
-                   ‖ frame(BLAKE3(payloads/<n>.bin)) ‖ … )
+                   ‖ frame(BLAKE3(0.bin)) ‖ … )
 ```
 
 `frame` is PurRDF's `purrdf_hash::frame::frame_le`: an eight-byte little-endian
-length followed by the bytes. Digests are the raw 32 bytes. Quarantine and
-payload files appear in ascending entry index. The PurRDF codec is
+length followed by the bytes. Digests are the raw 32 bytes. Quarantine files
+appear in ascending entry index. The PurRDF codec is
 byte-deterministic, so the same range of the same store, encoded by the same
 PurRDF revision, always gives the same identity. A restored store backup
 therefore rebuilds and adopts its existing segments. A different PurRDF revision
@@ -155,16 +152,15 @@ in its range, with its dependencies:
 
 | Content | Where |
 | --- | --- |
-| Record bytes `[byte_start, byte_end)` | One blob per record in `blobs.parquet`, keyed by lowercase hexadecimal SHA-256. A record's chunks are joined in order. A record larger than `max_segment_bytes` is a payload file instead (section 2). |
-| Record metadata graph `urn:sparrow:graph:record:<hex>` | `quads.parquet`, including its provenance and tracing facts. |
-| Diagnostic graph | `quads.parquet`, under its recorded graph IRI. |
-| Artifact graph `urn:sparrow:graph:artifact:<hex>` | `quads.parquet` of the segment whose covered range contains the artifact's position. When artifacts share a millisecond, that can be an earlier segment that holds none of the artifact's records. The gate treats the artifact as archived once that segment commits. |
-| Content projection graphs | `quads.parquet`, under each projection's graph IRI. A projection shared by records in several segments appears in each of them. |
+| Record bytes `[byte_start, byte_end)` | One blob per record in the segment's GTS files, keyed by lowercase hexadecimal SHA-256. A record's chunks are joined in order. |
+| Record metadata graph `urn:sparrow:graph:record:<hex>` | the segment's GTS files, including its provenance and tracing facts. |
+| Diagnostic graph | the segment's GTS files, under its recorded graph IRI. |
+| Artifact graph `urn:sparrow:graph:artifact:<hex>` | the segment's GTS files of the segment whose covered range contains the artifact's position. When artifacts share a millisecond, that can be an earlier segment that holds none of the artifact's records. The gate treats the artifact as archived once that segment commits. |
+| Content projection graphs | the segment's GTS files, under each projection's graph IRI. A projection shared by records in several segments appears in each of them. |
 | Link quads | One per record with bytes, in the graph `urn:sparrow:graph:archive-links`. |
-| Reifiers and annotations of these graphs | `reifiers.parquet` and `annotations.parquet`. |
+| Reifiers and annotations of these graphs | the segment's GTS files. |
 
-A link quad ties a record to its blob or payload file. Both use the same
-predicate and the SHA-256 of the record's bytes:
+A link quad ties a record to its blob by the SHA-256 of the record's bytes:
 
 ```text
 <urn:sparrow:record:HEX> <urn:sparrow:vocab:payloadSha256> "64 hex digits" <urn:sparrow:graph:archive-links> .
@@ -272,9 +268,8 @@ from a store is not supported in this version.
 The worker runs every archive operation on one dedicated thread,
 `sparrow-archive-nas`, with at most one operation in flight:
 
-1. Write each staged table and payload file into a fresh
-   `.staging/<staging-id>/` directory and fsync it. Payload files are streamed
-   from the store chunk by chunk.
+1. Write each staged table into a fresh
+   `.staging/<staging-id>/` directory and fsync it.
 2. Write `manifest.nq` last and fsync it.
 3. Fsync the staging directory.
 4. Create the missing parent directories, fsyncing each one and its parent.
@@ -309,44 +304,31 @@ the `urn:sparrow:vocab:` namespace, written `sp:` below.
 | --- | --- | --- |
 | Segment | `rdf:type` | `sp:ArchiveSegment` |
 | Segment | `sp:archiveFormat` | `"sparrow-archive/1"` |
-| Segment | `sp:columnarSchema` | `"1"^^xsd:nonNegativeInteger` |
 | Segment | `sp:compression` | `"zstd"` |
 | Segment | `sp:storeId` | `"store:<hex>"` |
 | Segment | `sp:rdfProfile` | The store's recorded RDF profile identity. |
 | Segment | `sp:purrdfRevision` | The full PurRDF commit that encoded the tables. |
 | Segment | `sp:firstPosition`, `sp:lastPosition` | Eviction positions, as strings. |
 | Segment | `sp:receivedFrom`, `sp:receivedThrough` | `xsd:dateTime` receipt instants of the first and last entries. |
-| Segment | `sp:recordCount`, `sp:artifactCount`, `sp:blobCount`, `sp:quarantineCount`, `sp:payloadFileCount` | `xsd:nonNegativeInteger` counts. |
-| Segment | `sp:table` | One table IRI, `<segment>#<table name>`, per Parquet file. |
+| Segment | `sp:recordCount`, `sp:artifactCount`, `sp:blobCount`, `sp:quarantineCount` | `xsd:nonNegativeInteger` counts. |
+| Segment | `sp:table` | One file IRI, `<segment>#<file name>`, per segment file. |
 | Table | `rdf:type` | `sp:ArchiveTable` |
-| Table | `sp:fileName` | For example `"quads.parquet"`. |
+| Table | `sp:fileName` | The segment file's name. |
 | Table | `sp:blake3` | Lowercase hexadecimal BLAKE3 of the file. |
-| Table | `sp:byteLength`, `sp:rowCount` | `xsd:nonNegativeInteger`. |
+| Table | `sp:byteLength` | `xsd:nonNegativeInteger`. |
 | Segment | `sp:quarantined` | One entry IRI, `<segment>#quarantine-<n>`, per entry. |
 | Entry | `rdf:type` | `sp:QuarantineEntry` |
 | Entry | `sp:evidence` | The record or artifact IRI. |
 | Entry | `sp:quarantineReason` | `"encode"`, `"projection"` or `"retired"`. |
 | Entry | `sp:fileName`, `sp:blake3`, `sp:payloadSha256`, `sp:byteLength` | The quarantine file and its digests. |
-| Segment | `sp:payloadFile` | One entry IRI, `<segment>#payload-<n>`, per payload file. |
-| Payload entry | `rdf:type` | `sp:PayloadFile` |
-| Payload entry | `sp:evidence` | The record IRI. |
-| Payload entry | `sp:fileName`, `sp:blake3`, `sp:payloadSha256`, `sp:byteLength` | For example `"payloads/0.bin"`, and its digests and length. |
 
 ## 10. Readers
 
-PurRDF reads a segment directly. `purrdf::columnar::read` over the five files
-returns a validated dataset and its content store; every blob is checked
-against its SHA-256 digest. The result is ready for SPARQL. Readers verify each
-file's BLAKE3 against the manifest first. A record whose link digest is not a
-blob names a `PayloadFile` entry with the same `sp:payloadSha256`; readers
-stream that file and check its SHA-256 rather than loading it whole.
-
-DuckDB can query the tables without Sparrow. Term ids are local to one
-segment, so joins stay inside one segment. To find a record's bytes, join
-`quads` through `terms` (predicate IRI `urn:sparrow:vocab:payloadSha256`) to
-`blobs.digest`. To scan several segments, use
-`read_parquet('<root>/<store-hex>/segments/*/*/*/*/quads.parquet', filename = true)`
-and join on the segment directory as well as the term id.
+PurRDF's GTS reader reads a segment directly and returns the validated dataset
+and its content; every blob is checked against its SHA-256 digest. Readers
+verify each file's BLAKE3 against the manifest first. Every record's link
+digest names a blob. To find a record's bytes, follow the link quad
+(predicate IRI `urn:sparrow:vocab:payloadSha256`) to the blob with that digest.
 
 Duplicates can appear after a PurRDF revision change (section 3). Readers keep
 one copy per record IRI and report duplicates rather than merging conflicting
