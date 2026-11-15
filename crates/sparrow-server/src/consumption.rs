@@ -5,7 +5,9 @@
 
 use crate::source_file::{BENEATH, open};
 use rustix::fs::{self, AtFlags, FlockOperation, Mode, OFlags, RenameFlags};
-use sparrow_client::parts::{ClaimParts, MissingLimits, PartLimits, PartsProgress};
+use sparrow_client::parts::{
+    ClaimParts, Frontier, MissingLimits, PartLimits, PartsProgress, Resume,
+};
 use sparrow_client::{Client, CompletedFileIdentity};
 use sparrow_core::{
     ConsumptionDirectories, ConsumptionGeneration, ConsumptionJournal, RetiredConsumption,
@@ -717,7 +719,27 @@ impl ClaimRoot {
         }
         let length = claim.journal.observed.byte_length;
         let packet = sparrow_core::SYSLOG_MESSAGE_BYTES as u64;
-        let limits = match PartLimits::from_discovery(client.discovery(), packet) {
+        let limits = PartLimits::from_discovery(client.discovery(), packet);
+        // What the daemon recorded decides the path before any size rule: a claim with any
+        // kept part receipt, a part draft or a part row is never published as one artifact,
+        // whatever its limits now are. Only a clean absence at index 0 is measured below.
+        match sparrow_client::parts::recorded_prefix(client, &claim.journal.request_id).await? {
+            Frontier::Pending(error) => return Err(error.into()),
+            Frontier::Recorded(resume) => {
+                return self
+                    .publish_set(
+                        client,
+                        claim,
+                        attempt,
+                        format,
+                        limits.as_ref().map_err(|missing| *missing),
+                        &resume,
+                    )
+                    .await;
+            }
+            Frontier::Measure => {}
+        }
+        let limits = match limits {
             Ok(limits) => limits,
             Err(missing) => {
                 let bound = client.discovery().max_import_bytes;
@@ -725,7 +747,7 @@ impl ClaimRoot {
                     return Err(Error::Storage(sparrow_core::Error::new(
                         "RESOURCE_LIMIT",
                         format!(
-                            "declared input of {length} bytes exceeds the daemon's import bound of {bound} bytes and the daemon did not advertise {}; the file cannot be split; the source is held",
+                            "declared input of {length} bytes exceeds the daemon's import bound of {bound} bytes and the daemon did not advertise {}; the file cannot be split; the claim is pending until the daemon advertises it, which is the daemon's configuration; the claim continues by itself when it does",
                             missing.names()
                         ),
                     )));
@@ -740,8 +762,15 @@ impl ClaimRoot {
                 .publish_single(client, claim, attempt, format, None)
                 .await;
         }
-        self.publish_set(client, claim, attempt, format, &limits)
-            .await
+        self.publish_set(
+            client,
+            claim,
+            attempt,
+            format,
+            Ok(&limits),
+            &Resume::fresh(),
+        )
+        .await
     }
 
     async fn publish_single(
@@ -783,7 +812,8 @@ impl ClaimRoot {
         claim: &mut ClaimedFile,
         attempt: &ClaimAttempt,
         format: sparrow_client::Format,
-        limits: &PartLimits,
+        limits: Result<&PartLimits, MissingLimits>,
+        resume: &Resume,
     ) -> Result<String, Error> {
         let journal = &claim.journal;
         let parts = sparrow_client::parts::upload_parts(
@@ -795,6 +825,7 @@ impl ClaimRoot {
             limits,
             &attempt.parts,
             &attempt.progress,
+            resume,
         )
         .await?;
         #[cfg(test)]

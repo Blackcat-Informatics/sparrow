@@ -1095,12 +1095,16 @@ A held claim whose move into `.sparrow-inflight/` fails is recorded as a pending
 attempt and logged once, and again only when the failure text changes.
 
 A part of a set keeps its receipt for as long as its claim's journal exists, as the manifest
-receipt does. A part sent again after an outage, even one longer than two days, returns its
-saved receipt and is not stored a second time, so a records query over the source returns its
-bytes once. A resumed set whose advertised limits changed is refused `CONFLICT` for a part
-whose cut changed, for as long as the claim's journal exists, because those receipts no
-longer lapse; restoring the limits the set began under lets it resume. A set's cut is not
-recorded when it begins, so a change of limits is not absorbed.
+receipt does. A part sent again after an outage, even one longer than two days, with the same
+cut returns its saved receipt for as long as its artifact is stored, and is not stored a second
+time, so a records query over the source returns its bytes once. A part whose artifact eviction
+or deletion retired is sent again from the claim's source, and its bytes come back under a new
+publication time; while only some of its records are retired the claim is pending and nothing is
+sent. A resumed set reads the daemon's recorded parts on every attempt and cuts only the rest
+under the advertised limits as they stand, so a change of limits is absorbed. A recorded part
+whose span the new limits no longer admit cannot be cut again, because later parts start where
+it ends: the claim stays pending, holding its source, until limits that admit that span are
+restored. No retirement removes such a claim while its source is held.
 
 ### Claims after a rollback
 

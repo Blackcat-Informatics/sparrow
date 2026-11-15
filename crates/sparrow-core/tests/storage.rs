@@ -3,10 +3,13 @@
 
 //! Persistent lifetime scenarios using temporary stores and injected UTC instants.
 
-use sparrow_core::{Config, PinPageBody, PinRead, PinSelector, QueryScope, Store};
+use sparrow_core::{
+    Config, ImportStart, PartReceiptState, PinPageBody, PinRead, PinSelector, QueryScope, Store,
+};
 use sparrow_test_support::{catalog_db, remove_artifact_rdf_upgrade, remove_tail_range_index};
 
 const DAY: u64 = 86_400_000;
+const HOUR: u64 = 60 * 60 * 1000;
 
 /// Hang deadline for the two load-sensitive event-driven tests. The slowest measured
 /// run was 44.41 s (sigkill test under load 33-43, .stage/flaky-tests/s1.log), so five
@@ -25694,11 +25697,14 @@ fn lapsed_reclaimed_part_begins_again_under_the_same_request_id() {
 }
 
 /// INVARIANT (#280, #285): while a set claim's journal exists, a part whose two-day receipt
-/// window has lapsed is answered its saved receipt when it is sent again. The source holds one
-/// artifact for its bytes, so a records query returns them once. A cut that differs under the
-/// same part id is refused CONFLICT and publishes nothing.
+/// window has lapsed is answered its saved receipt when it is sent again, for as long as its
+/// artifact is stored. The source holds one artifact for its bytes, so a records query returns
+/// them once. A cut that differs under the same part id is refused CONFLICT and publishes
+/// nothing. A part whose artifact eviction retired is not answered its saved receipt, inside or
+/// past the window: its read says `Evicted`, and the same cut sent again through the wire's
+/// store entry stages anew once the old row is reclaimed, and is read exactly once.
 #[test]
-fn a_lapsed_part_of_a_claim_keeps_its_saved_receipt() {
+fn a_part_of_a_claim_keeps_its_saved_receipt_until_its_artifact_is_evicted() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
     let input = b"part bytes\n";
@@ -25763,6 +25769,300 @@ fn a_lapsed_part_of_a_claim_keeps_its_saved_receipt() {
         .unwrap_err();
     assert_eq!(refused.code, "CONFLICT");
     assert_eq!(store.records(later).unwrap().len(), 1);
+
+    // Eviction retires the part's artifact and its record. The saved receipt then names
+    // nothing readable, so the same cut is sent again: inside the window, where the wire's
+    // store entry would otherwise answer the saved receipt, and past it.
+    for now in [1_000 + HOUR, later] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        let claim = set_claim(&store, b"set", input);
+        let request = part_request_of(&claim, 0);
+        let first = publish_part(&store, &request, input, 1_000);
+        assert!(matches!(
+            store.ingest_part_receipt(&request, now).unwrap(),
+            PartReceiptState::Stored(_)
+        ));
+        let report = store
+            .evict_oldest(now, sparrow_core::EvictionLimits::default())
+            .unwrap();
+        assert_eq!(report.records.len(), 1, "now {now}");
+        let PartReceiptState::Evicted(evicted) = store.ingest_part_receipt(&request, now).unwrap()
+        else {
+            panic!("an evicted part reads as evicted at {now}");
+        };
+        assert_eq!(evicted.artifact_id, first.id);
+        assert_eq!(evicted.byte_length, input.len() as u64);
+
+        // A different cut is still refused, and publishes nothing.
+        let longer = b"part bytes\nmore\n";
+        let refused = store
+            .import_start(
+                &request,
+                "source",
+                "log",
+                longer.len() as u64,
+                &digest_of(longer),
+                now,
+            )
+            .unwrap_err();
+        assert_eq!(refused.code, "CONFLICT", "now {now}");
+
+        // The evicted artifact's old row awaits reclamation: the part begins again after it.
+        let waiting = store
+            .import_start(
+                &request,
+                "source",
+                "log",
+                input.len() as u64,
+                &digest_of(input),
+                now,
+            )
+            .unwrap_err();
+        assert_eq!(waiting.code, "IMPORT_EXPIRED", "now {now}");
+        for _ in 0..4 {
+            store.import_reclaim(now).unwrap();
+        }
+        let ImportStart::Staging(staging) = store
+            .import_start(
+                &request,
+                "source",
+                "log",
+                input.len() as u64,
+                &digest_of(input),
+                now,
+            )
+            .unwrap()
+        else {
+            panic!("an evicted part is staged again, not answered its saved receipt, at {now}");
+        };
+        // The status of a part begun again reports the new staging, not a contradiction.
+        let status = store
+            .ingest_status(
+                &sparrow_core::IngestSelector::Request(request.clone()),
+                Default::default(),
+                now,
+            )
+            .unwrap();
+        assert!(status.accepted.is_none(), "now {now}");
+        assert_eq!(status.staging.map(|row| row.id), Some(staging.id.clone()));
+        store.import_append(&staging.id, 0, input, now).unwrap();
+        store.import_seal(&staging.id, now).unwrap();
+        store.import_prepare_layout(&staging.id, now).unwrap();
+        store.import_prepare_record(&staging.id, 0, now).unwrap();
+        let again = store.import_publish(&staging.id, now).unwrap();
+        assert_ne!(again.id, first.id, "now {now}");
+        assert_eq!(store.records(now).unwrap().len(), 1, "now {now}");
+        assert_eq!(store.bytes(&again.id, 0, input.len(), now).unwrap(), input);
+    }
+}
+
+/// The request id of set part `index` of `claim`.
+fn part_request_of(claim: &sparrow_core::ConsumptionJournal, index: u64) -> String {
+    let hash = claim
+        .request_id
+        .strip_prefix("consume:")
+        .expect("a set claim has a consume request id");
+    format!("{}{hash}.part{index:010}", sparrow_core::SET_PREFIX)
+}
+
+fn digest_of(bytes: &[u8]) -> String {
+    format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(bytes).as_bytes())
+    )
+}
+
+/// Stage `bytes` as set part `request` through the wire's store entry, `Store::import_start`,
+/// and publish it, one record per line as the daemon's part upload does.
+fn publish_part(store: &Store, request: &str, bytes: &[u8], now: u64) -> sparrow_core::Artifact {
+    let ImportStart::Staging(staging) = store
+        .import_start(
+            request,
+            "source",
+            "log",
+            bytes.len() as u64,
+            &digest_of(bytes),
+            now,
+        )
+        .unwrap()
+    else {
+        panic!("part {request} was already accepted");
+    };
+    for (index, chunk) in bytes.chunks(sparrow_core::IMPORT_CHUNK_BYTES).enumerate() {
+        store
+            .import_append(
+                &staging.id,
+                (index * sparrow_core::IMPORT_CHUNK_BYTES) as u64,
+                chunk,
+                now,
+            )
+            .unwrap();
+    }
+    store.import_seal(&staging.id, now).unwrap();
+    let layout = store.import_prepare_layout(&staging.id, now).unwrap();
+    let mut prepared = 0;
+    while prepared < layout.layout_records {
+        prepared = store
+            .import_prepare_record(&staging.id, prepared, now)
+            .unwrap()
+            .prepared_records;
+    }
+    store.import_publish(&staging.id, now).unwrap()
+}
+
+/// INVARIANT (#285): a claim publishes as one artifact or as a set, never both, whichever
+/// begins first. The two orders are serialized by the store, so neither leaves a duplicate.
+#[test]
+fn a_claim_publishes_as_one_artifact_or_as_a_set_never_both() {
+    let content = b"one\n";
+    let single = |store: &Store, claim: &sparrow_core::ConsumptionJournal| {
+        single_staging(store, claim, content);
+        store.import_seal(&claim.import_id, 1_000).unwrap();
+        store
+            .import_prepare_layout(&claim.import_id, 1_000)
+            .unwrap();
+        store
+            .import_prepare_record(&claim.import_id, 0, 1_000)
+            .unwrap();
+    };
+
+    // (a) The single import is published first: part 0 is refused and writes nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let claim = set_claim(&store, b"a", content);
+    single(&store, &claim);
+    store.import_publish(&claim.import_id, 1_000).unwrap();
+    let request = part_request_of(&claim, 0);
+    let refused = store
+        .import_start(
+            &request,
+            "source",
+            "log",
+            content.len() as u64,
+            &digest_of(content),
+            1_000,
+        )
+        .unwrap_err();
+    assert_eq!(refused.code, "CONFLICT");
+    let status = store
+        .ingest_status(
+            &sparrow_core::IngestSelector::Request(request),
+            Default::default(),
+            1_000,
+        )
+        .unwrap_err();
+    assert_eq!(status.code, "NOT_FOUND");
+    assert_eq!(store.records(1_000).unwrap().len(), 1);
+
+    // (b) Part 0 is accepted first: the single publish is refused, the set records, and the
+    // claim's staging row is released by reclaim as ruling A says.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let claim = set_claim(&store, b"b", content);
+    single(&store, &claim);
+    let part = publish_part(&store, &part_request_of(&claim, 0), content, 1_000);
+    let refused = store.import_publish(&claim.import_id, 1_000).unwrap_err();
+    assert_eq!(refused.code, "CONFLICT");
+    let manifest = set_manifest_for(&store, &claim, "source", "json", 1_000).unwrap();
+    store.consumption_publish_set(&claim.import_id).unwrap();
+    let records = store.records(1_000).unwrap();
+    let mut ids = records
+        .iter()
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), records.len(), "each record is read once");
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.artifact_id == part.id)
+            .count(),
+        1
+    );
+    let claimed = claim.claimed.clone().unwrap();
+    store
+        .consumption_removed(&claim.import_id, &manifest.id, &claimed, 1_000)
+        .unwrap();
+    for _ in 0..4 {
+        store.import_reclaim(1_000).unwrap();
+    }
+    drop(store);
+    assert!(!import_row_present(dir.path(), &claim.import_id));
+}
+
+/// INVARIANT (#285): the by-key part read answers a part published with the store's configured
+/// maximum record count as `Stored`, with its artifact id and byte length, and never
+/// `RESOURCE_LIMIT`: the read owns no record array, so its cost does not follow the count.
+#[test]
+fn the_part_read_answers_a_part_of_the_maximum_record_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config();
+    // The configured maximum, set low enough that the fixture fits the test store's disk budget.
+    settings.max_records = 1_000;
+    let records = settings.max_records;
+    let store = Store::open(dir.path(), settings).unwrap();
+    let claim = set_claim(&store, b"max", b"x\n");
+    let bytes = "x\n".repeat(records).into_bytes();
+    let request = part_request_of(&claim, 0);
+    let part = publish_part(&store, &request, &bytes, 1_000);
+    assert_eq!(part.record_ids.len(), records);
+    let PartReceiptState::Stored(read) = store.ingest_part_receipt(&request, 1_000).unwrap() else {
+        panic!("a stored part reads as stored");
+    };
+    assert_eq!(read.artifact_id, part.id);
+    assert_eq!(read.byte_length, bytes.len() as u64);
+    assert_eq!(read.format, "log");
+}
+
+/// INVARIANT (#285): a pending claim's single-path artifact, and the manifest it accepted but
+/// has not recorded, survive an eviction pass that would otherwise retire them, until the
+/// claim's source is removed. After removal the next pass evicts them.
+#[test]
+fn a_pending_claims_single_and_manifest_artifacts_survive_eviction_until_removal() {
+    let content = b"one\n";
+    for single in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        let claim = set_claim(&store, b"held", content);
+        let artifact = if single {
+            single_staging(&store, &claim, content);
+            store.import_seal(&claim.import_id, 1_000).unwrap();
+            store
+                .import_prepare_layout(&claim.import_id, 1_000)
+                .unwrap();
+            store
+                .import_prepare_record(&claim.import_id, 0, 1_000)
+                .unwrap();
+            store.import_publish(&claim.import_id, 1_000).unwrap()
+        } else {
+            set_manifest_for(&store, &claim, "source", "json", 1_000).unwrap()
+        };
+        let limits = sparrow_core::EvictionLimits::default();
+        store.evict_oldest(2_000, limits).unwrap();
+        assert!(
+            store.bytes(&artifact.id, 0, 1, 2_000).is_ok(),
+            "single {single}: a pending claim's artifact is held"
+        );
+        if !single {
+            store.consumption_publish_set(&claim.import_id).unwrap();
+            store.evict_oldest(2_000, limits).unwrap();
+            assert!(
+                store.bytes(&artifact.id, 0, 1, 2_000).is_ok(),
+                "a recorded manifest is held until removal"
+            );
+        }
+        let claimed = claim.claimed.clone().unwrap();
+        store
+            .consumption_removed(&claim.import_id, &artifact.id, &claimed, 2_000)
+            .unwrap();
+        store.evict_oldest(2_000, limits).unwrap();
+        assert!(
+            store.bytes(&artifact.id, 0, 1, 2_000).is_err(),
+            "single {single}: the hold ends with the claim"
+        );
+    }
 }
 
 /// INVARIANT (#280, ruling A): a claim that began single staging and was then recorded as a

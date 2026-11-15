@@ -206,6 +206,7 @@ impl Store {
             Some(_) => None,
             None => {
                 publication::published_admitted(&writer, &import_id, now, Some(&mut remaining))?
+                    .saved()
             }
         };
         let mut staging = published.as_ref().map(|(manifest, _)| manifest.clone());
@@ -254,6 +255,11 @@ impl Store {
             .as_ref()
             .map(|saved| Artifact::decode(field(saved, "receipt")?))
             .transpose()?;
+        // A set part whose saved artifact is gone is not accepted: it is sent again (#285).
+        let direct = match direct {
+            Some(saved) if !publication::part_answerable(&writer, &request_id, &saved)? => None,
+            other => other,
+        };
         if let (Some(direct), Some((_, staged))) = (&direct, &published)
             && direct.encode() != staged.encode()
         {
@@ -544,5 +550,80 @@ impl IngestStatus {
         }
         self.inspected_records += 1;
         Ok(())
+    }
+}
+
+/// One set part's saved receipt, read by request id (#285).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartReceipt {
+    /// The part's request id, `consumeset:{H}.part{k:010}`.
+    pub request_id: String,
+    /// The part's artifact id.
+    pub artifact_id: String,
+    /// The part's byte length.
+    pub byte_length: u64,
+    /// The part's stored format label.
+    pub format: String,
+}
+
+/// What a set part's saved receipt says about its artifact (#285).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PartReceiptState {
+    /// No receipt is kept: the part is not published.
+    Absent,
+    /// The receipt's artifact is stored and not evicted.
+    Stored(PartReceipt),
+    /// The artifact is gone and no record of it is stored; the part is sent again.
+    Evicted(PartReceipt),
+    /// Eviction began and some record of the artifact is still stored.
+    Evicting(PartReceipt),
+}
+
+impl Store {
+    /// Read set part `request_id`'s saved receipt by its key, with no record scan: the receipt's
+    /// scalars only, never its record or chunk arrays. A receipt is kept only for a claim whose
+    /// journal exists (`handoff.rs`), so a part without one answers `Absent`. The receipt's age
+    /// is not tested: the part walk of a pending claim reads it for the life of the claim. No
+    /// append, publication or retention renewal occurs.
+    pub fn ingest_part_receipt(
+        &self,
+        request_id: &str,
+        now: u64,
+    ) -> Result<PartReceiptState, Error> {
+        let Some(claim) = super::consumption::part_claim_import(request_id) else {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "a set part receipt is read only for a claim's set part",
+            ));
+        };
+        crate::format_instant(now)?;
+        let writer = self.lock()?;
+        if writer.consumption(&claim)?.is_none() {
+            return Ok(PartReceiptState::Absent);
+        }
+        let Some(bytes) = writer
+            .db
+            .get_pinned(format!("request:ingest:{request_id}"))?
+        else {
+            return Ok(PartReceiptState::Absent);
+        };
+        let mut remaining = publication::PUBLICATION_BYTES;
+        let (header, slice) = super::manifest_retire::saved_receipt(&bytes, &mut remaining)?;
+        let receipt = PartReceipt {
+            request_id: request_id.to_owned(),
+            artifact_id: header.artifact.id.clone(),
+            byte_length: header.artifact.byte_length,
+            format: header.artifact.format.clone(),
+        };
+        Ok(
+            match publication::part_artifact(&writer, &receipt.artifact_id, || {
+                let mut remaining = publication::PUBLICATION_BYTES;
+                header.record_ids(slice, &mut remaining, 0, usize::MAX)
+            })? {
+                publication::PartArtifact::Stored => PartReceiptState::Stored(receipt),
+                publication::PartArtifact::Evicting => PartReceiptState::Evicting(receipt),
+                publication::PartArtifact::Gone => PartReceiptState::Evicted(receipt),
+            },
+        )
     }
 }

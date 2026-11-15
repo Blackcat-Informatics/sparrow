@@ -1256,8 +1256,46 @@ impl Writer {
                 super::consumption::SET_INTAKE_REFUSAL,
             ));
         }
+        // A claim publishes as one artifact or as a set, never both (#285).
+        if let Some(claim) = super::consumption::part_claim_import(request_id)
+            && let Some(journal) = writer.consumption(&claim)?
+            && journal.published_artifact.is_some()
+            && matches!(
+                writer.set_manifest(&journal)?,
+                super::consumption::SetManifest::Absent
+            )
+        {
+            return Err(Error::new(
+                "CONFLICT",
+                format!(
+                    "claim {} is published as one artifact; set part {request_id} is refused",
+                    journal.import_id
+                ),
+            ));
+        }
         let id = import_id(request_id);
-        if let Some(previous) = super::publication::published(writer, &id, now)? {
+        let mut part_gone = false;
+        let previous = match super::publication::published_admitted(writer, &id, now, None)? {
+            super::publication::Published::Saved(manifest, artifact) => Some((manifest, *artifact)),
+            super::publication::Published::PartGone(manifest) => {
+                // Later parts start where this one ends, so the same cut is sent again.
+                part_gone = true;
+                if manifest.request_id != request_id
+                    || manifest.source != source
+                    || manifest.format != format
+                    || manifest.byte_length != byte_length
+                    || manifest.payload_id != payload_id
+                {
+                    return Err(Error::new(
+                        "CONFLICT",
+                        "published import request has different declared input",
+                    ));
+                }
+                None
+            }
+            super::publication::Published::None => None,
+        };
+        if let Some(previous) = previous {
             let saved = previous.0;
             if saved.request_id != request_id
                 || saved.source != source
@@ -1305,6 +1343,14 @@ impl Writer {
                 ));
             }
             super::intake::admit_import(previous.intake.as_ref(), intake.as_ref())?;
+            if part_gone && previous.published_artifact.is_some() {
+                return Err(Error::new(
+                    "IMPORT_EXPIRED",
+                    format!(
+                        "set part {request_id}'s earlier publication row awaits reclamation; the part begins again after it"
+                    ),
+                ));
+            }
             previous.require_live(now)?;
             return Ok(previous);
         }

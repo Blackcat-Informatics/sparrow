@@ -126,7 +126,7 @@ async fn reconnect(endpoint: &Endpoint) -> Result<Client, Error> {
     }
 }
 
-async fn cancel(endpoint: &Endpoint, store: &str, id: &str) -> Result<(), Error> {
+pub(crate) async fn cancel(endpoint: &Endpoint, store: &str, id: &str) -> Result<(), Error> {
     let client = reconnect(endpoint).await?;
     let mut request = client.capability().import_cancel_request();
     import_reference(request.get().init_import(), store, id);

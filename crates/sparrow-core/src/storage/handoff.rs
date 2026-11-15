@@ -317,7 +317,8 @@ impl Writer {
             let claim = super::import::import_id(&format!("consume:{hash}"));
             return Ok(self.consumption(&claim)?.is_some());
         }
-        // A set part's ingest receipt is kept with its claim, as the manifest receipt is (#285).
+        // A set part's ingest receipt is kept with its claim, as the manifest receipt is. The
+        // part walk reads it (`Store::ingest_part_receipt`) (#285).
         if let Some(claim) = key
             .strip_prefix(b"request:ingest:")
             .and_then(|request| std::str::from_utf8(request).ok())

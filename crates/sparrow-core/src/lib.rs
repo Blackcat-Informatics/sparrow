@@ -66,7 +66,8 @@ pub use storage::import::{
     ImportManifest, ImportRecordSpan, ImportStart, MAX_IMPORT_BYTES, RAW_RECORD_BYTES,
 };
 pub use storage::ingest_status::{
-    IngestDeletion, IngestIndexCounts, IngestReadLimits, IngestSelector, IngestStatus,
+    IngestDeletion, IngestIndexCounts, IngestReadLimits, IngestSelector, IngestStatus, PartReceipt,
+    PartReceiptState,
 };
 pub use storage::intake::{INGEST_SOCKET, Intake, PeerCredential, admit_import};
 pub use storage::listing_build::BuildProgress;
