@@ -1706,11 +1706,11 @@ fn tail_open_gaps_a_renumbered_device_and_refuses_a_changed_inode() {
         )
     };
 
-    // Inode changed: refused, and nothing is gapped.
+    // Inode changed together with a stale device: refused, and nothing is gapped.
     let changed = declare(
         "changed-inode",
         &first_meta,
-        root_meta.dev(),
+        root_meta.dev() + 1,
         root_meta.ino() + 1,
     );
     assert!(matches!(open(), Err(crate::consumption::Error::State(_))));
