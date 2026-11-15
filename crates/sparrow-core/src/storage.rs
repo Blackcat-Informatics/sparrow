@@ -1959,6 +1959,51 @@ impl Store {
         )
     }
 
+    /// Restore one archived artifact under its original artifact and record identities
+    /// and its original receipt time. `record_ids` must name exactly the records the
+    /// format splits `bytes` into, in source order. A stable request identity returns the
+    /// first restore's receipt, so repeating a restore adds nothing; an identity that
+    /// already names other evidence is a `CONFLICT`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the ingest request plus the original identities and receipt time it is restored under"
+    )]
+    pub fn restore_artifact(
+        &self,
+        request_id: &str,
+        source: &str,
+        format: &str,
+        bytes: &[u8],
+        artifact_id: &str,
+        record_ids: &[String],
+        received_at: u64,
+    ) -> Result<Artifact, Error> {
+        let well_formed =
+            |id: &str, kind: &str| id.len() > kind.len() && id.len() <= 128 && id.starts_with(kind);
+        if !well_formed(artifact_id, "artifact:")
+            || record_ids.iter().any(|id| !well_formed(id, "record:"))
+        {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "restore requires artifact: and record: identities",
+            ));
+        }
+        let restore = ingest::Restore {
+            artifact_id: artifact_id.to_owned(),
+            record_ids: record_ids.to_vec(),
+        };
+        self.ingest_input(
+            request_id,
+            source,
+            format,
+            bytes,
+            ingest::Origin::Restore(&restore),
+            None,
+            received_at,
+            durability::Durability::Durable,
+        )
+    }
+
     /// Accept normalized typed events and their producer positions in one WAL batch.
     pub fn ingest_producer(
         &self,
@@ -2163,13 +2208,40 @@ impl Store {
             .tail()
             .map(|input| tail::prepare(&writer, source, format, input, record_count, now))
             .transpose()?;
-        let id = random_id("artifact")?;
+        let id = match origin.restore() {
+            Some(restore) => {
+                if restore.record_ids.len() != record_count {
+                    return Err(Error::new(
+                        "INVALID_ARGUMENT",
+                        "restore names a different number of records than the bytes hold",
+                    ));
+                }
+                let taken = std::iter::once(restore.artifact_id.as_str())
+                    .chain(restore.record_ids.iter().map(String::as_str))
+                    .try_fold(false, |taken, id| {
+                        writer.db.get(id).map(|row| taken || row.is_some())
+                    })?;
+                if taken {
+                    return Err(Error::new(
+                        "CONFLICT",
+                        "restore identity already names evidence in this store",
+                    ));
+                }
+                restore.artifact_id.clone()
+            }
+            None => random_id("artifact")?,
+        };
         let mut prepared = ingest::RecordBatch::new(&writer)?;
         let mut records = Vec::new();
         let mut start = 0;
         for (ordinal, end) in record_ends(format, bytes, true).enumerate() {
             let record = prepared.record(ingest::RecordInput {
-                id: random_id("record")?,
+                id: match origin.restore() {
+                    Some(restore) => restore.record_ids.get(ordinal).cloned().ok_or_else(|| {
+                        Error::new("INVALID_ARGUMENT", "restore names too few records")
+                    })?,
+                    None => random_id("record")?,
+                },
                 artifact_id: &id,
                 source,
                 format,

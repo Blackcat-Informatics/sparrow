@@ -1360,6 +1360,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sparrow-archive"
+version = "0.1.0"
+dependencies = [
+ "purrdf",
+ "sparrow-core",
+ "sparrow-test-support",
+ "tempfile",
+]
+
+[[package]]
 name = "sparrow-client"
 version = "0.1.0"
 dependencies = [

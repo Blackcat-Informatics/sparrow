@@ -332,6 +332,14 @@ digest names a blob. To find a record's bytes, follow the link quad
 
 Duplicates can appear after a PurRDF revision change (section 3). Readers keep
 one copy per record IRI and report duplicates rather than merging conflicting
-content. P4 adds an offline `sparrow-archive verify|list <dir>` tool. It checks
-`STORE.nq`, manifests, digests and quarantine files, and reports corruption.
-Re-importing archived evidence into a store is deferred (decision 6).
+content. The offline `sparrow-archive list|verify DIR` tool (crate `sparrow-archive`)
+walks `DIR` for segment files, decodes each in memory through one decoder module, and
+prints one JSON line per segment with its record, artifact and blob counts. `verify`
+also fails any segment the decoder refuses, with `"ok":false` and exit 1. The tool never
+opens a live store and writes nothing.
+
+Recovery is record by record: `sparrow_archive::restore` writes chosen entries from decoded
+segments into a store under their original artifact and record identities, receipt times
+and sources, byte-exact, and repeating it adds nothing. It is not a store rebuild. The
+test `archived_segment_reimports_byte_exact` covers it. Decision 6 (original identities)
+is recorded here: the target is a fresh store, so the identities cannot collide.
