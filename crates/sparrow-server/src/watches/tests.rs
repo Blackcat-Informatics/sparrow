@@ -1748,3 +1748,73 @@ fn tail_open_gaps_a_renumbered_device_and_refuses_a_changed_inode() {
     assert_eq!(after.offset, published.offset);
     assert_eq!(after.records, 1);
 }
+
+/// INVARIANT: a pending finished-file claim whose stored root and parent device alone differ
+/// from the directory now held (btrfs renumbers devices at boot) stays bound: the watch root
+/// opens and recovery clears the root and parent scope checks. A claim stored under another
+/// root inode is still refused.
+#[test]
+fn consume_root_accepts_a_renumbered_device_and_refuses_a_changed_inode() {
+    use std::os::unix::fs::MetadataExt;
+    let directory = tempfile::tempdir().unwrap();
+    let producer = directory.path().join("producer");
+    std::fs::create_dir(&producer).unwrap();
+    let path = producer.join("done.log");
+    std::fs::write(&path, b"line\n").unwrap();
+    let data = directory.path().join("store");
+    let config_path =
+        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
+    let store = crate::ServerConfig::read(&config_path)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let (root, file) = (
+        std::fs::metadata(&producer).unwrap(),
+        std::fs::metadata(&path).unwrap(),
+    );
+    let reserve = |watch: &str, device: u64, inode: u64| {
+        store
+            .consumption_reserve(
+                watch,
+                b"done.log",
+                "consume-boot",
+                "log",
+                {
+                    // The store requires the claimed file and the roots on one device.
+                    let mut observed = CompletedFileIdentity::capture(&file);
+                    observed.device = device;
+                    crate::consumption::generation(observed).unwrap()
+                },
+                sparrow_core::ConsumptionDirectories {
+                    root_device: device,
+                    root_inode: inode,
+                    parent_device: device,
+                    parent_inode: inode,
+                },
+                crate::now().unwrap(),
+            )
+            .unwrap()
+    };
+
+    // Inode changed (with a stale device too): the open refuses.
+    reserve("changed-inode", root.dev() + 1, root.ino() + 1);
+    assert!(matches!(
+        ClaimRoot::open(store.clone(), "changed-inode", &producer),
+        Err(crate::consumption::Error::State(_))
+    ));
+
+    // Device renumbered alone: the open succeeds and recovery passes the root and parent
+    // scope checks. It then stops at the claimed file's own recorded device, which stays
+    // strict and leaves the source in place.
+    let journal = reserve("renumbered", root.dev() + 1, root.ino());
+    let owner = ClaimRoot::open(store.clone(), "renumbered", &producer).unwrap();
+    let refused = owner
+        .recover(&journal.import_id, crate::now().unwrap())
+        .err()
+        .unwrap();
+    assert!(
+        !matches!(refused, crate::consumption::Error::State(_)),
+        "the renumbered root is bound; only the file identity refuses: {refused}"
+    );
+    assert!(path.exists(), "the source is never moved or deleted");
+}

@@ -2703,7 +2703,14 @@ active generation whose root device alone differs from the root's current device
 `identity_changed` at start, because a filesystem such as btrfs renumbers its
 devices at boot; the daemon writes one operator line naming the watch, the
 generation and both device numbers, and the file is then read again from the
-beginning under a new generation. Any other difference refuses the start. After a
+beginning under a new generation. Any other difference refuses the start. A
+pending finished-file claim is treated alike: a stored root or parent device
+that alone differs from the current one (the inode is equal) still names the
+same directory, so the claim stays bound and recoverable, and the daemon writes
+one operator line naming the watch and both root device numbers. A changed
+inode still refuses it. The claimed file's own recorded device is not relaxed:
+after a renumbering a claim whose file was already moved into the private claim
+directory refuses its recovery and removal, and keeps the file. After a
 complete reconciliation, unavailable active identities receive durable read gaps;
 no missing prefix is invented. Status exposes finite `tail_generation_ids`,
 `tail_read_bytes`, `tail_descriptors`, `tail_admission_waiting` and
