@@ -15,7 +15,7 @@ use super::{Error, Store};
 use purrdf::gts::writer::digest_string;
 use purrdf::gts_write::to_writer;
 use purrdf::{RdfDataset, RdfLookaside};
-use purrdf_core::{ContentDigest, ScopeBinding, UnionDatasetView, ViewLimits, dataset_from_view};
+use purrdf_core::{ContentDigest, ir::import::DatasetImporter};
 
 const LINK_GRAPH: &str = "urn:sparrow:graph:archive-links";
 const LINK_SHA256: &str = "urn:sparrow:vocab:payloadSha256";
@@ -55,51 +55,85 @@ fn write_gts(dataset: &RdfDataset, blobs: Vec<Vec<u8>>) -> Result<Vec<u8>, Error
 }
 
 /// Ceilings for the archive's own read: a segment's content projections can be large, so the
-/// default query limits would refuse an ordinary segment. Row, request and byte ceilings are
-/// the store's own bounds, not a throttle; the lease is the longest the read admits.
-const ARCHIVE_READ: RdfReadLimits = RdfReadLimits {
-    live_bytes: 2 * 1024 * 1024 * 1024,
-    requests: 1 << 32,
-    io_bytes: 8 * 1024 * 1024 * 1024,
-    row_visits: 1 << 32,
-    lease_ms: 60_000,
-};
+/// default query limits would refuse an ordinary segment. The request and row ceilings are a
+/// per-record allowance plus a fixed base, so the read's cost per record cannot grow with the
+/// segment: a read that costs more per record than the allowance (as the union read did, at
+/// quadratic cost) is refused instead of running for minutes. The allowance is about twice
+/// the measured cost per record. The lease is the longest the read admits.
+fn archive_read(entries: usize) -> RdfReadLimits {
+    let entries = entries as u64;
+    RdfReadLimits {
+        live_bytes: 2 * 1024 * 1024 * 1024,
+        requests: BASE_REQUESTS + entries * REQUESTS_PER_ENTRY,
+        io_bytes: 8 * 1024 * 1024 * 1024,
+        row_visits: BASE_ROWS + entries * ROWS_PER_ENTRY,
+        lease_ms: 60_000,
+    }
+}
+
+/// Request allowance for each record or artifact in a segment; measured cost is about 255.
+const REQUESTS_PER_ENTRY: u64 = 512;
+/// Row-visit allowance for each record or artifact in a segment; measured cost is about 32.
+const ROWS_PER_ENTRY: u64 = 64;
+/// Fixed request allowance for the scope's own setup.
+const BASE_REQUESTS: u64 = 10_000;
+/// Fixed row-visit allowance for the scope's own setup.
+const BASE_ROWS: u64 = 2_000;
+
+/// One record's link quads: its identity and the two digests of its bytes.
+fn push_links(
+    builder: &mut purrdf::RdfDatasetBuilder,
+    links: &[(String, String, String)],
+) -> Result<(), Error> {
+    let graph = builder.intern_iri(LINK_GRAPH).map_err(failure)?;
+    let sha256 = builder.intern_iri(LINK_SHA256).map_err(failure)?;
+    let blake3 = builder.intern_iri(LINK_BLAKE3).map_err(failure)?;
+    for (id, sha, blake) in links {
+        let subject = builder
+            .intern_iri(&format!("urn:sparrow:{id}"))
+            .map_err(failure)?;
+        for (predicate, value) in [(sha256, sha), (blake3, blake)] {
+            let object = builder
+                .intern_literal(purrdf::RdfLiteral::simple(value.as_str()))
+                .map_err(failure)?;
+            builder
+                .push_quad(subject, predicate, object, Some(graph))
+                .map_err(failure)?;
+        }
+    }
+    Ok(())
+}
 
 /// Encode the records `ids` and the artifacts `artifact_ids` (their graphs) and the records'
 /// `contents` (id and bytes, one per record) as one GTS file, and count the artifacts that
 /// have no graph to carry. Each record's bytes are a blob keyed by BLAKE3, tied to its record
 /// by link quads that also carry the SHA-256.
+///
+/// The stored graphs and the link quads go into one builder: the scoped view is imported
+/// once, then the links are added. A union of the two views is not used, because its row
+/// de-duplication looks each stored row up again in the scoped view, and a scoped lookup
+/// opens a cursor per graph, so the read cost per record grew with the segment.
 pub(super) fn encode(
     store: &Store,
     ids: &[String],
     artifact_ids: &[String],
     contents: Vec<(String, Vec<u8>)>,
 ) -> Result<(Vec<u8>, u64), Error> {
-    let mut links = purrdf::RdfDatasetBuilder::new();
-    let graph = links.intern_iri(LINK_GRAPH).map_err(failure)?;
-    let sha256 = links.intern_iri(LINK_SHA256).map_err(failure)?;
-    let blake3 = links.intern_iri(LINK_BLAKE3).map_err(failure)?;
+    let mut links = Vec::with_capacity(contents.len());
     let mut blobs = Vec::with_capacity(contents.len());
     for (id, bytes) in contents {
-        let subject = links
-            .intern_iri(&format!("urn:sparrow:{id}"))
-            .map_err(failure)?;
-        for (predicate, value) in [
-            (sha256, ContentDigest::of(&bytes).to_hex()),
-            (blake3, digest_string(&bytes)),
-        ] {
-            let object = links
-                .intern_literal(purrdf::RdfLiteral::simple(value))
-                .map_err(failure)?;
-            links
-                .push_quad(subject, predicate, object, Some(graph))
-                .map_err(failure)?;
-        }
+        links.push((
+            id,
+            ContentDigest::of(&bytes).to_hex(),
+            digest_string(&bytes),
+        ));
         blobs.push(bytes);
     }
-    let links = links.freeze().map_err(failure)?;
     if ids.is_empty() && artifact_ids.is_empty() {
-        return Ok((write_gts(&links, blobs)?, 0));
+        let mut builder = purrdf::RdfDatasetBuilder::new();
+        push_links(&mut builder, &links)?;
+        let dataset = builder.freeze().map_err(failure)?;
+        return Ok((write_gts(&dataset, blobs)?, 0));
     }
     // Archive scope: `now` of zero reads evidence past its ordinary deadline, which the
     // deletion gate holds until a segment covers it.
@@ -109,19 +143,14 @@ pub(super) fn encode(
             artifact_ids,
             RdfGraphLayers::ALL,
             0,
-            ARCHIVE_READ,
+            archive_read(ids.len() + artifact_ids.len()),
             |view, absent| {
-                let union = UnionDatasetView::new(
-                    view,
-                    &*links,
-                    (ScopeBinding::Independent, ScopeBinding::Independent),
-                    ViewLimits::default(),
-                )
-                .map_err(failure)?;
-                Ok::<_, Error>((
-                    dataset_from_view(&union).map_err(failure)?,
-                    absent.len() as u64,
-                ))
+                let mut builder = purrdf::RdfDatasetBuilder::new();
+                DatasetImporter::try_new(&mut builder, view)
+                    .and_then(|mut importer| importer.try_append())
+                    .map_err(failure)?;
+                push_links(&mut builder, &links)?;
+                Ok::<_, Error>((builder.freeze().map_err(failure)?, absent.len() as u64))
             },
         )
         .map_err(|error| Error::new(error.code, error.message.clone()))??;

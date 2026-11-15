@@ -18,8 +18,6 @@ use rocksdb::{Direction, IteratorMode};
 /// The horizon never trails `now` by less than this (archive format, section 5).
 const HORIZON_FLOOR_MS: u64 = 10 * 60 * 1000;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
-/// One RDF snapshot admits at most this many record identities.
-const SNAPSHOT_RECORDS: u64 = 1000;
 /// Records above this are held: neither archived nor deleted. The GTS writer holds the whole
 /// segment resident and costs about three times a record while it writes; 128 MiB is the size
 /// measured (`.stage/archive/probe/result.md`). It is a memory limit that relaxes when PurRDF
@@ -164,7 +162,7 @@ fn select(
                 .saturating_sub(writer.config.maintenance_reserve) as f64;
     let horizon = now
         .saturating_sub(HORIZON_FLOOR_MS.max(u64::from(writer.config.buffered_flush_interval_ms)));
-    let entry_cap = cap.unwrap_or(policy.max_segment_records.min(SNAPSHOT_RECORDS));
+    let entry_cap = cap.unwrap_or(policy.max_segment_records);
     let mut selection = Selection {
         first: String::new(),
         last: String::new(),

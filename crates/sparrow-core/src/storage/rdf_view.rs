@@ -1308,12 +1308,20 @@ impl Store {
         limits: RdfReadLimits,
         operation: impl FnOnce(&StoredRdfView<'_>) -> T,
     ) -> Result<T, ReadError> {
+        if ids.is_empty() || ids.len() > 1000 {
+            return Err(Arc::new(Error::new(
+                "INVALID_ARGUMENT",
+                "RDF selection requires 1..1000 record IDs",
+            )));
+        }
         self.with_rdf_scope_ids(ids, &[], layers, now, limits, |view, _| operation(view))
     }
 
     /// The same capture with named artifacts' graphs added to the records'. The operation also
     /// receives the artifact ids that have no RDF ownership (retired before the store was
-    /// fenced) and so are absent from the view.
+    /// fenced) and so are absent from the view. The selection is not capped at the query bound
+    /// of 1,000 (`with_rdf_record_layers` keeps it): the archive reads a whole segment, whose
+    /// size its own selection bounds, and each id is charged to the scope's live bytes.
     pub(super) fn with_rdf_scope_ids<T>(
         &self,
         ids: &[String],
@@ -1323,10 +1331,10 @@ impl Store {
         limits: RdfReadLimits,
         operation: impl FnOnce(&StoredRdfView<'_>, &[String]) -> T,
     ) -> Result<T, ReadError> {
-        if (ids.is_empty() && artifacts.is_empty()) || ids.len() > 1000 || artifacts.len() > 1000 {
+        if ids.is_empty() && artifacts.is_empty() {
             return Err(Arc::new(Error::new(
                 "INVALID_ARGUMENT",
-                "RDF selection requires 1..1000 record IDs",
+                "RDF selection requires at least one record or artifact ID",
             )));
         }
         let _lease = self.rdf_read_lease()?;

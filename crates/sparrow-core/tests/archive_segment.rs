@@ -200,3 +200,25 @@ fn a_segment_ending_between_an_artifact_and_its_record_still_holds_the_artifact(
         .unwrap();
     assert_eq!(done.records, 1);
 }
+
+/// INVARIANT: preparing a segment costs a bounded amount of read per record, whatever the
+/// segment's size, and a segment of more than 1,000 records prepares (the query selection
+/// bound does not apply to it). The read ceilings are a per-record allowance, which the
+/// earlier union read exceeded from about 20 records on. A retried prepare of the same due
+/// backlog is byte-equal, so the archive worker never meets a different file at a name.
+#[test]
+fn a_segment_of_over_a_thousand_records_prepares_within_its_read_bound_and_repeats_byte_equal() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), archiving(ArchivePolicy::default())).unwrap();
+    let body: String = (0..1100).map(|i| format!("line number {i:06}\n")).collect();
+    store
+        .ingest("seg-many", "source", "log", body.as_bytes(), 1)
+        .unwrap();
+    let now = 1 + 30 * DAY;
+    let first = store.archive_prepare(now).unwrap().expect("due");
+    assert_eq!(first.records, 1100);
+    let again = store.archive_prepare(now).unwrap().expect("rebuilt");
+    assert_eq!(first.segment_id, again.segment_id);
+    assert_eq!(first.files, again.files);
+    store.archive_commit(&first.segment_id).unwrap();
+}
