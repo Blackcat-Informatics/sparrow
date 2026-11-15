@@ -2697,7 +2697,13 @@ and starts a new opaque generation. Same-length observed modification produces
 a declared read gap. This is an append-only producer contract; these observations
 do not certify detection of every rewrite or overwrite followed by growth.
 
-Restart attaches surviving in-root identities to original checkpoints. After a
+Restart attaches surviving in-root identities to original checkpoints. A stored
+active generation whose root device alone differs from the root's current device
+(its inode, watch revision, source and format are equal) is gapped as
+`identity_changed` at start, because a filesystem such as btrfs renumbers its
+devices at boot; the daemon writes one operator line naming the watch, the
+generation and both device numbers, and the file is then read again from the
+beginning under a new generation. Any other difference refuses the start. After a
 complete reconciliation, unavailable active identities receive durable read gaps;
 no missing prefix is invented. Status exposes finite `tail_generation_ids`,
 `tail_read_bytes`, `tail_descriptors`, `tail_admission_waiting` and

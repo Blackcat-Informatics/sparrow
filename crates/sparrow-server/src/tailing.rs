@@ -511,18 +511,20 @@ impl TailRoot {
     }
 }
 
-/// Whether a generation declared on another root than ROOT must be left alone: only under a
-/// private root (`sparrowd --private-intake`), where the original root's generations are
-/// never resumed, adopted or closed.
 /// How a stored active generation's declaration relates to the watch as it is now.
 #[derive(Debug, PartialEq, Eq)]
 enum Declaration {
+    /// Every declared identity equals the current one.
     Matches,
     /// Only the root's device number differs; the inode, revision, source and format agree.
     DeviceRenumbered,
+    /// The inode, revision, source or format differs, whatever the device says.
     Refused,
 }
 
+/// Classify a stored active generation's declaration against the watch's current root,
+/// revision, source and format. The inode, revision, source and format are checked first, so a
+/// stale device never excuses another difference.
 #[must_use]
 fn check_declaration(
     declared: &TailStart,
@@ -543,6 +545,9 @@ fn check_declaration(
     }
 }
 
+/// Whether a generation declared on another root than ROOT must be left alone: only under a
+/// private root (`sparrowd --private-intake`), where the original root's generations are
+/// never resumed, adopted or closed.
 fn foreign(
     binding: crate::consumption::RootBinding,
     root: (u64, u64),

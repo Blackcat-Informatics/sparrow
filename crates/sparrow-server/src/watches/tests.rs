@@ -1731,9 +1731,20 @@ fn tail_open_gaps_a_renumbered_device_and_refuses_a_changed_inode() {
         root_meta.dev() + 1,
         root_meta.ino(),
     );
+    store
+        .tail_append(
+            &renumbered.id,
+            0,
+            b"second line\n",
+            false,
+            crate::now().unwrap(),
+        )
+        .unwrap();
+    let published = store.tail_generation(&renumbered.id).unwrap();
+    assert_eq!(published.records, 1);
     open().unwrap();
     let after = store.tail_generation(&renumbered.id).unwrap();
     assert_eq!(after.gap.as_deref(), Some("identity_changed"));
-    assert_eq!(after.offset, renumbered.offset);
-    assert_eq!(after.records, renumbered.records);
+    assert_eq!(after.offset, published.offset);
+    assert_eq!(after.records, 1);
 }
