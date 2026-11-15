@@ -15657,15 +15657,28 @@ async fn over_bound_consume_file_is_split_into_ordered_parts_and_removed() {
 async fn over_bound_non_line_consume_file_is_taken_as_opaque_parts() {
     tokio::task::LocalSet::new()
         .run_until(async {
-            let dir = tempfile::tempdir().unwrap();
-            let harness = set_harness(dir.path()).await;
             for (name, format) in [("big.json", "json"), ("big.syslog", "syslog")] {
+                // Each format has its own store: a published part holds one of the 16 import
+                // journals until maintenance reclaims it, and no maintenance runs here. A syslog
+                // file of 800 KiB is 13 parts at the packet limit, within those slots.
+                let dir = tempfile::tempdir().unwrap();
+                let harness = set_harness(dir.path()).await;
+                let size = if format == "syslog" {
+                    800 * 1024
+                } else {
+                    3 * 1024 * 1024
+                };
                 let mut input = b"{\"document\":\"".to_vec();
-                input.resize(3 * 1024 * 1024, b'd');
+                input.resize(size, b'd');
                 input.extend_from_slice(b"\"}");
                 let (manifest, claim) = harness.publish(name, format, &input).await;
                 let parts = harness.parts(&manifest, format, &input);
-                assert_eq!(parts.len(), 3, "{format}");
+                // A json file is cut at the import bound; a syslog file at the packet limit.
+                let expected = match format {
+                    "syslog" => input.len().div_ceil(65_536),
+                    _ => 3,
+                };
+                assert_eq!(parts.len(), expected, "{format}");
                 for (stored, artifact) in &parts {
                     assert_eq!(stored, "opaque");
                     assert_eq!(harness.store.artifact(artifact).unwrap().format, "opaque");
@@ -15675,6 +15688,51 @@ async fn over_bound_non_line_consume_file_is_taken_as_opaque_parts() {
                     .remove(&claim, sparrow_server::now().unwrap())
                     .unwrap();
             }
+        })
+        .await;
+}
+
+/// INVARIANT (#282): a syslog file above the packet limit and under the import bound is not
+/// refused at record preparation. It is cut into opaque parts of at most the packet limit, in
+/// order; the manifest keeps the original format and each part's byte range; and the parts read
+/// in manifest order are the source bytes (`harness.parts` checks both).
+#[tokio::test]
+async fn syslog_file_above_the_packet_limit_is_taken_as_ordered_opaque_parts() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let harness = set_harness(dir.path()).await;
+            let input: Vec<u8> = (0..102_400u32).map(|n| b'a' + (n % 26) as u8).collect();
+            let (manifest, _claim) = harness.publish("hundred.syslog", "syslog", &input).await;
+            let parts = harness.parts(&manifest, "syslog", &input);
+            let lengths: Vec<u64> = parts
+                .iter()
+                .map(|(_, artifact)| harness.store.artifact(artifact).unwrap().byte_length)
+                .collect();
+            assert_eq!(lengths, [65_536, 36_864]);
+            assert!(parts.iter().all(|(stored, _)| stored == "opaque"));
+        })
+        .await;
+}
+
+/// INVARIANT (#282): a syslog file at or under the packet limit keeps the single path: it is one
+/// syslog artifact holding the source bytes, and no manifest is written.
+#[tokio::test]
+async fn syslog_file_at_the_packet_limit_keeps_the_single_path() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let harness = set_harness(dir.path()).await;
+            let input = vec![b'x'; 65_536];
+            let (id, claim) = harness.publish("packet.syslog", "syslog", &input).await;
+            assert_eq!(
+                claim.journal().published_artifact.as_deref(),
+                Some(id.as_str())
+            );
+            let receipt = harness.store.artifact(&id).unwrap();
+            assert_eq!(receipt.format, "syslog");
+            assert_eq!(receipt.byte_length, 65_536);
+            assert_eq!(harness.read(&id, 65_536), input);
         })
         .await;
 }
@@ -15988,7 +16046,11 @@ async fn client_cut_parts_are_accepted_by_the_daemon_and_one_more_unit_is_refuse
             use sparrow_client::{Format, parts};
             let dir = tempfile::tempdir().unwrap();
             let harness = set_harness(dir.path()).await;
-            let limits = parts::PartLimits::from_discovery(harness.client.discovery()).unwrap();
+            let limits = parts::PartLimits::from_discovery(
+                harness.client.discovery(),
+                sparrow_core::SYSLOG_MESSAGE_BYTES as u64,
+            )
+            .unwrap();
             let input: Vec<u8> = (0..100)
                 .flat_map(|index| format!("dense line {index:04}\n").into_bytes())
                 .collect();
