@@ -136,10 +136,13 @@ pub struct ArchiveConfig {
     /// of the retention window or data budget by default.
     #[serde(default = "default_check_secs")]
     pub check_secs: u64,
-    /// Seconds before an archive operation in flight is reported stalled.
+    /// Seconds before an archive step in flight is journaled as stalled, and again every this
+    /// many seconds while it lasts.
     #[serde(default = "default_stall_warn")]
     pub stall_warn_secs: u64,
-    /// Seconds before an archive operation in flight marks the archive unavailable.
+    /// Seconds an archive step may run before the pass counts as overrun: the segment is not
+    /// committed on that pass and is verified again on the next. A blocked call cannot be
+    /// cancelled, so no further step starts until it returns.
     #[serde(default = "default_io_timeout")]
     pub io_timeout_secs: u64,
 }

@@ -4210,6 +4210,7 @@ async fn daemon_pressure_worker_evicts_only_after_its_segment_is_written() {
             if pressure.get_evicted_records() > 0 {
                 assert_eq!(pressure.get_disk_budget(), 16_777_216);
                 assert!(pressure.get_archive_configured());
+                assert!(!pressure.get_archive_held(), "the archive no longer holds the evidence");
                 assert!(
                     !archived_segments(&nas, &store_id).is_empty(),
                     "evidence was evicted before its segment was written"
