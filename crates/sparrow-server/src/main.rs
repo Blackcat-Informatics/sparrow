@@ -377,6 +377,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     store.clone(),
                     archive.dir.clone(),
                     std::time::Duration::from_secs(archive.check_secs),
+                    std::time::Duration::from_secs(archive.stall_warn_secs),
+                    std::time::Duration::from_secs(archive.io_timeout_secs),
                 )?),
                 None => None,
             };

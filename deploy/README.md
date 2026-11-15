@@ -71,7 +71,10 @@ Patrick's decisions for this deployment, 2026-11-01:
   service (Patrick, 2026-11-08: "Backup may not: stop the server, pause the
   server, or in any way perturb the ingestion."). The daemon's archive worker, which will write
   its own per-store directories under the same root, is not deployed; Sparrow
-  issues #15 to #17 add it.
+  issues #15 to #17 add it. That worker refuses a root until the backup engine has
+  written `STORE_ID` there, which it does on the first backup: `[archive] dir` must be the
+  same root as `backup_root`, and a first backup must have completed. A file naming
+  another store means `dir` is that store's archive or the wrong mount.
 - Restarts of the live service are approved and announced by the coordination
   session.
 
