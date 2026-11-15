@@ -15485,11 +15485,23 @@ struct SetHarness {
     client: sparrow_client::Client,
     root: sparrow_server::consumption::ClaimRoot,
     producer: std::path::PathBuf,
+    socket: std::path::PathBuf,
     _serving: tokio::task::JoinHandle<()>,
 }
 
 /// One chunk and one record charge 2 x (67 + 42) bytes of the row budget.
 const SET_ROW_BUDGET: usize = 20 * 218;
+
+/// Eviction limits whose retirement scale admits `units` one-chunk records per artifact: the
+/// fixed envelope charge at one payload reference, then `units` of row budget.
+fn set_limits(units: usize) -> sparrow_core::EvictionLimits {
+    let fixed = 2 * 4096 + 8192 + 64 * 4096 + 18 * 1024 + (2 * 66 + 2 * 24);
+    sparrow_core::EvictionLimits {
+        max_payload_refs: 1,
+        max_catalog_bytes: fixed + units * (SET_ROW_BUDGET / 20) + 1024,
+        ..sparrow_core::EvictionLimits::default()
+    }
+}
 
 async fn set_harness(dir: &Path) -> SetHarness {
     use sparrow_server::{Rpc, ServerConfig, consumption::ClaimRoot};
@@ -15497,13 +15509,7 @@ async fn set_harness(dir: &Path) -> SetHarness {
     let socket = data.join("rpc.sock");
     let config = ServerConfig::read(&write_server_config(dir, &data, &socket)).unwrap();
     let store = config.open_store().unwrap();
-    // The fixed envelope charge at one payload reference, then 20 units of row budget.
-    let fixed = 2 * 4096 + 8192 + 64 * 4096 + 18 * 1024 + (2 * 66 + 2 * 24);
-    let limits = sparrow_core::EvictionLimits {
-        max_payload_refs: 1,
-        max_catalog_bytes: fixed + SET_ROW_BUDGET + 1024,
-        ..sparrow_core::EvictionLimits::default()
-    };
+    let limits = set_limits(20);
     let bounds = store.scale_retirement_for_tests(limits, 1024).unwrap();
     assert_eq!(bounds.import_bytes, 20 * 65_536);
     let producer = dir.join("producer");
@@ -15517,11 +15523,20 @@ async fn set_harness(dir: &Path) -> SetHarness {
         std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
         config.max_pin_members,
     ));
+    // Every connection is served, so a test can reconnect to read the limits as they stand.
+    // One task owns them all, so aborting it drops every connection and releases the store.
     let serving = tokio::task::spawn_local(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        sparrow_server::serve_connection(stream, capability)
-            .await
-            .unwrap();
+        use futures::StreamExt;
+        let mut connections = futures::stream::FuturesUnordered::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.unwrap();
+                    connections.push(sparrow_server::serve_connection(stream, capability.clone()));
+                }
+                Some(done) = connections.next() => done.unwrap(),
+            }
+        }
     });
     let client = sparrow_client::Client::connect(&socket).await.unwrap();
     let root = ClaimRoot::open(store.clone(), "watch", &producer).unwrap();
@@ -15530,6 +15545,7 @@ async fn set_harness(dir: &Path) -> SetHarness {
         client,
         root,
         producer,
+        socket,
         _serving: serving,
     }
 }
@@ -15542,25 +15558,7 @@ impl SetHarness {
         format: &str,
         input: &[u8],
     ) -> (String, sparrow_server::consumption::ClaimedFile) {
-        use sparrow_server::consumption::Recovery;
-        let path = self.producer.join(name);
-        std::fs::write(&path, input).unwrap();
-        let journal = self
-            .root
-            .reserve(
-                Path::new(name),
-                sparrow_client::CompletedFileIdentity::capture(&path.metadata().unwrap()),
-                "set-source",
-                format,
-            )
-            .unwrap();
-        let Recovery::Claimed(mut claim) = self
-            .root
-            .recover(&journal.import_id, sparrow_server::now().unwrap())
-            .unwrap()
-        else {
-            panic!("a fresh claim is not removed");
-        };
+        let mut claim = self.claim(name, format, input);
         let published = self
             .root
             .publish(&self.client, &mut claim, &Default::default())
@@ -15607,6 +15605,634 @@ impl SetHarness {
         );
         parts
     }
+}
+
+/// One jsonl line of exactly one import chunk, so each line is one record and one chunk.
+fn chunk_line(index: usize, pad: u8) -> Vec<u8> {
+    let mut line = format!("{{\"line\":{index},\"pad\":\"").into_bytes();
+    line.resize(65_536 - 3, pad);
+    line.extend_from_slice(b"\"}\n");
+    line
+}
+
+/// `count` chunk lines from line `first`, as one source.
+fn chunk_lines(first: usize, count: usize, pad: u8) -> Vec<u8> {
+    (first..first + count)
+        .flat_map(|index| chunk_line(index, pad))
+        .collect()
+}
+
+impl SetHarness {
+    /// Reserve and claim `name` holding `input`, without publishing it.
+    fn claim(
+        &self,
+        name: &str,
+        format: &str,
+        input: &[u8],
+    ) -> sparrow_server::consumption::ClaimedFile {
+        use sparrow_server::consumption::Recovery;
+        let path = self.producer.join(name);
+        std::fs::write(&path, input).unwrap();
+        let journal = self
+            .root
+            .reserve(
+                Path::new(name),
+                sparrow_client::CompletedFileIdentity::capture(&path.metadata().unwrap()),
+                "set-source",
+                format,
+            )
+            .unwrap();
+        let Recovery::Claimed(claim) = self
+            .root
+            .recover(&journal.import_id, sparrow_server::now().unwrap())
+            .unwrap()
+        else {
+            panic!("a fresh claim is not removed");
+        };
+        claim
+    }
+
+    /// A new connection, whose discovery reads the limits as they stand now.
+    async fn reconnect(&self) -> sparrow_client::Client {
+        sparrow_client::Client::connect(&self.socket).await.unwrap()
+    }
+
+    /// Scale the import bound and the retirement row budget to `units` one-chunk records.
+    fn scale(&self, units: usize) {
+        let bounds = self
+            .store
+            .scale_retirement_for_tests(set_limits(units), 1024)
+            .unwrap();
+        assert_eq!(bounds.import_bytes, units as u64 * 65_536);
+    }
+
+    /// The claim's private source file, opened as the part upload reads it.
+    fn source(&self, claim: &sparrow_server::consumption::ClaimedFile) -> std::fs::File {
+        std::fs::File::open(
+            self.producer
+                .join(".sparrow-inflight")
+                .join(&claim.journal().import_id),
+        )
+        .unwrap()
+    }
+
+    /// Upload every part of the claim, as an attempt does, and return its parts in order.
+    async fn upload(
+        &self,
+        client: &sparrow_client::Client,
+        claim: &sparrow_server::consumption::ClaimedFile,
+        resume: &sparrow_client::parts::Resume,
+    ) -> Vec<(sparrow_client::parts::PartSpan, String)> {
+        use sparrow_client::parts;
+        let limits = parts::PartLimits::from_discovery(
+            client.discovery(),
+            sparrow_core::SYSLOG_MESSAGE_BYTES as u64,
+        )
+        .unwrap();
+        let journal = claim.journal();
+        parts::upload_parts(
+            client,
+            &journal.request_id,
+            &journal.source,
+            sparrow_client::Format::Jsonl,
+            &self.source(claim),
+            Ok(&limits),
+            &parts::ClaimParts::default(),
+            &std::sync::Arc::new(parts::PartsProgress::default()),
+            resume,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Publish the first `spans` of `input` as the claim's set parts and nothing else, as an
+    /// attempt interrupted after them leaves the claim.
+    async fn publish_prefix(
+        &self,
+        claim: &sparrow_server::consumption::ClaimedFile,
+        input: &[u8],
+        spans: &[sparrow_client::parts::PartSpan],
+    ) -> Vec<String> {
+        use sparrow_client::parts;
+        let set = parts::set_request(&claim.journal().request_id).unwrap();
+        let mut artifacts = Vec::new();
+        for span in spans {
+            let path = self.producer.join(format!("prefix-{}", span.index));
+            let bytes = &input[span.start as usize..(span.start + span.length) as usize];
+            std::fs::write(&path, bytes).unwrap();
+            let mut file = std::fs::File::open(&path).unwrap();
+            let receipt = self
+                .client
+                .import_open_file_with_progress(
+                    &parts::part_request(&set, span.index),
+                    "set-source",
+                    span.format,
+                    &mut file,
+                    None,
+                )
+                .await
+                .unwrap();
+            artifacts.push(receipt.id);
+        }
+        artifacts
+    }
+
+    /// Reclaim every published or lapsed staging row the daemon's reclaim duty would.
+    fn reclaim(&self) {
+        let now = sparrow_server::now().unwrap();
+        for _ in 0..8 {
+            self.store.import_reclaim(now).unwrap();
+        }
+    }
+
+    /// One eviction pass of at most `units` retirement units, with no archive configured.
+    fn evict(&self, units: usize) {
+        self.store
+            .evict_oldest(
+                sparrow_server::now().unwrap(),
+                sparrow_core::EvictionLimits {
+                    max_records: units,
+                    ..sparrow_core::EvictionLimits::default()
+                },
+            )
+            .unwrap();
+    }
+
+    /// The by-key read of set part `index` of the claim.
+    fn part_state(
+        &self,
+        claim: &sparrow_server::consumption::ClaimedFile,
+        index: u32,
+    ) -> sparrow_core::PartReceiptState {
+        use sparrow_client::parts;
+        let set = parts::set_request(&claim.journal().request_id).unwrap();
+        self.store
+            .ingest_part_receipt(
+                &parts::part_request(&set, index),
+                sparrow_server::now().unwrap(),
+            )
+            .unwrap()
+    }
+
+    async fn publish_claim(
+        &self,
+        client: &sparrow_client::Client,
+        claim: &mut sparrow_server::consumption::ClaimedFile,
+    ) -> Result<String, sparrow_server::consumption::Error> {
+        self.root.publish(client, claim, &Default::default()).await
+    }
+
+    /// The live records of the claim's parts: each source line is read exactly once.
+    fn assert_lines_read_once(&self, manifest: &str, lines: usize) {
+        let now = sparrow_server::now().unwrap();
+        let manifest_records = self.store.artifact(manifest).unwrap().record_ids.len();
+        let records = self.store.records(now).unwrap();
+        assert_eq!(
+            records.len(),
+            lines + manifest_records,
+            "every line is read once"
+        );
+        let mut ids = records
+            .iter()
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), records.len());
+    }
+}
+
+/// INVARIANT (#285, ruling condition 1): the source of a set claim stays held, and its bytes
+/// are unchanged, for as long as the claim is pending: while a part is being evicted and while
+/// the manifest is accepted and not yet recorded. Once `publish` completes, removal succeeds.
+#[tokio::test]
+async fn a_set_claims_source_stays_held_while_the_claim_is_pending() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for manifest_accepted in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let harness = set_harness(dir.path()).await;
+                let input = chunk_lines(0, 50, b'p');
+                let mut claim = harness.claim("held.jsonl", "jsonl", &input);
+                let uploaded = harness
+                    .upload(
+                        &harness.client,
+                        &claim,
+                        &sparrow_client::parts::Resume::fresh(),
+                    )
+                    .await;
+                let journal = claim.journal().clone();
+                if manifest_accepted {
+                    sparrow_client::parts::ingest_manifest(
+                        &harness.client,
+                        &journal.request_id,
+                        &journal.source,
+                        sparrow_client::Format::Jsonl,
+                        input.len() as u64,
+                        &uploaded,
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    // Part 0 is evicted part way: one of its 20 records is retired.
+                    harness.evict(1);
+                    assert!(matches!(
+                        harness.part_state(&claim, 0),
+                        sparrow_core::PartReceiptState::Evicting(_)
+                    ));
+                    let error = harness
+                        .publish_claim(&harness.client, &mut claim)
+                        .await
+                        .unwrap_err();
+                    assert!(error.to_string().contains("is being evicted"), "{error}");
+                }
+                let now = sparrow_server::now().unwrap();
+                harness.root.remove(&claim, now).unwrap_err();
+                assert_eq!(
+                    std::fs::read(
+                        harness
+                            .producer
+                            .join(".sparrow-inflight")
+                            .join(&journal.import_id)
+                    )
+                    .unwrap(),
+                    input,
+                    "manifest_accepted {manifest_accepted}: the claimed source is unchanged"
+                );
+                if !manifest_accepted {
+                    harness.evict(19);
+                    harness.reclaim();
+                }
+                harness
+                    .publish_claim(&harness.client, &mut claim)
+                    .await
+                    .unwrap();
+                harness.root.remove(&claim, now).unwrap();
+            }
+        })
+        .await;
+}
+
+/// INVARIANT (#285, ruling condition 2, review-pr286 B1): with no archive configured, a set part
+/// that eviction retired is answered as evicted, sent again from the held source under the same
+/// request id, and then read exactly once. While eviction has retired only some of its records
+/// the claim is pending, and nothing is sent: a record still stored would be shown twice.
+#[tokio::test]
+async fn an_evicted_part_without_an_archive_is_sent_again_and_read_exactly_once() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let harness = set_harness(dir.path()).await;
+            let input = chunk_lines(0, 50, b'p');
+            let mut claim = harness.claim("evicted.jsonl", "jsonl", &input);
+            let first = harness
+                .upload(
+                    &harness.client,
+                    &claim,
+                    &sparrow_client::parts::Resume::fresh(),
+                )
+                .await;
+            assert_eq!(first.len(), 3);
+
+            // Eviction retires one record of part 0: it is evicting, and the claim pends.
+            harness.evict(1);
+            assert!(matches!(
+                harness.part_state(&claim, 0),
+                sparrow_core::PartReceiptState::Evicting(_)
+            ));
+            let error = harness
+                .publish_claim(&harness.client, &mut claim)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("part 0 is being evicted"),
+                "{error}"
+            );
+            assert!(
+                error.to_string().contains("nothing was uploaded"),
+                "{error}"
+            );
+
+            // The rest of part 0 is retired: it is evicted, and, inside the retry window,
+            // sent again from the source once the old staging row is reclaimed.
+            harness.evict(19);
+            assert!(matches!(
+                harness.part_state(&claim, 0),
+                sparrow_core::PartReceiptState::Evicted(_)
+            ));
+            harness.reclaim();
+            let manifest = harness
+                .publish_claim(&harness.client, &mut claim)
+                .await
+                .unwrap();
+            let parts = harness.parts(&manifest, "jsonl", &input);
+            assert_eq!(parts.len(), 3);
+            assert_ne!(parts[0].1, first[0].1, "part 0 is a new artifact");
+            assert_eq!(parts[1].1, first[1].1);
+            assert_eq!(parts[2].1, first[2].1);
+            harness.assert_lines_read_once(&manifest, 50);
+            let now = sparrow_server::now().unwrap();
+            harness.root.remove(&claim, now).unwrap();
+        })
+        .await;
+}
+
+/// INVARIANT (#285): a restarted attempt skips the parts the daemon recorded and cuts the rest
+/// under the limits as they stand now. With the limits grown, even to admit the whole file in
+/// one part, the claim still finishes as a set and no byte is read twice. A claim whose parts
+/// are all recorded writes its manifest with no limit read.
+#[tokio::test]
+async fn a_restarted_attempt_under_grown_limits_skips_its_recorded_parts() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use sparrow_client::parts;
+            let input = chunk_lines(0, 50, b'p');
+            let limits = |harness: &SetHarness| {
+                parts::PartLimits::from_discovery(
+                    harness.client.discovery(),
+                    sparrow_core::SYSLOG_MESSAGE_BYTES as u64,
+                )
+                .unwrap()
+            };
+            for grown in [40, 60] {
+                let dir = tempfile::tempdir().unwrap();
+                let harness = set_harness(dir.path()).await;
+                let mut claim = harness.claim("grown.jsonl", "jsonl", &input);
+                let first = parts::next_cut(
+                    &input[..],
+                    input.len() as u64,
+                    0,
+                    0,
+                    sparrow_client::Format::Jsonl,
+                    &limits(&harness),
+                )
+                .unwrap();
+                let recorded = harness.publish_prefix(&claim, &input, &[first]).await;
+                harness.scale(grown);
+                let wider = harness.reconnect().await;
+                let manifest = harness.publish_claim(&wider, &mut claim).await.unwrap();
+                let listed = harness.parts(&manifest, "jsonl", &input);
+                assert_eq!(listed.len(), 2, "grown {grown}: a set, never one artifact");
+                assert_eq!(listed[0].1, recorded[0], "the recorded part is skipped");
+                harness.assert_lines_read_once(&manifest, 50);
+            }
+
+            // Every part recorded: the manifest needs no limit.
+            let dir = tempfile::tempdir().unwrap();
+            let harness = set_harness(dir.path()).await;
+            let mut claim = harness.claim("all.jsonl", "jsonl", &input);
+            let uploaded = harness
+                .upload(&harness.client, &claim, &parts::Resume::fresh())
+                .await;
+            let parts::Frontier::Recorded(resume) =
+                parts::recorded_prefix(&harness.client, &claim.journal().request_id)
+                    .await
+                    .unwrap()
+            else {
+                panic!("a recorded set continues, it is not measured");
+            };
+            assert_eq!(resume.parts.len(), uploaded.len());
+            let missing = parts::MissingLimits {
+                max_import_bytes: true,
+                raw_record_bytes: true,
+                retirement: true,
+            };
+            let journal = claim.journal().clone();
+            let listed = parts::upload_parts(
+                &harness.client,
+                &journal.request_id,
+                &journal.source,
+                sparrow_client::Format::Jsonl,
+                &harness.source(&claim),
+                Err(missing),
+                &parts::ClaimParts::default(),
+                &std::sync::Arc::new(parts::PartsProgress::default()),
+                &resume,
+            )
+            .await
+            .unwrap();
+            assert_eq!(listed, uploaded, "no cut was needed, so no limit was read");
+            let manifest = harness
+                .publish_claim(&harness.client, &mut claim)
+                .await
+                .unwrap();
+            assert_eq!(
+                harness.parts(&manifest, "jsonl", &input).len(),
+                uploaded.len()
+            );
+        })
+        .await;
+}
+
+/// The part request id of set part `index` of `claim`.
+fn set_part_request(claim: &sparrow_server::consumption::ClaimedFile, index: u32) -> String {
+    let set = sparrow_client::parts::set_request(&claim.journal().request_id).unwrap();
+    sparrow_client::parts::part_request(&set, index)
+}
+
+/// Begin part `index`, declared as `bytes`, and upload them without publishing: a draft the
+/// daemon holds, stamped at `now`.
+fn stage_draft(harness: &SetHarness, request: &str, bytes: &[u8], now: u64) {
+    let payload = format!(
+        "blake3:{}",
+        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(bytes).as_bytes())
+    );
+    let draft = harness
+        .store
+        .import_begin(
+            request,
+            "set-source",
+            "jsonl",
+            bytes.len() as u64,
+            &payload,
+            now,
+        )
+        .unwrap();
+    for (index, chunk) in bytes.chunks(65_536).enumerate() {
+        harness
+            .store
+            .import_append(&draft.id, (index * 65_536) as u64, chunk, now)
+            .unwrap();
+    }
+}
+
+fn pending_text(error: &sparrow_server::consumption::Error) -> String {
+    error.to_string()
+}
+
+/// INVARIANT (#285): a draft at the frontier that the limits as they stand no longer admit, or
+/// whose payload is not the file's bytes at its span, is cancelled and waited for, and the part
+/// is cut again at its index under the current limits. The parts read in order are the source.
+#[tokio::test]
+async fn a_frontier_draft_under_shrunk_limits_is_cancelled_and_recut_at_its_index() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let input = chunk_lines(0, 50, b'p');
+            // (limits after the draft, the draft's bytes for part 1)
+            for (shrunk, draft) in [
+                (10, chunk_lines(20, 20, b'p')),
+                (20, chunk_lines(20, 20, b'q')),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let harness = set_harness(dir.path()).await;
+                let mut claim = harness.claim("shrunk.jsonl", "jsonl", &input);
+                harness
+                    .publish_prefix(
+                        &claim,
+                        &input,
+                        &[sparrow_client::parts::PartSpan {
+                            index: 0,
+                            start: 0,
+                            length: 20 * 65_536,
+                            format: sparrow_client::Format::Jsonl,
+                        }],
+                    )
+                    .await;
+                let now = sparrow_server::now().unwrap();
+                stage_draft(&harness, &set_part_request(&claim, 1), &draft, now);
+                harness.scale(shrunk);
+                let narrower = harness.reconnect().await;
+                let error = harness
+                    .publish_claim(&narrower, &mut claim)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    pending_text(&error)
+                        .contains("part 1 waits for reclamation of its cancelled draft"),
+                    "{error}"
+                );
+                // Still waiting while the cancelled row is not reclaimed: nothing is begun.
+                let error = harness
+                    .publish_claim(&narrower, &mut claim)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    pending_text(&error).contains("part 1 waits for reclamation"),
+                    "{error}"
+                );
+                assert!(matches!(
+                    harness.part_state(&claim, 1),
+                    sparrow_core::PartReceiptState::Absent
+                ));
+                harness.reclaim();
+                let manifest = harness.publish_claim(&narrower, &mut claim).await.unwrap();
+                harness.parts(&manifest, "jsonl", &input);
+                harness.assert_lines_read_once(&manifest, 50);
+            }
+        })
+        .await;
+}
+
+/// INVARIANT (#285): a frontier whose lapsed draft is not reclaimed yet is waited for: nothing is
+/// begun while its status reports IMPORT_EXPIRED, the part begins only once the status is
+/// NOT_FOUND, the pending text names the wait, and the claim completes with no operator.
+#[tokio::test]
+async fn a_frontier_refused_by_shrunk_limits_waits_for_reclaim_then_completes() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let harness = set_harness(dir.path()).await;
+            let input = chunk_lines(0, 50, b'p');
+            let mut claim = harness.claim("lapsed.jsonl", "jsonl", &input);
+            harness
+                .publish_prefix(
+                    &claim,
+                    &input,
+                    &[sparrow_client::parts::PartSpan {
+                        index: 0,
+                        start: 0,
+                        length: 20 * 65_536,
+                        format: sparrow_client::Format::Jsonl,
+                    }],
+                )
+                .await;
+            // A draft begun at time 1 has a lease that ended long ago.
+            let request = set_part_request(&claim, 1);
+            stage_draft(&harness, &request, &chunk_lines(20, 20, b'p'), 1);
+            let status = |harness: &SetHarness| {
+                harness
+                    .store
+                    .ingest_status(
+                        &sparrow_core::IngestSelector::Request(request.clone()),
+                        Default::default(),
+                        sparrow_server::now().unwrap(),
+                    )
+                    .unwrap_err()
+                    .code
+            };
+            assert_eq!(status(&harness), "IMPORT_EXPIRED");
+            let error = harness
+                .publish_claim(&harness.client, &mut claim)
+                .await
+                .unwrap_err();
+            assert!(
+                pending_text(&error).contains("part 1 waits for reclamation"),
+                "{error}"
+            );
+            assert_eq!(status(&harness), "IMPORT_EXPIRED", "nothing was begun");
+            harness.reclaim();
+            assert_eq!(status(&harness), "NOT_FOUND");
+            let manifest = harness
+                .publish_claim(&harness.client, &mut claim)
+                .await
+                .unwrap();
+            harness.parts(&manifest, "jsonl", &input);
+            harness
+                .root
+                .remove(&claim, sparrow_server::now().unwrap())
+                .unwrap();
+        })
+        .await;
+}
+
+/// INVARIANT (#285): a draft at index 0 never takes the single path, whatever the limits now
+/// admit. A live draft that the grown limits still admit continues, and the claim finishes as a
+/// set. A lapsed draft that is not reclaimed yet is waited for, and nothing is published.
+#[tokio::test]
+async fn a_draft_at_index_zero_never_takes_the_single_path() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let input = chunk_lines(0, 30, b'p');
+            for lapsed in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let harness = set_harness(dir.path()).await;
+                let mut claim = harness.claim("zero.jsonl", "jsonl", &input);
+                let now = if lapsed {
+                    1
+                } else {
+                    sparrow_server::now().unwrap()
+                };
+                stage_draft(
+                    &harness,
+                    &set_part_request(&claim, 0),
+                    &chunk_lines(0, 20, b'p'),
+                    now,
+                );
+                harness.scale(60);
+                let wider = harness.reconnect().await;
+                let outcome = harness.publish_claim(&wider, &mut claim).await;
+                if lapsed {
+                    let error = outcome.unwrap_err();
+                    assert!(
+                        pending_text(&error).contains("part 0 waits for reclamation"),
+                        "{error}"
+                    );
+                    assert!(claim.journal().published_artifact.is_none());
+                    assert!(matches!(
+                        harness.part_state(&claim, 0),
+                        sparrow_core::PartReceiptState::Absent
+                    ));
+                } else {
+                    let manifest = outcome.unwrap();
+                    assert_eq!(harness.parts(&manifest, "jsonl", &input).len(), 2);
+                    assert_eq!(
+                        claim.journal().published_artifact.as_deref(),
+                        Some(manifest.as_str())
+                    );
+                }
+            }
+        })
+        .await;
 }
 
 /// INVARIANT (#280, OR-A): a consume file above the import bound is published as ordered

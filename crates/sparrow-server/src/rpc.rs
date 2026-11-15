@@ -2426,6 +2426,79 @@ impl wire::sparrow::Server for Rpc {
         Ok(())
     }
 
+    async fn ingest_part_receipt(
+        self: Rc<Self>,
+        params: wire::sparrow::IngestPartReceiptParams,
+        mut results: wire::sparrow::IngestPartReceiptResults,
+    ) -> capnp::Result<()> {
+        let query = params.get()?.get_query()?;
+        let input = || -> Result<String, Error> {
+            self.check_store(
+                query
+                    .get_store_id()
+                    .map_err(invalid)?
+                    .to_str()
+                    .map_err(invalid)?,
+            )?;
+            if query.get_schema_version() != sparrow_client::SCHEMA_VERSION {
+                return Err(Error::new(
+                    "UNSUPPORTED",
+                    "part receipt reads require the current discovered schema",
+                ));
+            }
+            Ok(query
+                .get_request_id()
+                .map_err(invalid)?
+                .to_str()
+                .map_err(invalid)?
+                .to_owned())
+        };
+        let request_id = match input() {
+            Ok(request_id) => request_id,
+            Err(error) => {
+                failure(results.get().init_result(), error);
+                return Ok(());
+            }
+        };
+        match self
+            .lookup(move |store, now| store.ingest_part_receipt(&request_id, now))
+            .await
+        {
+            Ok(state) => {
+                let mut out = results.get().init_result().init_ok();
+                let (receipt, mut slot) = match state {
+                    sparrow_core::PartReceiptState::Absent => {
+                        out.set_absent(());
+                        return Ok(());
+                    }
+                    sparrow_core::PartReceiptState::Stored(receipt) => (receipt, out.init_stored()),
+                    sparrow_core::PartReceiptState::Evicted(receipt) => {
+                        (receipt, out.init_evicted())
+                    }
+                    sparrow_core::PartReceiptState::Evicting(receipt) => {
+                        (receipt, out.init_evicting())
+                    }
+                };
+                slot.set_request_id(&receipt.request_id);
+                slot.set_artifact_id(&receipt.artifact_id);
+                slot.set_byte_length(receipt.byte_length);
+                match sparrow_client::parse_format(&receipt.format) {
+                    Ok(format) => slot.set_format(format),
+                    Err(error) => {
+                        // A stored format label that does not parse is a broken store, not a
+                        // transport fault.
+                        failure(
+                            results.get().init_result(),
+                            Error::new("STORAGE_FAILURE", error.to_string()),
+                        );
+                    }
+                }
+            }
+            Err(error) => failure(results.get().init_result(), error),
+        }
+        Ok(())
+    }
+
     async fn import_get(
         self: Rc<Self>,
         params: wire::sparrow::ImportGetParams,

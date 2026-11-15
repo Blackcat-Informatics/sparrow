@@ -530,7 +530,15 @@ impl Writer {
                         "request_id was committed with different intake provenance",
                     ));
                 }
-                <super::Artifact as super::Catalog>::decode(super::field(&saved, "receipt")?)?
+                let artifact =
+                    <super::Artifact as super::Catalog>::decode(super::field(&saved, "receipt")?)?;
+                // A set part whose saved artifact is gone is not accepted: the daemon sends it
+                // again from the claim's source (#285). The wire's part upload reaches here
+                // first, inside the two-day window, so the decision is made here too.
+                if !super::publication::part_answerable(self, request_id, &artifact)? {
+                    return Ok(None);
+                }
+                artifact
             }
             None => match super::publication::published(
                 self,

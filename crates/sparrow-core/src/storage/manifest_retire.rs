@@ -448,6 +448,31 @@ fn artifact_receipt(bytes: &[u8]) -> Result<bool, Error> {
     }
 }
 
+/// The native header of a saved request's `receipt` member, and that member's bytes, read
+/// without building any tree or owning the record and chunk arrays (#285).
+pub(super) fn saved_receipt<'a>(
+    bytes: &'a [u8],
+    remaining: &mut usize,
+) -> Result<(Header, &'a [u8]), Error> {
+    let mut reader = json::Reader::from_slice(bytes, CATALOG_LIMITS)?;
+    if !matches!(reader.next_event()?, json::Event::BeginObject { .. }) {
+        return Err(failure("request catalog must be an object"));
+    }
+    loop {
+        match reader.next_event()? {
+            json::Event::Key(raw) => {
+                let receipt = raw.decode()? == "receipt";
+                let slice = &bytes[reader.skip_value()?];
+                if receipt {
+                    return Ok((header(slice, remaining, 0, 0)?, slice));
+                }
+            }
+            json::Event::EndObject { .. } => return Err(failure("request has no receipt")),
+            _ => return Err(failure("request catalog member expected")),
+        }
+    }
+}
+
 /// Expiry consumes only the bounded control envelope, never an agent retry response.
 pub(super) fn request_expiry(
     writer: &Writer,

@@ -193,12 +193,101 @@ pub(super) fn preparation_admitted(
     Ok(Some(progress))
 }
 
+/// What a request's saved publication says (#285). `PartGone` is a set part whose saved
+/// artifact is no longer stored: it is published again, under the same request, from the
+/// claim's source. Every reader other than a part's own begin treats it as not published.
+pub(super) enum Published {
+    Saved(ImportManifest, Box<Artifact>),
+    None,
+    PartGone(ImportManifest),
+}
+
+impl Published {
+    /// The saved publication, or none for an unpublished request or a gone set part.
+    pub(super) fn saved(self) -> Option<(ImportManifest, Artifact)> {
+        match self {
+            Self::Saved(manifest, artifact) => Some((manifest, *artifact)),
+            Self::None | Self::PartGone(_) => None,
+        }
+    }
+}
+
 pub(super) fn published(
     writer: &Writer,
     id: &str,
     now: u64,
 ) -> Result<Option<(ImportManifest, Artifact)>, Error> {
-    published_admitted(writer, id, now, None)
+    Ok(published_admitted(writer, id, now, None)?.saved())
+}
+
+/// Whether a set part's saved artifact is still readable (#285).
+pub(super) enum PartArtifact {
+    /// The artifact is stored and not evicted.
+    Stored,
+    /// Eviction began and some record of it is still stored: sending the part again would
+    /// show that record twice.
+    Evicting,
+    /// The artifact and every record it names are gone.
+    Gone,
+}
+
+/// Classify the stored artifact `artifact_id` of a set part. `record_ids` is read only when the
+/// artifact row is absent or evicted. Each read is admitted against a fresh publication-sized
+/// budget: the rows were written inside one publication batch of that size.
+pub(super) fn part_artifact(
+    writer: &Writer,
+    artifact_id: &str,
+    record_ids: impl FnOnce() -> Result<Vec<String>, Error>,
+) -> Result<PartArtifact, Error> {
+    if let Some(bytes) = writer.db.get_pinned(artifact_id)? {
+        let mut remaining = PUBLICATION_BYTES;
+        let header = super::artifact_rdf::catalog(&writer.db, artifact_id, &bytes, &mut remaining)?;
+        if !header.artifact.evicted {
+            return Ok(PartArtifact::Stored);
+        }
+    }
+    // Eviction retires records one at a time and may stop part way, so a record that is
+    // neither evicted nor retired is still readable. Last to first stops soonest, because
+    // eviction works through the records in close to source order.
+    for id in record_ids()?.iter().rev() {
+        let mut remaining = PUBLICATION_BYTES;
+        let record: Record = match writer.get_limited(id, &mut remaining) {
+            Ok(record) => record,
+            Err(error) if error.code == "NOT_FOUND" => continue,
+            Err(error) => return Err(error),
+        };
+        if !record.evicted && !record.retired {
+            return Ok(PartArtifact::Evicting);
+        }
+    }
+    Ok(PartArtifact::Gone)
+}
+
+/// Whether the saved artifact of request `request_id` can answer it. A request outside a
+/// claim's part set always can. A set part can unless its artifact is gone (`false`: it is sent
+/// again) or still being evicted (`STORAGE_PRESSURE`).
+pub(super) fn part_answerable(
+    writer: &Writer,
+    request_id: &str,
+    artifact: &Artifact,
+) -> Result<bool, Error> {
+    if super::consumption::part_claim_import(request_id).is_none() {
+        return Ok(true);
+    }
+    match part_artifact(writer, &artifact.id, || Ok(artifact.record_ids.clone()))? {
+        PartArtifact::Stored => Ok(true),
+        PartArtifact::Gone => Ok(false),
+        PartArtifact::Evicting => Err(part_evicting(request_id)),
+    }
+}
+
+pub(super) fn part_evicting(request_id: &str) -> Error {
+    Error::new(
+        "STORAGE_PRESSURE",
+        format!(
+            "set part {request_id} is being evicted; it is sent again from the claim's source once eviction retires its last stored record"
+        ),
+    )
 }
 
 /// The refusal for a recorded claim with no single-path publication receipt (#280). A claim
@@ -227,12 +316,31 @@ fn missing_publication_receipt(
     })
 }
 
+/// A publication receipt is live inside its window, or for as long as it names a set part whose
+/// claim is recorded (#285).
+fn live_receipt(
+    writer: &Writer,
+    id: &str,
+    now: u64,
+    remaining: Option<&mut usize>,
+) -> Result<Option<Value>, Error> {
+    let Some(bytes) = writer.db.get_pinned(receipt_key(id))? else {
+        return Ok(None);
+    };
+    if let Some(remaining) = remaining {
+        Writer::charge_catalog_shape(remaining, &bytes)?;
+    }
+    let value = parse(&bytes)?;
+    let live = integer(&value, "expires_at")? > now || writer.set_part_retained(&value)?;
+    Ok(live.then_some(value))
+}
+
 pub(super) fn published_admitted(
     writer: &Writer,
     id: &str,
     now: u64,
     mut remaining: Option<&mut usize>,
-) -> Result<Option<(ImportManifest, Artifact)>, Error> {
+) -> Result<Published, Error> {
     let managed = writer.consumption_admitted(id, remaining.as_deref_mut())?;
     let saved = if let Some(journal) = managed
         .as_ref()
@@ -246,10 +354,10 @@ pub(super) fn published_admitted(
         }
         Some(parse(&bytes)?)
     } else {
-        writer.retry_admitted(&receipt_key(id), now, remaining.as_deref_mut())?
+        live_receipt(writer, id, now, remaining.as_deref_mut())?
     };
     let Some(saved) = saved else {
-        return Ok(None);
+        return Ok(Published::None);
     };
     let manifest = ImportManifest::decode(field(&saved, "manifest")?)?;
     let artifact = Artifact::decode(field(&saved, "receipt")?)?;
@@ -288,7 +396,10 @@ pub(super) fn published_admitted(
             "published import receipt contradicts its declared input",
         ));
     }
-    Ok(Some((manifest, artifact)))
+    if !part_answerable(writer, &manifest.request_id, &artifact)? {
+        return Ok(Published::PartGone(manifest));
+    }
+    Ok(Published::Saved(manifest, Box::new(artifact)))
 }
 
 impl Store {

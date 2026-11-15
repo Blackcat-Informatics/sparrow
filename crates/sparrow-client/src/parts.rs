@@ -9,7 +9,11 @@
 //! manifest `consumeset:{H}.manifest` lists the parts in order and alone defines the set.
 
 use crate::imports::{Checkpoint, StagedInput, payload_id, upload};
-use crate::{ArtifactReceipt, Client, CompletedFileIdentity, Discovery, Error, Format};
+use crate::ingest_status::PartGate;
+use crate::{
+    ArtifactReceipt, Client, CompletedFileIdentity, Discovery, Error, Format, PartDraft, PartRead,
+    PartRecord,
+};
 use purrdf_lex::json::{self, Object, Value};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -173,12 +177,41 @@ fn line_format(format: Format) -> bool {
     matches!(format, Format::Jsonl | Format::Log)
 }
 
-/// Refusal of a part no cut can make fit, before any byte of it is uploaded.
-fn unplannable(index: u32) -> Error {
+/// Refusal of a part no cut can make fit, before any byte of it is uploaded. It names the
+/// advertised values that admit no byte, and says the claim is pending, not refused.
+fn unplannable(index: u32, limits: &PartLimits) -> Error {
+    let mut failing = Vec::new();
+    if limits.max_bytes == 0 {
+        failing.push("maxImportBytes");
+    }
+    if limits.max_records == 0 {
+        failing.push("maxRecordsPerArtifact");
+    }
+    if u128::from(limits.retire_chunk_charge) + u128::from(limits.retire_record_charge)
+        > u128::from(limits.retire_row_budget)
+    {
+        failing.push(
+            "the retirement numbers (retireRowBudget, retireChunkCharge, retireRecordCharge)",
+        );
+    }
     Error::Domain {
         code: "RESOURCE_LIMIT".into(),
         message: format!(
-            "part {index} cannot fit the advertised record or retirement limit; no byte was uploaded"
+            "part {index} cannot fit one byte under the daemon's advertised {}; no byte was uploaded; the claim is pending; the daemon's configuration sets these values; the claim continues by itself when a connection advertises a usable value",
+            failing.join(" and ")
+        ),
+        retryable: false,
+        class: crate::FailureClass::Unclassified,
+    }
+}
+
+/// The attempt's refusal to cut part `index` while the daemon advertises no usable limits.
+fn missing_pending(index: u32, missing: MissingLimits) -> Error {
+    Error::Domain {
+        code: "RESOURCE_LIMIT".into(),
+        message: format!(
+            "part {index} cannot be cut: the daemon did not advertise {}; no byte was uploaded; the claim is pending until the daemon advertises it, which is the daemon's configuration; the claim continues by itself when it does",
+            missing.names()
         ),
         retryable: false,
         class: crate::FailureClass::Unclassified,
@@ -208,7 +241,7 @@ fn line_end(
 /// The longest raw piece from `start`, at most `cap` bytes, that fits stored opaque.
 fn raw_piece(limits: &PartLimits, start: u64, cap: u64, index: u32) -> Result<PartSpan, Error> {
     if !limits.fits_raw(1) || cap == 0 {
-        return Err(unplannable(index));
+        return Err(unplannable(index, limits));
     }
     // Every charge grows with the length, so the fitting lengths are a prefix of 1..=cap.
     let (mut low, mut high) = (1, cap);
@@ -309,6 +342,40 @@ pub fn next_cut(
     // Not even the first line fits: cut it raw.
     let end = line_end(source, start, window, &mut buffer)?;
     raw_piece(limits, start, end - start, index)
+}
+
+/// Whether `span`, cut earlier, is still admitted by `limits`: within the byte bound (and the
+/// syslog packet bound), and, counting each whole line as the daemon charges it, within the
+/// record limit and the joint retirement bound. A span stored opaque is one raw unit.
+pub(crate) fn admits(
+    source: &(impl CutSource + ?Sized),
+    span: &PartSpan,
+    limits: &PartLimits,
+) -> Result<bool, Error> {
+    let reach = match span.format {
+        Format::Syslog => limits.max_bytes.min(limits.syslog_packet_bytes),
+        _ => limits.max_bytes,
+    };
+    if span.length == 0 || span.length > reach {
+        return Ok(false);
+    }
+    if !line_format(span.format) {
+        return Ok(limits.fits_raw(span.length));
+    }
+    let end = span.start + span.length;
+    let mut buffer = vec![0; crate::IMPORT_CHUNK_BYTES];
+    let (mut chunks, mut records, mut line_start) = (0_u64, 0_u64, span.start);
+    while line_start < end {
+        let line_end = line_end(source, line_start, end, &mut buffer)?;
+        let line = line_end - line_start;
+        chunks += line.div_ceil(CHUNK);
+        records += records_of(line, limits.raw_split_bytes);
+        if !limits.fits(chunks, records) {
+            return Ok(false);
+        }
+        line_start = line_end;
+    }
+    Ok(true)
 }
 
 /// Whether a source of `length` bytes is a single part, so it takes the single path. A
@@ -418,32 +485,69 @@ impl PartsProgress {
     }
 }
 
+/// A planned part and its payload digest, kept so a retried attempt does not hash it again.
 #[derive(Clone, Debug)]
 struct PartState {
     span: PartSpan,
-    payload: Option<String>,
-    receipt: Option<ArtifactReceipt>,
-    /// The part's staging lapsed; its next begin is a begin again.
-    expired: bool,
+    payload: String,
 }
 
-/// One claim's planned parts, digests and receipts, kept across attempts in memory so a
-/// completed part is never read, hashed or begun again while the worker runs.
+/// One claim's planned part spans and payload digests, kept across attempts in memory so a
+/// part is never hashed twice while the worker runs. Which parts are published is never kept
+/// here: every attempt reads it from the daemon ([`recorded_prefix`]).
 #[derive(Debug, Default)]
 pub struct ClaimParts {
     state: Mutex<Option<(CompletedFileIdentity, Vec<PartState>)>>,
+    /// The part whose cancelled or lapsed staging is awaited; its next begin is a begin again.
+    waiting: Mutex<Option<u32>>,
 }
 
 impl ClaimParts {
-    /// Parts with a receipt.
-    pub fn completed(&self) -> usize {
+    fn payload(&self, index: u32, span: &PartSpan) -> Option<String> {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .map_or(0, |(_, parts)| {
-                parts.iter().filter(|part| part.receipt.is_some()).count()
-            })
+            .and_then(|(_, list)| list.get(index as usize))
+            .filter(|part| part.span == *span)
+            .map(|part| part.payload.clone())
+    }
+
+    fn remember(&self, index: u32, span: PartSpan, payload: String) {
+        if let Some((_, list)) = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            let part = PartState { span, payload };
+            if let Some(slot) = list.get_mut(index as usize) {
+                *slot = part;
+            } else if list.len() == index as usize {
+                list.push(part);
+            }
+        }
+    }
+
+    fn wait_for(&self, index: u32) {
+        *self
+            .waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+    }
+
+    /// Whether `index` was awaited; clears the wait.
+    fn take_wait(&self, index: u32) -> bool {
+        let mut waiting = self
+            .waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *waiting == Some(index) {
+            *waiting = None;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -549,13 +653,265 @@ pub fn manifest_body(
     json::write_compact(&body).into_bytes()
 }
 
+/// What the first index with no kept receipt says (#285).
+#[derive(Debug)]
+pub enum Next {
+    /// Nothing of that part was begun: it is cut under the current limits.
+    Fresh,
+    /// A live draft is held for it: it continues only if the current limits still admit it.
+    Draft(PartDraft),
+    /// A cancelled or lapsed draft is not reclaimed yet: the part waits for reclamation.
+    Expired,
+}
+
+/// A claim's recorded set prefix and what follows it (#285).
+#[derive(Debug)]
+pub struct Resume {
+    /// The parts with a kept receipt from index 0, each `Stored` or `Evicted`.
+    pub parts: Vec<PartRead>,
+    /// The state of the first part without one.
+    pub next: Next,
+}
+
+impl Resume {
+    /// A claim with nothing recorded and nothing begun.
+    #[must_use]
+    pub fn fresh() -> Self {
+        Self {
+            parts: Vec::new(),
+            next: Next::Fresh,
+        }
+    }
+}
+
+/// The decision of the part walk. Only `Measure` lets the caller take the single path (#285).
+#[derive(Debug)]
+pub enum Frontier {
+    /// Index 0 has no receipt and no draft: measure the file against the limits.
+    Measure,
+    /// The set is begun: continue it from its recorded prefix.
+    Recorded(Resume),
+    /// A read failed or the state is unusable now. Nothing was uploaded; the claim is pending
+    /// and the next attempt reads again.
+    Pending(Error),
+}
+
+/// Why the walk stopped at index `parts.len()`.
+#[derive(Debug)]
+pub(crate) enum WalkStop {
+    /// The receipt read failed.
+    Receipt(Error),
+    /// The part is being evicted: some record of it is still stored.
+    Evicting,
+    /// The part has no kept receipt; its status read gave this.
+    Gate(Result<PartGate, Error>),
+}
+
+fn unimplemented(error: &Error) -> bool {
+    matches!(error, Error::Transport(error) if error.kind == capnp::ErrorKind::Unimplemented)
+}
+
+fn pending(message: String) -> Error {
+    Error::Domain {
+        code: "CLAIM_PENDING".into(),
+        message,
+        retryable: true,
+        class: crate::FailureClass::Unclassified,
+    }
+}
+
+fn read_pending(index: usize, read: &str, error: &Error) -> Error {
+    if unimplemented(error) {
+        return pending(format!(
+            "the daemon does not implement ingestPartReceipt; part {index} is pending until it does; nothing was uploaded"
+        ));
+    }
+    pending(format!(
+        "part {index} state could not be read ({read}: {error}); nothing was uploaded; the claim is pending and retries"
+    ))
+}
+
+/// The one decision on a walk's reads: which of the claim's paths its recorded state admits.
+/// `parts` are the non-absent receipts from index 0. Every input maps to exactly one variant,
+/// and only a clean absence at index 0 (no receipt, then no draft) maps to `Measure`.
+pub(crate) fn decide_frontier(parts: Vec<PartRead>, stop: WalkStop) -> Frontier {
+    let index = parts.len();
+    let gate = match stop {
+        WalkStop::Receipt(error) => {
+            return Frontier::Pending(read_pending(index, "receipt read", &error));
+        }
+        WalkStop::Evicting => {
+            return Frontier::Pending(pending(format!(
+                "part {index} is being evicted and is sent again once its last stored record is retired; nothing was uploaded; the claim is pending and retries"
+            )));
+        }
+        WalkStop::Gate(Err(error)) => {
+            return Frontier::Pending(read_pending(index, "status read", &error));
+        }
+        WalkStop::Gate(Ok(gate)) => gate,
+    };
+    let next = match gate {
+        PartGate::NotFound if parts.is_empty() => return Frontier::Measure,
+        PartGate::NotFound => Next::Fresh,
+        PartGate::Draft(draft) => Next::Draft(draft),
+        PartGate::Expired => Next::Expired,
+        PartGate::Other(state) => {
+            return Frontier::Pending(pending(format!(
+                "part {index} has no kept receipt but its status is {state}; nothing was uploaded; the claim is pending and retries"
+            )));
+        }
+    };
+    Frontier::Recorded(Resume { parts, next })
+}
+
+/// Read claim `claim_request`'s recorded part prefix from the daemon: every kept receipt from
+/// index 0, then the status of the first part without one. It runs on every attempt before any
+/// begin, because a cached answer could hide an eviction between attempts.
+pub async fn recorded_prefix(client: &Client, claim_request: &str) -> Result<Frontier, Error> {
+    let set = set_request(claim_request)?;
+    let store = client.discovery().store_id.clone();
+    let mut parts = Vec::new();
+    loop {
+        let request = part_request(
+            &set,
+            u32::try_from(parts.len()).map_err(|_| {
+                Error::Protocol("a part set cannot have more parts than a part ordinal can number")
+            })?,
+        );
+        let stop = match crate::get_ingest_part_receipt(client.capability(), &store, &request).await
+        {
+            Err(error) => WalkStop::Receipt(error),
+            Ok(PartRead::Evicting(_)) => WalkStop::Evicting,
+            Ok(read @ (PartRead::Stored(_) | PartRead::Evicted(_))) => {
+                parts.push(read);
+                continue;
+            }
+            Ok(PartRead::Absent) => WalkStop::Gate(
+                crate::ingest_status::get_part_gate(client.capability(), &store, &request).await,
+            ),
+        };
+        return Ok(decide_frontier(parts, stop));
+    }
+}
+
+/// The spans of a recorded prefix, each with the artifact id of a `Stored` part. Starts are the
+/// sums of the recorded lengths: the set is cut from byte 0 with no gap. A prefix longer than
+/// the file is a named storage failure and nothing is uploaded.
+fn recorded_spans(
+    set: &str,
+    recorded: &[PartRead],
+    length: u64,
+) -> Result<Vec<(PartSpan, Option<String>)>, Error> {
+    let mut start = 0_u64;
+    let mut spans = Vec::with_capacity(recorded.len());
+    for (index, read) in recorded.iter().enumerate() {
+        let (record, stored) = match read {
+            PartRead::Stored(record) => (record, true),
+            PartRead::Evicted(record) => (record, false),
+            PartRead::Absent | PartRead::Evicting(_) => {
+                return Err(Error::Protocol("a recorded part is stored or evicted"));
+            }
+        };
+        let PartRecord {
+            artifact_id,
+            byte_length,
+            format,
+        } = record;
+        let end = start.checked_add(*byte_length).filter(|end| *end <= length);
+        let (Some(end), true) = (end, *byte_length > 0) else {
+            return Err(Error::Domain {
+                code: "STORAGE_FAILURE".into(),
+                message: format!(
+                    "recorded part {index} of {set} covers bytes from {start} for {byte_length}, which a source of {length} bytes does not hold; nothing was uploaded"
+                ),
+                retryable: false,
+                class: crate::FailureClass::Unclassified,
+            });
+        };
+        let index = u32::try_from(index)
+            .map_err(|_| Error::Protocol("a part ordinal exceeds its number"))?;
+        spans.push((
+            PartSpan {
+                index,
+                start,
+                length: *byte_length,
+                format: *format,
+            },
+            stored.then(|| artifact_id.clone()),
+        ));
+        start = end;
+    }
+    Ok(spans)
+}
+
+/// The span of the draft held at the frontier, if the current limits still admit it and its
+/// payload is the file's bytes at that span. Otherwise the draft is cancelled and the part
+/// waits for its reclamation: it is cut again under the current limits at the same index.
+async fn continue_draft(
+    client: &Client,
+    parts: &ClaimParts,
+    file: &File,
+    identity: CompletedFileIdentity,
+    limits: Result<&PartLimits, MissingLimits>,
+    (index, start): (u32, u64),
+    draft: &PartDraft,
+) -> Result<(PartSpan, String), Error> {
+    let limits = limits.map_err(|missing| missing_pending(index, missing))?;
+    let span = PartSpan {
+        index,
+        start,
+        length: draft.byte_length,
+        format: draft.format,
+    };
+    let admitted =
+        start.saturating_add(span.length) <= identity.length && admits(file, &span, limits)?;
+    let mut buffer = vec![0; crate::IMPORT_CHUNK_BYTES];
+    let payload = if admitted {
+        let input = PartInput {
+            file,
+            identity,
+            start,
+            length: span.length,
+            payload: None,
+        };
+        Some(payload_id(&input, &mut buffer)?)
+    } else {
+        None
+    };
+    if let Some(payload) = payload.filter(|payload| *payload == draft.payload_id) {
+        return Ok((span, payload));
+    }
+    crate::imports::cancel(
+        &client.endpoint,
+        &client.discovery().store_id,
+        &draft.import_id,
+    )
+    .await?;
+    parts.wait_for(index);
+    Err(pending_reclaim(index))
+}
+
+fn pending_reclaim(index: u32) -> Error {
+    Error::Domain {
+        code: "IMPORT_EXPIRED".into(),
+        message: format!(
+            "part {index} waits for reclamation of its cancelled draft, then is cut again under the current limits"
+        ),
+        retryable: false,
+        class: crate::FailureClass::Unclassified,
+    }
+}
+
 /// Upload claim `claim_request`'s completed `file` as ordered parts, returning each part's span
-/// and artifact id in order for [`ingest_manifest`]. Parts already published in `parts` are
-/// skipped without a read, a hash or a begin; the rest are cut, hashed and uploaded in order.
-/// Progress is reported to `progress`.
+/// and artifact id in order for [`ingest_manifest`]. `resume` is what [`recorded_prefix`] read
+/// on this attempt: a part `Stored` is listed without a read, a hash or a begin; a part `Evicted`
+/// is sent again on its recorded span under the same request id, because later parts start
+/// where it ends; the rest are cut under the current `limits` and uploaded in order. A frontier
+/// draft the limits no longer admit is cancelled and waited for. `limits` are read only when a
+/// span must be cut. Progress is reported to `progress`.
 #[expect(
     clippy::too_many_arguments,
-    reason = "one claim's identity, its file, its cache and its progress sink"
+    reason = "one claim's identity, its file, its limits, its cache, its progress sink and its resume point"
 )]
 pub async fn upload_parts(
     client: &Client,
@@ -563,9 +919,10 @@ pub async fn upload_parts(
     source: &str,
     format: Format,
     file: &File,
-    limits: &PartLimits,
+    limits: Result<&PartLimits, MissingLimits>,
     parts: &ClaimParts,
     progress: &Arc<PartsProgress>,
+    resume: &Resume,
 ) -> Result<Vec<(PartSpan, String)>, Error> {
     let set = set_request(claim_request)?;
     let identity = CompletedFileIdentity::capture(&file.metadata()?);
@@ -579,100 +936,112 @@ pub async fn upload_parts(
             *state = Some((identity, Vec::new()));
         }
     }
+    let recorded = recorded_spans(&set, &resume.parts, length)?;
+    let frontier = u32::try_from(recorded.len())
+        .map_err(|_| Error::Protocol("a part ordinal exceeds its number"))?;
+    let frontier_start = recorded
+        .last()
+        .map_or(0, |(span, _)| span.start + span.length);
+    let mut held = None;
+    if frontier_start < length {
+        match &resume.next {
+            Next::Fresh => {}
+            Next::Expired => {
+                parts.wait_for(frontier);
+                return Err(pending_reclaim(frontier));
+            }
+            Next::Draft(draft) => {
+                held = Some(
+                    continue_draft(
+                        client,
+                        parts,
+                        file,
+                        identity,
+                        limits,
+                        (frontier, frontier_start),
+                        draft,
+                    )
+                    .await?,
+                );
+            }
+        }
+    }
     let mut buffer = vec![0; crate::IMPORT_CHUNK_BYTES];
     let mut index = 0_u32;
     let mut start = 0_u64;
     let mut listed = Vec::new();
     while start < length {
-        let known = parts
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .and_then(|(_, list)| list.get(index as usize).cloned());
-        let mut part = match known {
-            Some(part) => part,
+        let mut known = None;
+        let span = if let Some((span, stored)) = recorded.get(index as usize) {
+            known = stored.clone();
+            *span
+        } else if let Some((span, payload)) = held.take().filter(|_| index == frontier) {
+            parts.remember(index, span, payload);
+            span
+        } else {
+            let limits = limits.map_err(|missing| missing_pending(index, missing))?;
+            next_cut(file, length, start, index, format, limits)?
+        };
+        if span.start + span.length == length {
+            progress.parts_total.store(index + 1, Ordering::Relaxed);
+        }
+        let id = match known {
+            Some(id) => id,
             None => {
-                let span = next_cut(file, length, start, index, format, limits)?;
-                let part = PartState {
-                    span,
+                let mut input = PartInput {
+                    file,
+                    identity,
+                    start: span.start,
+                    length: span.length,
                     payload: None,
-                    receipt: None,
-                    expired: false,
                 };
-                if let Some((_, list)) = parts
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .as_mut()
-                {
-                    list.push(part.clone());
+                let payload = match parts.payload(index, &span) {
+                    Some(payload) => payload,
+                    None => payload_id(&input, &mut buffer)?,
+                };
+                parts.remember(index, span, payload.clone());
+                input.payload = Some(&payload);
+                if parts.take_wait(index) {
+                    progress.begun_again.fetch_add(1, Ordering::Relaxed);
                 }
-                if span.start + span.length == length {
-                    progress.parts_total.store(index + 1, Ordering::Relaxed);
+                let result = upload(
+                    client.capability(),
+                    client.discovery(),
+                    &part_request(&set, index),
+                    source,
+                    span.format,
+                    &input,
+                    &mut Checkpoint::reporting(Some(Arc::clone(progress)), index),
+                )
+                .await;
+                match result {
+                    Ok(receipt) => receipt.id,
+                    Err(error) => {
+                        let wait = part_wait(index, &error);
+                        if wait.is_some() {
+                            parts.wait_for(index);
+                        }
+                        return Err(match (wait, error) {
+                            (
+                                Some(PartWait::AwaitingReclaim { part }),
+                                Error::Domain { message, .. },
+                            ) => Error::Domain {
+                                code: "IMPORT_EXPIRED".into(),
+                                message: format!(
+                                    "part {part} waits for reclamation of its lapsed staging, then begins again under the same request id: {message}"
+                                ),
+                                retryable: false,
+                                class: crate::FailureClass::Unclassified,
+                            },
+                            (_, error) => error,
+                        });
+                    }
                 }
-                part
             }
         };
-        if part.receipt.is_none() {
-            let mut input = PartInput {
-                file,
-                identity,
-                start: part.span.start,
-                length: part.span.length,
-                payload: None,
-            };
-            let payload = match part.payload.clone() {
-                Some(payload) => payload,
-                None => payload_id(&input, &mut buffer)?,
-            };
-            input.payload = Some(&payload);
-            if part.expired {
-                progress.begun_again.fetch_add(1, Ordering::Relaxed);
-                part.expired = false;
-            }
-            let result = upload(
-                client.capability(),
-                client.discovery(),
-                &part_request(&set, index),
-                source,
-                part.span.format,
-                &input,
-                &mut Checkpoint::reporting(Some(Arc::clone(progress)), index),
-            )
-            .await;
-            part.payload = Some(payload.clone());
-            match result {
-                Ok(receipt) => part.receipt = Some(receipt),
-                Err(error) => {
-                    let wait = part_wait(index, &error);
-                    part.expired = wait.is_some();
-                    store(parts, index, part);
-                    return Err(match (wait, error) {
-                        (
-                            Some(PartWait::AwaitingReclaim { part }),
-                            Error::Domain { message, .. },
-                        ) => Error::Domain {
-                            code: "IMPORT_EXPIRED".into(),
-                            message: format!(
-                                "part {part} waits for reclamation of its lapsed staging, then begins again under the same request id: {message}"
-                            ),
-                            retryable: false,
-                            class: crate::FailureClass::Unclassified,
-                        },
-                        (_, error) => error,
-                    });
-                }
-            }
-            store(parts, index, part.clone());
-        }
         progress.raise(index + 1, (0, 0, 0, 0));
-        let receipt = part
-            .receipt
-            .as_ref()
-            .ok_or(Error::Protocol("published part has no receipt"))?;
-        listed.push((part.span, receipt.id.clone()));
-        start = part.span.start + part.span.length;
+        listed.push((span, id));
+        start = span.start + span.length;
         index += 1;
     }
     identity.require(file)?;
@@ -694,18 +1063,6 @@ pub async fn ingest_manifest(
     client
         .ingest(&manifest_request(&set), source, Format::Json, &body)
         .await
-}
-
-fn store(parts: &ClaimParts, index: u32, part: PartState) {
-    if let Some(slot) = parts
-        .state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_mut()
-        .and_then(|(_, list)| list.get_mut(index as usize))
-    {
-        *slot = part;
-    }
 }
 
 #[cfg(test)]
@@ -953,5 +1310,277 @@ mod tests {
             assert_eq!(mark.parts_done, 2);
             previous = mark;
         }
+    }
+
+    fn domain(code: &str) -> Error {
+        Error::Domain {
+            code: code.into(),
+            message: format!("{code} from the daemon"),
+            retryable: false,
+            class: crate::FailureClass::Unclassified,
+        }
+    }
+
+    fn stored(artifact: &str, byte_length: u64, format: Format) -> PartRead {
+        PartRead::Stored(PartRecord {
+            artifact_id: artifact.into(),
+            byte_length,
+            format,
+        })
+    }
+
+    /// INVARIANT (#285): a span cut earlier is admitted only while each of the three limits
+    /// that cut it still holds, counted as the daemon charges it: the byte bound, the record
+    /// limit and the joint retirement bound, exactly at each boundary. A span stored opaque
+    /// is one raw unit.
+    #[test]
+    fn a_span_is_admitted_only_while_the_limits_that_cut_it_still_hold() {
+        let input = lines(40, 16);
+        let span = PartSpan {
+            index: 0,
+            start: 0,
+            length: input.len() as u64,
+            format: Format::Log,
+        };
+        let need = (134 + 84) * 40;
+        let admitted = |limits: PartLimits| admits(&input[..], &span, &limits).unwrap();
+        assert!(admitted(limits(span.length, 40, need)));
+        assert!(!admitted(limits(span.length - 1, 40, need)), "byte bound");
+        assert!(!admitted(limits(span.length, 39, need)), "record limit");
+        assert!(
+            !admitted(limits(span.length, 40, need - 1)),
+            "retirement bound"
+        );
+        let raw = PartSpan {
+            format: Format::Opaque,
+            length: 100,
+            ..span
+        };
+        assert!(admits(&input[..], &raw, &limits(100, 1, 134 + 84)).unwrap());
+        assert!(!admits(&input[..], &raw, &limits(99, 1, 134 + 84)).unwrap());
+    }
+
+    /// INVARIANT (#285): after a recorded prefix, which may end inside a line, the remainder
+    /// is cut from the prefix's end under the current limits and the parts cover the source
+    /// exactly once, in order, with no gap and no overlap.
+    #[test]
+    fn a_remainder_after_a_recorded_prefix_covers_the_source_exactly_once() {
+        let input = lines(30, 16);
+        let length = input.len() as u64;
+        let recorded = [stored("artifact:a", 40, Format::Opaque)];
+        let prefix = recorded_spans("consumeset:x", &recorded, length).unwrap();
+        let mut start = prefix[0].0.start + prefix[0].0.length;
+        let mut covered = vec![(0, start)];
+        let current = limits(64, 1000, 1 << 30);
+        let mut index = 1;
+        while start < length {
+            let span = next_cut(&input[..], length, start, index, Format::Log, &current).unwrap();
+            assert_eq!(span.start, start);
+            if index == 1 {
+                assert_eq!(
+                    span.format,
+                    Format::Opaque,
+                    "the rest of a cut line is opaque"
+                );
+                assert_eq!(span.start + span.length, 48, "it ends at that line's end");
+            }
+            covered.push((span.start, span.start + span.length));
+            start += span.length;
+            index += 1;
+        }
+        assert_eq!(covered.first().map(|part| part.0), Some(0));
+        assert_eq!(covered.last().map(|part| part.1), Some(length));
+        assert!(covered.windows(2).all(|pair| pair[0].1 == pair[1].0));
+    }
+
+    /// INVARIANT (#285): a limit that fits no byte uploads nothing and leaves the claim pending
+    /// with a text naming the failing advertised values and the way out; a later connection
+    /// that advertises a usable limit cuts the whole source.
+    #[test]
+    fn a_limit_below_one_byte_leaves_the_claim_pending_until_a_usable_limit_is_advertised() {
+        let input = lines(10, 16);
+        let length = input.len() as u64;
+        for (bound, name) in [
+            (limits(0, 100, 1 << 30), "maxImportBytes"),
+            (limits(1 << 20, 100, 100), "the retirement numbers"),
+        ] {
+            let Err(Error::Domain { message, .. }) =
+                next_cut(&input[..], length, 0, 0, Format::Log, &bound)
+            else {
+                panic!("a limit that fits no byte plans no part");
+            };
+            for text in [
+                name,
+                "no byte was uploaded",
+                "the claim is pending",
+                "continues by itself when a connection advertises a usable value",
+            ] {
+                assert!(message.contains(text), "{text}: {message}");
+            }
+        }
+        let usable = limits(64, 100, 1 << 30);
+        let parts = cut_all(&input, Format::Log, &usable);
+        assert_eq!(parts.iter().map(|part| part.length).sum::<u64>(), length);
+    }
+
+    /// INVARIANT (#285): only a clean absence at index 0 (no receipt, then no draft) admits the
+    /// single path. Every other result of either read is a named pending attempt that uploads
+    /// nothing, and a daemon without the part read is a named pending state, never a failure.
+    #[test]
+    fn only_a_clean_index_zero_absence_admits_the_single_path() {
+        let unimplemented = Error::Transport(capnp::Error::unimplemented("no such method".into()));
+        let disconnected = Error::Transport(capnp::Error::disconnected("gone".into()));
+        let draft = || {
+            PartGate::Draft(PartDraft {
+                import_id: "import:x".into(),
+                byte_length: 1,
+                payload_id: "blake3:x".into(),
+                format: Format::Log,
+            })
+        };
+        let one = || vec![stored("artifact:a", 8, Format::Log)];
+        let rows: Vec<(&str, Vec<PartRead>, WalkStop, &str)> = vec![
+            (
+                "clean absence",
+                vec![],
+                WalkStop::Gate(PartGate::from_error(domain("NOT_FOUND"))),
+                "measure",
+            ),
+            (
+                "draft at 0",
+                vec![],
+                WalkStop::Gate(Ok(draft())),
+                "recorded 0 draft",
+            ),
+            (
+                "expired at 0",
+                vec![],
+                WalkStop::Gate(PartGate::from_error(domain("IMPORT_EXPIRED"))),
+                "recorded 0 expired",
+            ),
+            (
+                "receipt RESOURCE_LIMIT",
+                vec![],
+                WalkStop::Receipt(domain("RESOURCE_LIMIT")),
+                "pending part 0 state could not be read (receipt read",
+            ),
+            (
+                "receipt STORAGE_FAILURE",
+                vec![],
+                WalkStop::Receipt(domain("STORAGE_FAILURE")),
+                "pending part 0 state could not be read (receipt read",
+            ),
+            (
+                "receipt unimplemented",
+                vec![],
+                WalkStop::Receipt(unimplemented),
+                "pending the daemon does not implement ingestPartReceipt; part 0 is pending until it does; nothing was uploaded",
+            ),
+            (
+                "receipt disconnected",
+                vec![],
+                WalkStop::Receipt(disconnected),
+                "pending part 0 state could not be read (receipt read",
+            ),
+            (
+                "status STORAGE_FAILURE",
+                vec![],
+                WalkStop::Gate(PartGate::from_error(domain("STORAGE_FAILURE"))),
+                "pending part 0 state could not be read (status read",
+            ),
+            (
+                "status RESOURCE_LIMIT",
+                vec![],
+                WalkStop::Gate(PartGate::from_error(domain("RESOURCE_LIMIT"))),
+                "pending part 0 state could not be read (status read",
+            ),
+            (
+                "accepted, not a draft",
+                vec![],
+                WalkStop::Gate(Ok(PartGate::Other("accepted".into()))),
+                "pending part 0 has no kept receipt but its status is accepted",
+            ),
+            (
+                "next part never begun",
+                one(),
+                WalkStop::Gate(PartGate::from_error(domain("NOT_FOUND"))),
+                "recorded 1 fresh",
+            ),
+            (
+                "draft at the frontier",
+                one(),
+                WalkStop::Gate(Ok(draft())),
+                "recorded 1 draft",
+            ),
+            (
+                "expired at the frontier",
+                one(),
+                WalkStop::Gate(PartGate::from_error(domain("IMPORT_EXPIRED"))),
+                "recorded 1 expired",
+            ),
+            (
+                "frontier status fails",
+                one(),
+                WalkStop::Gate(PartGate::from_error(domain("STORAGE_FAILURE"))),
+                "pending part 1 state could not be read (status read",
+            ),
+            (
+                "part being evicted",
+                one(),
+                WalkStop::Evicting,
+                "pending part 1 is being evicted",
+            ),
+        ];
+        for (label, parts, stop, expected) in rows {
+            let seen = match decide_frontier(parts, stop) {
+                Frontier::Measure => "measure".to_owned(),
+                Frontier::Recorded(resume) => format!(
+                    "recorded {} {}",
+                    resume.parts.len(),
+                    match resume.next {
+                        Next::Fresh => "fresh",
+                        Next::Draft(_) => "draft",
+                        Next::Expired => "expired",
+                    }
+                ),
+                Frontier::Pending(Error::Domain { message, .. }) => format!("pending {message}"),
+                Frontier::Pending(other) => {
+                    panic!("{label}: pending is a named domain error: {other}")
+                }
+            };
+            if expected.starts_with("pending") {
+                assert!(seen.starts_with(expected), "{label}: {seen}");
+                assert!(seen.contains("nothing was uploaded"), "{label}: {seen}");
+            } else {
+                assert_eq!(seen, expected, "{label}");
+            }
+        }
+    }
+
+    /// INVARIANT (#285): a recorded prefix longer than the file is a named storage failure and
+    /// nothing is uploaded; a prefix that ends exactly at the file's end is the whole set.
+    #[test]
+    fn a_recorded_prefix_longer_than_the_file_is_a_named_storage_failure() {
+        let recorded = [
+            stored("artifact:a", 40, Format::Log),
+            PartRead::Evicted(PartRecord {
+                artifact_id: "artifact:b".into(),
+                byte_length: 40,
+                format: Format::Log,
+            }),
+        ];
+        let Err(Error::Domain { code, message, .. }) =
+            recorded_spans("consumeset:abc", &recorded, 60)
+        else {
+            panic!("a prefix longer than the file is refused");
+        };
+        assert_eq!(code, "STORAGE_FAILURE");
+        assert!(
+            message.contains("recorded part 1 of consumeset:abc"),
+            "{message}"
+        );
+        let whole = recorded_spans("consumeset:abc", &recorded, 80).unwrap();
+        assert_eq!(whole.len(), 2);
+        assert!(whole[1].1.is_none(), "an evicted part is sent again");
     }
 }

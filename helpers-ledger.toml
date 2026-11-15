@@ -4720,3 +4720,31 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(cut_parts|plan_parts|split_parts)$']
+
+[[job]]
+id = "set-part-artifact-state"
+summary = "One classification decides whether a set part's saved artifact is stored, still being evicted, or gone. The by-key part read, both begin entry points and ingestion status call it, so a part is sent again only once no record of its old artifact is readable."
+home = "sparrow_core::storage::publication::part_artifact"
+entry_points = ["sparrow_core::storage::publication::part_answerable", "sparrow_core::Store::ingest_part_receipt"]
+spec = "docs/interfaces.md: part sets and retention of a pending claim's parts."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(part_gone|part_artifact_again|set_part_evicted)$']
+
+[[job]]
+id = "pending-claim-artifact-holds"
+summary = "One derivation names the artifacts a pending consumption claim still needs before its source may be removed: its published single-path or manifest artifact, and an accepted manifest not yet recorded. Eviction merges it into its protected set; set parts are not held."
+home = "sparrow_core::storage::consumption::Writer::journal_holds"
+entry_points = ["sparrow_core::storage::eviction::Writer::evict_oldest"]
+spec = "docs/interfaces.md: part sets and retention of a pending claim's parts."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(claim_holds_again|pending_claim_protection)$']

@@ -716,14 +716,29 @@ Limits of the part path:
 - A part whose staging lease lapsed answers `IMPORT_EXPIRED`; it is never
   permanent. Once reclamation deletes its row, the part begins again from byte zero
   under the same request id and publishes under a new artifact id; the manifest
-  lists the ids finally published. While the worker runs, published parts are kept
-  in memory and are never read, hashed or begun again. After a restart that
-  follows a stall of more than two days, lapsed parts are uploaded again and their
-  records appear twice until retention (tracked in issue 285, "Close the duplicate-part
-  read").
-- Parts age from their own publication, so the earliest can be evicted before the
-  manifest. Removal checks the manifest proof, not that each listed part is still
-  stored.
+  lists the ids finally published. Every attempt reads the daemon's recorded parts
+  first (`ingestPartReceipt`, by request id) and never trusts a cached answer: a part
+  the daemon holds is listed without a read, a hash or a begin, and only the parts after
+  them are cut, under the limits as they stand now. A part's receipt is kept while its
+  claim's journal exists, so a part published before a restart, even after a stall of
+  more than two days, returns its saved receipt for as long as its artifact is stored,
+  and its records are not stored twice.
+- While the claim is pending, a part whose artifact is evicted or deleted is sent again
+  from the claim's source under the same request id, and its bytes come back under a
+  new publication time. It is sent again only once no record of the old artifact is
+  still stored: while eviction has retired some of its records and not the rest, the
+  claim is pending and nothing is sent, so no record is read twice. Time expiry still
+  runs from each part's own publication, so the earliest part can expire or be
+  evicted before the manifest; a part past its time but not yet swept is listed, not
+  sent again. The artifact of a claim's single path, and of a manifest accepted and not
+  yet recorded, is held against eviction until the source is removed; set parts are not
+  held. Removal checks the manifest proof, not that each listed part is still stored.
+- A part whose recorded span the limits as they stand no longer admit cannot be cut
+  again, because later parts start where it ends; the claim stays pending until limits
+  that admit that span are restored. A draft at the frontier that the limits no longer
+  admit, or whose bytes are not the file's, is cancelled and waited for, then cut again
+  at its index. A daemon without `ingestPartReceipt` leaves every unrecorded claim pending
+  with a named text until it has the method.
 - The choice between the single path and a split is not durable for a claim with
   no recorded state; a claim whose manifest is accepted or recorded never plans
   again, and a recorded single-path claim returns its saved receipt.
@@ -3060,6 +3075,7 @@ are bounded. Domain errors remain distinct from a broken RPC connection.
 | `watchClaimRetire` | Administration (schema 70): retire one claim that can never complete, recording the authenticated caller, time and reason; see "Retiring an unrecoverable claim". |
 | `backup` | Administration (schema 70): start an online backup of the store into the configured `backup_root`; see "Online backup". |
 | `watchClaims` | Read-only (schema 71): every pending claim and every completed or abandoned claim whose pending span overlaps a time window, with its history; see "Per-claim state listing". |
+| `ingestPartReceipt` | Read-only (schema 71, additive): one set part's receipt state by request id (absent, stored, evicted or evicting) with its artifact id, byte length and format, and no record scan while the artifact is stored (once it is evicted or absent, the records it names are read until one is still stored); used by the part walk of a pending claim. |
 | `watchHandoff`, `watchHandoffGet` | Immutable store/request/watch/revision/raw-path/file-generation handoff; durable admission and explicit reserved/claimed/published/removed progress. Stable retries recover the original binding before inspecting the current source path. |
 
 Schema 23 adds `discover`: store identity, schema version, native text/RDF profile

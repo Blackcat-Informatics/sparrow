@@ -311,7 +311,7 @@ impl Writer {
         let mut catalog = limits.max_catalog_bytes;
         let mut pin_catalog = limits.max_pin_catalog_bytes;
         let mut pins = 0;
-        let protected = writer.protected_matching(
+        let mut protected = writer.protected_matching(
             now,
             |_| true,
             || {
@@ -328,6 +328,13 @@ impl Writer {
             None,
             Some(&mut pin_catalog),
         )?;
+        // A pending claim's single-path and manifest artifacts stay until its source is removed.
+        protected.extend(writer.journal_holds().map_err(|error| {
+            Error::new(
+                error.code,
+                format!("eviction pass blocked by the consumption registry: {error}"),
+            )
+        })?);
         let mut cursor = self.eviction.borrow_mut();
         if cursor.protected == protected && cursor.exhausted {
             return Ok(EvictionReport::default());

@@ -871,6 +871,19 @@ struct IngestStatus {
   rdf @15 :IngestIndexCounts; text @16 :IngestIndexCounts;
 }
 
+# Schema 71 additive (#285): one set part's receipt state by request id. Read-only; carries no
+# record counts. A daemon without this method answers the protocol's unimplemented error.
+struct IngestPartReceiptQuery { storeId @0 :Text; schemaVersion @1 :UInt32; requestId @2 :Text; }
+struct IngestPartReceipt { requestId @0 :Text; artifactId @1 :Text; byteLength @2 :UInt64; format @3 :Format; }
+struct IngestPartState {
+  union {
+    absent @0 :Void;                    # no kept receipt: the part is not published
+    stored @1 :IngestPartReceipt;       # the receipt's artifact is stored and not evicted
+    evicted @2 :IngestPartReceipt;      # the artifact is gone and no record of it is stored
+    evicting @3 :IngestPartReceipt;     # eviction began; some record of it is still stored
+  }
+}
+
 # Complete logical raw-payload account; physical files and indexes are excluded.
 struct RetentionMetricsQuery {
   storeId @0 :Text; schemaVersion @1 :UInt32;
@@ -968,6 +981,9 @@ interface Sparrow {
   # abandoned claim whose pending span (reservation to latest pending attempt) overlaps the
   # window; an abandoned claim is also listed when retired inside it.
   watchClaims @54 (query :WatchClaimsQuery) -> (result :Result(WatchClaims));
+  # Schema 71 additive (#285): one set part's receipt state by request id, read-only. A daemon
+  # without this method answers the protocol's unimplemented error.
+  ingestPartReceipt @55 (query :IngestPartReceiptQuery) -> (result :Result(IngestPartState));
 }
 
 struct TcpChallenge { nonce @0 :Data; }

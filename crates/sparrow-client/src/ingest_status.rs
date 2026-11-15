@@ -388,6 +388,153 @@ pub async fn get_ingest_status(
     })
 }
 
+/// One set part's receipt as the daemon kept it (#285).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartRecord {
+    /// The part's artifact id.
+    pub artifact_id: String,
+    /// The part's byte length.
+    pub byte_length: u64,
+    /// The part's stored format.
+    pub format: crate::Format,
+}
+
+/// What the daemon says about one set part (#285).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PartRead {
+    /// No receipt is kept: the part is not published.
+    Absent,
+    /// The receipt's artifact is stored.
+    Stored(PartRecord),
+    /// The artifact is gone and no record of it is stored: the part is sent again.
+    Evicted(PartRecord),
+    /// Eviction began and some record of the artifact is still stored.
+    Evicting(PartRecord),
+}
+
+/// Read set part `request_id`'s receipt state by key. A daemon without the method answers the
+/// protocol's unimplemented error, which stays [`Error::Transport`] for the caller to name.
+pub async fn get_ingest_part_receipt(
+    client: &wire::sparrow::Client,
+    store: &str,
+    request_id: &str,
+) -> Result<PartRead, Error> {
+    if store.is_empty() || store.len() > 128 || request_id.is_empty() || request_id.len() > 128 {
+        return Err(Error::InvalidArgument(
+            "require a bounded store identity and set part request ID",
+        ));
+    }
+    let mut call = client.ingest_part_receipt_request();
+    let mut query = call.get().init_query();
+    query.set_store_id(store);
+    query.set_schema_version(crate::SCHEMA_VERSION);
+    query.set_request_id(request_id);
+    let response = call.send().promise.await?;
+    crate::receipt::certify_result(response.get()?.get_result()?, |value| {
+        let record = |value: wire::ingest_part_receipt::Reader<'_>| -> Result<PartRecord, Error> {
+            if value.get_request_id()?.to_str()? != request_id {
+                return Err(Error::Protocol("part receipt changed its request"));
+            }
+            Ok(PartRecord {
+                artifact_id: value.get_artifact_id()?.to_str()?.to_owned(),
+                byte_length: value.get_byte_length(),
+                format: value.get_format()?,
+            })
+        };
+        Ok(match value.which()? {
+            wire::ingest_part_state::Absent(()) => PartRead::Absent,
+            wire::ingest_part_state::Stored(value) => PartRead::Stored(record(value?)?),
+            wire::ingest_part_state::Evicted(value) => PartRead::Evicted(record(value?)?),
+            wire::ingest_part_state::Evicting(value) => PartRead::Evicting(record(value?)?),
+        })
+    })
+}
+
+/// What the ingestion status of a part with no kept receipt says (#285).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PartGate {
+    /// No draft and no receipt: nothing of the part was begun.
+    NotFound,
+    /// A live draft the daemon holds for the part.
+    Draft(PartDraft),
+    /// The draft's lease ended or it was cancelled, and its row is not reclaimed yet.
+    Expired,
+    /// A status that is neither: the text names it.
+    Other(String),
+}
+
+/// The declared input and identity of a live draft.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartDraft {
+    /// The staging identity, for a cancel.
+    pub import_id: String,
+    /// Declared byte length.
+    pub byte_length: u64,
+    /// Declared payload identity.
+    pub payload_id: String,
+    /// Declared format.
+    pub format: crate::Format,
+}
+
+impl PartGate {
+    /// The gate a status read that failed with `error` stands for: `NOT_FOUND` is no draft and
+    /// `IMPORT_EXPIRED` is an unreclaimed one; any other failure stays the failure.
+    pub(crate) fn from_error(error: Error) -> Result<Self, Error> {
+        match &error {
+            Error::Domain { code, .. } if code == "NOT_FOUND" => Ok(Self::NotFound),
+            Error::Domain { code, .. } if code == "IMPORT_EXPIRED" => Ok(Self::Expired),
+            _ => Err(error),
+        }
+    }
+}
+
+/// Classify set part `request_id` by its ingestion status, once it has no kept receipt.
+pub(crate) async fn get_part_gate(
+    client: &wire::sparrow::Client,
+    store: &str,
+    request_id: &str,
+) -> Result<PartGate, Error> {
+    let selector = IngestSelector::Request(request_id.to_owned());
+    let status = match get_ingest_status(
+        client,
+        store,
+        &selector,
+        IngestReadLimits {
+            scan_budget: 100_000,
+            catalog_bytes: 33_554_432,
+        },
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(error) => return PartGate::from_error(error),
+    };
+    let reader = status.reader()?;
+    let accepted = !matches!(
+        reader.get_accepted()?.which()?,
+        wire::optional_ingest_acceptance::Absent(())
+    );
+    let staging = match reader.get_staging()?.which()? {
+        wire::optional_import_progress::Absent(()) => None,
+        wire::optional_import_progress::Value(progress) => {
+            Some(crate::ImportProgress::decode(progress?)?)
+        }
+    };
+    Ok(match staging {
+        Some(progress) if !accepted && progress.published_artifact.is_none() => {
+            PartGate::Draft(PartDraft {
+                import_id: progress.id,
+                byte_length: progress.byte_length,
+                payload_id: progress.payload_id,
+                format: progress.format,
+            })
+        }
+        Some(_) => PartGate::Other("a staging row that is accepted or published".into()),
+        None if accepted => PartGate::Other("accepted".into()),
+        None => PartGate::Other("neither staged nor accepted".into()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

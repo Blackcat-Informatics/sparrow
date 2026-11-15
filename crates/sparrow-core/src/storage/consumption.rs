@@ -370,6 +370,22 @@ pub(super) fn manifest_receipt_key(request_id: &str) -> Option<String> {
         .map(|hash| format!("request:ingest:{SET_PREFIX}{hash}.manifest"))
 }
 
+/// The import identity of the claim `consume:{H}` that owns set part `consumeset:{H}.part{k:010}`;
+/// none for any other request id (#285).
+pub(super) fn part_claim_import(request_id: &str) -> Option<String> {
+    let (hash, index) = request_id.strip_prefix(SET_PREFIX)?.split_once(".part")?;
+    (!hash.is_empty() && index.len() == 10 && index.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| super::import::import_id(&format!("consume:{hash}")))
+}
+
+/// The request id of set part `index` of the claim whose request is `consume:{H}`; the inverse of
+/// [`part_claim_import`]. The client cuts the same ids on the wire (`sparrow-client` `parts.rs`),
+/// so the format is a wire contract (#285).
+pub(super) fn part_request_id(claim_request: &str, index: u64) -> Option<String> {
+    let hash = claim_request.strip_prefix("consume:")?;
+    Some(format!("{SET_PREFIX}{hash}.part{index:010}"))
+}
+
 /// What a claim's set manifest receipt says about its publication (#280).
 #[derive(Clone, Debug)]
 pub enum SetManifest {
@@ -852,9 +868,47 @@ impl Writer {
                 "consumption publication already recorded",
             ));
         }
+        // A claim publishes as one artifact or as a set, never both: a part-0 row or receipt
+        // means a set began, and the single publication is refused (#285).
+        if let Some(part) = part_request_id(&manifest.request_id, 0) {
+            let part = super::import::import_id(&part);
+            if self.db.get_pinned(&part)?.is_some()
+                || self
+                    .db
+                    .get_pinned(super::publication::receipt_key(&part))?
+                    .is_some()
+            {
+                return Err(Error::new(
+                    "CONFLICT",
+                    format!(
+                        "claim {} has set part 0; it publishes as a part set, not as one artifact",
+                        manifest.id
+                    ),
+                ));
+            }
+        }
         journal.published_artifact = Some(artifact.id.clone());
         put(batch, &key(&manifest.id), &journal);
         Ok(())
+    }
+
+    /// The artifacts a pending claim still needs for its source to be removed safely: a
+    /// published single-path artifact or recorded manifest, and the manifest accepted but not
+    /// yet recorded (#285). Eviction leaves them alone; set parts are not held, because a part
+    /// that is gone is sent again from the claim's source. The reads are bounded by the
+    /// registry's 16 journals and are not charged to the pin catalog.
+    pub(super) fn journal_holds(&self) -> Result<std::collections::BTreeSet<String>, Error> {
+        let mut held = std::collections::BTreeSet::new();
+        for journal in self.pending_journals()? {
+            if let Some(id) = &journal.published_artifact {
+                held.insert(id.clone());
+            } else if journal.tail.is_none()
+                && let SetManifest::Receipt(manifest) = self.set_manifest(&journal)?
+            {
+                held.insert(manifest.id);
+            }
+        }
+        Ok(held)
     }
 }
 
