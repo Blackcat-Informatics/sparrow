@@ -281,7 +281,7 @@ filesystem quota's responsibility.
 
 Sparrow keeps a 30-day searchable window of disposable logs. It can also
 archive aged-out evidence to a large, slower store, such as a NAS, before
-deleting it. The archive uses PurRDF's Parquet codec with N-Quads manifests, as
+deleting it. The archive uses PurRDF's GTS files with N-Quads manifests, as
 specified in [the archive format](archive-format.md). Archiving is optional and
 configured by an `[archive]` table. Once a store has been fenced for archiving,
 it never deletes unarchived evidence. That holds when the archive is down, while

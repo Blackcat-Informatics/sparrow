@@ -20,6 +20,7 @@ purrdf-hash.workspace = true
 purrdf-lex.workspace = true
 purrdf-core.workspace = true
 getrandom.workspace = true
+tracing.workspace = true
 rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]

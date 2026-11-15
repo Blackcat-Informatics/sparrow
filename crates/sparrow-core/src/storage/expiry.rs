@@ -491,6 +491,15 @@ impl Pass<'_> {
                 }
             }
         }
+        // The parent is retired with its records, so its own position must be archived too: a
+        // record can be received at another instant than its artifact (a stream or session
+        // publication), and the test above covers only the record's position.
+        if let Some(envelope) = self.parents.get(&parent)
+            && !writer.archived(envelope.received_at, &envelope.id)
+        {
+            self.report.archive_waiting += 1;
+            return Ok(Step::Stop(ExpiryFrontier::ArchiveLag));
+        }
         if !held && !record.evicted && !record.retired {
             if self.units() == self.limits.max_records as u64 {
                 return Ok(Step::Stop(ExpiryFrontier::UnitLimit));

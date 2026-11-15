@@ -14,6 +14,8 @@ use purrdf_lex::json::{self, Object, Value};
 use rocksdb::{DB, IteratorMode, WriteBatch, WriteOptions};
 
 pub(crate) mod archive;
+mod archive_encode;
+pub(crate) mod archive_segment;
 mod artifact_rdf;
 pub(crate) mod backup;
 mod event_fallback_rdf;

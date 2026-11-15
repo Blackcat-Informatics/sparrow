@@ -21,10 +21,11 @@ const POSITION_BYTES: usize = 20 + 1 + ID_BYTES;
 pub const ARCHIVE_START_FRACTION: f64 = 0.75;
 /// Default closing size of one segment's payload.
 pub const ARCHIVE_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
-/// Largest admitted segment payload, below the columnar codec's 256 MiB table bound.
-pub const ARCHIVE_MAX_SEGMENT_BYTES: u64 = 192 * 1024 * 1024;
+/// Largest admitted segment payload. A memory limit of the GTS writer, which holds the whole
+/// segment resident: it relaxes when PurRDF issue 1257 (a streaming writer) lands.
+pub const ARCHIVE_MAX_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
 /// Smallest admitted segment closing size. An entry larger than the target forms
-/// its own segment and streams its bytes outside the codec tables.
+/// its own segment.
 pub const ARCHIVE_MIN_SEGMENT_BYTES: u64 = 1024 * 1024;
 /// Default closing record count of one segment.
 pub const ARCHIVE_SEGMENT_RECORDS: u64 = 50_000;
@@ -34,7 +35,7 @@ pub const ARCHIVE_SEGMENT_RECORDS: u64 = 50_000;
 pub struct ArchivePolicy {
     /// Fraction of the retention window or data budget that starts archiving, 0.5..=0.95.
     pub start_fraction: f64,
-    /// Payload bytes that close a segment, from 1 MiB to 192 MiB. A closing target,
+    /// Payload bytes that close a segment, from 1 MiB to 256 MiB. A closing target,
     /// not a capacity: an entry larger than it is archived in a segment of its own.
     pub max_segment_bytes: u64,
     /// Eviction entries that close a segment; at least one.
@@ -65,7 +66,7 @@ impl ArchivePolicy {
         {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
-                "archive max_segment_bytes must be 1 MiB..192 MiB",
+                "archive max_segment_bytes must be 1 MiB..256 MiB",
             ));
         }
         if self.max_segment_records == 0 {
@@ -161,7 +162,7 @@ fn valid_position(position: &[u8]) -> bool {
         && std::str::from_utf8(&position[21..]).is_ok()
 }
 
-fn corrupt(message: &str) -> Error {
+pub(super) fn corrupt(message: &str) -> Error {
     Error::new("STORAGE_FAILURE", format!("archive {message}"))
 }
 
