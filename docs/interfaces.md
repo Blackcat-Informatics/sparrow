@@ -488,7 +488,11 @@ refuse them. The fence records `archive:through` with nothing archived, so an
 existing backlog is archived before anything is deleted. Reopening a fenced
 store without `[archive]` fails with `INVALID_ARGUMENT`. A fence without its
 watermark, or a watermark without its fence, fails with `STORAGE_FAILURE`.
-Stores without the fence or the table behave exactly as before.
+A store with no archive policy has archived nothing, so it deletes nothing:
+expiry and pressure eviction hold at `ArchiveLag`, and disk use grows toward
+`disk_budget` until an archive is configured and has committed segments. Each
+expiry pass that retired or held evidence, and each eviction pass, writes one
+structured journal line with its counts.
 
 One gate guards every deletion. Expiry stops at the first due entry the watermark
 does not cover, with frontier `ArchiveLag` and `ExpiryReport.archive_waiting` of 1,

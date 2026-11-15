@@ -3266,8 +3266,13 @@ async fn source_listing_exposes_declared_idle_and_occurrence_sources_through_sha
         .await;
 }
 
+/// Behaviour protected: artifact listing pages are typed and shared by the CLI and MCP, and an
+/// artifact that is due for expiry but unarchived is held, not reclaimed. With no archive
+/// policy the expiry pass retires nothing, so the listing still reports the artifact's origin,
+/// its complete bytes and both retained records, and a receipt window finds it. Agent
+/// refusals keep their typed codes.
 #[tokio::test(flavor = "current_thread")]
-async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals() {
+async fn artifact_listing_shares_typed_pages_held_origins_and_agent_refusals() {
     use purrdf_lex::json::{Object, Value};
     tokio::task::LocalSet::new()
         .run_until(async {
@@ -3291,7 +3296,8 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
                     old,
                 )
                 .unwrap();
-            owner.expire(clock).unwrap();
+            // The fragment is 31 days old and due, and nothing is archived: expiry holds.
+            assert_eq!(owner.expire(clock).unwrap(), 0);
             drop(owner);
             let _daemon = start(&config, &socket).await;
             let client = sparrow_client::Client::connect(&socket).await.unwrap();
@@ -3393,14 +3399,14 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
                 fragments["rows"][0]["artifact_id"].as_str(),
                 Some(fragment.id.as_str())
             );
-            assert_eq!(fragments["rows"][0]["origin"], Value::Null);
+            assert_ne!(fragments["rows"][0]["origin"], Value::Null);
             assert_eq!(
                 fragments["rows"][0]["complete_bytes_available"].as_bool(),
                 Some(false)
             );
+            // Counts live records at `now`: the pinned one. The unpinned record is expired but kept.
             assert_eq!(fragments["rows"][0]["retained_records"].as_str(), Some("1"));
-            // The per-source index keeps the reclaimed parent's receipt, so a receipt window
-            // finds the fragment, still without an origin.
+            // The held artifact keeps its receipt, so a receipt window finds it with its origin.
             let windowed = cli(
                 &socket,
                 &[
@@ -3419,7 +3425,7 @@ async fn artifact_listing_shares_typed_pages_unknown_origins_and_agent_refusals(
                 windowed["rows"][0]["artifact_id"],
                 fragments["rows"][0]["artifact_id"]
             );
-            assert_eq!(windowed["rows"][0]["origin"], Value::Null);
+            assert_ne!(windowed["rows"][0]["origin"], Value::Null);
             assert_eq!(windowed["rows"][0]["retained_records"].as_str(), Some("1"));
             for (args, code) in [
                 (
@@ -3871,8 +3877,12 @@ async fn source_arrays_are_shared_by_generated_cli_and_mcp_queries() {
         .await;
 }
 
+/// Behaviour protected: with no archive policy the daemon's expiry holds at the archive gate.
+/// An artifact whose records are all due is never retired: the daemon journals the held pass
+/// (`archive_waiting=1`), every record stays readable by id and by bytes, and a reopened store
+/// still holds every record and the pin that protected the first.
 #[tokio::test(flavor = "current_thread")]
-async fn daemon_expiry_resumes_multiple_passes_and_keeps_pinned_evidence() {
+async fn daemon_expiry_holds_unarchived_evidence_at_the_archive_gate() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
@@ -3891,7 +3901,6 @@ async fn daemon_expiry_resumes_multiple_passes_and_keeps_pinned_evidence() {
                     0,
                 )
                 .unwrap();
-            // Protection was established while the original evidence was live.
             store
                 .pin(
                     "daemon-expiry-original-pin",
@@ -3902,40 +3911,18 @@ async fn daemon_expiry_resumes_multiple_passes_and_keeps_pinned_evidence() {
                 )
                 .unwrap();
             drop(store);
-            let daemon = start(&config, &socket).await;
+            let mut daemon = start_with_stderr(&config, &socket, Stdio::piped()).await;
+            // The daemon's first expiry pass finds the due artifact and reports it held.
+            let journal = journal_lines(&mut daemon);
+            await_journal(&journal, &["expiry pass", "archive_waiting=1"]);
             let connection = connect(&socket).await.unwrap();
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                let mut retained_catalogs = 0;
-                for id in &artifact.record_ids[1..] {
-                    let mut request = connection.client.record_get_request();
-                    let mut reference = request.get().init_record();
-                    reference.set_store_id(&store_id);
-                    reference.set_id(id);
-                    let response = request.send().promise.await.unwrap();
-                    match response
-                        .get()
-                        .unwrap()
-                        .get_result()
-                        .unwrap()
-                        .which()
-                        .unwrap()
-                    {
-                        wire::result::Ok(_) => retained_catalogs += 1,
-                        wire::result::Error(error) => assert_eq!(
-                            error.unwrap().get_code().unwrap().to_str().unwrap(),
-                            "NOT_FOUND"
-                        ),
-                    }
-                }
-                if retained_catalogs == 0 {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "daemon did not finish bounded expiry passes"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
+            for id in &artifact.record_ids {
+                let mut request = connection.client.record_get_request();
+                let mut reference = request.get().init_record();
+                reference.set_store_id(&store_id);
+                reference.set_id(id);
+                let response = request.send().promise.await.unwrap();
+                rpc_ok(response.get().unwrap().get_result().unwrap());
             }
             let mut request = connection.client.bytes_read_request();
             let mut read = request.get().init_request();
@@ -3954,20 +3941,54 @@ async fn daemon_expiry_resumes_multiple_passes_and_keeps_pinned_evidence() {
             drop(daemon);
             let store = settings.open_store().unwrap();
             let now = sparrow_server::now().unwrap();
+            // Only the pinned record is live at `now`; the expired unpinned records are hidden
+            // from the listing but still retained, and each is read by id below.
             assert_eq!(store.records(now).unwrap().len(), 1);
-            assert_eq!(
-                store.status(now).unwrap()["unique_payload_chunks"].as_str(),
-                Some("1")
-            );
-            for id in &artifact.record_ids[1..] {
-                assert_eq!(store.record(id).unwrap_err().code, "NOT_FOUND");
+            for id in &artifact.record_ids {
+                store.record(id).unwrap();
             }
         })
         .await;
 }
 
+/// Forward the daemon's stderr lines to a channel, so a test waits for a journal event under a
+/// deadline instead of reading the pipe blocking.
+fn journal_lines(daemon: &mut Daemon) -> std::sync::mpsc::Receiver<String> {
+    use std::io::BufRead;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let stderr = daemon.0.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { return };
+            if sender.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    receiver
+}
+
+/// Wait up to 10 seconds for a journal line containing every needle.
+fn await_journal(lines: &std::sync::mpsc::Receiver<String>, needles: &[&str]) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let line = lines
+            .recv_timeout(left)
+            .unwrap_or_else(|_| panic!("daemon never journaled a line with {needles:?}"));
+        if needles.iter().all(|needle| line.contains(needle)) {
+            return;
+        }
+    }
+}
+
+/// Behaviour protected: with no archive policy, pressure never retires evidence. The worker
+/// waits on the archive (`awaiting_archive`, frontier `archive_lag`, no evicted records), a
+/// write over the reserve is refused with a retryable `STORAGE_PRESSURE` and refused again
+/// while the ballast stays, every record stays readable, and CLI and MCP share the typed
+/// status. Once space returns the same request is accepted.
 #[tokio::test(flavor = "current_thread")]
-async fn daemon_pressure_worker_preserves_pins_and_shares_typed_cli_mcp_status() {
+async fn daemon_pressure_worker_holds_unarchived_evidence_and_shares_typed_cli_mcp_status() {
     tokio::task::LocalSet::new().run_until(async {
         use purrdf_lex::json::{Object, Value};
         let dir = tempfile::tempdir().unwrap();
@@ -4001,19 +4022,25 @@ async fn daemon_pressure_worker_preserves_pins_and_shares_typed_cli_mcp_status()
             let status = rpc_ok(response.get().unwrap().get_result().unwrap());
             let pressure = status.get_pressure_status().unwrap();
             assert_eq!(status.get_schema_version(), sparrow_client::SCHEMA_VERSION);
-            if pressure.get_evicted_records() == 1 {
-                assert_eq!(pressure.get_evicted_recordless_artifacts(), 1);
+            if pressure.get_phase().unwrap() == wire::PressurePhase::AwaitingArchive {
+                assert_eq!(pressure.get_evicted_records(), 0);
+                assert_eq!(pressure.get_evicted_recordless_artifacts(), 0);
                 assert!(pressure.get_requested_bytes() > 0);
+                assert!(pressure.get_passes() >= 1);
+                let wire::pressure_pass::Present(pass) = pressure.get_last_pass().unwrap().which().unwrap() else { panic!("a held pass is reported") };
+                assert!(pass.unwrap().get_frontier().unwrap() == wire::EvictionFrontier::ArchiveLag);
                 assert!(matches!(pressure.get_failure().unwrap().which().unwrap(), wire::optional_text::Absent(())));
                 break;
             }
-            assert!(Instant::now() < deadline, "owned daemon did not run pressure retirement");
+            assert!(Instant::now() < deadline, "owned daemon never held pressure retirement at the archive gate");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let cli_status = cli(&socket, &["status"]);
         let mcp_status = mcp.tool(3, "status", Object::new().into()).await;
-        assert_eq!(cli_status["pressure"]["evicted_records"].as_str(), Some("1"));
-        assert_eq!(cli_status["pressure"]["evicted_recordless_artifacts"].as_str(), Some("1"));
+        assert_eq!(cli_status["pressure"]["phase"].as_str(), Some("awaiting_archive"));
+        assert_eq!(cli_status["pressure"]["evicted_records"].as_str(), Some("0"));
+        assert_eq!(cli_status["pressure"]["evicted_recordless_artifacts"].as_str(), Some("0"));
+        assert_eq!(mcp_status["structuredContent"]["pressure"]["phase"], cli_status["pressure"]["phase"]);
         assert_eq!(mcp_status["structuredContent"]["pressure"]["evicted_recordless_artifacts"], cli_status["pressure"]["evicted_recordless_artifacts"]);
         assert_eq!(mcp_status["structuredContent"]["pressure"]["evicted_records"], cli_status["pressure"]["evicted_records"]);
         // A new store owes no table rewrite, and both adapters render the same status.
@@ -4022,9 +4049,12 @@ async fn daemon_pressure_worker_preserves_pins_and_shares_typed_cli_mcp_status()
         let retained = mcp.tool(4, "bytes_read", Object::new().with("store_id", &protected.store_id)
             .with("id", &protected.id).with("offset", "0").with("length", 7_u64).into()).await;
         assert_eq!(retained["isError"].as_bool(), Some(false));
-        let unavailable = mcp.tool(5, "bytes_read", Object::new().with("store_id", &old.store_id)
+        // The oldest evidence is held, not retired: it stays readable under the refusal.
+        let held = mcp.tool(5, "bytes_read", Object::new().with("store_id", &old.store_id)
             .with("id", &old.id).with("offset", "0").with("length", 1_u64).into()).await;
-        assert_eq!(unavailable["structuredContent"]["error"]["code"].as_str(), Some("EVIDENCE_UNAVAILABLE"));
+        assert_eq!(held["isError"].as_bool(), Some(false));
+        let refused = producer.ingest("pressure-retry", "source", wire::Format::Log, b"later\n").await.unwrap_err();
+        assert!(matches!(refused, sparrow_client::Error::Domain { ref code, retryable: true, .. } if code == "STORAGE_PRESSURE"));
         let released = mcp.tool(6, "pin_release", Object::new().with("store_id", &protected.store_id)
             .with("request_id", "pressure-release").with("pin_id", &pin_id).into()).await;
         assert_eq!(released["isError"].as_bool(), Some(false));
@@ -15745,9 +15775,11 @@ impl SetHarness {
         }
     }
 
-    /// One eviction pass of at most `units` retirement units, with no archive configured.
-    fn evict(&self, units: usize) {
-        self.store
+    /// One eviction pass of at most `units` retirement units, with no archive configured, and
+    /// proof that the archive gate held it: nothing retired, and the pass stopped at `ArchiveLag`.
+    fn evict_held(&self, units: usize) {
+        let report = self
+            .store
             .evict_oldest(
                 sparrow_server::now().unwrap(),
                 sparrow_core::EvictionLimits {
@@ -15756,6 +15788,11 @@ impl SetHarness {
                 },
             )
             .unwrap();
+        assert!(
+            report.records.is_empty() && report.artifacts.is_empty(),
+            "no archive, so nothing is retired: {report:?}"
+        );
+        assert_eq!(report.frontier, sparrow_core::EvictionFrontier::ArchiveLag);
     }
 
     /// The by-key read of set part `index` of the claim.
@@ -15803,8 +15840,10 @@ impl SetHarness {
 }
 
 /// INVARIANT (#285, ruling condition 1): the source of a set claim stays held, and its bytes
-/// are unchanged, for as long as the claim is pending: while a part is being evicted and while
-/// the manifest is accepted and not yet recorded. Once `publish` completes, removal succeeds.
+/// are unchanged, for as long as the claim is pending: before the manifest and while it is
+/// accepted and not yet recorded. With no archive configured, eviction holds at `ArchiveLag`
+/// and retires no part, so the claim's parts stay stored and `publish` completes the set. Once
+/// `publish` completes, removal succeeds.
 #[tokio::test]
 async fn a_set_claims_source_stays_held_while_the_claim_is_pending() {
     tokio::task::LocalSet::new()
@@ -15834,17 +15873,12 @@ async fn a_set_claims_source_stays_held_while_the_claim_is_pending() {
                     .await
                     .unwrap();
                 } else {
-                    // Part 0 is evicted part way: one of its 20 records is retired.
-                    harness.evict(1);
+                    // Eviction is offered part 0 and holds: it retires nothing.
+                    harness.evict_held(1);
                     assert!(matches!(
                         harness.part_state(&claim, 0),
-                        sparrow_core::PartReceiptState::Evicting(_)
+                        sparrow_core::PartReceiptState::Stored(_)
                     ));
-                    let error = harness
-                        .publish_claim(&harness.client, &mut claim)
-                        .await
-                        .unwrap_err();
-                    assert!(error.to_string().contains("is being evicted"), "{error}");
                 }
                 let now = sparrow_server::now().unwrap();
                 harness.root.remove(&claim, now).unwrap_err();
@@ -15860,7 +15894,7 @@ async fn a_set_claims_source_stays_held_while_the_claim_is_pending() {
                     "manifest_accepted {manifest_accepted}: the claimed source is unchanged"
                 );
                 if !manifest_accepted {
-                    harness.evict(19);
+                    harness.evict_held(20);
                     harness.reclaim();
                 }
                 harness
@@ -15873,18 +15907,18 @@ async fn a_set_claims_source_stays_held_while_the_claim_is_pending() {
         .await;
 }
 
-/// INVARIANT (#285, ruling condition 2, review-pr286 B1): with no archive configured, a set part
-/// that eviction retired is answered as evicted, sent again from the held source under the same
-/// request id, and then read exactly once. While eviction has retired only some of its records
-/// the claim is pending, and nothing is sent: a record still stored would be shown twice.
+/// INVARIANT (#285, ruling condition 2, review-pr286 B1): with no archive configured, eviction
+/// holds at `ArchiveLag` and retires no record of a set part, so a part is never answered as
+/// evicted and never sent again. Every part keeps its original artifact, the claim publishes
+/// from the stored parts, and each source line is read exactly once.
 #[tokio::test]
-async fn an_evicted_part_without_an_archive_is_sent_again_and_read_exactly_once() {
+async fn a_set_part_without_an_archive_is_held_by_eviction_and_read_exactly_once() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
             let harness = set_harness(dir.path()).await;
             let input = chunk_lines(0, 50, b'p');
-            let mut claim = harness.claim("evicted.jsonl", "jsonl", &input);
+            let mut claim = harness.claim("held-parts.jsonl", "jsonl", &input);
             let first = harness
                 .upload(
                     &harness.client,
@@ -15894,42 +15928,26 @@ async fn an_evicted_part_without_an_archive_is_sent_again_and_read_exactly_once(
                 .await;
             assert_eq!(first.len(), 3);
 
-            // Eviction retires one record of part 0: it is evicting, and the claim pends.
-            harness.evict(1);
-            assert!(matches!(
-                harness.part_state(&claim, 0),
-                sparrow_core::PartReceiptState::Evicting(_)
-            ));
-            let error = harness
-                .publish_claim(&harness.client, &mut claim)
-                .await
-                .unwrap_err();
-            assert!(
-                error.to_string().contains("part 0 is being evicted"),
-                "{error}"
-            );
-            assert!(
-                error.to_string().contains("nothing was uploaded"),
-                "{error}"
-            );
-
-            // The rest of part 0 is retired: it is evicted, and, inside the retry window,
-            // sent again from the source once the old staging row is reclaimed.
-            harness.evict(19);
-            assert!(matches!(
-                harness.part_state(&claim, 0),
-                sparrow_core::PartReceiptState::Evicted(_)
-            ));
+            // Eviction is offered every record of part 0, one at a time and all at once, and
+            // holds each time: no part is evicting or evicted.
+            harness.evict_held(1);
+            harness.evict_held(19);
             harness.reclaim();
+            for index in 0..3 {
+                assert!(matches!(
+                    harness.part_state(&claim, index),
+                    sparrow_core::PartReceiptState::Stored(_)
+                ));
+            }
             let manifest = harness
                 .publish_claim(&harness.client, &mut claim)
                 .await
                 .unwrap();
             let parts = harness.parts(&manifest, "jsonl", &input);
             assert_eq!(parts.len(), 3);
-            assert_ne!(parts[0].1, first[0].1, "part 0 is a new artifact");
-            assert_eq!(parts[1].1, first[1].1);
-            assert_eq!(parts[2].1, first[2].1);
+            for (part, original) in parts.iter().zip(&first) {
+                assert_eq!(part.1, original.1, "a held part keeps its artifact");
+            }
             harness.assert_lines_read_once(&manifest, 50);
             let now = sparrow_server::now().unwrap();
             harness.root.remove(&claim, now).unwrap();

@@ -72,6 +72,7 @@ macro_rules! storage_config {
                 text_analyzer: $crate::resolve_text_analyzer($crate::text_lexicon_dir())
                     .expect("standard storage fixture analyzer"),
                 archive: None,
+                retire_without_archive: true,
             })
             .clone()
     }};

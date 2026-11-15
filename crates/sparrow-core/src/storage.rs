@@ -371,6 +371,10 @@ pub struct Config {
     pub text_analyzer: purrdf::text::Analyzer,
     /// Archive-before-delete policy. Once a store is fenced for archiving it requires one.
     pub archive: Option<archive::ArchivePolicy>,
+    /// Let a store with no archive policy retire evidence as if it were archived. For test
+    /// fixtures that exercise retention without an archive; the daemon never sets it, so a
+    /// production store with no policy holds its evidence.
+    pub retire_without_archive: bool,
 }
 
 impl Config {

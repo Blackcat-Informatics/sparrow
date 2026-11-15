@@ -354,6 +354,69 @@ fn observe_floor(
 
 /// Skipped-duty counts of the test running on this thread, so a test waits for the skip it
 /// exercises as an event instead of sleeping.
+/// One structured line for an expiry pass that retired or held evidence. The counts are the
+/// pass's own; `archive_waiting` is the due entry the archive gate held back.
+fn journal_expiry(report: &ExpiryReport, floor_paused: bool) {
+    if report.records == 0
+        && report.artifacts == 0
+        && report.deleted == 0
+        && report.archive_waiting == 0
+    {
+        return;
+    }
+    eprintln!(
+        "sparrowd: expiry pass records={} artifacts={} payload_refs={} deleted={} archive_waiting={} floor_paused={floor_paused}",
+        report.records,
+        report.artifacts,
+        report.payload_refs,
+        report.deleted,
+        report.archive_waiting
+    );
+    tracing::info!(
+        records = report.records,
+        artifacts = report.artifacts,
+        payload_refs = report.payload_refs,
+        deleted = report.deleted,
+        archive_waiting = report.archive_waiting,
+        floor_paused,
+        "expiry pass"
+    );
+}
+
+/// One structured line per eviction pass that retired evidence. The status repeats its last
+/// pass until another runs, so `seen` holds the pass count already journaled.
+fn journal_eviction(status: &PressureStatus, seen: &mut u64) {
+    if status.passes == *seen {
+        return;
+    }
+    *seen = status.passes;
+    let Some(pass) = &status.last_pass else {
+        return;
+    };
+    eprintln!(
+        "sparrowd: eviction pass={} records={} artifacts={} recordless_artifacts={} payload_refs={} protected={} frontier={:?} evicted_records_total={}",
+        status.passes,
+        pass.records.len(),
+        pass.artifacts.len(),
+        pass.recordless_artifacts,
+        pass.payload_refs,
+        pass.protected,
+        pass.frontier,
+        status.evicted_records
+    );
+    tracing::info!(
+        pass = status.passes,
+        records = pass.records.len(),
+        artifacts = pass.artifacts.len(),
+        recordless_artifacts = pass.recordless_artifacts,
+        payload_refs = pass.payload_refs,
+        protected = pass.protected,
+        frontier = ?pass.frontier,
+        evicted_records_total = status.evicted_records,
+        "eviction pass"
+    );
+}
+
 #[cfg(test)]
 mod skips {
     use super::Job;
@@ -535,6 +598,7 @@ async fn run(
     // Buffered synchronization retains its configured initial delay.
     flush.tick().await;
     let mut continuation = false;
+    let mut journaled_eviction_passes = 0_u64;
     let mut pressure_duty = pressure_duty::Duty::default();
     let mut pressure_at = tokio::time::Instant::now();
     // The first pass runs at once; each later one at the deadline the previous one reported.
@@ -640,6 +704,7 @@ async fn run(
             Ok(Outcome::Expired(report, now)) => {
                 // Only real due backlog continues without sleeping; otherwise sleep until
                 // the next deadline, however long the pass took.
+                journal_expiry(&report, paused);
                 if report.anomalies != 0 {
                     eprintln!(
                         "sparrowd: retention saw {} entries whose own deadline differs from receipt plus retention; honoured at their own deadline",
@@ -670,6 +735,7 @@ async fn run(
             }
             Ok(Outcome::Pressured(status)) => {
                 held.wake();
+                journal_eviction(&status, &mut journaled_eviction_passes);
                 let verdict = pressure_duty.observe(&status);
                 for line in &verdict.lines {
                     eprintln!("{line}");
@@ -729,6 +795,27 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The daemon's store configuration, except that evidence may retire without an archive:
+    /// these tests exercise retention itself, and the daemon's own store holds it.
+    fn open_retiring(
+        config: &sparrow_server::ServerConfig,
+    ) -> Result<Store, Box<dyn std::error::Error>> {
+        Ok(Store::open(
+            &config.data_dir,
+            sparrow_core::Config {
+                buffered_flush_interval_ms: config.buffered_flush_interval_ms,
+                disk_budget: config.disk_budget,
+                maintenance_reserve: config.maintenance_reserve,
+                min_free_bytes: config.min_free_bytes,
+                max_records: config.max_records,
+                max_pin_members: config.max_pin_members,
+                text_analyzer: sparrow_core::resolve_text_analyzer(&config.text_lexicon_dir)?,
+                archive: None,
+                retire_without_archive: true,
+            },
+        )?)
+    }
 
     /// Wait until `done` holds, blocking on the worker's pass event (a loop turn ended) and
     /// re-checking each time. The 30 s deadline covers the whole wait, not each turn (the
@@ -822,10 +909,7 @@ mod tests {
         let raised = text.replace("min_free_bytes = 1048576", "min_free_bytes = 33554432");
         assert_ne!(raised, text);
         std::fs::write(&path, raised).unwrap();
-        sparrow_server::ServerConfig::read(&path)
-            .unwrap()
-            .open_store()
-            .unwrap()
+        open_retiring(&sparrow_server::ServerConfig::read(&path).unwrap()).unwrap()
     }
 
     /// Free space above the 8 MiB reserve and below the 32 MiB floor.
@@ -931,7 +1015,7 @@ mod tests {
         let path =
             sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
         let config = sparrow_server::ServerConfig::read(&path).unwrap();
-        let store = config.open_store().unwrap();
+        let store = open_retiring(&config).unwrap();
         let now = sparrow_server::now().unwrap();
         let old = now - 31 * 86_400_000;
         let input = (0..1024)
@@ -994,10 +1078,7 @@ mod tests {
                 &data,
                 &data.join("rpc.sock"),
             );
-            let store = sparrow_server::ServerConfig::read(&path)
-                .unwrap()
-                .open_store()
-                .unwrap();
+            let store = open_retiring(&sparrow_server::ServerConfig::read(&path).unwrap()).unwrap();
             let freed = Arc::new(Notify::new());
             store.set_import_slot_waker(Some(Arc::new({
                 let freed = Arc::clone(&freed);
@@ -1102,10 +1183,7 @@ mod tests {
         let data = dir.path().join("store");
         let path =
             sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
-        let store = sparrow_server::ServerConfig::read(&path)
-            .unwrap()
-            .open_store()
-            .unwrap();
+        let store = open_retiring(&sparrow_server::ServerConfig::read(&path).unwrap()).unwrap();
         let now = sparrow_server::now().unwrap();
         let old = now - 31 * 86_400_000;
         let artifact = store
@@ -1139,7 +1217,7 @@ mod tests {
         let data = dir.join("store");
         let path = sparrow_test_support::write_server_config(dir, &data, &data.join("rpc.sock"));
         let config = sparrow_server::ServerConfig::read(&path).unwrap();
-        let store = config.open_store().unwrap();
+        let store = open_retiring(&config).unwrap();
         let now = sparrow_server::now().unwrap();
         let input = (0..300).map(|i| format!("line {i}\n")).collect::<String>();
         store
@@ -1151,7 +1229,7 @@ mod tests {
         sparrow_test_support::pending_source_summary_migration(&db).unwrap();
         sparrow_test_support::stale_source_context_cache(&db).unwrap();
         drop(db);
-        config.open_store().unwrap()
+        open_retiring(&config).unwrap()
     }
 
     /// INVARIANT: a store opened with the owner index, the source summary migration and a
@@ -1235,10 +1313,7 @@ mod tests {
         let data = dir.path().join("store");
         let path =
             sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
-        let store = sparrow_server::ServerConfig::read(&path)
-            .unwrap()
-            .open_store()
-            .unwrap();
+        let store = open_retiring(&sparrow_server::ServerConfig::read(&path).unwrap()).unwrap();
         let mut worker = Worker::start(store, Duration::from_millis(1), Default::default());
         let (mut consumer, mut syslog) = (None, None);
         // A running worker: a second passes without a failure.
@@ -1276,10 +1351,7 @@ mod tests {
         let data = dir.path().join("store");
         let path =
             sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
-        let store = sparrow_server::ServerConfig::read(&path)
-            .unwrap()
-            .open_store()
-            .unwrap();
+        let store = open_retiring(&sparrow_server::ServerConfig::read(&path).unwrap()).unwrap();
         let now = sparrow_server::now().unwrap();
         let old = now - 31 * 86_400_000;
         let artifact = store
@@ -1374,10 +1446,7 @@ mod tests {
         let data = dir.path().join("store");
         let path =
             sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
-        let store = sparrow_server::ServerConfig::read(&path)
-            .unwrap()
-            .open_store()
-            .unwrap();
+        let store = open_retiring(&sparrow_server::ServerConfig::read(&path).unwrap()).unwrap();
         store.space_floor().set_free_for_tests(Some(0));
         let held = sparrow_server::pressure_wake::PressureWake::default();
         assert!(observe_floor(&store, Job::Reclaim, &held).unwrap());
@@ -1405,10 +1474,7 @@ mod tests {
         let data = dir.path().join("store");
         let path =
             sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
-        let store = sparrow_server::ServerConfig::read(&path)
-            .unwrap()
-            .open_store()
-            .unwrap();
+        let store = open_retiring(&sparrow_server::ServerConfig::read(&path).unwrap()).unwrap();
         store.space_floor().set_free_for_tests(Some(0));
         let held = sparrow_server::pressure_wake::PressureWake::default();
         let waiter = held.subscribe();
@@ -1433,10 +1499,7 @@ mod tests {
         let data = dir.path().join("store");
         let path =
             sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
-        let store = sparrow_server::ServerConfig::read(&path)
-            .unwrap()
-            .open_store()
-            .unwrap();
+        let store = open_retiring(&sparrow_server::ServerConfig::read(&path).unwrap()).unwrap();
         let held = sparrow_server::pressure_wake::PressureWake::default();
         let delay = pressure_failed(
             &store,
@@ -1455,7 +1518,7 @@ mod tests {
         let path =
             sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
         let config = sparrow_server::ServerConfig::read(&path).unwrap();
-        let store = config.open_store().unwrap();
+        let store = open_retiring(&config).unwrap();
         store
             .ingest_with_durability(
                 "stopped-buffer",

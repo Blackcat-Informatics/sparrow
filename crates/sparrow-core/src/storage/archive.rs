@@ -293,13 +293,19 @@ pub(super) fn open(db: &DB, policy: Option<&ArchivePolicy>) -> Result<Option<Arc
 
 impl Writer {
     /// The deletion gate shared by expiry, eviction and retirement.
-    /// Stores without an archive policy retire exactly as before.
+    ///
+    /// A store with no archive policy has archived nothing, so nothing passes: expiry and
+    /// eviction hold at their `ArchiveLag` frontier and delete no evidence until an archive
+    /// is configured and its worker commits a segment over the entry. Only a test fixture's
+    /// `Config::retire_without_archive` lets such a store retire.
     pub(super) fn archived(&self, received_at: u64, id: &str) -> bool {
-        self.archive.as_ref().is_none_or(|state| {
-            state
-                .borrow()
-                .archived(position(received_at, id).as_bytes())
-        })
+        self.archive
+            .as_ref()
+            .map_or(self.config.retire_without_archive, |state| {
+                state
+                    .borrow()
+                    .archived(position(received_at, id).as_bytes())
+            })
     }
 
     /// Retirement's own assertion of the gate; reaching it unarchived is a broken invariant.
@@ -457,6 +463,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Config;
 
     /// INVARIANT: the durable encodings round-trip and refuse truncation or foreign versions.
     #[test]
@@ -483,5 +490,40 @@ mod tests {
         let mut longer = bytes.clone();
         longer.push(0);
         assert!(decode_intent(&longer).is_err());
+    }
+
+    /// INVARIANT: a store with no archive policy retires no record or artifact however old:
+    /// expiry holds at `ArchiveLag` and counts the entry it held. Ingest retry rows are
+    /// operational state outside the archive and still expire by their own window.
+    #[test]
+    fn a_store_with_no_archive_policy_expires_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::Config {
+            retire_without_archive: false,
+            ..sparrow_test_support::storage_config!(Config)
+        };
+        let store = Store::open(dir.path(), config).unwrap();
+        store.ingest("held", "source", "log", b"a\n", 1).unwrap();
+        let far = 400 * 24 * 3600 * 1000;
+        let count = |prefix: &[u8]| {
+            let writer = store.lock().unwrap();
+            writer
+                .db
+                .prefix_iterator(prefix)
+                .map(|entry| entry.unwrap().0)
+                .take_while(|key| key.starts_with(prefix))
+                .count()
+        };
+        assert_eq!((count(b"request:"), count(b"time:")), (1, 1));
+        let report = store
+            .expire_bounded(far, crate::EvictionLimits::default())
+            .unwrap();
+        // No record or artifact retires and the held entry is counted.
+        assert_eq!((report.records, report.artifacts), (0, 0));
+        assert_eq!(report.archive_waiting, 1);
+        // The ingest's retry row still expires by its own window; the archive leaves retry
+        // rows out as operational state. The record's time index entry stays.
+        assert_eq!(report.deleted, 1);
+        assert_eq!((count(b"request:"), count(b"time:")), (0, 1));
     }
 }
