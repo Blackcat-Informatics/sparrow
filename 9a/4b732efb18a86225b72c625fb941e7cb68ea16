@@ -1,0 +1,24 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 9a4b732efb18a86225b72c625fb941e7cb68ea16
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 289
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/289
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: c426770f673ecd933efe3927de9b7b1fdb62a033
+GhpRsq-Head-Ref: paudley/288-agents-md-consolidate-claude-md-the
+GhpRsq-Head-OID: 9a4b732efb18a86225b72c625fb941e7cb68ea16
+GhpRsq-Result-Tree: fba0e8527bea6309ca4f599c288d40161d7ba77d
+GhpRsq-Result-Commit: 3d44a5ac39a660314c0626e10ee933ba79ab5662
+GhpRsq-Parent-Hashes: 9a4b732efb18a86225b72c625fb941e7cb68ea16
+GhpRsq-Squash-Notes-SHA256: dd7fe2ca9bca55d5e70ee7a45ad01f5fcc49e83f14540158039a0c6bc2b7e11f
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Tree: 13de523684ff489f4b0e922b0e9436d998b972a0
+GhpRsq-Stage-Commit: 3ab2bb58f77ebf9cf1a2cd8e25242f72a6fd2536
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/3ab2bb58f77ebf9cf1a2cd8e25242f72a6fd2536
+GhpRsq-Stage-Ref: refs/ghprsq/pr/289/stage
+GhpRsq-Stage-Files: 3
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/3ab2bb58f77ebf9cf1a2cd8e25242f72a6fd2536
