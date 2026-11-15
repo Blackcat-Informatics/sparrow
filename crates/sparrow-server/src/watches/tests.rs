@@ -1637,3 +1637,103 @@ fn a_held_claim_that_cannot_move_records_one_attempt_until_its_failure_changes()
     assert_eq!(store.consumption_get(&id).unwrap().history.attempts, 1);
     assert!(detector.status_failure().is_some());
 }
+
+/// INVARIANT: a reboot that renumbers the root's device (btrfs) does not stop the daemon: an
+/// active generation that differs from the root only in `root_device` is gapped
+/// `identity_changed` with its records untouched and the open succeeds, while a changed root
+/// inode still refuses to open.
+#[test]
+fn tail_open_gaps_a_renumbered_device_and_refuses_a_changed_inode() {
+    use std::os::unix::fs::MetadataExt;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let (first, second) = (root.join("first.log"), root.join("second.log"));
+    std::fs::write(&first, b"first line\n").unwrap();
+    std::fs::write(&second, b"second line\n").unwrap();
+    let data = directory.path().join("store");
+    let config_path =
+        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
+    let store = crate::ServerConfig::read(&config_path)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let (root_meta, first_meta, second_meta) = (
+        std::fs::metadata(&root).unwrap(),
+        std::fs::metadata(&first).unwrap(),
+        std::fs::metadata(&second).unwrap(),
+    );
+    let declare = |request: &str, file: &std::fs::Metadata, device: u64, inode: u64| {
+        store
+            .tail_start(
+                &sparrow_core::TailStart {
+                    request_id: request.into(),
+                    watch: "tail-boot".into(),
+                    watch_revision: 1,
+                    directories: sparrow_core::ConsumptionDirectories {
+                        root_device: device,
+                        root_inode: inode,
+                        parent_device: device,
+                        parent_inode: inode,
+                    },
+                    path: b"file.log".to_vec(),
+                    source: "tail-boot".into(),
+                    format: "log".into(),
+                    device: file.dev(),
+                    inode: file.ino(),
+                },
+                crate::now().unwrap(),
+            )
+            .unwrap()
+    };
+    let config = ConsumeWatch {
+        id: "tail-boot".into(),
+        root: root.clone(),
+        producer_contract: crate::ProducerContract::ActiveFilesRetain,
+        source: "tail-boot".into(),
+        format: "log".into(),
+        quiet_ms: 30_000,
+        max_directories: 2,
+        max_candidates: 2,
+        publish_hold: false,
+    };
+    let open = || {
+        crate::tailing::TailRoot::open(
+            store.clone(),
+            &config,
+            1,
+            crate::consumption::RootBinding::Stored,
+        )
+    };
+
+    // Inode changed: refused, and nothing is gapped.
+    let changed = declare(
+        "changed-inode",
+        &first_meta,
+        root_meta.dev(),
+        root_meta.ino() + 1,
+    );
+    assert!(matches!(open(), Err(crate::consumption::Error::State(_))));
+    assert_eq!(store.tail_generation(&changed.id).unwrap().gap, None);
+    store
+        .tail_discontinue(
+            &changed.id,
+            changed.offset,
+            "read_gap",
+            crate::now().unwrap(),
+        )
+        .unwrap();
+
+    // Device renumbered alone: the open succeeds and the generation is gapped.
+    let renumbered = declare(
+        "renumbered",
+        &second_meta,
+        root_meta.dev() + 1,
+        root_meta.ino(),
+    );
+    open().unwrap();
+    let after = store.tail_generation(&renumbered.id).unwrap();
+    assert_eq!(after.gap.as_deref(), Some("identity_changed"));
+    assert_eq!(after.offset, renumbered.offset);
+    assert_eq!(after.records, renumbered.records);
+}
