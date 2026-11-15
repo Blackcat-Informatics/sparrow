@@ -499,6 +499,7 @@ impl ServerConfig {
                 max_pin_members: self.max_pin_members,
                 text_analyzer: sparrow_core::resolve_text_analyzer(&self.text_lexicon_dir)?,
                 archive: self.archive.as_ref().map(ArchiveConfig::policy),
+                retire_without_archive: false,
             },
         )?;
         // The daemon's group may traverse to the socket it binds here (mode 0660); it can
