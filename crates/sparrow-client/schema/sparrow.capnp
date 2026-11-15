@@ -470,6 +470,12 @@ struct PressureStatus {
   floorRequestedBytes @31 :UInt64; # bytes below the floor at the last pass; 0 when none
   floorPasses @32 :UInt64;         # retirement passes run while the floor was the reason
   floorFreedBytes @33 :UInt64;     # linked bytes the current or last floor episode freed
+  # #298, additive (SCHEMA_VERSION unchanged; an older server leaves these zero or false).
+  diskBudget @34 :UInt64;          # the configured data budget
+  maintenanceReserve @35 :UInt64;  # the configured reserve; intake is refused past budget - reserve
+  archiveConfigured @36 :Bool;     # the store has an archive policy
+  archiveHeld @37 :Bool;           # expiry and eviction are held for want of an archive
+  reserveHeadroom @38 :Int64;      # budget - reserve - linkedBytes at the last pass; negative when over
 }
 struct CompactionFamily { family @0 :Text; beforeBytes @1 :UInt64; afterBytes @2 :UInt64; }
 

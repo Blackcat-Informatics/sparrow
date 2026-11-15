@@ -47,6 +47,11 @@ pub(crate) fn encode(
     out.set_floor_requested_bytes(status.floor_requested_bytes);
     out.set_floor_passes(status.floor_passes);
     out.set_floor_freed_bytes(status.floor_freed_bytes);
+    out.set_disk_budget(status.disk_budget);
+    out.set_maintenance_reserve(status.maintenance_reserve);
+    out.set_archive_configured(status.archive_configured);
+    out.set_archive_held(status.archive_held);
+    out.set_reserve_headroom(status.reserve_headroom());
     let mut families = out
         .reborrow()
         .init_forced_compaction_families(status.forced_compaction_families.len() as u32);
@@ -176,6 +181,14 @@ pub(crate) fn decode(value: wire::pressure_status::Reader<'_>) -> capnp::Result<
         )
         .with("snapshots", value.get_snapshots().to_string())
         .with("linked_bytes", value.get_linked_bytes().to_string())
+        .with("disk_budget", value.get_disk_budget().to_string())
+        .with(
+            "maintenance_reserve",
+            value.get_maintenance_reserve().to_string(),
+        )
+        .with("reserve_headroom", value.get_reserve_headroom().to_string())
+        .with("archive_configured", value.get_archive_configured())
+        .with("archive_held", value.get_archive_held())
         .with("observed_at", value.get_observed_at().to_string())
         .with("episode_since", value.get_episode_since().to_string())
         .with(
@@ -312,6 +325,9 @@ mod tests {
             floor_requested_bytes: 2_048,
             floor_passes: 6,
             floor_freed_bytes: 1_536,
+            disk_budget: 1_000,
+            maintenance_reserve: 100,
+            archive_held: true,
             floor: sparrow_core::FloorStatus {
                 paused_since: 99_000,
                 pauses: 3,
@@ -325,6 +341,9 @@ mod tests {
         let value = decode(message.get_root_as_reader().unwrap()).unwrap();
         for (name, expected) in [
             ("linked_bytes", "700"),
+            ("disk_budget", "1000"),
+            ("maintenance_reserve", "100"),
+            ("reserve_headroom", "200"),
             ("wait_before_bytes", "650"),
             ("wait_age_ms", "30000"),
             ("episode_age_ms", "60000"),
@@ -343,6 +362,8 @@ mod tests {
             value["waiting_on"].as_str(),
             Some("a forced compaction is running")
         );
+        assert_eq!(value["archive_held"].as_bool(), Some(true));
+        assert_eq!(value["archive_configured"].as_bool(), Some(false));
         let family = &value["forced_compaction_families"][0];
         assert_eq!(family["family"].as_str(), Some("payload"));
         assert_eq!(family["before_bytes"].as_str(), Some("900"));

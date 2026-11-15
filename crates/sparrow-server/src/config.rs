@@ -131,6 +131,11 @@ pub struct ArchiveConfig {
     /// Eviction entries that close a segment.
     #[serde(default = "default_segment_records")]
     pub max_segment_records: u64,
+    /// Seconds the archive worker waits after a pass that found nothing due, or failed, before
+    /// it asks the store again. What is due is the store's call: `start_fraction`, 75 per cent
+    /// of the retention window or data budget by default.
+    #[serde(default = "default_check_secs")]
+    pub check_secs: u64,
     /// Seconds before an archive operation in flight is reported stalled.
     #[serde(default = "default_stall_warn")]
     pub stall_warn_secs: u64,
@@ -147,6 +152,9 @@ fn default_segment_bytes() -> u64 {
 }
 fn default_segment_records() -> u64 {
     sparrow_core::ARCHIVE_SEGMENT_RECORDS
+}
+fn default_check_secs() -> u64 {
+    60
 }
 fn default_stall_warn() -> u64 {
     120
@@ -181,6 +189,9 @@ impl ArchiveConfig {
         }
         if self.dir.starts_with(data_dir) || data_dir.starts_with(&self.dir) {
             return Err("archive dir must be outside data_dir and must not contain it".into());
+        }
+        if self.check_secs == 0 {
+            return Err("archive check_secs must be positive".into());
         }
         if self.stall_warn_secs == 0 || self.io_timeout_secs <= self.stall_warn_secs {
             return Err("archive requires 0 < stall_warn_secs < io_timeout_secs".into());

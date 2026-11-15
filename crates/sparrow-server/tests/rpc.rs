@@ -3971,14 +3971,16 @@ fn journal_lines(daemon: &mut Daemon) -> std::sync::mpsc::Receiver<String> {
 /// Wait up to 10 seconds for a journal line containing every needle.
 fn await_journal(lines: &std::sync::mpsc::Receiver<String>, needles: &[&str]) {
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        let line = lines
-            .recv_timeout(left)
-            .unwrap_or_else(|_| panic!("daemon never journaled a line with {needles:?}"));
+        let line = lines.recv_timeout(left).unwrap_or_else(|_| {
+            panic!("daemon never journaled a line with {needles:?}; it journaled {seen:#?}")
+        });
         if needles.iter().all(|needle| line.contains(needle)) {
             return;
         }
+        seen.push(line);
     }
 }
 
@@ -4040,6 +4042,14 @@ async fn daemon_pressure_worker_holds_unarchived_evidence_and_shares_typed_cli_m
         assert_eq!(cli_status["pressure"]["phase"].as_str(), Some("awaiting_archive"));
         assert_eq!(cli_status["pressure"]["evicted_records"].as_str(), Some("0"));
         assert_eq!(cli_status["pressure"]["evicted_recordless_artifacts"].as_str(), Some("0"));
+        // The status says retirement is held for want of an archive, and where the reserve line is.
+        assert_eq!(cli_status["pressure"]["archive_configured"].as_bool(), Some(false));
+        assert_eq!(cli_status["pressure"]["archive_held"].as_bool(), Some(true));
+        assert_eq!(cli_status["pressure"]["disk_budget"].as_str(), Some("16777216"));
+        assert_eq!(cli_status["pressure"]["maintenance_reserve"].as_str(), Some("4194304"));
+        assert!(cli_status["pressure"]["reserve_headroom"].as_str().unwrap().starts_with('-'), "13 MiB of ballast puts the store over a 12 MiB line");
+        assert_eq!(mcp_status["structuredContent"]["pressure"]["archive_held"], cli_status["pressure"]["archive_held"]);
+        assert_eq!(mcp_status["structuredContent"]["pressure"]["reserve_headroom"], cli_status["pressure"]["reserve_headroom"]);
         assert_eq!(mcp_status["structuredContent"]["pressure"]["phase"], cli_status["pressure"]["phase"]);
         assert_eq!(mcp_status["structuredContent"]["pressure"]["evicted_recordless_artifacts"], cli_status["pressure"]["evicted_recordless_artifacts"]);
         assert_eq!(mcp_status["structuredContent"]["pressure"]["evicted_records"], cli_status["pressure"]["evicted_records"]);
@@ -4063,6 +4073,152 @@ async fn daemon_pressure_worker_holds_unarchived_evidence_and_shares_typed_cli_m
         assert_eq!(producer.ingest("pressure-empty-old", "source", wire::Format::Log, b"").await.unwrap(), empty);
         assert_eq!(producer.ingest("pressure-retry", "source", wire::Format::Log, b"later\n").await.unwrap(), accepted);
         mcp.close(true).await;
+        drop(connection);
+        drop(producer);
+        drop(daemon);
+    }).await;
+}
+
+/// The one `.gts` segment files the archive worker has written for a store under `nas`.
+fn archived_segments(nas: &Path, store_id: &str) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(nas.join(store_id)) else {
+        return Vec::new();
+    };
+    entries
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "gts"))
+        .collect()
+}
+
+/// Behaviour protected: with an archive configured, the daemon's expiry retires due evidence
+/// only after the archive worker has written its segment. The record that the pin protects is
+/// archived with the rest and stays; when expiry reports it retired the unpinned records, the
+/// segment is already on the archive root, and the archive's watermark covers them.
+#[tokio::test(flavor = "current_thread")]
+async fn daemon_expiry_retires_evidence_only_after_its_segment_is_written() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let nas = dir.path().join("nas");
+            std::fs::create_dir(&nas).unwrap();
+            let config = write_server_config(dir.path(), &data, &socket);
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str(&format!("\n[archive]\ndir = {nas:?}\ncheck_secs = 1\n"));
+            std::fs::write(&config, text).unwrap();
+            let settings = sparrow_server::ServerConfig::read(&config).unwrap();
+            let store = settings.open_store().unwrap();
+            let store_id = store.store_id().unwrap();
+            std::fs::write(nas.join("STORE_ID"), format!("{store_id}\n")).unwrap();
+            let artifact = store
+                .ingest(
+                    "daemon-expiry-archived",
+                    "source",
+                    "log",
+                    &b"expired occurrence\n".repeat(5),
+                    0,
+                )
+                .unwrap();
+            store
+                .pin(
+                    "daemon-expiry-archived-pin",
+                    "case",
+                    &artifact.record_ids[..1],
+                    30000,
+                    0,
+                )
+                .unwrap();
+            drop(store);
+            assert!(archived_segments(&nas, &store_id).is_empty());
+            let mut daemon = start_with_stderr(&config, &socket, Stdio::piped()).await;
+            let journal = journal_lines(&mut daemon);
+            // Expiry retires the unpinned records: no pass held, and the segment is there.
+            await_journal(&journal, &["expiry pass", "archive_waiting=0", "deleted="]);
+            let segments = archived_segments(&nas, &store_id);
+            assert_eq!(segments.len(), 1, "one segment holds the archived evidence");
+            let bytes = std::fs::read(&segments[0]).unwrap();
+            assert!(
+                purrdf::gts::reader::read(&bytes, false, None)
+                    .diagnostics
+                    .is_empty()
+            );
+            assert!(
+                !std::fs::read_dir(nas.join(&store_id))
+                    .unwrap()
+                    .any(|entry| entry
+                        .unwrap()
+                        .path()
+                        .to_string_lossy()
+                        .ends_with(".partial")),
+                "no partial file is left behind"
+            );
+            drop(daemon);
+            let store = settings.open_store().unwrap();
+            let state = store.archive_state().unwrap().unwrap();
+            assert!(
+                state.through.is_some(),
+                "the watermark covers what was retired"
+            );
+            let now = sparrow_server::now().unwrap();
+            assert_eq!(
+                store.records(now).unwrap().len(),
+                1,
+                "only the pinned record is live"
+            );
+        })
+        .await;
+}
+
+/// Behaviour protected: with an archive configured, the pressure worker retires evidence only
+/// once its segment is on the archive root. The store that no-archive pressure holds at
+/// `awaiting_archive` evicts after the archive worker commits, and by the time the status shows
+/// an evicted record the segment file exists and the status no longer reports a hold.
+#[tokio::test(flavor = "current_thread")]
+async fn daemon_pressure_worker_evicts_only_after_its_segment_is_written() {
+    tokio::task::LocalSet::new().run_until(async {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let socket = data.join("rpc.sock");
+        let nas = dir.path().join("nas");
+        std::fs::create_dir(&nas).unwrap();
+        let config = write_server_config(dir.path(), &data, &socket);
+        let text = std::fs::read_to_string(&config).unwrap()
+            .replace("disk_budget = 134217728", "disk_budget = 16777216")
+            .replace("maintenance_reserve = 8388608", "maintenance_reserve = 4194304");
+        std::fs::write(&config, format!("{text}\n[archive]\ndir = {nas:?}\ncheck_secs = 1\n")).unwrap();
+        // Evidence 25 days old: past the archive's 75 per cent start, not yet expired.
+        let settings = sparrow_server::ServerConfig::read(&config).unwrap();
+        let owner = settings.open_store().unwrap();
+        let store_id = owner.store_id().unwrap();
+        std::fs::write(nas.join("STORE_ID"), format!("{store_id}\n")).unwrap();
+        let received = sparrow_server::now().unwrap() - 25 * 86_400_000;
+        owner.ingest("pressure-archived-old", "source", "log", b"old\n", received).unwrap();
+        drop(owner);
+        let daemon = start(&config, &socket).await;
+        let producer = sparrow_client::Client::connect(&socket).await.unwrap();
+        let ballast = data.join("test-owned-pressure-ballast");
+        std::fs::write(&ballast, vec![0_u8; 13 * 1024 * 1024]).unwrap();
+        let error = producer.ingest("pressure-archived-retry", "source", wire::Format::Log, b"later\n").await.unwrap_err();
+        assert!(matches!(error, sparrow_client::Error::Domain { ref code, retryable: true, .. } if code == "STORAGE_PRESSURE"));
+        let connection = connect(&socket).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let response = connection.client.status_request().send().promise.await.unwrap();
+            let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+            let pressure = status.get_pressure_status().unwrap();
+            if pressure.get_evicted_records() > 0 {
+                assert_eq!(pressure.get_disk_budget(), 16_777_216);
+                assert!(pressure.get_archive_configured());
+                assert!(
+                    !archived_segments(&nas, &store_id).is_empty(),
+                    "evidence was evicted before its segment was written"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "the pressure worker never evicted archived evidence");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         drop(connection);
         drop(producer);
         drop(daemon);

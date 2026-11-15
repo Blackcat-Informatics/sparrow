@@ -123,9 +123,30 @@ pub struct PressureStatus {
     /// deficit plus the maintenance reserve) and retires no more. The daemon journals the
     /// edge; the status text says it in words.
     pub floor_bound_reached: bool,
+    /// The store's data budget in bytes, as configured.
+    pub disk_budget: u64,
+    /// The maintenance reserve in bytes, as configured. Intake is refused once linked bytes
+    /// pass `disk_budget - maintenance_reserve`.
+    pub maintenance_reserve: u64,
+    /// Whether the store has an archive policy.
+    pub archive_configured: bool,
+    /// Whether retirement (expiry and eviction) is held for want of an archive: the store has
+    /// no archive policy, or the last pass stopped at an archive watermark that has not
+    /// reached the oldest evidence. Evidence is kept, never discarded, while this is set.
+    pub archive_held: bool,
 }
 
 impl PressureStatus {
+    /// Bytes left before intake is refused at the last pass's measure: the budget less the
+    /// reserve less `linked_bytes`. Negative when the store is already over that line.
+    #[must_use]
+    pub fn reserve_headroom(&self) -> i64 {
+        let headroom = i128::from(self.disk_budget)
+            - i128::from(self.maintenance_reserve)
+            - i128::from(self.linked_bytes);
+        i64::try_from(headroom).unwrap_or(if headroom < 0 { i64::MIN } else { i64::MAX })
+    }
+
     /// How long the current wait for native reclamation has lasted at the last pass.
     #[must_use]
     pub fn wait_age_ms(&self) -> u64 {
@@ -1123,6 +1144,16 @@ impl Store {
         self.refuse_poisoned()?;
         let mut status = self.unlocked.pressure.read();
         status.floor = self.space.status();
+        let config = &self.unlocked.config;
+        status.disk_budget = config.disk_budget;
+        status.maintenance_reserve = config.maintenance_reserve;
+        status.archive_configured = config.archive.is_some();
+        status.archive_held = !status.archive_configured
+            || status.phase == PressurePhase::AwaitingArchive
+            || status
+                .last_pass
+                .as_ref()
+                .is_some_and(|pass| pass.frontier == super::eviction::EvictionFrontier::ArchiveLag);
         Ok(status)
     }
 

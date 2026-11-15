@@ -371,6 +371,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pressure_wake.clone(),
                 )
             });
+            // Segments go to `<dir>/<store_id>/`; the worker never writes anywhere else in `dir`.
+            let archive = match config.archive.as_ref().filter(|_| !config.query_only) {
+                Some(archive) => Some(sparrow_server::archive::Worker::start(
+                    store.clone(),
+                    archive.dir.clone(),
+                    std::time::Duration::from_secs(archive.check_secs),
+                )?),
+                None => None,
+            };
             let serving = async {
                 // Pinned once, so its waits and any worker shutdown it starts survive every turn.
                 let health = worker_health(&mut consumer, &mut syslog, maintenance.as_mut());
@@ -410,6 +419,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await
             }
             .await;
+            // Dropping the handle stops the archive thread; it is not joined, so a hung mount
+            // cannot hold the shutdown.
+            drop(archive);
             shutdown::finish(
                 serving,
                 shutdown::Workers {
