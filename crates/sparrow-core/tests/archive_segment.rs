@@ -226,21 +226,37 @@ fn a_segment_of_over_a_thousand_records_prepares_within_its_read_bound_and_repea
 }
 
 /// REGRESSION: the read ceiling follows the graph rows a record stores, not only the entry
-/// count, so a single JSON record with more than 2,100 graph rows prepares. A ceiling that
-/// counted entries alone refused such a record even when it stood alone, and the archive
-/// stuck behind it.
+/// count, so a single json record and a single markdown record, each with thousands of graph
+/// rows, prepare and commit under the committed ceilings. A ceiling that counted entries
+/// alone refused such a record even when it stood alone, and the archive stuck behind it.
+/// The markdown document carries links, emphasis, lists, code, quotes and footnote citations,
+/// which the markdown projection turns into more kinds of row than json or log lines do.
 #[test]
-fn a_json_record_with_thousands_of_graph_rows_prepares() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path(), archiving(ArchivePolicy::default())).unwrap();
-    // 800 keys store about 12,000 graph rows (15 per key, measured), and its read costs about
-    // 250,000 requests, where a ceiling by entries alone allowed 10,512.
+fn a_json_or_markdown_record_with_thousands_of_graph_rows_prepares() {
+    // 800 json keys store about 12,000 graph rows (15 per key, measured), and the read costs
+    // about 250,000 requests, where a ceiling by entries alone allowed 11,024 (one record and
+    // its artifact).
     let fields: Vec<String> = (0..800).map(|i| format!("\"k{i}\":\"v{i}\"")).collect();
-    let body = format!("{{{}}}\n", fields.join(","));
-    store
-        .ingest("seg-wide", "source", "json", body.as_bytes(), 1)
-        .unwrap();
-    let segment = store.archive_prepare(1 + 30 * DAY).unwrap().expect("due");
-    assert_eq!(segment.records, 1);
-    store.archive_commit(&segment.segment_id).unwrap();
+    let json = format!("{{{}}}\n", fields.join(","));
+    let markdown: String = (0..300)
+        .map(|i| {
+            format!(
+                "## Section {i}\n\nA *claim* with a [link](https://example.org/{i}) and \
+                 `code {i}`.[^{i}]\n\n- item {i}a\n- item {i}b\n\n> quote {i}\n\n[^{i}]: note {i}\n\n"
+            )
+        })
+        .collect();
+    for (format, body) in [("json", json), ("markdown", markdown)] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), archiving(ArchivePolicy::default())).unwrap();
+        store
+            .ingest("seg-wide", "source", format, body.as_bytes(), 1)
+            .unwrap();
+        let segment = store
+            .archive_prepare(1 + 30 * DAY)
+            .unwrap_or_else(|error| panic!("{format} record did not prepare: {error:?}"))
+            .expect("due");
+        assert_eq!(segment.records, 1, "{format}");
+        store.archive_commit(&segment.segment_id).unwrap();
+    }
 }
