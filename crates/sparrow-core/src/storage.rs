@@ -598,6 +598,8 @@ pub struct Store {
     #[cfg(feature = "test-support")]
     owed_window: Arc<std::sync::atomic::AtomicUsize>,
     open_phases: Arc<[OpenPhase]>,
+    /// Archive prepares that halved their range after an encode error; clones share it.
+    archive_halvings: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Wall time of one phase of [`Store::open`], in the order the open ran them.
@@ -1814,6 +1816,7 @@ impl Store {
             #[cfg(feature = "test-support")]
             owed_window: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             open_phases: Arc::new([]),
+            archive_halvings: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let writer = store.lock()?;
         producer_stream::registry(&writer)?;

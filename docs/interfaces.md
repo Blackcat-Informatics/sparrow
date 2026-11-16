@@ -485,7 +485,7 @@ count held and the bytes waiting behind it are reported as unknown.
 dir = "/net/synology/archives/sparrow"  # required, absolute, outside data_dir
 start_fraction = 0.75                   # 0.5..0.95
 max_segment_bytes = 67108864            # 1 MiB..256 MiB; a larger entry gets its own segment
-max_segment_records = 50000             # at least 1
+max_segment_records = 10000             # at least 1
 check_secs = 60                         # wait between worker passes when nothing is due
 stall_warn_secs = 120                   # 0 < stall_warn_secs < io_timeout_secs
 io_timeout_secs = 900
