@@ -298,8 +298,9 @@ every NAS operation, one at a time, so a hung NAS degrades archiving without
 blocking queries, ingest or maintenance. A store format fence keeps older
 binaries away from an archiving store, and a clock-regression guard refuses
 publication behind the watermark. Archive reads give way to waiting writers
-(`lock_page`) and hold the archive's own RDF read slot, separate from the query
-slot, so queries are served while a segment prepares. The archive read renews
+(`lock_page`, once per batch of 256 index entries or records, and for record bytes also
+per 1 MiB, not per record) and hold the archive's own RDF read slot, separate from the
+query slot, so queries are served while a segment prepares. The archive read renews
 its 60-second lease while it makes progress, so a segment is never cut short
 for its length. A segment closes on its quad count as well as its records and payload
 bytes (`max_segment_quads`, 3,000,000 by default), so one JSON-heavy segment cannot
