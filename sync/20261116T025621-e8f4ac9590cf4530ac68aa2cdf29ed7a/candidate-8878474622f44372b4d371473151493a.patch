@@ -1,0 +1,699 @@
+diff --git crates/sparrow-core/src/storage/table_options.rs crates/sparrow-core/src/storage/table_options.rs
+index 70157e5..c51faea 100644
+--- crates/sparrow-core/src/storage/table_options.rs
++++ crates/sparrow-core/src/storage/table_options.rs
+@@ -40,6 +40,19 @@ const WRITE_BUFFERS: i32 = 4;
+ const BACKGROUND_JOBS: i32 = 6;
+ /// Threads one level-0 compaction may split into, so a backlog drains in parallel.
+ const SUBCOMPACTIONS: u32 = 2;
++/// Cap on live write-ahead-log bytes. A log file is deleted only once every family has
++/// flushed past it, so a family that takes few writes (`payload`, `rdf_reverse`) pins every
++/// log written after its last flush; with the cap unset RocksDB sizes it at four times all
++/// memtable capacity (3 families x 4 x 32 MiB x 4 = 1.5 GiB), which is the retained WAL seen
++/// in the live store (#309). Past this cap RocksDB itself flushes the families whose
++/// memtables hold the oldest live log, so it also covers a family added later. 256 MiB is two
++/// full memtable sets of the busy family (4 x 32 MiB), so ordinary ingest, which flushes the
++/// default family every 32 MiB, never reaches it and no flush storm results. A forced flush
++/// of an idle family writes one small level-0 file, at most about once per 256 MiB of WAL.
++/// Retained log is thus bounded at about this size, far inside the production maintenance
++/// reserve.
++/// It is an engine option, not a stored format; it takes effect when the store next opens.
++const MAX_TOTAL_WAL_BYTES: u64 = 256 * 1024 * 1024;
+ const BLOCK_BYTES: usize = 32 * 1024;
+ const REVERSE_BLOCK_BYTES: usize = 4 * 1024;
+ const BOTTOMMOST_ZSTD_LEVEL: i32 = 6;
+@@ -64,6 +77,7 @@ pub(super) fn database(max_open_files: i32) -> Result<Options, Error> {
+     options.create_missing_column_families(true);
+     options.set_max_background_jobs(BACKGROUND_JOBS);
+     options.set_max_subcompactions(SUBCOMPACTIONS);
++    options.set_max_total_wal_size(MAX_TOTAL_WAL_BYTES);
+     let mut env = Env::new().map_err(|error| {
+         Error::new(
+             "STORAGE_FAILURE",
+@@ -129,3 +143,49 @@ pub(super) fn family(name: &str) -> Options {
+     options.set_block_based_table_factory(&table);
+     options
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::MAX_TOTAL_WAL_BYTES;
++    use crate::storage::{Config, Store};
++    use rocksdb::WaitForCompactOptions;
++    use std::collections::BTreeSet;
++    use std::path::Path;
++
++    fn wal_files(path: &Path) -> BTreeSet<String> {
++        std::fs::read_dir(path)
++            .unwrap()
++            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
++            .filter(|name| name.ends_with(".log"))
++            .collect()
++    }
++
++    // Value: an idle family must not pin the write-ahead log (#309: 1.55 GB of retained logs
++    // while `payload` never flushed). Protects: once live WAL bytes pass the cap, RocksDB
++    // flushes the idle families holding the oldest log and releases that log file, though
++    // only the default family keeps taking writes.
++    #[test]
++    fn writes_past_the_wal_cap_release_the_log_an_idle_family_pins() {
++        let dir = tempfile::tempdir().unwrap();
++        let store = Store::open(dir.path(), sparrow_test_support::storage_config!(Config)).unwrap();
++        let db = std::sync::Arc::clone(&store.lock().unwrap().db);
++        for family in super::FAMILIES.iter().skip(1) {
++            let handle = db.cf_handle(family).unwrap();
++            db.put_cf(handle, b"idle", b"pinned").unwrap();
++        }
++        let pinned = wal_files(dir.path());
++        let value = vec![7_u8; 1024 * 1024];
++        let writes = MAX_TOTAL_WAL_BYTES / value.len() as u64 + 64;
++        for index in 0..writes {
++            db.put(index.to_be_bytes(), &value).unwrap();
++        }
++        db.wait_for_compact(&WaitForCompactOptions::default())
++            .unwrap();
++        let remaining = wal_files(dir.path());
++        assert!(
++            pinned.is_disjoint(&remaining),
++            "WAL files still pinned by idle families: {:?}",
++            pinned.intersection(&remaining).collect::<Vec<_>>()
++        );
++    }
++}
+diff --git crates/sparrow-server/src/consumption.rs crates/sparrow-server/src/consumption.rs
+index 081e249..2f65207 100644
+--- crates/sparrow-server/src/consumption.rs
++++ crates/sparrow-server/src/consumption.rs
+@@ -166,6 +166,31 @@ pub enum RootBinding {
+ #[cfg(test)]
+ mod crash_tests;
+ 
++/// How a persisted (device, inode) directory identity relates to the directory held now.
++#[derive(Debug, PartialEq, Eq)]
++enum Bound {
++    Same,
++    /// The inode is the stored one and only the device number differs. A filesystem such as
++    /// btrfs renumbers its devices at boot, so a stored device alone cannot say the directory
++    /// was replaced.
++    Renumbered,
++    Replaced,
++}
++
++/// Decide whether a stored directory identity names the directory held now. Under the stored
++/// root the inode decides; under a private root the claims of the original root must stay
++/// foreign, so only the exact (device, inode) pair is bound.
++#[must_use]
++fn bound(binding: RootBinding, stored: (u64, u64), current: (u64, u64)) -> Bound {
++    if stored == current {
++        Bound::Same
++    } else if binding == RootBinding::Stored && stored.1 == current.1 {
++        Bound::Renumbered
++    } else {
++        Bound::Replaced
++    }
++}
++
+ fn observation(file: &File) -> Result<ConsumptionGeneration, Error> {
+     generation(CompletedFileIdentity::capture(&file.metadata()?))
+ }
+@@ -213,6 +238,7 @@ pub struct ClaimRoot {
+     root: File,
+     inflight: File,
+     lock: ClaimLock,
++    binding: RootBinding,
+ }
+ 
+ /// Explicitly release ownership even if a fork temporarily inherited the open description.
+@@ -307,20 +333,40 @@ impl ClaimRoot {
+     ) -> Result<Self, Error> {
+         let root_identity = CompletedFileIdentity::capture(&root.metadata()?);
+         let bound_here = |journal: &ConsumptionJournal| {
+-            journal.directories.root_device == root_identity.device
+-                && journal.directories.root_inode == root_identity.inode
++            bound(
++                binding,
++                (
++                    journal.directories.root_device,
++                    journal.directories.root_inode,
++                ),
++                (root_identity.device, root_identity.inode),
++            )
+         };
+         let pending = store
+             .consumption_pending()?
+             .into_iter()
+             .filter(|journal| journal.watch == watch)
+-            .filter(|journal| binding == RootBinding::Stored || bound_here(journal))
++            .filter(|journal| {
++                binding == RootBinding::Stored || bound_here(journal) != Bound::Replaced
++            })
+             .collect::<Vec<_>>();
+-        if !pending.iter().all(bound_here) {
++        if pending
++            .iter()
++            .any(|journal| bound_here(journal) == Bound::Replaced)
++        {
+             return Err(Error::State(
+                 "configured watch root was replaced while source recovery ownership remains",
+             ));
+         }
++        if let Some(journal) = pending
++            .iter()
++            .find(|journal| bound_here(journal) == Bound::Renumbered)
++        {
++            eprintln!(
++                "sparrowd: watch={watch} root device changed from {} to {}; pending claims stay bound to the same root inode",
++                journal.directories.root_device, root_identity.device
++            );
++        }
+         match fs::mkdirat(&root, INFLIGHT, Mode::from_raw_mode(0o700)) {
+             Ok(()) => root.sync_all()?,
+             Err(error) if error == rustix::io::Errno::EXIST => {}
+@@ -383,6 +429,7 @@ impl ClaimRoot {
+             root,
+             inflight,
+             lock,
++            binding,
+         };
+         owner.private_namespace()?;
+         Ok(owner)
+@@ -403,8 +450,14 @@ impl ClaimRoot {
+             ));
+         }
+         let root = CompletedFileIdentity::capture(&self.root.metadata()?);
+-        if root.device != journal.directories.root_device
+-            || root.inode != journal.directories.root_inode
++        if bound(
++            self.binding,
++            (
++                journal.directories.root_device,
++                journal.directories.root_inode,
++            ),
++            (root.device, root.inode),
++        ) == Bound::Replaced
+         {
+             return Err(Error::State(
+                 "watch root was replaced; preserve original claim ownership",
+@@ -446,7 +499,19 @@ impl ClaimRoot {
+         }
+         let relative = Path::new(std::ffi::OsStr::from_bytes(&journal.relative_path));
+         let parent = self.parent(relative)?;
+-        if self.directories(&parent)? != journal.directories {
++        let current = self.directories(&parent)?;
++        let stored = &journal.directories;
++        if bound(
++            self.binding,
++            (stored.root_device, stored.root_inode),
++            (current.root_device, current.root_inode),
++        ) == Bound::Replaced
++            || bound(
++                self.binding,
++                (stored.parent_device, stored.parent_inode),
++                (current.parent_device, current.parent_inode),
++            ) == Bound::Replaced
++        {
+             return Err(Error::State(
+                 "original parent directory was replaced before the claim checkpoint; preserve the source for reconciliation",
+             ));
+diff --git crates/sparrow-server/src/tailing.rs crates/sparrow-server/src/tailing.rs
+index 241749c..6d381bd 100644
+--- crates/sparrow-server/src/tailing.rs
++++ crates/sparrow-server/src/tailing.rs
+@@ -66,15 +66,35 @@ impl TailRoot {
+             if foreign(binding, (identity.device, identity.inode), &declared) {
+                 continue;
+             }
+-            if declared.directories.root_device != identity.device
+-                || declared.directories.root_inode != identity.inode
+-                || declared.watch_revision != revision
+-                || declared.source != config.source
+-                || declared.format != config.format
+-            {
+-                return Err(Error::State(
+-                    "active file checkpoints require their original watch revision, root and interpretation; restore that definition before recovery",
+-                ));
++            match check_declaration(
++                &declared,
++                (identity.device, identity.inode),
++                config,
++                revision,
++            ) {
++                Declaration::Matches => {}
++                Declaration::DeviceRenumbered => {
++                    // The same directory under a renumbered device (btrfs hands out a new
++                    // anonymous st_dev per boot): the checkpoint cannot be proven continuous,
++                    // so it is gapped as `identity_changed` with its records kept, and the
++                    // open continues. A generation already gapped or completed never reaches
++                    // here, so a CONFLICT can only mean a concurrent change and fails loudly.
++                    store.tail_discontinue(
++                        &generation.id,
++                        generation.offset,
++                        "identity_changed",
++                        crate::now()?,
++                    )?;
++                    eprintln!(
++                        "sparrowd: watch={} tail generation={} root device changed from {} to {}; recorded identity_changed",
++                        config.id, generation.id, declared.directories.root_device, identity.device
++                    );
++                }
++                Declaration::Refused => {
++                    return Err(Error::State(
++                        "active file checkpoints require their original watch revision, root and interpretation; restore that definition before recovery",
++                    ));
++                }
+             }
+         }
+         Ok(Self {
+@@ -491,6 +511,40 @@ impl TailRoot {
+     }
+ }
+ 
++/// How a stored active generation's declaration relates to the watch as it is now.
++#[derive(Debug, PartialEq, Eq)]
++enum Declaration {
++    /// Every declared identity equals the current one.
++    Matches,
++    /// Only the root's device number differs; the inode, revision, source and format agree.
++    DeviceRenumbered,
++    /// The inode, revision, source or format differs, whatever the device says.
++    Refused,
++}
++
++/// Classify a stored active generation's declaration against the watch's current root,
++/// revision, source and format. The inode, revision, source and format are checked first, so a
++/// stale device never excuses another difference.
++#[must_use]
++fn check_declaration(
++    declared: &TailStart,
++    root: (u64, u64),
++    config: &ConsumeWatch,
++    revision: u64,
++) -> Declaration {
++    if declared.directories.root_inode != root.1
++        || declared.watch_revision != revision
++        || declared.source != config.source
++        || declared.format != config.format
++    {
++        Declaration::Refused
++    } else if declared.directories.root_device != root.0 {
++        Declaration::DeviceRenumbered
++    } else {
++        Declaration::Matches
++    }
++}
++
+ /// Whether a generation declared on another root than ROOT must be left alone: only under a
+ /// private root (`sparrowd --private-intake`), where the original root's generations are
+ /// never resumed, adopted or closed.
+diff --git crates/sparrow-server/src/watches/tests.rs crates/sparrow-server/src/watches/tests.rs
+index 956c650..ae2612f 100644
+--- crates/sparrow-server/src/watches/tests.rs
++++ crates/sparrow-server/src/watches/tests.rs
+@@ -1637,3 +1637,184 @@ fn a_held_claim_that_cannot_move_records_one_attempt_until_its_failure_changes()
+     assert_eq!(store.consumption_get(&id).unwrap().history.attempts, 1);
+     assert!(detector.status_failure().is_some());
+ }
++
++/// INVARIANT: a reboot that renumbers the root's device (btrfs) does not stop the daemon: an
++/// active generation that differs from the root only in `root_device` is gapped
++/// `identity_changed` with its records untouched and the open succeeds, while a changed root
++/// inode still refuses to open.
++#[test]
++fn tail_open_gaps_a_renumbered_device_and_refuses_a_changed_inode() {
++    use std::os::unix::fs::MetadataExt;
++    let directory = tempfile::tempdir().unwrap();
++    let root = directory.path().join("root");
++    std::fs::create_dir(&root).unwrap();
++    let (first, second) = (root.join("first.log"), root.join("second.log"));
++    std::fs::write(&first, b"first line\n").unwrap();
++    std::fs::write(&second, b"second line\n").unwrap();
++    let data = directory.path().join("store");
++    let config_path =
++        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
++    let store = crate::ServerConfig::read(&config_path)
++        .unwrap()
++        .open_store()
++        .unwrap();
++    let (root_meta, first_meta, second_meta) = (
++        std::fs::metadata(&root).unwrap(),
++        std::fs::metadata(&first).unwrap(),
++        std::fs::metadata(&second).unwrap(),
++    );
++    let declare = |request: &str, file: &std::fs::Metadata, device: u64, inode: u64| {
++        store
++            .tail_start(
++                &sparrow_core::TailStart {
++                    request_id: request.into(),
++                    watch: "tail-boot".into(),
++                    watch_revision: 1,
++                    directories: sparrow_core::ConsumptionDirectories {
++                        root_device: device,
++                        root_inode: inode,
++                        parent_device: device,
++                        parent_inode: inode,
++                    },
++                    path: b"file.log".to_vec(),
++                    source: "tail-boot".into(),
++                    format: "log".into(),
++                    device: file.dev(),
++                    inode: file.ino(),
++                },
++                crate::now().unwrap(),
++            )
++            .unwrap()
++    };
++    let config = ConsumeWatch {
++        id: "tail-boot".into(),
++        root: root.clone(),
++        producer_contract: crate::ProducerContract::ActiveFilesRetain,
++        source: "tail-boot".into(),
++        format: "log".into(),
++        quiet_ms: 30_000,
++        max_directories: 2,
++        max_candidates: 2,
++        publish_hold: false,
++    };
++    let open = || {
++        crate::tailing::TailRoot::open(
++            store.clone(),
++            &config,
++            1,
++            crate::consumption::RootBinding::Stored,
++        )
++    };
++
++    // Inode changed together with a stale device: refused, and nothing is gapped.
++    let changed = declare(
++        "changed-inode",
++        &first_meta,
++        root_meta.dev() + 1,
++        root_meta.ino() + 1,
++    );
++    assert!(matches!(open(), Err(crate::consumption::Error::State(_))));
++    assert_eq!(store.tail_generation(&changed.id).unwrap().gap, None);
++    store
++        .tail_discontinue(
++            &changed.id,
++            changed.offset,
++            "read_gap",
++            crate::now().unwrap(),
++        )
++        .unwrap();
++
++    // Device renumbered alone: the open succeeds and the generation is gapped.
++    let renumbered = declare(
++        "renumbered",
++        &second_meta,
++        root_meta.dev() + 1,
++        root_meta.ino(),
++    );
++    store
++        .tail_append(
++            &renumbered.id,
++            0,
++            b"second line\n",
++            false,
++            crate::now().unwrap(),
++        )
++        .unwrap();
++    let published = store.tail_generation(&renumbered.id).unwrap();
++    assert_eq!(published.records, 1);
++    open().unwrap();
++    let after = store.tail_generation(&renumbered.id).unwrap();
++    assert_eq!(after.gap.as_deref(), Some("identity_changed"));
++    assert_eq!(after.offset, published.offset);
++    assert_eq!(after.records, 1);
++}
++
++/// INVARIANT: a pending finished-file claim whose stored root and parent device alone differ
++/// from the directory now held (btrfs renumbers devices at boot) stays bound: the watch root
++/// opens and recovery clears the root and parent scope checks. A claim stored under another
++/// root inode is still refused.
++#[test]
++fn consume_root_accepts_a_renumbered_device_and_refuses_a_changed_inode() {
++    use std::os::unix::fs::MetadataExt;
++    let directory = tempfile::tempdir().unwrap();
++    let producer = directory.path().join("producer");
++    std::fs::create_dir(&producer).unwrap();
++    let path = producer.join("done.log");
++    std::fs::write(&path, b"line\n").unwrap();
++    let data = directory.path().join("store");
++    let config_path =
++        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
++    let store = crate::ServerConfig::read(&config_path)
++        .unwrap()
++        .open_store()
++        .unwrap();
++    let (root, file) = (
++        std::fs::metadata(&producer).unwrap(),
++        std::fs::metadata(&path).unwrap(),
++    );
++    let reserve = |watch: &str, device: u64, inode: u64| {
++        store
++            .consumption_reserve(
++                watch,
++                b"done.log",
++                "consume-boot",
++                "log",
++                {
++                    // The store requires the claimed file and the roots on one device.
++                    let mut observed = CompletedFileIdentity::capture(&file);
++                    observed.device = device;
++                    crate::consumption::generation(observed).unwrap()
++                },
++                sparrow_core::ConsumptionDirectories {
++                    root_device: device,
++                    root_inode: inode,
++                    parent_device: device,
++                    parent_inode: inode,
++                },
++                crate::now().unwrap(),
++            )
++            .unwrap()
++    };
++
++    // Inode changed (with a stale device too): the open refuses.
++    reserve("changed-inode", root.dev() + 1, root.ino() + 1);
++    assert!(matches!(
++        ClaimRoot::open(store.clone(), "changed-inode", &producer),
++        Err(crate::consumption::Error::State(_))
++    ));
++
++    // Device renumbered alone: the open succeeds and recovery passes the root and parent
++    // scope checks. It then stops at the claimed file's own recorded device, which stays
++    // strict and leaves the source in place.
++    let journal = reserve("renumbered", root.dev() + 1, root.ino());
++    let owner = ClaimRoot::open(store.clone(), "renumbered", &producer).unwrap();
++    let refused = owner
++        .recover(&journal.import_id, crate::now().unwrap())
++        .err()
++        .unwrap();
++    assert!(
++        !matches!(refused, crate::consumption::Error::State(_)),
++        "the renumbered root is bound; only the file identity refuses: {refused}"
++    );
++    assert!(path.exists(), "the source is never moved or deleted");
++}
+diff --git crates/sparrow-server/tests/rpc.rs crates/sparrow-server/tests/rpc.rs
+index a960e54..86751ed 100644
+--- crates/sparrow-server/tests/rpc.rs
++++ crates/sparrow-server/tests/rpc.rs
+@@ -7144,6 +7144,64 @@ fn shipper_reports_a_whole_file_above_the_import_bound_and_mirrors_it() {
+     );
+ }
+ 
++/// INVARIANT: a changed device number alone never ships a file again. The ledger key is
++/// inode, size and mtime; legacy four-field lines (a device number first, renumbered at
++/// every btrfs boot) are read as the same entry, mixed with new ones, and a changed size
++/// still ships the file again.
++#[test]
++fn shipper_never_reships_a_file_whose_device_number_alone_changed() {
++    let dir = tempfile::tempdir().unwrap();
++    let reports = dir.path().join("reports");
++    std::fs::create_dir_all(&reports).unwrap();
++    std::fs::create_dir_all(dir.path().join("intake/reports")).unwrap();
++    let kept = reports.join("kept.json");
++    let other = reports.join("other.json");
++    std::fs::write(&kept, b"{\"a\":1}").unwrap();
++    std::fs::write(&other, b"{\"b\":2}").unwrap();
++    // A name with a carriage return must not split its ledger line.
++    std::fs::write(reports.join("odd\rname.json"), b"{\"c\":3}").unwrap();
++    let config = dir.path().join("ship.toml");
++    std::fs::write(
++        &config,
++        format!(
++            "intake_root = {:?}\nstate_dir = {:?}\nmax_chunk_bytes = 1048576\n\
++             max_chunk_lines = 50000\nmax_files_per_run = 64\n\
++             max_pending_bytes = 16777216\nmax_queue_bytes = 1073741824\n\n\
++             [[source]]\nname = \"reports\"\ndir = {:?}\npattern = \"*.json\"\n\
++             rule = \"settled\"\nformat = \"json\"\nsettle_seconds = 0\n",
++            dir.path().join("intake"),
++            dir.path().join("ship"),
++            reports,
++        ),
++    )
++    .unwrap();
++    let report = |output: &std::process::Output| {
++        assert!(output.status.success(), "{output:?}");
++        String::from_utf8_lossy(&output.stdout).into_owned()
++    };
++    assert!(report(&ship(&config)).contains("reports: queued 3"));
++    // Simulate a reboot's renumbering: every line gains a different leading device number,
++    // one file's line stays in the new form, so the ledger mixes both.
++    let ledger = dir.path().join("ship/reports.ledger");
++    let lines = std::fs::read_to_string(&ledger).unwrap();
++    let mixed: String = lines
++        .lines()
++        .map(|line| {
++            if line.ends_with("kept.json") {
++                format!("4242:{line}\n")
++            } else {
++                format!("{line}\n")
++            }
++        })
++        .collect();
++    assert!(mixed.contains("\n4242:") || mixed.starts_with("4242:"));
++    std::fs::write(&ledger, mixed).unwrap();
++    assert!(report(&ship(&config)).contains("reports: queued 0"));
++    // A file that really changed is shipped again.
++    std::fs::write(&kept, b"{\"a\":1,\"c\":3}").unwrap();
++    assert!(report(&ship(&config)).contains("reports: queued 1"));
++}
++
+ /// INVARIANT: the shipper refuses at configuration load, naming both paths, a source
+ /// directory that equals, contains or lies inside `intake_root` or `state_dir`, including
+ /// through a symlink, because it would otherwise ship its own queue and ledgers forever.
+diff --git deploy/libexec/katamari-manager-spool deploy/libexec/katamari-manager-spool
+index d90bc32..6af95cf 100755
+--- deploy/libexec/katamari-manager-spool
++++ deploy/libexec/katamari-manager-spool
+@@ -13,7 +13,7 @@
+ # Its three differences from katamari-journal-spool, each on purpose:
+ #   * its own cursor file, given by the caller and never the namespace forwarder's;
+ #   * its own file names, SPOOL_DIR/katamari-manager-YYYYMMDDTHHMM.jsonl, so a bucket the other forwarder
+-#     wrote is never appended to (sparrow-ship keys a file by device, inode, size and mtime and ships a
++#     wrote is never appended to (sparrow-ship keys a file by inode, size and mtime and ships a
+ #     changed file again whole);
+ #   * every record carries "source":"systemd-manager", and the unit's own process lines are dropped, so a record
+ #     in these files is the manager's or another entry that names the unit (a coredump, for example).
+diff --git deploy/libexec/sparrow-ship deploy/libexec/sparrow-ship
+index 30e59ab..52af6f4 100755
+--- deploy/libexec/sparrow-ship
++++ deploy/libexec/sparrow-ship
+@@ -25,9 +25,13 @@ Feeding keeps the bytes waiting in all consume roots together within
+ source file is. An item larger than the budget is fed only when every consume
+ root is empty, and then alone.
+ 
+-A ledger per source records each shipped identity (device, inode, size and
+-modification time) after all of its copies are durably queued. A crash between
+-those steps queues the file again; an identical item already waiting in a root
++A ledger per source records each shipped identity (inode, size and modification
++time) after all of its copies are durably queued. The device number is not part
++of it, because it can change at boot (btrfs renumbers it), which would ship every
++file again. Older ledger lines carry the device as a fourth, leading field and
++are read as the same entry. Inode reuse after a delete and create is not
++detected, and the device number never detected that either. A crash between
++queueing and recording the identity queues the file again; an identical item already waiting in a root
+ is recognized and dropped, and a different one waits until Sparrow consumes the
+ earlier copy. A finished file that later changes has a new identity and is
+ shipped again whole.
+@@ -98,7 +102,28 @@ def load_config(path):
+ 
+ 
+ def identity(stat):
+-    return f"{stat.st_dev}:{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}"
++    return f"{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}"
++
++
++def ledger_keys(ledger_path):
++    """Return the identities a ledger records, reading legacy `dev:` lines as the same entry."""
++    keys = set()
++    # The writer ends lines with "\n" only. Neither splitlines() nor universal-newline
++    # reading may split a file name that holds a carriage return or another separator.
++    with open(ledger_path, newline="") as handle:
++        lines = handle.read().split("\n")
++    if lines[-1] == "":
++        lines.pop()
++    for number, line in enumerate(lines, 1):
++        key = line.split("\t", 1)[0]
++        fields = key.split(":")
++        if len(fields) == 4:
++            fields = fields[1:]
++        elif len(fields) != 3:
++            fail(f"{ledger_path}:{number}: ledger key {key!r} must be inode:size:mtime_ns "
++                 "(or the older dev:inode:size:mtime_ns); repair or remove the line")
++        keys.add(":".join(fields))
++    return keys
+ 
+ 
+ def is_regular(stat):
+@@ -282,7 +307,7 @@ def run(config):
+         ledger_path = state / f"{source['name']}.ledger"
+         shipped = set()
+         if ledger_path.exists():
+-            shipped = {line.split("\t", 1)[0] for line in ledger_path.read_text().splitlines()}
++            shipped = ledger_keys(ledger_path)
+         count = 0
+         with open(ledger_path, "a") as ledger:
+             for path, stat in finished(source, now):
+diff --git docs/deployment.md docs/deployment.md
+index d35ef84..f2321e5 100644
+--- docs/deployment.md
++++ docs/deployment.md
+@@ -395,8 +395,12 @@ standard error is redirected; keep any such file outside every watch root.
+ Each file is staged completely and checked against the original's size and
+ identity before any part of it is queued. Its copies or chunks then enter the
+ queue together, the queue directory is synchronized, and a per-source ledger
+-under `state_dir` records the shipped identity (device, inode, size,
+-modification time). A crash between the two queues the file again. Each run
++under `state_dir` records the shipped identity (inode, size,
++modification time). The device number is not part of it, because it can change
++at boot; older four-field ledger lines that lead with the device are read as the
++same entry. Inode reuse after a delete and create is not detected, and the
++device number never detected that either. A crash between queueing and recording
++the identity queues the file again. Each run
+ then feeds the oldest queued items into their roots while the bytes waiting in
+ all roots together stay within `max_pending_bytes`; an item larger than that
+ budget is fed only into empty roots. Each move synchronizes the root and the
+@@ -442,7 +446,7 @@ found there, not in Sparrow). The manager forwarder drops the unit's own
+ process, so a record in a `katamari-manager-*` file comes from the manager or from another journal entry that names the unit (a coredump, for example); `source` says which journal it came from, not which process.
+ 
+ The manager lines use their own file prefix and cursor, never the node's.
+-`sparrow-ship` keys a file by device, inode, size and modification time and
++`sparrow-ship` keys a file by inode, size and modification time and
+ ships a changed file again whole, so appending to a bucket the other forwarder
+ wrote would send it twice. A manager bucket can still be appended to after it
+ shipped when a line arrives more than `settle_seconds` after the previous one in
+diff --git docs/interfaces.md docs/interfaces.md
+index c88ae61..32d8e5e 100644
+--- docs/interfaces.md
++++ docs/interfaces.md
+@@ -2697,7 +2697,27 @@ and starts a new opaque generation. Same-length observed modification produces
+ a declared read gap. This is an append-only producer contract; these observations
+ do not certify detection of every rewrite or overwrite followed by growth.
+ 
+-Restart attaches surviving in-root identities to original checkpoints. After a
++Restart attaches surviving in-root identities to original checkpoints. A stored
++active generation whose root device alone differs from the root's current device
++(its inode, watch revision, source and format are equal) is gapped as
++`identity_changed` at start, because a filesystem such as btrfs renumbers its
++devices at boot; the daemon writes one operator line naming the watch, the
++generation and both device numbers, and the file is then read again from the
++beginning under a new generation. Any other difference refuses the start. A
++pending finished-file claim is treated alike at start: a stored root or parent
++device that alone differs from the current one (the inode is equal) still names
++the same directory, so the daemon starts, the claim stays pending with its bytes
++kept, and one operator line names the watch and both root device numbers. A
++changed inode still refuses the start. The claim's recorded file device is not
++relaxed, and after a real reboot the file's own device has changed as well, so
++recovery of a claim whose file never moved fails at the check of the file
++against its recorded observation. The failure shows in the watch status and in
++`watch claims`, and the recovery is retried from 5 seconds up to a 15 minute
++ceiling with one log line per attempt, while the watch's other files keep
++flowing. Such a claim holds one of the shared journal slots and has no in-place
++way out until the stable-identity decision (issue #315). A claim whose file was
++already moved into the private claim directory likewise refuses its recovery
++and removal, and keeps the file. After a
+ complete reconciliation, unavailable active identities receive durable read gaps;
+ no missing prefix is invented. Status exposes finite `tail_generation_ids`,
+ `tail_read_bytes`, `tail_descriptors`, `tail_admission_waiting` and

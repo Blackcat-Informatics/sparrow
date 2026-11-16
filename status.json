@@ -1,0 +1,79 @@
+{
+  "issue": 304,
+  "pr_number": 308,
+  "branch": "paudley/304-archive-prepare-read-cost-grows-with",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/304-archive-prepare-read-cost-grows-with/.stage/archive-prepare-read-cost-grows-with",
+  "observed_at": "2026-11-16T03:29:54.539331+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/304-archive-prepare-read-cost-grows-with/.stage/archive-prepare-read-cost-grows-with/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/304-archive-prepare-read-cost-grows-with/.stage/archive-prepare-read-cost-grows-with/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/304-archive-prepare-read-cost-grows-with/.stage/archive-prepare-read-cost-grows-with/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/304-archive-prepare-read-cost-grows-with/.stage/archive-prepare-read-cost-grows-with/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/304-archive-prepare-read-cost-grows-with/.stage/archive-prepare-read-cost-grows-with/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 308,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Make archive prepare read cost per record constant, bound it per stored row, and keep prepare from stalling ingestion",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/308",
+    "baseRefName": "main",
+    "baseRefOid": "bf42118fdb4430c1c93c48b7012c06121899082e",
+    "headRefName": "paudley/304-archive-prepare-read-cost-grows-with",
+    "headRefOid": "a91cddee4d63c4a896dfe220912ceee84ccc9daa",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/250/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "a91cddee4d63c4a896dfe220912ceee84ccc9daa",
+    "branch": "paudley/304-archive-prepare-read-cost-grows-with",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 308,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #308 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}

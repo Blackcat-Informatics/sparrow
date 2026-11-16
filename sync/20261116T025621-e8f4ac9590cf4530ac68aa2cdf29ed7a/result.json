@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/304-archive-prepare-read-cost-grows-with",
+  "branch": "paudley/304-archive-prepare-read-cost-grows-with",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "b7de656abfede5e63263e79fc84e04ddeaf080ec",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/304-archive-prepare-read-cost-grows-with/.stage/archive-prepare-read-cost-grows-with/sync/20261116T025621-e8f4ac9590cf4530ac68aa2cdf29ed7a",
+  "conflicts": [],
+  "status": "completed",
+  "base": "bf42118fdb4430c1c93c48b7012c06121899082e",
+  "merge_bases": [
+    "5f6202b174a1a6da27acc593b71e4ac7dc703dd9"
+  ],
+  "merge_index": "cb12d488d99228b2ae4ca384237a2fd370471b7326ca9db7b3c40e5db1f721b9",
+  "candidate_tree": "b7fd29de44c27b6535277981c42c2d31bd01af33",
+  "candidate_patch": "candidate-8878474622f44372b4d371473151493a.patch",
+  "validation_records": [],
+  "commit": "a91cddee4d63c4a896dfe220912ceee84ccc9daa",
+  "tree": "b7fd29de44c27b6535277981c42c2d31bd01af33"
+}
