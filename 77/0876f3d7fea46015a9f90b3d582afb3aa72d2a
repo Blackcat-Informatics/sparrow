@@ -1,0 +1,23 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 82bd6642cffbbee1950952cc9dd8084a2ca91c7e
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 331
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/331
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 2116021cb1acf8e3f24e21a52bc7981a1c11a359
+GhpRsq-Head-Ref: paudley/330-remove-the-online-store-backup-156-and
+GhpRsq-Head-OID: 82bd6642cffbbee1950952cc9dd8084a2ca91c7e
+GhpRsq-Result-Tree: 3525885d8a4721f153a705513f2f2c3c880413c3
+GhpRsq-Result-Commit: 770876f3d7fea46015a9f90b3d582afb3aa72d2a
+GhpRsq-Parent-Hashes: 82bd6642cffbbee1950952cc9dd8084a2ca91c7e
+GhpRsq-Squash-Notes-SHA256: ea7e8adf6359fe1e96a178417ab8cc63606d5ce684b0c39ba4f8a2c82c953713
+GhpRsq-Stage-Tree: 30cc63d33ae10c9746ab5d4318218d1517826974
+GhpRsq-Stage-Commit: 14070cbf3b2ad217c32acd12c8a290107709f7fe
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/14070cbf3b2ad217c32acd12c8a290107709f7fe
+GhpRsq-Stage-Ref: refs/ghprsq/pr/331/stage
+GhpRsq-Stage-Files: 193
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/14070cbf3b2ad217c32acd12c8a290107709f7fe
