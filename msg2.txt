@@ -1,0 +1,9 @@
+Keep live device checks at tail admission and handoff preparation (#315)
+
+Tail admission again compares the opened descriptor's device with the one
+observed in the same pass, so a re-resolved path into a nested subvolume cannot
+take another file's checkpoint by inode. The journal no longer compares a saved
+handoff's file device with the live directories, which refused a retry after a
+reboot; preparing a source now checks the opened file's live device against the
+held root, keeping the same-filesystem rename guarantee. The private-intake and
+handoff docs say what decides.

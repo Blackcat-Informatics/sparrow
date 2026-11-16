@@ -1,0 +1,9 @@
+Identify files and roots by inode alone; never compare a stored device number (#315)
+
+The device number changes across a reboot on btrfs subvolumes, network, overlay
+and re-enumerated mounts. Equality of completed-file identities, journal
+observations, directory bindings and tail declarations now ignores it, tail
+resume is keyed by inode, and the device-only discontinuity path of #313 is
+removed because a device-only change is now a plain match. Stored device fields
+and the wire are unchanged; same-boot checks against live descriptors still
+read the device.
