@@ -5954,7 +5954,10 @@ One native RDF snapshot per store is admitted across all store clones; another
 request returns retryable `RESOURCE_LIMIT` rather than retaining another native
 version or waiting in an unbounded queue. This preserves the former single-query
 memory admission while allowing ingestion and maintenance to run during it.
-The admission slot is released on callback return or a typed error.
+The admission slot is released on callback return or a typed error. The archive's
+segment read takes its own second slot, so archiving never refuses a query and a
+query never refuses it; at most one query snapshot and one archive snapshot are live,
+each charged to its own read budget.
 
 The concurrency scenario releases the selected record's protection, retires it
 and ingests a new record from another thread while the callback is active. It
