@@ -8,11 +8,27 @@ use purrdf::dataset_view::{OwnedWorkspaceReservation, WorkspaceReservation};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+/// How a read's lease of `lease_ms` ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LeaseRenewal {
+    /// The lease ends `lease_ms` after the read starts, however far it has got: every
+    /// ordinary query read.
+    Fixed,
+    /// Every admitted read renews the lease for another `lease_ms`, so the read ends only
+    /// after `lease_ms` with no progress, never for its total length: the archive's segment
+    /// read, whose length follows the segment it encodes. Its request and row ceilings
+    /// still bound its total work.
+    OnProgress,
+}
+
 pub(super) struct Budget {
     state: Mutex<State>,
     limits: RdfReadLimits,
-    deadline: Instant,
+    renewal: LeaseRenewal,
     cancellation: crate::QueryCancellation,
+    /// Test-only skew added to the monotonic clock, so a test moves time without sleeping.
+    #[cfg(test)]
+    skew: std::sync::atomic::AtomicU64,
 }
 
 struct State {
@@ -20,6 +36,8 @@ struct State {
     evidence: RdfReadEvidence,
     /// Request and row-visit ceiling added by [`Budget::allow`].
     allowance: (u64, u64),
+    /// When the lease ends unless [`LeaseRenewal::OnProgress`] renews it first.
+    deadline: Instant,
 }
 
 pub(super) struct Reservation {
@@ -36,12 +54,17 @@ struct RetainedReservation {
 impl Budget {
     #[cfg(test)]
     pub(super) fn new(limits: RdfReadLimits) -> Result<Arc<Self>, ReadError> {
-        Self::new_cancellable(limits, crate::QueryCancellation::default())
+        Self::new_cancellable(
+            limits,
+            crate::QueryCancellation::default(),
+            LeaseRenewal::Fixed,
+        )
     }
 
     pub(super) fn new_cancellable(
         limits: RdfReadLimits,
         cancellation: crate::QueryCancellation,
+        renewal: LeaseRenewal,
     ) -> Result<Arc<Self>, ReadError> {
         if limits.live_bytes == 0 || limits.lease_ms == 0 || limits.lease_ms > 60000 {
             return Err(Arc::new(Error::new(
@@ -54,11 +77,28 @@ impl Budget {
                 error: None,
                 evidence: RdfReadEvidence::default(),
                 allowance: (0, 0),
+                deadline: Instant::now() + Duration::from_millis(limits.lease_ms),
             }),
             limits,
-            deadline: Instant::now() + Duration::from_millis(limits.lease_ms),
+            renewal,
             cancellation,
+            #[cfg(test)]
+            skew: std::sync::atomic::AtomicU64::new(0),
         }))
+    }
+
+    fn now(&self) -> Instant {
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = now + Duration::from_millis(self.skew.load(std::sync::atomic::Ordering::Relaxed));
+        now
+    }
+
+    /// Move this budget's clock forward by `ms`, as if the read had spent that long.
+    #[cfg(test)]
+    pub(super) fn advance(&self, ms: u64) {
+        self.skew
+            .fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -81,7 +121,7 @@ impl Budget {
         if let Err(error) = self.cancellation.checkpoint() {
             state.error.get_or_insert_with(|| Arc::new(error));
         }
-        if Instant::now() >= self.deadline {
+        if self.now() >= state.deadline {
             state.error.get_or_insert_with(|| {
                 Arc::new(Error::new("RESULT_EXPIRED", "RDF read lease ended"))
             });
@@ -157,6 +197,9 @@ impl Budget {
         state.evidence.requests = requests;
         state.evidence.admitted_bytes = admitted_bytes;
         state.evidence.row_visits = row_visits;
+        if self.renewal == LeaseRenewal::OnProgress {
+            state.deadline = self.now() + Duration::from_millis(self.limits.lease_ms);
+        }
         Ok(())
     }
 
@@ -311,11 +354,43 @@ mod tests {
 
     #[test]
     fn expired_lease_refuses_without_reading_or_waiting() {
-        let mut budget = Budget::new(RdfReadLimits::default()).unwrap();
-        Arc::get_mut(&mut budget).unwrap().deadline = Instant::now();
+        let budget = Budget::new(RdfReadLimits::default()).unwrap();
+        budget.advance(RdfReadLimits::default().lease_ms);
         assert_eq!(budget.request(1, false).unwrap_err().code, "RESULT_EXPIRED");
         assert_eq!(budget.checkpoint().1.requests, 0);
         assert_eq!(budget.checkpoint().1.admitted_bytes, 0);
+    }
+
+    /// INVARIANT (#328): a renewing lease ends only after a lease's length without progress,
+    /// so a read that keeps admitting reads outlives any total length, and one that stops
+    /// expires with `RESULT_EXPIRED`; a fixed lease ends at its length however busy the read
+    /// is, which is what every ordinary query keeps. Time moves through the budget's clock.
+    #[test]
+    fn a_renewing_lease_ends_only_when_progress_stops_and_a_fixed_one_at_its_length() {
+        let limits = RdfReadLimits {
+            lease_ms: 10_000,
+            ..Default::default()
+        };
+        for (renewal, served) in [(LeaseRenewal::OnProgress, 20), (LeaseRenewal::Fixed, 1)] {
+            let budget =
+                Budget::new_cancellable(limits, crate::QueryCancellation::default(), renewal)
+                    .unwrap();
+            // Twenty reads 6 s apart: 120 s of progress against a 10 s lease. The wide steps leave
+            // seconds of margin for real time the test itself spends under load.
+            let admitted = (0..20)
+                .take_while(|_| {
+                    budget.advance(6_000);
+                    budget.request(1, true).is_ok()
+                })
+                .count();
+            assert_eq!(admitted, served, "{renewal:?}");
+            budget.advance(10_000);
+            assert_eq!(
+                budget.request(1, true).unwrap_err().code,
+                "RESULT_EXPIRED",
+                "{renewal:?}"
+            );
+        }
     }
 
     #[test]

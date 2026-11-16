@@ -205,8 +205,9 @@ fn a_segment_ending_between_an_artifact_and_its_record_still_holds_the_artifact(
 /// segment's size, and a segment of more than 1,000 records prepares (the query selection
 /// bound does not apply to it). The read ceilings are a fixed allowance per entry plus one
 /// per stored graph row. The earlier union read cost about 2,800 requests per record already
-/// at 5 records, against a measured 255 now, and its cost per record grew with the segment,
-/// so it exceeds those ceilings at this size. A retried prepare of the same due
+/// at 5 records, and its cost per record grew with the segment, so it exceeds those ceilings
+/// at this size; so does a read that verifies each row's dictionary identities again on every
+/// row (19 requests per row, #328) instead of once per view. A retried prepare of the same due
 /// backlog is byte-equal, so the archive worker never meets a different file at a name.
 #[test]
 fn a_segment_of_over_a_thousand_records_prepares_within_its_read_bound_and_repeats_byte_equal() {
@@ -234,7 +235,7 @@ fn a_segment_of_over_a_thousand_records_prepares_within_its_read_bound_and_repea
 #[test]
 fn a_json_or_markdown_record_with_thousands_of_graph_rows_prepares() {
     // 800 json keys store about 12,000 graph rows (15 per key, measured), and the read costs
-    // about 250,000 requests, where a ceiling by entries alone allowed 11,024 (one record and
+    // about 58,000 requests, where a ceiling by entries alone allowed 11,024 (one record and
     // its artifact).
     let fields: Vec<String> = (0..800).map(|i| format!("\"k{i}\":\"v{i}\"")).collect();
     let json = format!("{{{}}}\n", fields.join(","));
