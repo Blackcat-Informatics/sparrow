@@ -1,0 +1,79 @@
+{
+  "issue": 319,
+  "pr_number": 333,
+  "branch": "paudley/319-archive-prepare-holds-the-single-rdf",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/319-archive-prepare-holds-the-single-rdf/.stage/archive-prepare-holds-the-single-rdf",
+  "observed_at": "2026-11-16T11:54:39.758287+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/319-archive-prepare-holds-the-single-rdf/.stage/archive-prepare-holds-the-single-rdf/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/319-archive-prepare-holds-the-single-rdf/.stage/archive-prepare-holds-the-single-rdf/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/319-archive-prepare-holds-the-single-rdf/.stage/archive-prepare-holds-the-single-rdf/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/319-archive-prepare-holds-the-single-rdf/.stage/archive-prepare-holds-the-single-rdf/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/319-archive-prepare-holds-the-single-rdf/.stage/archive-prepare-holds-the-single-rdf/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 333,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Give the archive its own RDF read slot so queries are served during a prepare",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/333",
+    "baseRefName": "main",
+    "baseRefOid": "770876f3d7fea46015a9f90b3d582afb3aa72d2a",
+    "headRefName": "paudley/319-archive-prepare-holds-the-single-rdf",
+    "headRefOid": "b6313d07893fc738fad61e3eadb7710624285dae",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/258/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "b6313d07893fc738fad61e3eadb7710624285dae",
+    "branch": "paudley/319-archive-prepare-holds-the-single-rdf",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 333,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #333 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}

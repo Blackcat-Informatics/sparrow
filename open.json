@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 319,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/319-archive-prepare-holds-the-single-rdf",
+  "branch": "paudley/319-archive-prepare-holds-the-single-rdf",
+  "slug": "archive-prepare-holds-the-single-rdf",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/319-archive-prepare-holds-the-single-rdf/.stage/archive-prepare-holds-the-single-rdf",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "770876f3d7fea46015a9f90b3d582afb3aa72d2a",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/319-archive-prepare-holds-the-single-rdf",
+    "branch:paudley/319-archive-prepare-holds-the-single-rdf",
+    "ignored:3 files (3 reflinked, 0 written)",
+    "rust-caches:reflink copy /opt/.cargo/10/697cc5edb114ef -> /opt/.cargo/f4/2a76824cbf500a failed: cp: '/opt/.cargo/10/697cc5edb114ef/tmp/.tmpaA6oUL/verify/verify-m5IF3P/store/000020.sst' -> '/opt/.cargo/f4/.2a76824cbf500a.seed-3075086/tmp/.tmpaA6oUL/verify/verify-m5IF3P/store/000020.sst': Invalid argument",
+    "stage:/home/paudley/Active/sparrow/.worktrees/319-archive-prepare-holds-the-single-rdf/.stage/archive-prepare-holds-the-single-rdf",
+    "issue:/home/paudley/Active/sparrow/.worktrees/319-archive-prepare-holds-the-single-rdf/.stage/archive-prepare-holds-the-single-rdf/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-16T04:29:24-0600",
+  "seed_error": ""
+}

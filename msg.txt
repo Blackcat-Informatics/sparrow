@@ -1,0 +1,21 @@
+Give the archive its own RDF read slot so a prepare does not refuse queries
+
+Cause: the store had one RDF read slot (`Store.rdf_read`). An archive prepare read a whole
+segment through `with_rdf_scope_ids` and held that slot for the length of the read, about
+21 s at 10,000 records, so every concurrent SPARQL or RDF read was refused with the
+retryable `RESOURCE_LIMIT` for that time.
+
+Change: `rdf_read_lease` takes a `ReadSlot` (`Query` or `Archive`), and the store holds a
+second `archive_read` slot. `with_rdf_scope_ids` takes the slot as a parameter: the archive
+encoder passes `Archive`, `with_rdf_record_layers` and `capture_rdf_scope` pass `Query`.
+Each slot still admits one snapshot and refuses a second with `RESOURCE_LIMIT`. Capture
+logic, ceilings and the writer lock are unchanged. Each read builds its own budget, so the
+two snapshots charge their own live bytes. `docs/architecture.md` section 4.4 and
+`docs/development-runtime.md` describe the separate slot.
+
+Tests: `a_query_is_served_during_an_archive_read_and_still_excludes_another_query` is new.
+`a_prepare_halved_by_an_encode_failure_reports_the_shortening_and_counts_it` now holds the
+archive slot through the dev-only `with_archive_read_slot_for_tests`, because a query no
+longer refuses an archive read.
+
+Not verified: behaviour under a real loaded host; tests outside `archive_segment`.

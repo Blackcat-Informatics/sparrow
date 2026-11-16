@@ -1,0 +1,12 @@
+Correct the read-slot docs and name the query slot in its refusal
+
+Cause: the review of the archive slot change found `docs/development-runtime.md` still
+opening with one snapshot per store and calling the memory bound unchanged, and the
+`with_rdf_records` doc comment saying one RDF snapshot per store.
+
+Change: the runtime doc now describes one query and one archive snapshot with the combined
+live-byte bound, the 128 MiB query limit plus the 2 GiB archive read, about 2.125 GiB. The
+`with_rdf_records` comment says the archive has its own slot. The query refusal message now
+says "active query RDF snapshot".
+
+Not verified: the refusal text is not asserted by any test.
