@@ -249,7 +249,6 @@ store-format upgrade.
 For isolated recovery qualification, work on a disposable copy of a store, made while its
 daemon is stopped, in a separate empty directory, and copy the deployment configuration with
 `data_dir` and `socket_path` changed to that directory. Keep the source immutable. The recovery
-The recovery
 example uses the existing configuration/store readers directly, without starting
 listeners, maintenance or saved watch workers:
 

@@ -979,7 +979,7 @@ interface Sparrow {
   # Administration: retire a claim that can never complete (claimed, private source missing,
   # never published). Refused for a recoverable or published claim.
   watchClaimRetire @52 (request :WatchClaimRetire) -> (result :Result(RetiredClaim));
-  # Removed (#330). The ordinal stays; the server answers every call with UNSUPPORTED.
+  # Removed (#330). The ordinal stays; the server answers UNSUPPORTED (a query-only daemon: READ_ONLY).
   backup @53 (storeId :Text) -> (result :Result(BackupStatus));
   # Schema 71: read-only per-claim states; every pending claim and every completed or
   # abandoned claim whose pending span (reservation to latest pending attempt) overlaps the

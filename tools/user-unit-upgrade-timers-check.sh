@@ -10,7 +10,7 @@
 # configuration and a status-answering CLI, and stub systemctl, getcap, lsattr, ps and sleep first
 # on PATH. The stub systemctl keeps timer state in files and logs every call, so the assertions read
 # what the script asked of the user manager. Nothing here reaches a real unit, timer, store or
-# daemon. It stays out of `make check` (it needs python3 and runs the whole script three times); run
+# daemon. It stays out of `make check` (it needs python3 and runs the whole script four times); run
 # it after any change to the script's timer handling.
 #
 # Usage: tools/user-unit-upgrade-timers-check.sh SCRATCH_DIR   (absolute; created if absent, never emptied)
@@ -127,5 +127,16 @@ run "$w" STUB_SHIP_BUSY=1
 [[ ! -e $w/state/sparrow-ship.timer.active ]] || fail "abort path started a timer that was not active before"
 ! grep -q 'sparrow-ship.timer' <<<"$(starts "$w")" || fail "abort path started sparrow-ship.timer: $(starts "$w")"
 echo "ok   abort, timer stopped before: starts none"
+
+# 4. A configuration that still names a removed backup key is refused before anything is touched.
+w=$(world stale-config)
+printf 'backup_root = "/nowhere"\nbackup_keep = 3\n' >>"$w/home/.config/sparrow/server.toml"
+touch "$w/state/sparrow-ship.timer.active"
+run "$w"
+((rc != 0)) || fail "stale-config path exited 0"
+grep -q 'backup_root or backup_keep' <<<"$out" || fail "stale-config refusal did not name the keys: $out"
+[[ ! -e $w/state/calls ]] || ! grep -Eq '^(stop|start) ' "$w/state/calls" || fail "stale-config path touched a unit"
+[[ $(readlink "$w/home/.local/libexec/sparrow/sparrowd") == sparrowd-schema68-aaa ]] || fail "stale-config path moved a link"
+echo "ok   stale backup keys: refused before any change"
 
 echo PASS

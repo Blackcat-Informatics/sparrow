@@ -3756,7 +3756,9 @@ backup (#156) was removed in #330, with `sparrow-backup`, the restore, and the `
 names either key fails to load with the parser's `unknown field` error.
 
 The wire stays additive-only, so no ordinal moved. `backup @53` stays in the schema and the
-server answers every call with `UNSUPPORTED` ("the online store backup was removed"); the `sparrow`
+server answers a call with `UNSUPPORTED` ("the online store backup was removed"), except that a
+query-only daemon answers `READ_ONLY` and the ingest socket and anonymous TCP refuse it like other
+non-producer operations; the `sparrow`
 CLI has no `backup` command. `Status.backup @55` stays too, and the daemon always reports it as
 before for a daemon without a backup: `phase` `unconfigured`, an empty `root` and no `failure`.
 `BackupStatus` and `BackupPhase` remain in the schema for those two. CLI and MCP status no longer

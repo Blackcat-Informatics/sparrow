@@ -353,7 +353,9 @@ requires none: it relies on the kept previous image and the link swap, and a
 format-changing upgrade has no undo (the store fence), so the only way out is forward on the
 new image. It starts only `sparrow-ship.timer` again. If the shipper is still running when the
 script has stopped the timer, it starts the timer again if it was active before and changes
-nothing else. `tools/user-unit-upgrade-timers-check.sh` records both behaviors against a stubbed
+nothing else. Before it stops anything it refuses while `SPARROW_CONFIG` still sets `backup_root`
+or `backup_keep`: those keys were removed and the new image refuses the file, so delete those
+two lines first (the old image accepts the file without them). `tools/user-unit-upgrade-timers-check.sh` records both behaviors against a stubbed
 `systemctl`.
 
 ## Moving a running service

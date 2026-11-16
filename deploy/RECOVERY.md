@@ -221,11 +221,26 @@ every watch in `consume_watches` names a root that exists.
 
 - When: the system unit cannot serve after the cutover of Sparrow issue #22,
   and the operator's old user unit must serve `/SPARROW` again.
-- Limit: this revert used to restore the issue's step 5a online backup. That backup feature was
-  removed in #330 and none exists, so the revert keeps the cutover's store in place and serves it
-  with the user unit's image, which must be able to open it (the store fence refuses an image
-  older than the one that last upgraded the store's format). Anything the system unit
-  ingested stays in the store.
+- Limit: the revert used to restore the issue's step 5a online backup. That backup feature was
+  removed in #330 and none exists, so this revert keeps the cutover's store and intake in place
+  and serves them with the user unit. This script cannot undo a store-format change.
+- Fenced store: if the system unit's image upgraded the store's format, the old user image refuses
+  the store (the store fence), and there is no revert by this procedure. Before anything else the
+  user unit's `sparrowd` and CLI links must point at an image that opens the store's format (the
+  system unit's image or a newer one). `user-unit-upgrade.sh` cannot do it, because it needs a
+  running daemon that answers status; swap the links by hand and start the unit.
+- Unfenced store: the shipper's state must agree with the store it feeds. Known from the
+  repository: the shipper renames each item into the consume root, so `state_dir` must be on the
+  same filesystem as `intake_root` (`config/ship.toml.example`); `/SPARROW` is on the root
+  filesystem and `/home` is a separate mount, so the user shipper's `state_dir` under
+  `~/.local/state/sparrow/ship` cannot feed `/SPARROW/intake`. The system shipper's ledgers
+  (`/SPARROW/ship`, kept by `uninstall.sh`) record what was delivered into the kept store; the
+  user shipper's older ledgers would resend those files and ingest them twice. Not tested: point
+  the user `ship.toml` at `intake_root = "/SPARROW/intake"` and `state_dir = "/SPARROW/ship"`, and
+  check that the operator can write `/SPARROW/ship` (it is `paudley:sparrow`, 2700 under the
+  tmpfiles entry) before enabling the timer.
+- Configuration: the user `server.toml` must name neither `backup_root` nor `backup_keep`; the
+  current image refuses them.
 - Before the cutover (`stat`, 2026-11-02), `/SPARROW` was `paudley:root` 0700
   with no ACL entries, `/SPARROW/store` was `paudley:paudley` 0700, and
   nothing else existed under `/SPARROW`.
@@ -247,9 +262,8 @@ the `sparrow` user and group, the installed images and `/SPARROW/ship` in place,
 Once `/SPARROW` is paudley's again, the user manager does not need the `sparrow` group.
 
 Stop the shipper timer and the system unit through its drain first (`sudo systemctl stop
-sparrow-ship.timer`, then `sudo deploy/stop.sh`), run `sudo deploy/uninstall.sh`, point the user
-shipper's `ship.toml` at `/SPARROW/intake`, and enable the user units. Reversible: run
-`install.sh` again.
+sparrow-ship.timer`, then `sudo deploy/stop.sh`), run `sudo deploy/uninstall.sh`, settle the links
+and the shipper state as above, and enable the user units. Reversible: run `install.sh` again.
 
 Unverified: `uninstall.sh` was exercised only in staged mode
 (`SPARROW_DESTDIR`) against a test instance's root, where it removes the

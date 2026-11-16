@@ -33,7 +33,8 @@ refuses it (the store fence), so the only way out is forward on TO.
 Before anything changes it refuses unless: the daemon link names --from; all four images are
 executable; the --to pair is byte-identical to the kept pair in SPARROW_BIN; the --to daemon
 carries cap_net_bind_service (getcap: a human with root runs setcap, this script never does);
-server.toml sets the ingest keys; the store has copy-on-write off; the unit's drop-in directory
+server.toml sets the ingest keys and names neither backup_root nor backup_keep (both keys
+were removed; delete those two lines first, which the --from image also accepts); the store has copy-on-write off; the unit's drop-in directory
 holds no .conf but an identical limits.conf (deploy/systemd/user/sparrow.service.d); and the
 running daemon reports the --from schema. Then it stops sparrow-ship.timer and waits for the
 shipper, stops the unit, installs limits.conf (LimitNOFILE=65536, the store refuses to open below
@@ -147,6 +148,11 @@ command -v getcap >/dev/null || die "getcap is missing; it checks the --to daemo
 getcap -- "$LIBEXEC/$TO" 2>/dev/null | grep -q cap_net_bind_service \
     || die "$LIBEXEC/$TO lacks cap_net_bind_service; a human with root runs: setcap cap_net_bind_service=ep $LIBEXEC/$TO"
 grep -q '^ingest_socket_path = ' "$SPARROW_CONFIG" || die "$SPARROW_CONFIG lacks the ingest keys"
+# The online backup keys were removed (#330), and the server file refuses unknown keys, so the --to
+# image would fail to load a file that still names them, after this script had stopped the daemon.
+if grep -Eq '^[[:space:]]*(backup_root|backup_keep)[[:space:]]*=' "$SPARROW_CONFIG"; then
+    die "$SPARROW_CONFIG still sets backup_root or backup_keep; the --to image refuses them. Delete those two lines (the --from image accepts the file without them) and run this again"
+fi
 STORE=$(config_value data_dir) || exit 1
 SOCKET=$(config_value socket_path) || exit 1
 INGEST_SOCKET=$(config_value ingest_socket_path) || exit 1
