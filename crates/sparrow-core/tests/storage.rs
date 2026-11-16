@@ -25938,10 +25938,14 @@ fn reclaim_keeps_the_staging_row_of_a_set_claim_without_its_manifest_receipt() {
 
 /// Value (#340): an intake whose RDF would exceed the staging limit is counted and named, not
 /// silent. Protects: a JSONL artifact of 100 records with 100 distinct keys each, the shape the
-/// #336 measurement found refused, is answered `RESOURCE_LIMIT`; the status counts the refusal
-/// where the write raised it and names its source, graph and anticipated size (over the 64 MiB
-/// limit); and the installed observer is told once per counted refusal, with the running total.
-/// Before, the refusal reached only the client.
+/// #336 measurement found refused, is answered `RESOURCE_LIMIT`, and the status counts refused
+/// GRAPHS, not intakes. For this input the count is exactly 4, observed on the code path: the
+/// projection graphs of records 1 to 3 each pass the 64 MiB write limit and ingest absorbs
+/// each into a failed projection state (3 counts, no client error); then the metadata graph of
+/// the next record is refused and drops the whole batch (1 count, the client's error). The
+/// status names the last of them: limit `write`, source, graph `record:...` and anticipated
+/// bytes over 64 MiB. The installed observer is told once per count, in order. Before, the
+/// refusal reached only the client.
 #[test]
 fn an_intake_refused_for_rdf_staging_is_counted_and_named_in_status() {
     let dir = tempfile::tempdir().unwrap();
@@ -25975,21 +25979,20 @@ fn an_intake_refused_for_rdf_staging_is_counted_and_named_in_status() {
         .ingest("wide", "wide-source", "jsonl", input.as_bytes(), 1)
         .unwrap_err();
     assert_eq!(refused.code, "RESOURCE_LIMIT", "{refused:?}");
+    assert_eq!(refused.message, "RDF write staging exceeds 64 MiB");
     let status = store.properties().unwrap();
     let told = told.lock().unwrap();
+    assert_eq!(status["staging_refusals"], "4");
     assert_eq!(
-        status["staging_refusals"].as_str().unwrap(),
-        told.len().to_string(),
-        "every counted refusal told the observer once"
+        told.iter().map(|(_, total)| *total).collect::<Vec<_>>(),
+        [1, 2, 3, 4]
     );
-    let (last, total) = told.last().unwrap();
-    assert_eq!(*total, told.len() as u64);
+    let (last, _) = told.last().unwrap();
+    assert_eq!(last.limit, "write");
+    assert!(last.graph.starts_with("record:"), "{last:?}");
+    assert!(last.bytes > 64 * 1024 * 1024, "{last:?}");
+    assert_eq!(status["staging_refused_last_limit"], "write");
     assert_eq!(status["staging_refused_last_source"], "wide-source");
-    assert_eq!(status["staging_refused_last_limit"], last.limit);
     assert_eq!(status["staging_refused_last_graph"], last.graph.as_str());
     assert_eq!(status["staging_refused_last_bytes"], last.bytes.to_string());
-    assert!(
-        last.bytes > 32 * 1024 * 1024,
-        "anticipated size is named: {last:?}"
-    );
 }

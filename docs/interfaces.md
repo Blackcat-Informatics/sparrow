@@ -707,14 +707,19 @@ bound.
 ### RDF staging refusals are counted and named (#340)
 
 An intake stages its RDF in memory before commit: at most 32 MiB of new dictionary
-terms and 64 MiB of anticipated index and manifest writes per batch. A graph that
+terms and 64 MiB of anticipated writes per batch (the RDF index rows and manifest, plus
+the batch's other pending writes, so earlier records in the batch count). A graph that
 would pass either is refused with `RESOURCE_LIMIT` ("RDF dictionary staging exceeds 32
 MiB", "RDF write staging exceeds 64 MiB"). The refusal is counted where the write
 raises it, so every intake path that stages through a counted write is covered:
 inline `ingest`, record batches and the import publication's artifact graph. A
-refused projection graph that an ingest absorbs into a failed projection state
-(the record is stored without its graph) is counted too, though no client sees an
-error. Upgrades and migrations stage uncounted.
+refused projection graph that an ingest absorbs into a failed projection state is
+counted too, though no client sees an error; if the batch then commits, the record is
+stored without its graph, but a later graph of the same batch can still be refused and
+drop the whole batch, and that refusal counts again. The counter therefore names
+refused graphs, not refused intakes: one client-visible refusal can add several
+counts. A client retry of a refused intake adds its own. Upgrades and migrations
+stage uncounted.
 
 `Status.stagingRefusals` (field 62, additive; a reader that does not know it sees no
 change) carries `refusals` (every refused graph since the daemon started, in memory),
@@ -730,9 +735,9 @@ The daemon journals one stderr line per refusal, with no record bytes:
 sparrowd: rdf staging refused limit=write source="app" graph="record:..." anticipated_bytes=70123456 refusals_total=3
 ```
 
-The first sixteen refusals each write a line; after that only the 32nd, 64th and each
-doubling, so a loop of refused artifacts writes a logarithmic number of lines while the
-status counter stays exact. Whether to stage an artifact's RDF in pieces or store it with
+Every counted refusal writes its line; none is thinned. The line is written without
+panicking, because it is written while the store's writer lock is held, and a failed
+stderr write is dropped (the counter still holds the fact). Whether to stage an artifact's RDF in pieces or store it with
 its graph deferred is separate work.
 
 ### Part sets for consume roots (#280)
