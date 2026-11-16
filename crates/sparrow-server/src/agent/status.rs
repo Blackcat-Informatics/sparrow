@@ -157,6 +157,10 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         .with("admission", admission(value.get_admission()?)?)
         .with("floor_pause", floor_pause(value.get_floor_pause()?))
         .with(
+            "staging_refusals",
+            staging_refusals(value.get_staging_refusals()?)?,
+        )
+        .with(
             "pressure",
             crate::pressure::decode(value.get_pressure_status()?)?,
         )
@@ -500,6 +504,17 @@ fn floor_pause(status: wire::floor_pause_status::Reader<'_>) -> Value {
             status.get_read_staging_refused().to_string(),
         )
         .into()
+}
+
+/// RDF staging refusals and the latest one (#340); a daemon that predates them reports zeros.
+fn staging_refusals(status: wire::staging_refusal_status::Reader<'_>) -> capnp::Result<Value> {
+    Ok(Object::new()
+        .with("refusals", status.get_refusals().to_string())
+        .with("last_limit", status.get_last_limit()?.to_str()?)
+        .with("last_source", status.get_last_source()?.to_str()?)
+        .with("last_graph", status.get_last_graph()?.to_str()?)
+        .with("last_bytes", status.get_last_bytes().to_string())
+        .into())
 }
 
 /// Permit, import-slot and connection-ceiling waits (#246).

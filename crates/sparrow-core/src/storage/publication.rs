@@ -716,7 +716,12 @@ impl Store {
         writer.require_retirable(artifact.chunks.len(), artifact.record_ids.len())?;
         parse(json::write_compact(&artifact.encode()).as_bytes())?;
         put(&mut batch, &artifact.id, &artifact);
-        super::artifact_rdf::publish(&writer.db, &mut batch, &artifact)?;
+        super::artifact_rdf::publish_with(
+            &writer.db,
+            super::rdf_index::RdfWrite::counted(&writer.db, &writer.staging)?,
+            &mut batch,
+            &artifact,
+        )?;
         super::recordless::publish(&mut batch, &artifact)?;
         manifest.published_artifact = Some(artifact.id.clone());
         writer.publish_consumption(&mut batch, &manifest, &artifact)?;

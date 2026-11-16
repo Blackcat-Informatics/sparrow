@@ -57,6 +57,8 @@ pub(crate) mod producer_stream;
 pub(crate) mod publication;
 mod query_membership;
 mod rdf_index;
+mod staging_refusal;
+pub use staging_refusal::{StagingObserver, StagingRefusal};
 pub(crate) mod rdf_view;
 pub(crate) mod receiver_stream;
 pub(crate) mod recompression;
@@ -568,6 +570,8 @@ struct Unlocked {
     tail_evidence: tail_evidence::Ledger,
     /// The advertised import bound and the over-bound refusals counted (#280).
     import_ledger: Arc<import::ImportLedger>,
+    /// RDF staging refusals counted at the write that raised them (#340).
+    staging: Arc<staging_refusal::StagingLedger>,
 }
 
 /// A non-blocking callback that asks the retention duty to run a pass now.
@@ -670,6 +674,8 @@ struct Writer {
     retirement: std::cell::Cell<eviction::RetirementShare>,
     /// Shared with `Unlocked`; counts every over-bound declaration this writer refuses.
     import_ledger: Arc<import::ImportLedger>,
+    /// Shared with `Unlocked`; every intake's RDF write counts its staging refusals here.
+    staging: Arc<staging_refusal::StagingLedger>,
     /// Tail generations taken while the stored registry was full and nothing could be retired.
     /// They are never written to the registry and are lost with the process (#224).
     unrecorded: std::cell::RefCell<Vec<tail::TailGeneration>>,
@@ -1056,7 +1062,15 @@ fn store_properties(
     id: &str,
     config: &Config,
     imports: &import::ImportLedger,
+    staging: &staging_refusal::StagingLedger,
 ) -> Result<Object, Error> {
+    let (refused, last) = staging.snapshot();
+    let last = last.unwrap_or(StagingRefusal {
+        limit: "",
+        source: String::new(),
+        graph: String::new(),
+        bytes: 0,
+    });
     let format = format.ok_or_else(|| Error::new("STORAGE_FAILURE", "store format missing"))?;
     Ok(Object::new()
         .with("store_id", id.to_owned())
@@ -1097,6 +1111,11 @@ fn store_properties(
         .with("max_records_per_artifact", config.max_records.to_string())
         .with("max_import_bytes", imports.bound().to_string())
         .with("import_over_bound_refusals", imports.refusals().to_string())
+        .with("staging_refusals", refused.to_string())
+        .with("staging_refused_last_limit", last.limit)
+        .with("staging_refused_last_source", last.source)
+        .with("staging_refused_last_graph", last.graph)
+        .with("staging_refused_last_bytes", last.bytes.to_string())
         .with("max_raw_record_bytes", imports.raw_split().to_string())
         .with("retire_row_budget", imports.row_budget().to_string())
         .with(
@@ -1745,6 +1764,7 @@ impl Store {
         let forced = forced_compaction::Forced::new(Arc::clone(&retention_waker));
         let pressure_request_waker = Arc::new(Mutex::new(None));
         let import_ledger = Arc::new(import::ImportLedger::default());
+        let staging = Arc::new(staging_refusal::StagingLedger::default());
         let mut store = Self {
             id: Arc::from(id.as_str()),
             open_files,
@@ -1770,6 +1790,7 @@ impl Store {
                 source_time_evidence: stream_evidence::Ledger::default(),
                 tail_evidence: tail_evidence::Ledger::default(),
                 import_ledger: Arc::clone(&import_ledger),
+                staging: Arc::clone(&staging),
             }),
             inner: Arc::new(Mutex::new(Writer {
                 db,
@@ -1790,6 +1811,7 @@ impl Store {
                 query_staging,
                 retirement: std::cell::Cell::new(eviction::RetirementShare::DEFAULT),
                 import_ledger,
+                staging,
                 unrecorded: std::cell::RefCell::new(Vec::new()),
                 source_time_full: std::cell::Cell::new(false),
                 #[cfg(feature = "test-support")]
@@ -2915,8 +2937,22 @@ impl Store {
             &self.id,
             &self.unlocked.config,
             &self.unlocked.import_ledger,
+            &self.unlocked.staging,
         )?
         .into())
+    }
+
+    /// Install the callback told of every RDF staging refusal as it happens (#340). It runs
+    /// on the refused writer, so it must not block. A second observer is refused.
+    pub fn observe_staging_refusals(&self, observer: StagingObserver) -> Result<(), Error> {
+        if self.unlocked.staging.observe(observer) {
+            Ok(())
+        } else {
+            Err(Error::new(
+                "INVALID_ARGUMENT",
+                "a staging refusal observer is already installed",
+            ))
+        }
     }
 
     /// Install, or with `None` remove, the callback that wakes the retention duty. The
@@ -3108,6 +3144,7 @@ impl Store {
             &self.id,
             &self.unlocked.config,
             &self.unlocked.import_ledger,
+            &self.unlocked.staging,
         )?
         .with("source_read_handles", source_handles.to_string())
         .with("source_read_bytes", source_bytes.to_string())

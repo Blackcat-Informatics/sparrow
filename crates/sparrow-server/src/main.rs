@@ -179,6 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .sum::<std::time::Duration>()
             .as_millis()
     );
+    sparrow_server::staging_refusal::install(&store)?;
     let store_id = store.store_id()?;
     let operations = Arc::new(Semaphore::new(config.max_concurrent_requests));
     let admission = sparrow_server::admission::Admission::new(operations.clone());

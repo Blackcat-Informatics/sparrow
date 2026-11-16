@@ -314,6 +314,18 @@ struct Status {
   # names a caller that does not split its input. A reader that does not know this field sees
   # no change.
   importOverBoundRefusals @61 :UInt64;
+  # Additive (#340): graphs refused because their RDF would exceed a staging limit, and the
+  # latest one. One refused intake can add several, see `StagingRefusalStatus`. A reader that
+  # does not know this field sees no change.
+  stagingRefusals @62 :StagingRefusalStatus;
+}
+# RDF staging refusals since the daemon started: `refusals` counts every refused graph, not
+# refused intakes. A projection graph an ingest absorbs into a failed projection counts, and the
+# batch can still fail afterwards on a later graph, which counts again. The `last*` fields name the latest: the limit
+# (`write` or `dictionary`), the artifact's source, the graph identity and the bytes anticipated.
+# All are empty or 0 before the first refusal.
+struct StagingRefusalStatus {
+  refusals @0 :UInt64; lastLimit @1 :Text; lastSource @2 :Text; lastGraph @3 :Text; lastBytes @4 :UInt64;
 }
 # Connections the daemon kept accepting while paused, writes it answered with the floor label,
 # reads it served while paused and reads refused for staging, since it started. `pausedSince` is the

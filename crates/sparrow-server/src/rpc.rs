@@ -3331,6 +3331,15 @@ impl wire::sparrow::Server for Rpc {
                 out.set_max_records_per_artifact(number(&value, "max_records_per_artifact")?);
                 out.set_max_pin_members(number(&value, "max_pin_members")?);
                 out.set_import_over_bound_refusals(number(&value, "import_over_bound_refusals")?);
+                {
+                    let mut staging = out.reborrow().init_staging_refusals();
+                    staging.set_refusals(number(&value, "staging_refusals")?);
+                    staging.set_last_limit(&field::<String>(&value, "staging_refused_last_limit")?);
+                    staging
+                        .set_last_source(&field::<String>(&value, "staging_refused_last_source")?);
+                    staging.set_last_graph(&field::<String>(&value, "staging_refused_last_graph")?);
+                    staging.set_last_bytes(number(&value, "staging_refused_last_bytes")?);
+                }
                 out.set_pin_read_handles(number(&value, "pin_read_handles")?);
                 out.set_pin_read_bytes(number(&value, "pin_read_bytes")?);
                 out.set_max_pin_read_handles(number(&value, "max_pin_read_handles")?);

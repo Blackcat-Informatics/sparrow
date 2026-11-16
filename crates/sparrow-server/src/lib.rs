@@ -11,6 +11,7 @@ mod correlation_wire;
 mod diagnostics;
 pub mod floor_pause;
 mod source_file;
+pub mod staging_refusal;
 pub mod syslog_listener;
 mod syslog_wire;
 mod tail_wire;
