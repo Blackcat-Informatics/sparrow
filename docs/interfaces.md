@@ -1011,7 +1011,7 @@ Opening a store that owes the schema 69 migrations applies the writer fences
 and seeds the checkpoints in one synchronized batch, then serves; the open does
 not wait for any job. The joined maintenance worker runs them as one duty,
 `store-counters` first (see "Store counters"), then `source-summary` (see
-"Per-source counters and artifact index"), `owner-graph-index`
+"Per-source counters and artifact index"), `payload-index` (see "Payload id index"), `owner-graph-index`
 and `source-context` (see "Single context capture
 admission"), one page per admission. `source-summary` runs second because, until
 it completes, every `sources` and live `artifacts` listing first reads what the
@@ -1019,7 +1019,7 @@ migration still owes (#176). The migrations are independent: each reads and
 checkpoints its own keys, so a store left part way through by an image that ran
 them in another order resumes each one from its own checkpoint. `status` lists
 them in a fixed order apart from the run order: `store-counters`,
-`owner-graph-index`, `source-summary`, `source-context`.
+`owner-graph-index`, `source-summary`, `source-context`, `payload-index`.
 The migration duty is selected fairly with buffered synchronization, pressure
 maintenance, import reclamation, retention and the table rewrite. Below the
 free-space floor it is skipped, as import reclamation and retention are; buffered
@@ -1117,7 +1117,8 @@ big-endian 64-bit count, from one RocksDB snapshot:
 | `graph-declarations` | `rdf:g:` graph declarations |
 | `record-graphs` | `provenance-rdf:record:` markers, one per record metadata graph |
 | `payload-chunks`, `json-projections` | `ref:` and `projection-ref:` rows |
-| `done:owner-graph-index`, `done:source-summary`, `done:source-context` | The migration's source entries at or before its checkpoint |
+| `payload-index` | `payload-id:` index keys, one per complete artifact (see "Payload id index") |
+| `done:owner-graph-index`, `done:source-summary`, `done:source-context`, `done:payload-index` | The migration's source entries at or before its checkpoint |
 
 Status `live_records` is `retained-records` and keeps its deadline meaning:
 records neither evicted nor retired by expiry. Expiry marks a record `retired`
@@ -1311,6 +1312,79 @@ migration's pages for CPU.
 The migration's duration on the live store is measured on a copy of the newest
 online backup, restored by `deploy/verify-backup.sh --measure-migration`, recorded
 in [load qualification](load-qualification.md).
+
+### Payload id index (store format)
+
+An artifact's `payload_id` is `blake3:` and the 64 lower-case hex digits of the
+BLAKE3 hash of all its own bytes. The store indexes every complete artifact by
+it, so "does the store already hold this content" is a point read instead of a
+page walk over a source's artifacts. One key per artifact in the default family:
+
+```
+payload-id:<64 hex digest>:<artifact id>        value: empty
+```
+
+The artifact id is part of the key because the same bytes ingested under two
+requests make two artifacts, and a prefix scan of one digest returns them all.
+An artifact is indexed exactly while it is complete, the completeness the
+per-source counters use: its entry exists and neither the entry nor its manifest
+retirement state is marked evicted. One owner observes every write batch before
+it is written and adds the key changes to the same batch, so no writer can
+create, retire or delete an artifact entry without its key, and a crash cannot
+leave a catalog row with no key or a key with no row. The `payload-index`
+store counter (`store-counter:payload-index`) counts the keys through the same
+observer as every other counter, and
+`done:payload-index` counts the artifact entries the migration has passed.
+The count of keys equals the count of complete artifacts, so a count that
+disagrees with the catalog is detectable.
+
+Every entry is removed in the batch that ends its completeness:
+
+- expiry deletes an artifact entry (an artifact with records, in the batch that
+  deletes its first due record; a recordless artifact, with its time-index key);
+- pressure eviction marks an artifact evicted through its manifest retirement
+  state, or deletes a recordless artifact entry;
+- an import's reclamation deletes only import staging rows and the import
+  manifest, never an artifact entry, so it changes no key.
+
+An archived artifact stays indexed until its entry is deleted or retired: the
+index describes what the store holds, not what the archive holds.
+
+Which artifacts carry a digest of all their bytes. Inline ingestion hashes the
+whole input, and that covers a tail checkpoint (the artifact is exactly its
+checkpointed byte range, so the digest is of that range, not of the whole file
+that grew past it) and a recordless artifact (zero bytes, the digest of no
+bytes). A published import verifies the hash of the whole staged artifact
+against the manifest before publishing. Parts of a consume-root set are
+separate artifacts, each indexed under its own digest; the digest of the whole
+source file is never an artifact's `payload_id`, so a file cut into parts is
+found by its parts' digests and its manifest artifact's digest, not by its own.
+An evicted artifact, whose bytes are no longer all held, is not indexed. No
+other path exists: every `Artifact` entry is created by inline ingestion or by
+import publication.
+
+`payloadLookup` (schema 71, additive, ordinal 56) takes a store ID, a payload id,
+an optional cursor (the last artifact id of the previous page) and a page size
+(1 to 1000, default 200) and returns the artifact ids in order, the next
+cursor, and `complete`. It reads one snapshot and takes no writer lock. The CLI
+is `payload STORE_ID PAYLOAD_ID [--cursor CURSOR] [--page-size N]` and the
+read-only MCP tool is `payload_lookup`; both render `answer_certainty`:
+`exact` once the migration is complete (an empty list then means no artifact
+holds the digest), `pending` before (every listed artifact is held, and an
+unlisted one is unknown, never absent).
+
+A store written before the index is fenced at open with a new writer family
+(`sparrow.store/352` to `406`, lifting the store counter families) so an older
+binary cannot write or delete an artifact without its key. The open seeds the
+`payload-index-upgrade` checkpoint and zero counter rows. The `payload-index`
+migration then walks the artifact entries in id order, 1,024 entries at a time,
+puts the key of each complete one and advances the checkpoint in one batch
+through the ordinary write path, after the same wait for waiting writers as every
+migration page. A write during the migration keeps the keys it creates or retires
+exact whatever the checkpoint says; the migration puts the key of an entry it
+reaches again as a no-op. A restart resumes after the last committed page, and a
+failed page is retried, never skipped. `status` reports its done count and
+watermark with the other migrations.
 
 ## 1. Common types and defaults
 
@@ -2219,6 +2293,7 @@ read-only, while pin mutations are marked as mutations. [MCP transports](https:/
 | `source_time_define`, `source_time_get` | Source and optional explicit extraction/representation | Immutable JSON-pointer or bounded whole-log timestamp profile; no reinterpretation of existing evidence. |
 | `diagnostic_define`, `diagnostic_get` | Source and optional pointer mappings | Immutable normalized diagnostic interpretation profile. |
 | `retention_metrics` | Store ID and finite catalog/payload/visit limits | Logical retained window and shared payload ownership; no physical reclamation certificate. |
+| `payload_lookup` | Store ID, payload id, optional cursor and page size | The held artifacts of one content digest, from the payload id index; exact once the `payload-index` migration completes, pending before. |
 | `producer_stream_get`, `receiver_window_get` | Store ID and exact stream/window ID | Finite producer/receiver ordering, observed gaps and explicit unknown continuity. |
 | `syslog_listener_get` | Store, source and listener IDs | Actual binding, framing, limits and process-scoped counters. |
 | `file_generation_get` | Store ID and generation ID | Original file declaration, durable checkpoint and terminal/completion evidence. |
@@ -3132,6 +3207,7 @@ are bounded. Domain errors remain distinct from a broken RPC connection.
 | `backup` | Administration (schema 70): start an online backup of the store into the configured `backup_root`; see "Online backup". |
 | `watchClaims` | Read-only (schema 71): every pending claim and every completed or abandoned claim whose pending span overlaps a time window, with its history; see "Per-claim state listing". |
 | `ingestPartReceipt` | Read-only (schema 71, additive): one set part's receipt state by request id (absent, stored, evicted or evicting) with its artifact id, byte length and format, and no record scan while the artifact is stored (once it is evicted or absent, the records it names are read until one is still stored); used by the part walk of a pending claim. |
+| `payloadLookup` | Read-only (schema 71, additive, ordinal 56): the artifacts that hold one payload id (`blake3:` and 64 lower-case hex digits), one page by artifact id, bounded by `pageSize` (1 to 1000, default 200), with `complete` false while the `payload-index` migration runs; see "Payload id index". |
 | `watchHandoff`, `watchHandoffGet` | Immutable store/request/watch/revision/raw-path/file-generation handoff; durable admission and explicit reserved/claimed/published/removed progress. Stable retries recover the original binding before inspecting the current source path. |
 
 Schema 23 adds `discover`: store identity, schema version, native text/RDF profile

@@ -19,6 +19,7 @@ mod explanation;
 mod ingest;
 mod ingest_status;
 mod json;
+mod payload;
 mod pin;
 mod producer;
 mod query_receipt;
@@ -53,6 +54,7 @@ pub(super) const USAGE: &str = concat!(
     " | pins STORE_ID [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | sources STORE_ID [--source TEXT] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | producer-stream STORE_ID STREAM_ID | receiver-window STORE_ID WINDOW_ID | syslog-listener STORE_ID SOURCE LISTENER_ID | file-generation STORE_ID GENERATION_ID | file-finish-prepare REQUEST_ID STORE_ID GENERATION_ID FINAL_FILE INTENT.capnp | file-finish INTENT.capnp | file-finish-status INTENT.capnp",
+    " | payload STORE_ID PAYLOAD_ID [--cursor CURSOR] [--page-size N]",
     " | artifacts STORE_ID [--scope-file FILE] [--source TEXT] [--received-from RFC3339] [--received-before RFC3339] [--require-complete-index] [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | pin REQUEST_ID STORE_ID NAME DAYS EVIDENCE_ID... | pin-release REQUEST_ID STORE_ID PIN_ID | pin-get STORE_ID (--id PIN_ID | --name NAME) [--cursor CURSOR] [--page-size N] [--scan-budget N]",
     " | source-time SOURCE POINTER REPRESENTATION | source-time-define REQUEST.json | source-time-get SOURCE | diagnostic-define SOURCE MAPPINGS.json | diagnostic-get SOURCE | records [--group-by-artifact true|false] [--cursor CURSOR] [--page-size N] [--event-from RFC3339 --event-before RFC3339] [--text TEXT] [--where-file FILE] | context STORE_ID RECORD_ID [--before N] [--after N] | text QUERY [--cursor CURSOR] [--page-size N] | keys | values | result-next STORE_ID CURSOR | result-release STORE_ID SNAPSHOT_ID",
@@ -92,6 +94,7 @@ pub(super) enum Command {
     PinMutation(pin::Mutation),
     Artifacts(artifacts::Input),
     Sources(sources::Input),
+    Payload(payload::Input),
     Producer(producer::Input),
     Receiver(receiver::Input),
     Syslog(syslog::Input),
@@ -335,6 +338,9 @@ impl Command {
                 store: args[1].clone(),
                 id: args[2].clone(),
             }));
+        }
+        if args.first().is_some_and(|arg| arg == "payload") {
+            return Ok(Self::Payload(payload::Input::parse(&args[1..])?));
         }
         if args.first().is_some_and(|arg| arg == "artifacts") {
             return Ok(Self::Artifacts(artifacts::Input::parse(&args[1..])?));
@@ -634,6 +640,9 @@ impl Command {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::Producer(input) = self {
+            return Ok(Some(input.execute(client).await?));
+        }
+        if let Self::Payload(input) = self {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::Artifacts(input) = self {

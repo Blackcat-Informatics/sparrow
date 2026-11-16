@@ -2426,6 +2426,74 @@ impl wire::sparrow::Server for Rpc {
         Ok(())
     }
 
+    async fn payload_lookup(
+        self: Rc<Self>,
+        params: wire::sparrow::PayloadLookupParams,
+        mut results: wire::sparrow::PayloadLookupResults,
+    ) -> capnp::Result<()> {
+        let query = params.get()?.get_query()?;
+        let input = || -> Result<(String, String, Option<String>, usize), Error> {
+            let store_id = query
+                .get_store_id()
+                .map_err(invalid)?
+                .to_str()
+                .map_err(invalid)?
+                .to_owned();
+            self.check_store(&store_id)?;
+            if query.get_schema_version() != sparrow_client::SCHEMA_VERSION {
+                return Err(Error::new(
+                    "UNSUPPORTED",
+                    "payload lookups require the current discovered schema",
+                ));
+            }
+            let payload_id = query
+                .get_payload_id()
+                .map_err(invalid)?
+                .to_str()
+                .map_err(invalid)?
+                .to_owned();
+            let cursor = optional(query.get_cursor().map_err(invalid)?).map_err(invalid)?;
+            if cursor.as_ref().is_some_and(|cursor| cursor.len() > 160) {
+                return Err(Error::new(
+                    "INVALID_ARGUMENT",
+                    "payload lookup cursor exceeds 160 bytes",
+                ));
+            }
+            Ok((store_id, payload_id, cursor, query.get_page_size() as usize))
+        };
+        let (store_id, payload_id, cursor, page_size) = match input() {
+            Ok(input) => input,
+            Err(error) => {
+                failure(results.get().init_result(), error);
+                return Ok(());
+            }
+        };
+        let echoed = (store_id, payload_id.clone());
+        match self
+            .lookup(move |store, _| store.payload_lookup(&payload_id, cursor.as_deref(), page_size))
+            .await
+        {
+            Ok(page) => {
+                let mut out = results.get().init_result().init_ok();
+                out.set_store_id(&echoed.0);
+                out.set_payload_id(&echoed.1);
+                out.set_complete(page.complete);
+                let mut ids = out
+                    .reborrow()
+                    .init_artifact_ids(page.artifacts.len() as u32);
+                for (index, id) in page.artifacts.iter().enumerate() {
+                    ids.set(index as u32, id);
+                }
+                match page.next {
+                    Some(next) => out.init_next().set_value(&next),
+                    None => out.init_next().set_absent(()),
+                }
+            }
+            Err(error) => failure(results.get().init_result(), error),
+        }
+        Ok(())
+    }
+
     async fn ingest_part_receipt(
         self: Rc<Self>,
         params: wire::sparrow::IngestPartReceiptParams,

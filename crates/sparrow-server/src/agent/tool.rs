@@ -174,6 +174,16 @@ impl Operation {
                     source: fields.required("source")?,
                     id: fields.required("listener_id")?,
                 })),
+                "payload_lookup" => Self::Query(Command::Payload(super::payload::Input {
+                    store: fields.required("store_id")?,
+                    payload_id: fields.required("payload_id")?,
+                    cursor: fields.optional("cursor")?,
+                    page_size: fields
+                        .raw("page_size")?
+                        .map(u32::from_json)
+                        .transpose()?
+                        .unwrap_or(200),
+                })),
                 "producer_stream_get" => Self::Query(Command::Producer(super::producer::Input {
                     store: fields.required("store_id")?,
                     id: fields.required("stream_id")?,
