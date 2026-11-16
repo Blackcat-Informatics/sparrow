@@ -22,7 +22,7 @@ mod query;
 mod scope;
 mod sparse;
 mod text_relations;
-use budget::{Budget, Reservation};
+use budget::{Budget, LeaseRenewal, Reservation};
 pub use explanation::SparqlExplanationItem;
 pub use pages::{
     NativePageBody, SparqlExplanationPageBody, SparqlExplanationReadPage, SparqlGraphKind,
@@ -135,7 +135,21 @@ pub struct StoredRdfView<'a> {
     /// When set, each graph owner added to the scope raises the read ceilings by this cost
     /// per stored row in its manifest.
     row_allowance: Option<RowAllowance>,
+    /// Dictionary identities whose forward and reverse rows this view has already checked.
+    verified: std::sync::Mutex<VerifiedIds>,
 }
+
+/// The dictionary identities one view has verified: a forward row present and a reverse row
+/// naming it back. The snapshot cannot change, so one check holds for the view's life, and
+/// every later row naming the identity skips the two point reads. Each entry is charged to
+/// the view's live bytes.
+struct VerifiedIds {
+    ordinals: purrdf_core::FastSet<u64>,
+    reservation: Reservation,
+}
+
+/// Live bytes charged per verified identity: the key and its share of the table's slack.
+const VERIFIED_ENTRY_BYTES: u64 = 32;
 
 /// The receipt-time fallback facts one snapshot derives for selected record graphs that do
 /// not store them. The view serves those facts with the stored rows; ingest stores none.
@@ -248,12 +262,20 @@ fn input_capacity(value: &TermValue, depth: usize, remaining: &mut u64) -> Resul
 }
 
 impl<'a> StoredRdfView<'a> {
+    /// A view with a fixed lease and no cancellation, for tests of the stored index.
+    #[cfg(test)]
     pub(super) fn new(
         db: &'a DB,
         limits: RdfReadLimits,
         graph_ids: &[String],
     ) -> Result<Self, ReadError> {
-        Self::new_cancellable(db, limits, graph_ids, crate::QueryCancellation::default())
+        Self::new_cancellable(
+            db,
+            limits,
+            graph_ids,
+            crate::QueryCancellation::default(),
+            LeaseRenewal::Fixed,
+        )
     }
 
     fn new_cancellable(
@@ -261,9 +283,14 @@ impl<'a> StoredRdfView<'a> {
         limits: RdfReadLimits,
         graph_ids: &[String],
         cancellation: crate::QueryCancellation,
+        renewal: LeaseRenewal,
     ) -> Result<Self, ReadError> {
-        let budget = Budget::new_cancellable(limits, cancellation)?;
+        let budget = Budget::new_cancellable(limits, cancellation, renewal)?;
         let scope = Arc::new(budget.reserve(4096 + (graph_ids.len() as u64).saturating_mul(256))?);
+        let verified = std::sync::Mutex::new(VerifiedIds {
+            ordinals: purrdf_core::FastSet::default(),
+            reservation: budget.reserve(0)?,
+        });
         let mut view = Self {
             snapshot: db.snapshot(),
             reverse: rdf_index::reverse_family(db).map_err(|e| budget.fail(e))?,
@@ -279,6 +306,7 @@ impl<'a> StoredRdfView<'a> {
             scope_receipt: None,
             text_scope: None,
             row_allowance: None,
+            verified,
         };
         for key in ["rdf:term-count", "rdf:max-encoded"] {
             let bytes = view.point(key.as_bytes(), 8)?.ok_or_else(|| {
@@ -672,7 +700,8 @@ impl<'a> StoredRdfView<'a> {
         self.verified_forward_in(id, true)
     }
 
-    /// [`Self::verified_forward`], spending the request budget only when `charged`.
+    /// [`Self::verified_forward`], spending the request budget only when `charged`. The
+    /// reverse row is read only for an identity this view has not verified yet.
     fn verified_forward_in(
         &self,
         id: GlobalTermId,
@@ -686,18 +715,62 @@ impl<'a> StoredRdfView<'a> {
                 self.budget
                     .fail(Error::new("STORAGE_FAILURE", "RDF term missing or foreign"))
             })?;
-        let reverse = rdf_index::reverse_key(&bytes);
-        let stored = self.reverse_point(reverse.as_bytes(), charged)?;
-        if stored.as_deref() != Some(ordinal(id).to_be_bytes().as_slice()) {
-            return Err(self.budget.fail(Error::new(
-                "STORAGE_FAILURE",
-                "RDF reverse/forward identity mismatch",
-            )));
+        if !self.verified(id)? {
+            let reverse = rdf_index::reverse_key(&bytes);
+            let stored = self.reverse_point(reverse.as_bytes(), charged)?;
+            if stored.as_deref() != Some(ordinal(id).to_be_bytes().as_slice()) {
+                return Err(self.budget.fail(Error::new(
+                    "STORAGE_FAILURE",
+                    "RDF reverse/forward identity mismatch",
+                )));
+            }
+            self.mark_verified(id)?;
         }
         Ok(EncodedGuard {
             bytes,
             _reservation: reservation,
         })
+    }
+
+    /// Check that an index row's identity is a dictionary term of this snapshot, reading its
+    /// forward and reverse rows only the first time this view meets it.
+    fn verify(&self, id: GlobalTermId) -> Result<(), ReadError> {
+        if self.verified(id)? {
+            return Ok(());
+        }
+        self.verified_forward(id).map(drop)
+    }
+
+    fn verified_ids(&self) -> Result<std::sync::MutexGuard<'_, VerifiedIds>, ReadError> {
+        self.verified.lock().map_err(|_| {
+            self.budget.fail(Error::new(
+                "STORAGE_FAILURE",
+                "RDF verified identity set poisoned",
+            ))
+        })
+    }
+
+    fn verified(&self, id: GlobalTermId) -> Result<bool, ReadError> {
+        Ok(self.verified_ids()?.ordinals.contains(&ordinal(id)))
+    }
+
+    fn mark_verified(&self, id: GlobalTermId) -> Result<(), ReadError> {
+        let mut verified = self.verified_ids()?;
+        let VerifiedIds {
+            ordinals,
+            reservation,
+        } = &mut *verified;
+        if !ordinals.contains(&ordinal(id)) {
+            reservation.grow(VERIFIED_ENTRY_BYTES)?;
+            ordinals.try_reserve(1).map_err(|_| {
+                self.budget.fail(Error::new(
+                    "RESOURCE_LIMIT",
+                    "RDF verified identity allocation refused",
+                ))
+            })?;
+            ordinals.insert(ordinal(id));
+        }
+        Ok(())
     }
 
     fn rows(
@@ -969,7 +1042,7 @@ impl Iterator for QuadIter<'_> {
             }
             let ids = fields.map(|id| global(id).expect("checked nonzero index identity"));
             for id in ids {
-                self.view.verified_forward(id).ok()?;
+                self.view.verify(id).ok()?;
             }
             let row = QuadIds {
                 s: ids[0],
@@ -1037,7 +1110,7 @@ impl GraphIter<'_> {
                 return None;
             }
         };
-        self.view.verified_forward(graph).ok()?;
+        self.view.verify(graph).ok()?;
         Some(graph)
     }
 }
@@ -1089,7 +1162,7 @@ impl Iterator for GraphIter<'_> {
             if !self.view.owners.contains(&owner) || self.previous == Some(graph) {
                 continue;
             }
-            self.view.verified_forward(graph).ok()?;
+            self.view.verify(graph).ok()?;
             self.previous = Some(graph);
             return Some(graph);
         }
@@ -1372,6 +1445,7 @@ impl Store {
             layers,
             now,
             limits,
+            renewal: slot.lease(),
             allowance,
             expired: None,
         };
@@ -1402,6 +1476,7 @@ impl Store {
             layers,
             now,
             limits,
+            renewal,
             allowance,
             expired,
         } = *scope;
@@ -1409,7 +1484,13 @@ impl Store {
         // expired targets, which must be as of the same moment.
         let writer = self.lock().map_err(Arc::new)?;
         let db = Arc::clone(&writer.db);
-        let mut view = StoredRdfView::new(&db, limits, &[])?;
+        let mut view = StoredRdfView::new_cancellable(
+            &db,
+            limits,
+            &[],
+            crate::QueryCancellation::default(),
+            renewal,
+        )?;
         view.scoped = true;
         view.row_allowance = allowance;
         let protected = match expired {
@@ -1537,6 +1618,8 @@ struct ScopeCapture<'a> {
     layers: RdfGraphLayers,
     now: u64,
     limits: RdfReadLimits,
+    /// How the read's lease ends, which its slot decides.
+    renewal: LeaseRenewal,
     allowance: Option<RowAllowance>,
     expired: Option<&'a BTreeSet<String>>,
 }
