@@ -34,7 +34,6 @@ esac
 (($# == 0)) || die "unexpected arguments: $*"
 WORK=$(mktemp -d)
 trap 'rm -rf -- "$WORK"' EXIT
-hold_backup_lock
 
 if [[ $MODE == rollback ]]; then
     previous=$(readlink -- "$LIBEXEC/sparrowd.previous" 2>/dev/null) || die "no previous image to roll back to"
@@ -49,7 +48,6 @@ fi
 verify_image "$daemon" 'usage: sparrowd --config'
 verify_image "$cli" 'usage: sparrow'
 refuse_schema_downgrade "$daemon"
-require_pre_upgrade_backup "$daemon"
 refuse_start_limit
 if [[ $MODE != rollback ]]; then
     daemon=$(install_image "$daemon") || exit 1
@@ -58,7 +56,7 @@ fi
 
 store=
 if unit_active; then
-    # A unit that has just started (by the backup, say) may not answer yet.
+    # A unit that has just started (by systemd, say) may not answer yet.
     wait_ready
     store=$(status_json | status_field store_id)
     [[ $(readlink -- "$LIBEXEC/sparrowd") != "${daemon##*/}" ]] || note "already on ${daemon##*/}; restarting it"

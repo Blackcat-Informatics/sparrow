@@ -6,7 +6,6 @@
 pub use sparrow_client::{Connection, connect, sparrow_capnp};
 pub mod admission;
 pub mod archive;
-mod backup;
 mod config;
 mod correlation_wire;
 mod diagnostics;

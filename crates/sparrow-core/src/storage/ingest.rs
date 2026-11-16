@@ -17,23 +17,9 @@ pub(super) enum Origin<'a> {
     Event(&'a super::producer_stream::ProducerBatch),
     Receiver(&'a super::receiver_stream::SyslogReceiver),
     Tail(super::tail::Append<'a>),
-    /// Evidence restored from an archive segment under its original identities.
-    Restore(&'a Restore),
-}
-
-/// The original identities an archived artifact is restored under.
-pub(super) struct Restore {
-    pub artifact_id: String,
-    pub record_ids: Vec<String>,
 }
 
 impl<'a> Origin<'a> {
-    pub(super) fn restore(self) -> Option<&'a Restore> {
-        match self {
-            Self::Restore(value) => Some(value),
-            _ => None,
-        }
-    }
     pub(super) fn receiver(self) -> Option<&'a super::receiver_stream::SyslogReceiver> {
         match self {
             Self::Receiver(value) => Some(value),

@@ -75,14 +75,6 @@ pub struct ServerConfig {
     /// sets it too. It refuses every intake and archive key.
     #[serde(default)]
     pub query_only: bool,
-    /// Online backup root (#156): a directory on a network filesystem (nfs, nfs4, cifs or
-    /// smb3) that is not the store's; every backup refuses any other. Sparrow never backs up to
-    /// a local disk. Absent, the daemon refuses the backup operation.
-    #[serde(default)]
-    pub backup_root: Option<PathBuf>,
-    /// Online backups the engine keeps; older ones are purged after each backup.
-    #[serde(default = "default_backup_keep")]
-    pub backup_keep: u32,
 }
 
 /// Paths the daemon writes, by configuration key. `server.toml` names no log file, so these are
@@ -269,10 +261,6 @@ fn default_min_free() -> u64 {
     4 * 1024 * 1024 * 1024
 }
 
-fn default_backup_keep() -> u32 {
-    3
-}
-
 fn default_rpc_connections() -> usize {
     16
 }
@@ -335,23 +323,7 @@ impl ServerConfig {
             );
         }
         config.check_query_only()?;
-        config.backup_target()?;
         Ok(config)
-    }
-
-    /// The configured online backup target. Startup checks only its paths: the network
-    /// filesystem rule is applied at every backup, so a daemon that starts before the NAS is
-    /// mounted still serves its intake (sparrow_core::BackupTarget::new).
-    pub fn backup_target(
-        &self,
-    ) -> Result<Option<sparrow_core::BackupTarget>, Box<dyn std::error::Error>> {
-        self.backup_root
-            .as_ref()
-            .map(|root| {
-                sparrow_core::BackupTarget::new(root.clone(), self.backup_keep, &self.data_dir)
-                    .map_err(|error| error.message.into())
-            })
-            .transpose()
     }
 
     /// Select query-only mode, as `sparrowd --query-only` does, and check that nothing in the
@@ -388,11 +360,6 @@ impl ServerConfig {
     pub fn check_private_intake(&self) -> Result<(), Box<dyn std::error::Error>> {
         if self.query_only {
             return Err("--private-intake and query-only mode exclude each other".into());
-        }
-        // A copy shares the live store's identity, so its backup would pass the store check
-        // and land in the live backup root, purging its oldest sets.
-        if self.backup_root.is_some() {
-            return Err("--private-intake refuses the configured `backup_root`: a private-intake daemon serves a disposable copy, which never backs up; remove `backup_root` from this configuration".into());
         }
         self.refuse_intake("--private-intake", "a private-intake daemon", false)
     }
@@ -468,7 +435,6 @@ impl ServerConfig {
                 Some(("data_dir", self.data_dir.clone())),
                 Some(("socket_path", self.socket_path.clone())),
                 optional("ingest_socket_path", self.ingest_socket_path.as_ref()),
-                optional("backup_root", self.backup_root.as_ref()),
                 optional(
                     "archive.dir",
                     self.archive.as_ref().map(|archive| &archive.dir),
@@ -705,7 +671,7 @@ mod tests {
     }
 
     /// INVARIANT: a consume or tail root that contains, or lies inside, any path the daemon
-    /// writes itself (store, sockets, backup root, archive) refuses configuration load and
+    /// writes itself (store, sockets, archive) refuses configuration load and
     /// names both paths, because the daemon would otherwise watch its own output.
     #[test]
     fn watch_root_overlapping_a_daemon_output_path_refuses_load() {
@@ -729,19 +695,13 @@ mod tests {
             "ingest_socket_path = \"{}\"\ningest_socket_gid = 1\n",
             ingest.display()
         );
-        let backup = dir.path().join("backup");
         let archive = dir.path().join("nas");
-        let outputs = format!(
-            "{ingest_keys}backup_root = \"{}\"\n[archive]\ndir = \"{}\"\n",
-            backup.display(),
-            archive.display()
-        );
+        let outputs = format!("{ingest_keys}[archive]\ndir = \"{}\"\n", archive.display());
         // Top-level keys must precede the tables, so the watch goes last.
         for root in [
             dir.path().to_path_buf(),
             data.clone(),
             dir.path().join("run"),
-            backup.join("inside"),
             archive.clone(),
         ] {
             let error = with(&format!("{outputs}{}", watch(&root)))

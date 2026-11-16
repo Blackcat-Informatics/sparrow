@@ -10,7 +10,7 @@
 #
 # It leaves in place, and says so: /etc/sparrow (configuration and the secret's copy), the sparrow
 # user and group and their sysusers entry, the installed images, helpers, lexicons and documents,
-# /SPARROW/ship and the backups on the NAS (/net/synology/archives/sparrow). It never starts or
+# /SPARROW/ship. It never starts or
 # stops a unit: stop them first.
 #
 # Run as root. With SPARROW_DESTDIR=DIR it removes the staged files under DIR instead and prints
@@ -90,7 +90,7 @@ remove() {
 
 # 1. Disable the units that are installed, then remove every unit file.
 enabled=()
-for unit in sparrow.service sparrow-ship.timer sparrow-backup.timer; do
+for unit in sparrow.service sparrow-ship.timer; do
     if [[ -e $DEST/etc/systemd/system/$unit ]]; then enabled+=("$unit"); fi
 done
 ((${#enabled[@]} == 0)) || host systemctl disable "${enabled[@]}"
@@ -139,4 +139,4 @@ fi
 
 report_changes
 note "kept: /etc/sparrow, the sparrow user and group (/etc/sysusers.d/sparrow.conf), the images, \
-helpers, lexicons and documents under $PREFIX, /SPARROW/ship and the backups under $SPARROW_BACKUPS"
+helpers, lexicons and documents under $PREFIX, /SPARROW/ship"

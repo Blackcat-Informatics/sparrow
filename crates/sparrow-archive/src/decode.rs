@@ -3,10 +3,12 @@
 
 //! The one place that knows the segment byte format (a GTS file, read by
 //! `purrdf::gts::reader::read`). [`decode`] turns a segment's bytes into records and
-//! artifacts; replacing the format replaces this module only. Listing, naming and the
-//! restore flow never see the format.
+//! artifacts; replacing the format replaces this module only. Listing, naming and
+//! extraction never see the format.
 
 use std::collections::BTreeMap;
+
+use purrdf::gts::writer::digest_string;
 
 use crate::segment::{ArchivedArtifact, ArchivedRecord};
 
@@ -30,8 +32,9 @@ pub(crate) struct Decoded {
     pub(crate) blobs: usize,
 }
 
-/// Decode one segment file. The reader checks the frame hash chain and every blob digest;
-/// any diagnostic, or a file with no segment head, is a refusal, never a partial read.
+/// Decode one segment file. The reader checks the frame hash chain; it does not hash a
+/// blob's decompressed bytes, so each record's bytes are hashed here and compared with the
+/// digest its link quad names. Any digest mismatch, any diagnostic, or a file with no segment head, is a refusal, never a partial read.
 pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded, String> {
     let mut graph = purrdf::gts::reader::read(bytes, false, None);
     if let Some(first) = graph.diagnostics.first() {
@@ -106,6 +109,11 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded, String> {
                     .blob_bytes_cloned(&digest)
                     .map_err(|error| format!("record {id}: blob {digest}: {error}"))?
                     .ok_or_else(|| format!("record {id} has no blob {digest}"))?;
+                if digest_string(&bytes) != digest {
+                    return Err(format!(
+                        "record {id}: its bytes do not match the digest {digest} its link names"
+                    ));
+                }
                 let artifact = need(facts.artifact, "artifact")?;
                 records.push(ArchivedRecord {
                     artifact_id: artifact

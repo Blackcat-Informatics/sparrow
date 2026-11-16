@@ -4,7 +4,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-/// Why a segment could not be read, decoded or restored. Every variant names the path or
+/// Why a segment could not be read, decoded or extracted. Every variant names the path or
 /// evidence it concerns, so a failure is never a silent pass.
 #[derive(Debug)]
 pub enum ArchiveError {
@@ -27,8 +27,11 @@ pub enum ArchiveError {
         /// What is missing or inconsistent, naming the evidence.
         reason: String,
     },
-    /// The destination store refused a restore.
-    Store(sparrow_core::Error),
+    /// No segment holds the artifact.
+    NotFound {
+        /// The artifact identity asked for.
+        artifact_id: String,
+    },
 }
 
 impl fmt::Display for ArchiveError {
@@ -39,17 +42,18 @@ impl fmt::Display for ArchiveError {
                 write!(f, "segment {} is corrupt: {reason}", path.display())
             }
             Self::Incomplete { reason } => write!(f, "segment evidence is incomplete: {reason}"),
-            Self::Store(error) => write!(f, "store refused the restore: {error}"),
+            Self::NotFound { artifact_id } => {
+                write!(f, "no segment under the directory holds {artifact_id}")
+            }
         }
     }
 }
 
 impl std::error::Error for ArchiveError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            Self::Store(error) => Some(error),
-            _ => None,
-        }
+        let Self::Io { source, .. } = self else {
+            return None;
+        };
+        Some(source)
     }
 }

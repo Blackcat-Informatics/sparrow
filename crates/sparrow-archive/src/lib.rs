@@ -4,14 +4,14 @@
 //! Offline reader for archived Sparrow segments (`docs/archive-format.md`).
 //!
 //! A segment is one GTS file, read into memory and decoded by one function,
-//! `decode::decode`, the only code that knows the byte format. Nothing here opens a live store or writes to the archive;
-//! [`restore`] writes only into the store the caller hands it.
+//! `decode::decode`, the only code that knows the byte format. Nothing here opens a live
+//! store or writes to the archive; [`extract`] returns one artifact's bytes to the caller.
 
 mod decode;
 mod error;
-mod restore;
+mod extract;
 mod segment;
 
 pub use error::ArchiveError;
-pub use restore::{RestoreReport, restore};
+pub use extract::extract;
 pub use segment::{ArchivedArtifact, ArchivedRecord, Segment, Summary, list_segments};

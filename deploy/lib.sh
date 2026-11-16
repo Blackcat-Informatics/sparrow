@@ -11,9 +11,6 @@
 #   SPARROW_PREFIX    images, CLI link and lexicons         /usr/local
 #   SPARROW_CONFIG    the daemon's configuration            /etc/sparrow/server.toml
 #   SPARROW_BIN       the kept images (make install-bin)    <repository>/bin
-#   SPARROW_BACKUPS   the online backup root, on the NAS    /net/synology/archives/sparrow
-#   SPARROW_INTAKE    the watched intake tree                /SPARROW/intake
-#   SPARROW_PRE_UPGRADE_MAX_HOURS  the oldest pre-upgrade backup accepted        24
 
 DEPLOY_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(cd -- "$DEPLOY_DIR/.." && pwd)
@@ -22,13 +19,10 @@ SPARROW_SCOPE=${SPARROW_SCOPE:-system}
 SPARROW_PREFIX=${SPARROW_PREFIX:-/usr/local}
 SPARROW_CONFIG=${SPARROW_CONFIG:-/etc/sparrow/server.toml}
 SPARROW_BIN=${SPARROW_BIN:-$REPO_DIR/bin}
-SPARROW_BACKUPS=${SPARROW_BACKUPS:-/net/synology/archives/sparrow}
-SPARROW_INTAKE=${SPARROW_INTAKE:-/SPARROW/intake}
 LIBEXEC=$SPARROW_PREFIX/libexec/sparrow
 CLI_LINK=$SPARROW_PREFIX/bin/sparrow
 # The daemon takes up to TimeoutStopSec (120 s) to drain; startup can wait longer for disk space.
 READY_SECONDS=${SPARROW_READY_SECONDS:-120}
-PRE_UPGRADE_MAX_HOURS=${SPARROW_PRE_UPGRADE_MAX_HOURS:-24}
 
 case $SPARROW_SCOPE in
     system) SYSTEMCTL=(systemctl) ;;
@@ -214,39 +208,7 @@ refuse_schema_downgrade() {
     new=$(image_schema "$daemon") || exit 1
     old=$(image_schema "$current") || exit 1
     ((new >= old)) || die "${daemon##*/} is schema $new, older than the current $current; it \
-cannot open a store that image upgraded. Fix forward, or restore the pre-upgrade backup \
-(RECOVERY.md, \"Rollback\")"
-}
-
-# Raising the schema may upgrade the store's format, after which only a backup taken before can go
-# back. Require the named pre-upgrade backup of the current image (README.md, "Upgrades and
-# rollback"); the backup rotation never prunes it. It must also be fresh: taken after the image link
-# was last set (start.sh and restart.sh set it at every start, a restore included), so a copy that
-# predates a restore is refused, and within PRE_UPGRADE_MAX_HOURS of now.
-require_pre_upgrade_backup() {
-    local daemon=$1 current backup new old taken taken_at linked_at
-    current=$(readlink -- "$LIBEXEC/sparrowd" 2>/dev/null || true)
-    [[ -n $current ]] || return 0
-    new=$(image_schema "$daemon") || exit 1
-    old=$(image_schema "$current") || exit 1
-    ((new > old)) || return 0
-    backup=$SPARROW_BACKUPS/pre-upgrade-$current
-    grep -qx "image=$current" "$backup/SOURCE" 2>/dev/null || die "${daemon##*/} raises the schema \
-from $old to $new; take the named pre-upgrade backup first: sudo deploy/pre-upgrade-backup.sh \
-(README.md, \"Upgrades and rollback\")"
-    # The RFC 3339 instant the daemon started the online backup (sparrow-backup's taken_utc).
-    taken=$(sed -n 's/^taken_utc=//p' "$backup/SOURCE")
-    taken_at=$(date -u -d "$taken" +%s 2>/dev/null) && [[ -n $taken ]] \
-        || die "$backup/SOURCE records no taken_utc; retire it and take a new one with deploy/pre-upgrade-backup.sh"
-    # The link's own time (no -L): when start.sh or restart.sh last pointed it at the image.
-    linked_at=$(stat -c %Y -- "$LIBEXEC/sparrowd")
-    ((taken_at >= linked_at)) || die "$backup was taken at $taken, before $current was last started \
-($(date -u -d "@$linked_at" +%Y%m%dT%H%M%SZ)); it may predate a restore. Retire it \
-(mv -T $backup $backup.retired-$taken) and take a new one: sudo deploy/pre-upgrade-backup.sh"
-    ((EPOCHSECONDS - taken_at <= PRE_UPGRADE_MAX_HOURS * 3600)) || die "$backup was taken at $taken, \
-more than $PRE_UPGRADE_MAX_HOURS hours ago; retire it (mv -T $backup $backup.retired-$taken) and take \
-a new one: sudo deploy/pre-upgrade-backup.sh"
-    note "pre-upgrade backup $backup (taken $taken) holds the store as $current left it"
+cannot open a store that image upgraded. Fix forward (RECOVERY.md, \"Rollback\")"
 }
 
 # Point the stable names at an image pair, keeping the pair they named as .previous.
@@ -261,17 +223,6 @@ select_current() {
     swap_link "$LIBEXEC/sparrow" "${cli##*/}"
     install -d -m 0755 -- "$(dirname -- "$CLI_LINK")"
     swap_link "$CLI_LINK" "$LIBEXEC/sparrow"
-}
-
-# Hold the backup's lock for the rest of the script, so a backup and an image switch cannot
-# interleave: the backup records the image the link names. Refuses rather than waits, because an
-# online backup can run for as long as its copy to the NAS takes.
-hold_backup_lock() {
-    # No backup directory yet means no backup has ever run, so none can be running.
-    [[ -d $SPARROW_BACKUPS ]] || return 0
-    exec {BACKUP_LOCK}>>"$SPARROW_BACKUPS/.lock"
-    flock -n "$BACKUP_LOCK" || die "a backup holds $SPARROW_BACKUPS/.lock; wait for it to finish \
-(journalctl -u sparrow-backup.service) and run this again"
 }
 
 # The unit's ActiveState. is-active's exit status is 0 only for "active", so gating on it treats a
@@ -455,7 +406,7 @@ free_bytes() {
 # Rewrite the closed store DATA so that it and every file in it have copy-on-write off. The copy
 # is made in a no-copy-on-write sibling, its file list, sizes and bytes are compared with DATA, and
 # it then takes DATA's name. The original is kept, renamed DATA.cow-STAMP, for the operator to
-# remove once a backup of the converted store has verified.
+# remove once the converted store has been checked.
 convert_store_no_cow() {
     local data partial kept need free link files
     data=$(realpath -e -- "$1") || die "$1 does not exist"

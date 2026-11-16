@@ -14,9 +14,10 @@ mod shutdown;
 
 /// How often the daemon compares filesystem free space with its floor while it waits to open.
 const SPACE_CHECK_INTERVAL: std::time::Duration = sparrow_server::serving::SPACE_CHECK_INTERVAL;
-/// Also the contract `deploy/verify-backup.sh` reads to tell an image with query-only mode
-/// and, for its migration measurements, an image with `--no-intake` or `--private-intake`.
-const USAGE: &str = "usage: sparrowd --config FILE.toml [--query-only | --no-intake | --private-intake DIR] | sparrowd --restore-backup BACKUP_ROOT [BACKUP_ID] EMPTY_DIR";
+/// Also the contract the deploy scripts read to tell an image with query-only mode and, for
+/// migration measurements, an image with `--no-intake` or `--private-intake`.
+const USAGE: &str =
+    "usage: sparrowd --config FILE.toml [--query-only | --no-intake | --private-intake DIR]";
 
 /// The daemon's mode, from its command line.
 enum Mode {
@@ -44,24 +45,6 @@ fn arguments(args: &[String]) -> Result<(&str, Mode), Box<dyn std::error::Error>
         }
     }
     Ok((path.ok_or(USAGE)?, mode.unwrap_or(Mode::Normal)))
-}
-
-/// Restore an online backup into an empty directory, offline: no daemon, socket or store opens.
-fn restore_backup(
-    root: &str,
-    id: Option<&str>,
-    target: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let id = id
-        .map(|id| {
-            id.parse::<u32>()
-                .map_err(|_| format!("backup id {id} is not a number"))
-        })
-        .transpose()?;
-    let restored = sparrow_core::restore_backup(Path::new(root), id, Path::new(target))
-        .map_err(|error| format!("{}: {}", error.code, error.message))?;
-    eprintln!("sparrowd: restored backup {restored} from {root} into {target}");
-    Ok(())
 }
 
 /// Wait for the workers the daemon started and return the failure of the first that ends.
@@ -123,19 +106,12 @@ async fn worker_health(
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        ["--restore-backup", root, target] => return restore_backup(root, None, target),
-        ["--restore-backup", root, id, target] => return restore_backup(root, Some(id), target),
-        _ => {}
-    }
     let (path, mode) = arguments(&args)?;
     let mut config = ServerConfig::read(Path::new(path))?;
     // A no-intake daemon writes and runs maintenance but, like a query-only one, opens no
     // stored watch root, so a copy of a store never consumes the intake its catalog names.
     // A private-intake daemon opens every watch at a private root instead.
     let intake = !matches!(mode, Mode::NoIntake);
-    // Both writable copy modes serve a disposable copy, which never backs up.
-    let copy = matches!(mode, Mode::NoIntake | Mode::PrivateIntake(_));
     let private = match &mode {
         Mode::QueryOnly => {
             config = config.into_query_only()?;
@@ -324,16 +300,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_syslog(syslog_registry);
     if let Some((_, socket)) = &ingest {
         rpc = rpc.with_ingest_socket(socket.clone());
-    }
-    // Only the daemon serving the live intake backs up; a query-only one refuses at its write
-    // gate, and a no-intake or private-intake one serves a copy (the latter also refused any
-    // `backup_root` above, in ServerConfig::check_private_intake).
-    if copy {
-        rpc = rpc.without_backup_for_copy();
-    } else if !config.query_only
-        && let Some(target) = config.backup_target()?
-    {
-        rpc = rpc.with_backup(target);
     }
     if config.query_only {
         rpc = rpc.query_only();

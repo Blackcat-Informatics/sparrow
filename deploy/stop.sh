@@ -4,8 +4,7 @@
 #
 # Stop Sparrow through systemd and the daemon's own SIGINT drain (workers drained, WAL
 # synchronized, socket removed), bounded by the unit's TimeoutStopSec. Reports the claims it still
-# held and whether the drain finished. The timers are left as they are: the backup refuses to run
-# while the service is stopped, and the shipper only fills roots.
+# held and whether the drain finished. The timer is left as it is: the shipper only fills roots.
 set -euo pipefail
 umask 022
 
@@ -21,7 +20,7 @@ trap 'rm -rf -- "$WORK"' EXIT
 
 drain_stop
 if [[ $SPARROW_SCOPE == system ]]; then
-    for timer in sparrow-ship.timer sparrow-backup.timer; do
+    for timer in sparrow-ship.timer; do
         note "$timer is $("${SYSTEMCTL[@]}" is-active "$timer" || true)"
     done
 fi

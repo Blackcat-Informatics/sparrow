@@ -290,7 +290,8 @@ struct Status {
   # uniqueJsonProjections then count only the keys through the `store-counters` watermark;
   # they are not totals until this is false.
   countsPending @54 :Bool;
-  # Schema 70: the online backup into the configured backup_root (#156).
+  # Schema 70: the online backup (#156), removed in #330. The ordinal stays reserved; the daemon
+  # always reports phase `unconfigured`, an empty root and no failure.
   backup @55 :BackupStatus;
   # Schema 71 (additive, #215): gap evidence lost to a full producer-stream or receiver-window
   # registry since the daemon started. The logs were taken; only the stream's window is absent.
@@ -375,9 +376,7 @@ struct StreamEvidenceLoss {
   otherStreamsExact @5 :Bool;
   totalBatches @6 :UInt64; totalEvents @7 :UInt64;
 }
-# The online backup (#156). `unconfigured` when the daemon has no backup_root or runs
-# --no-intake or --query-only; otherwise the latest backup since the daemon started. Times are
-# Unix milliseconds, 0 until set; `backupId`, `files` and `bytes` are 0 until a backup completes.
+# The removed online backup (#156, #330); kept only for `Status.backup` and the `backup` method.
 enum BackupPhase { unconfigured @0; idle @1; running @2; complete @3; failed @4; }
 struct BackupStatus {
   phase @0 :BackupPhase; root @1 :Text; keep @2 :UInt32;
@@ -992,8 +991,7 @@ interface Sparrow {
   # Administration: retire a claim that can never complete (claimed, private source missing,
   # never published). Refused for a recoverable or published claim.
   watchClaimRetire @52 (request :WatchClaimRetire) -> (result :Result(RetiredClaim));
-  # Administration (schema 70, #156): start an online backup into the configured backup_root
-  # and return at once; status reports its progress. Refused while one runs (CONFLICT).
+  # Removed (#330). The ordinal stays; the server answers UNSUPPORTED (a query-only daemon: READ_ONLY).
   backup @53 (storeId :Text) -> (result :Result(BackupStatus));
   # Schema 71: read-only per-claim states; every pending claim and every completed or
   # abandoned claim whose pending span (reservation to latest pending attempt) overlaps the

@@ -17,7 +17,6 @@ pub(crate) mod archive;
 mod archive_encode;
 pub(crate) mod archive_segment;
 mod artifact_rdf;
-pub(crate) mod backup;
 mod event_fallback_rdf;
 pub(crate) mod forced_compaction;
 #[cfg(feature = "test-support")]
@@ -547,8 +546,6 @@ struct Unlocked {
     /// Source and artifact listings still reading what the source-summary migration owes.
     source_builds: Mutex<source_read::Builds>,
     artifact_builds: Mutex<artifact_read::Builds>,
-    /// The one online backup slot (#156); a backup never takes the writer lock.
-    backup: backup::Slot,
     /// Wakes the maintenance worker's retention duty after an event that changes what
     /// expiry may retire: a pin release or commit and an archive commit.
     retention_waker: Arc<Mutex<Option<RetentionWaker>>>,
@@ -1460,13 +1457,11 @@ impl Writer {
 
 /// The bytes the store occupies: every file under the database directory except
 /// the ones RocksDB no longer references. Obsolete table and blob files and
-/// write-ahead logs normally vanish as soon as they become obsolete; an online
-/// backup holds them until its copy ends (#156), and they must not count against
-/// the disk budget, or a backup would refuse writes and evict evidence. Table and
-/// blob files therefore count at most the bytes every family's versions still
-/// reference, and logs below the oldest one recovery needs do not count. The
-/// filesystem's free-space floor, which sees the held files, is guarded by the
-/// backup itself (backup::start).
+/// write-ahead logs normally vanish as soon as they become obsolete; while RocksDB
+/// holds them they must not count against the disk budget, or the store would
+/// refuse writes and evict evidence. Table and blob files therefore count at most
+/// the bytes every family's versions still reference, and logs below the oldest
+/// one recovery needs do not count.
 pub(super) fn linked_physical_bytes(db: &DB) -> Result<u64, Error> {
     /// RocksDB deletes obsolete WAL and SST files while the walk runs. A file
     /// removed between listing and inspection no longer occupies space, so it
@@ -1765,7 +1760,6 @@ impl Store {
                 recompression: recompression.published(),
                 source_builds: Mutex::default(),
                 artifact_builds: Mutex::default(),
-                backup: backup::Slot::default(),
                 retention_waker,
                 import_slot_waker: Mutex::new(None),
                 import_reclaim_waker: Mutex::new(None),
@@ -1836,31 +1830,6 @@ impl Store {
     #[must_use]
     pub fn open_phases(&self) -> &[OpenPhase] {
         &self.open_phases
-    }
-
-    /// Start an online backup into `target` on its own thread and return at once (#156). It
-    /// clones the database handle the unlocked readers share and never takes the writer lock,
-    /// so ingest, maintenance and reads continue throughout. A request while a backup runs is
-    /// refused with `CONFLICT`.
-    pub fn backup_start(
-        &self,
-        target: &backup::BackupTarget,
-        now: u64,
-    ) -> Result<backup::BackupStatus, Error> {
-        backup::start(
-            &self.unlocked.backup,
-            Arc::clone(&self.unlocked.db),
-            self.space.clone(),
-            self.id.to_string(),
-            target,
-            now,
-        )
-    }
-
-    /// The latest online backup since the store opened, without the writer lock.
-    #[must_use]
-    pub fn backup_status(&self) -> backup::BackupStatus {
-        self.unlocked.backup.status()
     }
 
     /// Return the immutable identity validated at open, without waiting for a writer.
@@ -1972,51 +1941,6 @@ impl Store {
             intake,
             now,
             mode,
-        )
-    }
-
-    /// Restore one archived artifact under its original artifact and record identities
-    /// and its original receipt time. `record_ids` must name exactly the records the
-    /// format splits `bytes` into, in source order. A stable request identity returns the
-    /// first restore's receipt, so repeating a restore adds nothing; an identity that
-    /// already names other evidence is a `CONFLICT`.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the ingest request plus the original identities and receipt time it is restored under"
-    )]
-    pub fn restore_artifact(
-        &self,
-        request_id: &str,
-        source: &str,
-        format: &str,
-        bytes: &[u8],
-        artifact_id: &str,
-        record_ids: &[String],
-        received_at: u64,
-    ) -> Result<Artifact, Error> {
-        let well_formed =
-            |id: &str, kind: &str| id.len() > kind.len() && id.len() <= 128 && id.starts_with(kind);
-        if !well_formed(artifact_id, "artifact:")
-            || record_ids.iter().any(|id| !well_formed(id, "record:"))
-        {
-            return Err(Error::new(
-                "INVALID_ARGUMENT",
-                "restore requires artifact: and record: identities",
-            ));
-        }
-        let restore = ingest::Restore {
-            artifact_id: artifact_id.to_owned(),
-            record_ids: record_ids.to_vec(),
-        };
-        self.ingest_input(
-            request_id,
-            source,
-            format,
-            bytes,
-            ingest::Origin::Restore(&restore),
-            None,
-            received_at,
-            durability::Durability::Durable,
         )
     }
 
@@ -2224,40 +2148,13 @@ impl Store {
             .tail()
             .map(|input| tail::prepare(&writer, source, format, input, record_count, now))
             .transpose()?;
-        let id = match origin.restore() {
-            Some(restore) => {
-                if restore.record_ids.len() != record_count {
-                    return Err(Error::new(
-                        "INVALID_ARGUMENT",
-                        "restore names a different number of records than the bytes hold",
-                    ));
-                }
-                let taken = std::iter::once(restore.artifact_id.as_str())
-                    .chain(restore.record_ids.iter().map(String::as_str))
-                    .try_fold(false, |taken, id| {
-                        writer.db.get(id).map(|row| taken || row.is_some())
-                    })?;
-                if taken {
-                    return Err(Error::new(
-                        "CONFLICT",
-                        "restore identity already names evidence in this store",
-                    ));
-                }
-                restore.artifact_id.clone()
-            }
-            None => random_id("artifact")?,
-        };
+        let id = random_id("artifact")?;
         let mut prepared = ingest::RecordBatch::new(&writer)?;
         let mut records = Vec::new();
         let mut start = 0;
         for (ordinal, end) in record_ends(format, bytes, true).enumerate() {
             let record = prepared.record(ingest::RecordInput {
-                id: match origin.restore() {
-                    Some(restore) => restore.record_ids.get(ordinal).cloned().ok_or_else(|| {
-                        Error::new("INVALID_ARGUMENT", "restore names too few records")
-                    })?,
-                    None => random_id("record")?,
-                },
+                id: random_id("record")?,
                 artifact_id: &id,
                 source,
                 format,
