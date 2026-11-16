@@ -1,0 +1,23 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 31c654b931686a339b364823a3c42d2116a35ccd
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 337
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/337
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 17f4cfebbf85b2a08eee35e8cd82ff642f14225e
+GhpRsq-Head-Ref: paudley/315-design-stop-persisting-the-device
+GhpRsq-Head-OID: 31c654b931686a339b364823a3c42d2116a35ccd
+GhpRsq-Result-Tree: 390149e9b8be032b0603cc5b73ab529ffd13be38
+GhpRsq-Result-Commit: 0b65d179d5b7329613ecb4fd6401031ea2efb8fd
+GhpRsq-Parent-Hashes: 31c654b931686a339b364823a3c42d2116a35ccd
+GhpRsq-Squash-Notes-SHA256: f393d1def735f9f127bce700d27b1135bfb2041d264c6597f9d351aa0f14bf8f
+GhpRsq-Stage-Tree: 9b943c0f999936ce8acc50884cafe37f78fc070c
+GhpRsq-Stage-Commit: d2b5d91d57333616f092c149204f163b1ef7bd45
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/d2b5d91d57333616f092c149204f163b1ef7bd45
+GhpRsq-Stage-Ref: refs/ghprsq/pr/337/stage
+GhpRsq-Stage-Files: 14
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/d2b5d91d57333616f092c149204f163b1ef7bd45
