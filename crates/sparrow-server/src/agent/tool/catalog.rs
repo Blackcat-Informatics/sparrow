@@ -59,6 +59,10 @@ const TOOLS: &[(&str, &str)] = &[
         "Read a currently configured syslog listener under its exact store/source: framing, bounds, binding and process-scoped observed counters. Continuity and UDP kernel loss remain unknown; counters reset on restart.",
     ),
     (
+        "payload_lookup",
+        "Read which held artifacts carry one payload id (blake3: and the 64-hex digest of an artifact's bytes), one page by artifact id. answer_certainty is exact once the payload-index migration is complete; while it runs, every listed artifact is held and an unlisted one is unknown, not absent. An artifact leaves the index when it is evicted or its entry is deleted.",
+    ),
+    (
         "producer_stream_get",
         "Read a finite accepted producer window, exact aggregate unobserved positions and bounded recent gaps; prefix and trailing continuity remain unknown.",
     ),
@@ -303,6 +307,17 @@ pub(crate) fn definitions() -> Value {
                 .with("source", string())
                 .with("listener_id", string());
             required.extend(["store_id", "source", "listener_id"]);
+        }
+        if *name == "payload_lookup" {
+            properties = properties
+                .with("store_id", string())
+                .with("payload_id", string())
+                .with("page_size", integer(1000))
+                .with(
+                    "cursor",
+                    Object::new().with("type", Value::array(["string", "null"])),
+                );
+            required.extend(["store_id", "payload_id"]);
         }
         if *name == "producer_stream_get" {
             properties = properties

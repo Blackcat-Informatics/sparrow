@@ -447,6 +447,84 @@ const STORE_COUNTERS: [[&[u8]; 11]; 5] = [
     STORE_COUNTERS_INTAKE_ARCHIVE,
 ];
 
+// Payload id index (#323): older binaries cannot write or delete a `payload-id:` key with the
+// artifact entry it follows. Each family lifts one store counter family by 55, keeping its
+// log time, archive and intake switches.
+const PAYLOAD_INDEX_TRACING: [&[u8]; 11] = [
+    b"sparrow.store/352",
+    b"sparrow.store/353",
+    b"sparrow.store/354",
+    b"sparrow.store/355",
+    b"sparrow.store/356",
+    b"sparrow.store/357",
+    b"sparrow.store/358",
+    b"sparrow.store/359",
+    b"sparrow.store/360",
+    b"sparrow.store/361",
+    b"sparrow.store/362",
+];
+const PAYLOAD_INDEX_LOG_TIME: [&[u8]; 11] = [
+    b"sparrow.store/363",
+    b"sparrow.store/364",
+    b"sparrow.store/365",
+    b"sparrow.store/366",
+    b"sparrow.store/367",
+    b"sparrow.store/368",
+    b"sparrow.store/369",
+    b"sparrow.store/370",
+    b"sparrow.store/371",
+    b"sparrow.store/372",
+    b"sparrow.store/373",
+];
+const PAYLOAD_INDEX_ARCHIVE: [&[u8]; 11] = [
+    b"sparrow.store/374",
+    b"sparrow.store/375",
+    b"sparrow.store/376",
+    b"sparrow.store/377",
+    b"sparrow.store/378",
+    b"sparrow.store/379",
+    b"sparrow.store/380",
+    b"sparrow.store/381",
+    b"sparrow.store/382",
+    b"sparrow.store/383",
+    b"sparrow.store/384",
+];
+const PAYLOAD_INDEX_INTAKE: [&[u8]; 11] = [
+    b"sparrow.store/385",
+    b"sparrow.store/386",
+    b"sparrow.store/387",
+    b"sparrow.store/388",
+    b"sparrow.store/389",
+    b"sparrow.store/390",
+    b"sparrow.store/391",
+    b"sparrow.store/392",
+    b"sparrow.store/393",
+    b"sparrow.store/394",
+    b"sparrow.store/395",
+];
+const PAYLOAD_INDEX_INTAKE_ARCHIVE: [&[u8]; 11] = [
+    b"sparrow.store/396",
+    b"sparrow.store/397",
+    b"sparrow.store/398",
+    b"sparrow.store/399",
+    b"sparrow.store/400",
+    b"sparrow.store/401",
+    b"sparrow.store/402",
+    b"sparrow.store/403",
+    b"sparrow.store/404",
+    b"sparrow.store/405",
+    b"sparrow.store/406",
+];
+
+/// Families the payload index fence lifts, in the order of their lifted counterparts.
+const PAYLOAD_INDEX: [[&[u8]; 11]; 5] = [
+    PAYLOAD_INDEX_TRACING,
+    PAYLOAD_INDEX_LOG_TIME,
+    PAYLOAD_INDEX_ARCHIVE,
+    PAYLOAD_INDEX_INTAKE,
+    PAYLOAD_INDEX_INTAKE_ARCHIVE,
+];
+
 fn position(families: &[[&'static [u8]; 11]; 5], format: &[u8]) -> Option<(usize, usize)> {
     families
         .iter()
@@ -463,6 +541,8 @@ fn position(families: &[[&'static [u8]; 11]; 5], format: &[u8]) -> Option<(usize
 /// format lifts;
 /// other formats are unchanged.
 fn lower(format: &[u8]) -> &[u8] {
+    let format = position(&PAYLOAD_INDEX, format)
+        .map_or(format, |(family, index)| STORE_COUNTERS[family][index]);
     let format = position(&STORE_COUNTERS, format)
         .map_or(format, |(family, index)| SOURCE_SUMMARY[family][index]);
     let format = position(&SOURCE_SUMMARY, format)
@@ -490,8 +570,13 @@ fn relift<'a>(current: &[u8], next: &'a [u8]) -> Result<&'a [u8], Error> {
     } else {
         next
     };
-    if has_store_counters(current) {
-        enable_store_counters(next)
+    let next = if has_store_counters(current) {
+        enable_store_counters(next)?
+    } else {
+        next
+    };
+    if has_payload_index(current) {
+        enable_payload_index(next)
     } else {
         Ok(next)
     }
@@ -516,8 +601,15 @@ pub(super) fn lower_source_summary(format: &[u8]) -> &[u8] {
 /// The source summary identity a store counter family lifts; other formats are unchanged.
 #[cfg(feature = "test-support")]
 pub(super) fn lower_store_counters(format: &[u8]) -> &[u8] {
+    let format = lower_payload_index(format);
     position(&STORE_COUNTERS, format)
         .map_or(format, |(family, index)| SOURCE_SUMMARY[family][index])
+}
+
+/// The store counter identity a payload index family lifts; other formats are unchanged.
+#[cfg(feature = "test-support")]
+pub(super) fn lower_payload_index(format: &[u8]) -> &[u8] {
+    position(&PAYLOAD_INDEX, format).map_or(format, |(family, index)| STORE_COUNTERS[family][index])
 }
 
 pub(super) fn has_source_summary(format: &[u8]) -> bool {
@@ -525,11 +617,31 @@ pub(super) fn has_source_summary(format: &[u8]) -> bool {
 }
 
 pub(super) fn has_store_counters(format: &[u8]) -> bool {
-    position(&STORE_COUNTERS, format).is_some()
+    position(&STORE_COUNTERS, format).is_some() || has_payload_index(format)
+}
+
+pub(super) fn has_payload_index(format: &[u8]) -> bool {
+    position(&PAYLOAD_INDEX, format).is_some()
+}
+
+/// Fence a current store counter family for the payload id index (#323); idempotent.
+pub(super) fn enable_payload_index(format: &[u8]) -> Result<&'static [u8], Error> {
+    position(&PAYLOAD_INDEX, format)
+        .or_else(|| position(&STORE_COUNTERS, format))
+        .map(|(family, index)| PAYLOAD_INDEX[family][index])
+        .ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "the payload id index requires a store counter authority family",
+            )
+        })
 }
 
 /// Fence a current source summary family for the store counters; idempotent.
 pub(super) fn enable_store_counters(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {
+        return Ok(PAYLOAD_INDEX[family][index]);
+    }
     position(&STORE_COUNTERS, format)
         .or_else(|| position(&SOURCE_SUMMARY, format))
         .map(|(family, index)| STORE_COUNTERS[family][index])
@@ -544,6 +656,9 @@ pub(super) fn enable_store_counters(format: &[u8]) -> Result<&'static [u8], Erro
 /// Fence a current owner graph family for the per-source counters and artifact index;
 /// idempotent.
 pub(super) fn enable_source_summary(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {
+        return Ok(PAYLOAD_INDEX[family][index]);
+    }
     if let Some((family, index)) = position(&STORE_COUNTERS, format) {
         return Ok(STORE_COUNTERS[family][index]);
     }
@@ -560,6 +675,9 @@ pub(super) fn enable_source_summary(format: &[u8]) -> Result<&'static [u8], Erro
 
 /// Fence a current event fallback family for the owner-to-graph index; idempotent.
 pub(super) fn enable_owner_graphs(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {
+        return Ok(PAYLOAD_INDEX[family][index]);
+    }
     if let Some((family, index)) = position(&STORE_COUNTERS, format) {
         return Ok(STORE_COUNTERS[family][index]);
     }
@@ -579,6 +697,9 @@ pub(super) fn enable_owner_graphs(format: &[u8]) -> Result<&'static [u8], Error>
 
 /// Fence a current tracing-or-later family for receipt-time fallback RDF; idempotent.
 pub(super) fn enable_event_fallback(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {
+        return Ok(PAYLOAD_INDEX[family][index]);
+    }
     if let Some((family, index)) = position(&STORE_COUNTERS, format) {
         return Ok(STORE_COUNTERS[family][index]);
     }
@@ -616,6 +737,7 @@ fn families() -> impl Iterator<Item = &'static &'static [u8]> {
         .chain(OWNER_GRAPH.iter().flatten())
         .chain(SOURCE_SUMMARY.iter().flatten())
         .chain(STORE_COUNTERS.iter().flatten())
+        .chain(PAYLOAD_INDEX.iter().flatten())
 }
 
 fn base_index(format: &[u8], purpose: &str) -> Result<usize, Error> {
@@ -764,6 +886,7 @@ pub(super) fn read(db: &DB) -> Result<Option<Vec<u8>>, Error> {
             .chain(OWNER_GRAPH.iter().flatten())
             .chain(SOURCE_SUMMARY.iter().flatten())
             .chain(STORE_COUNTERS.iter().flatten())
+            .chain(PAYLOAD_INDEX.iter().flatten())
             .position(|identity| *identity == raw)
             .map_or(raw.clone(), |index| BASE[index % BASE.len()].to_vec())
     }))
@@ -862,6 +985,11 @@ mod tests {
             STORE_COUNTERS_ARCHIVE,
             STORE_COUNTERS_INTAKE,
             STORE_COUNTERS_INTAKE_ARCHIVE,
+            PAYLOAD_INDEX_TRACING,
+            PAYLOAD_INDEX_LOG_TIME,
+            PAYLOAD_INDEX_ARCHIVE,
+            PAYLOAD_INDEX_INTAKE,
+            PAYLOAD_INDEX_INTAKE_ARCHIVE,
         ] {
             for (base, format) in BASE.into_iter().zip(family) {
                 db.put("store_format", format).unwrap();
@@ -1092,6 +1220,50 @@ mod tests {
                 .chain(FALLBACK.iter())
                 .chain(OWNER_GRAPH.iter())
                 .chain(SOURCE_SUMMARY.iter())
+                .all(|family| !family.contains(identity))
+            );
+        }
+        // The payload index fence lifts every store counter family, keeps its switches and
+        // every earlier fence, and no older binary knows its identities.
+        for index in 0..BASE.len() {
+            for (counters, payload) in STORE_COUNTERS.iter().zip(PAYLOAD_INDEX.iter()) {
+                assert_eq!(
+                    enable_payload_index(counters[index]).unwrap(),
+                    payload[index]
+                );
+                for enable in [
+                    enable_payload_index,
+                    enable_store_counters,
+                    enable_source_summary,
+                    enable_owner_graphs,
+                    enable_event_fallback,
+                ] {
+                    assert_eq!(enable(payload[index]).unwrap(), payload[index]);
+                }
+                assert!(has_payload_index(payload[index]) && has_store_counters(payload[index]));
+                assert!(!has_payload_index(counters[index]));
+            }
+            assert!(enable_payload_index(SOURCE_SUMMARY_TRACING[index]).is_err());
+            assert_eq!(
+                enable_archive(PAYLOAD_INDEX_LOG_TIME[index]).unwrap(),
+                PAYLOAD_INDEX_ARCHIVE[index]
+            );
+            assert_eq!(
+                enable_intake(PAYLOAD_INDEX_ARCHIVE[index]).unwrap(),
+                PAYLOAD_INDEX_INTAKE_ARCHIVE[index]
+            );
+        }
+        for identity in PAYLOAD_INDEX.iter().flatten() {
+            assert!(
+                [
+                    BASE, RDF, ALL_RDF, PROVENANCE, TRACING, LOG_TIME, ARCHIVE, INTAKE
+                ]
+                .iter()
+                .chain(LIFTED.iter())
+                .chain(FALLBACK.iter())
+                .chain(OWNER_GRAPH.iter())
+                .chain(SOURCE_SUMMARY.iter())
+                .chain(STORE_COUNTERS.iter())
                 .all(|family| !family.contains(identity))
             );
         }

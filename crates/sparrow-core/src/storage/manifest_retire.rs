@@ -120,6 +120,13 @@ pub(super) fn evicted_flag(bytes: &[u8]) -> Result<bool, Error> {
     State::decode(bytes).map(|state| state.evicted)
 }
 
+/// Whether an encoded manifest retirement state has released any of its artifact's bytes: the
+/// complete artifact is evicted, or expiry or eviction has already retired chunks (their
+/// references are decremented and unreferenced payload deleted) while the entry stays.
+pub(super) fn releases_bytes(bytes: &[u8]) -> Result<bool, Error> {
+    State::decode(bytes).map(|state| state.evicted || state.retired > 0)
+}
+
 /// Apply effective ownership only to stored catalogs, never to original retry receipts.
 pub(super) fn resolve(writer: &Writer, artifact: &mut Artifact) -> Result<(), Error> {
     if let Some(state) = State::read(&writer.db, &artifact.id)? {

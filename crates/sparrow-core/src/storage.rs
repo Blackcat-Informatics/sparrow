@@ -26,6 +26,8 @@ mod tracing_rdf;
 #[cfg(feature = "test-support")]
 pub use artifact_rdf::retire_artifact_rdf_for_legacy_fixture;
 #[cfg(feature = "test-support")]
+pub use payload_index::remove_payload_index_for_legacy_fixture;
+#[cfg(feature = "test-support")]
 pub use source_summary::{SourceCountAudit, remove_source_summary_for_legacy_fixture};
 #[cfg(feature = "test-support")]
 pub use store_counters::{StoreCounterAudit, remove_store_counters_for_legacy_fixture};
@@ -48,6 +50,7 @@ pub(crate) mod listing_build;
 pub(crate) mod log_time;
 mod manifest_retire;
 pub(crate) mod migration;
+pub(crate) mod payload_index;
 pub(crate) mod pin_read;
 pub(crate) mod pressure;
 pub(crate) mod producer_stream;

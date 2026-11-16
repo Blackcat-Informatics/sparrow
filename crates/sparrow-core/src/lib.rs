@@ -72,6 +72,7 @@ pub use storage::listing_build::BuildProgress;
 pub use storage::log_time::LogTimeCapture;
 pub use storage::migration::{Migration, MigrationPage, MigrationStatus};
 pub use storage::open_files::OpenFiles;
+pub use storage::payload_index::{MAX_LOOKUP_PAGE, PayloadLookup};
 pub use storage::pin_read::PAGE_BYTES as PIN_READ_PAGE_BYTES;
 pub use storage::pin_read::{PinPageBody, PinRead, PinReadPage, PinSelector, PinSummary};
 pub use storage::pressure::{PressurePhase, PressureStatus};
@@ -137,7 +138,7 @@ pub use storage::{
 };
 #[cfg(feature = "test-support")]
 pub use storage::{
-    SourceCountAudit, StoreCounterAudit, remove_source_summary_for_legacy_fixture,
-    remove_store_counters_for_legacy_fixture,
+    SourceCountAudit, StoreCounterAudit, remove_payload_index_for_legacy_fixture,
+    remove_source_summary_for_legacy_fixture, remove_store_counters_for_legacy_fixture,
 };
 pub use text::resolve_text_analyzer;

@@ -614,7 +614,7 @@ applies the writer-format fence and seeds each migration's checkpoint durably,
 then serves. The joined maintenance worker runs the migrations in turn,
 `store-counters` first and `source-summary` second, since, until the source
 summary completes, every source and live artifact listing first reads what that
-migration still owes; each migration resumes from its own checkpoint, so the
+migration still owes, then `payload-index`; each migration resumes from its own checkpoint, so the
 order can change between images. The worker runs one bounded page per admission,
 fairly with its other duties, and each page commits its rows and checkpoint
 atomically through the ordinary write path, so a restart resumes after the last
@@ -657,6 +657,23 @@ copy the writer publishes when a change ends, so status never waits for a pass
 that holds that state across commits. Read-lease handle counts come from a ledger beside
 each listing registry, so status never waits for a registry that a listing holds
 while it waits for the writer.
+
+Content lookup reads the payload id index. An artifact's `payload_id` is the BLAKE3
+hash of all its own bytes, computed once in the ingest path, and the default family
+holds one empty-valued key `payload-id:<64 hex digest>:<artifact id>` for each complete
+artifact, so a digest's holders are one prefix scan and "do I already hold this
+content" is a point read. One owner observes every write batch and adds the key
+changes to it: an artifact entry is never created, retired (its bytes released through its
+manifest retirement state, at expiry or eviction) or deleted (expiry, recordless eviction) without its key
+following in the same atomic batch, and an archived artifact stays indexed until
+then. A store counter row counts the keys through the one batch observer, so a count
+that disagrees with the complete artifacts is detectable. Tail checkpoints, whose
+artifact is exactly the checkpointed range, recordless artifacts and published imports
+all carry the digest of the whole artifact; the parts of a consume-root set are each
+their own artifact and the digest of the whole source file is never indexed.
+The `payload-index` online migration seeds the keys of an older store in bounded pages
+with its checkpoint, as the other migrations do; until it completes, the lookup says
+it is pending, so a digest it does not list is unknown, never absent.
 
 Source and artifact discovery read three derived catalog row families instead of
 the record catalog:
