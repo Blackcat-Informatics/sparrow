@@ -368,22 +368,23 @@ mod tests {
     #[test]
     fn a_renewing_lease_ends_only_when_progress_stops_and_a_fixed_one_at_its_length() {
         let limits = RdfReadLimits {
-            lease_ms: 100,
+            lease_ms: 10_000,
             ..Default::default()
         };
         for (renewal, served) in [(LeaseRenewal::OnProgress, 20), (LeaseRenewal::Fixed, 1)] {
             let budget =
                 Budget::new_cancellable(limits, crate::QueryCancellation::default(), renewal)
                     .unwrap();
-            // Twenty reads 60 ms apart: 1.2 s of progress against a 100 ms lease.
+            // Twenty reads 6 s apart: 120 s of progress against a 10 s lease. The wide steps leave
+            // seconds of margin for real time the test itself spends under load.
             let admitted = (0..20)
                 .take_while(|_| {
-                    budget.advance(60);
+                    budget.advance(6_000);
                     budget.request(1, true).is_ok()
                 })
                 .count();
             assert_eq!(admitted, served, "{renewal:?}");
-            budget.advance(100);
+            budget.advance(10_000);
             assert_eq!(
                 budget.request(1, true).unwrap_err().code,
                 "RESULT_EXPIRED",
