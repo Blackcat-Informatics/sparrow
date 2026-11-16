@@ -1,0 +1,23 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 306103fc81a4c41e89fbb19860b1ee9b7b6a7788
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 316
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/316
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 9ceec320e3979d42e86c2c02f05ba7ad385aa820
+GhpRsq-Head-Ref: paudley/313-start-fails-after-a-reboot-tail
+GhpRsq-Head-OID: 306103fc81a4c41e89fbb19860b1ee9b7b6a7788
+GhpRsq-Result-Tree: 9ba92984571c2a33ded19337567c46ab15534f03
+GhpRsq-Result-Commit: fda28120e1d51211b75b4ac8dcf1814f474c7b05
+GhpRsq-Parent-Hashes: 306103fc81a4c41e89fbb19860b1ee9b7b6a7788
+GhpRsq-Squash-Notes-SHA256: b6947e65b4bb6d9b30b98c89b5b48b3f0baf2e88e551c59a41eb9b980a4ecff2
+GhpRsq-Stage-Tree: 6979455d36c143c2d0b7a729842b175337bcc2a2
+GhpRsq-Stage-Commit: 3a8eeac193eba96056be7d446db41928b7a2a7de
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/3a8eeac193eba96056be7d446db41928b7a2a7de
+GhpRsq-Stage-Ref: refs/ghprsq/pr/316/stage
+GhpRsq-Stage-Files: 12
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/3a8eeac193eba96056be7d446db41928b7a2a7de
