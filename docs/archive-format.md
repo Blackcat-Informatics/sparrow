@@ -35,8 +35,7 @@ Phase status: the specification and the deletion gate with its store fence
 `Store::archive_prepare`), the archive worker and NAS thread (P3,
 `sparrow_server::archive::Worker`, started by `sparrowd` when `[archive]` is
 configured and the daemon is not query-only) and the offline reader (P4, the
-`sparrow-archive` crate with its `list` and `verify` commands and a `restore`
-function). Implemented does not mean running: the worker is not installed or
+`sparrow-archive` crate with its `list`, `verify` and `extract` commands). Implemented does not mean running: the worker is not installed or
 running on the live daemon, so the live store retires nothing through it. Until
 a worker runs, an archiving store retires nothing on its own. Expiry waits, and
 under pressure ingest is refused with `STORAGE_PRESSURE`.
@@ -343,8 +342,13 @@ prints one JSON line per segment with its record, artifact and blob counts. `ver
 also fails any segment the decoder refuses, with `"ok":false` and exit 1. The tool never
 opens a live store and writes nothing.
 
-Recovery is record by record: `sparrow_archive::restore` writes chosen entries from decoded
-segments into a store under their original artifact and record identities, receipt times
-and sources, byte-exact, and repeating it adds nothing. It is not a store rebuild. The
-test `archived_segment_reimports_byte_exact` covers it. Decision 6 (original identities)
-is recorded here: the target is a fresh store, so the identities cannot collide.
+To take one artifact out of the archive with only the NAS directory and the binary:
+`sparrow-archive list DIR` prints one JSON line per segment, whose `entries` array gives
+each artifact's `id`, `source`, `received_at` (Unix milliseconds) and `byte_length`;
+`sparrow-archive verify DIR` checks every segment; and
+`sparrow-archive extract DIR ARTIFACT_ID > file` joins the artifact's records from every
+segment under `DIR` in byte order, wherever they were archived, and writes them to stdout
+only after every segment decoded with its blob digests checked and the bytes add up to the
+artifact's recorded `byteLength`. A damaged segment, an unknown id or an artifact with a
+missing record exits nonzero, names the file or artifact on stderr and writes nothing to
+stdout. There is no restore into Sparrow.

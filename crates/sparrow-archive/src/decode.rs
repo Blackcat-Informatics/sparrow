@@ -3,8 +3,8 @@
 
 //! The one place that knows the segment byte format (a GTS file, read by
 //! `purrdf::gts::reader::read`). [`decode`] turns a segment's bytes into records and
-//! artifacts; replacing the format replaces this module only. Listing, naming and the
-//! restore flow never see the format.
+//! artifacts; replacing the format replaces this module only. Listing, naming and
+//! extraction never see the format.
 
 use std::collections::BTreeMap;
 
