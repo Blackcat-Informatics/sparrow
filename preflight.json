@@ -1,0 +1,112 @@
+{
+  "issue": 341,
+  "pr_number": 343,
+  "branch": "paudley/341-archive-segments-close-on-graph-rows-as",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/341-archive-segments-close-on-graph-rows-as/.stage/archive-segments-close-on-graph-rows-as",
+  "observed_at": "2026-11-16T19:07:52.818987+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews",
+    "merge_candidate"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/341-archive-segments-close-on-graph-rows-as/.stage/archive-segments-close-on-graph-rows-as/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/341-archive-segments-close-on-graph-rows-as/.stage/archive-segments-close-on-graph-rows-as/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/341-archive-segments-close-on-graph-rows-as/.stage/archive-segments-close-on-graph-rows-as/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/341-archive-segments-close-on-graph-rows-as/.stage/archive-segments-close-on-graph-rows-as/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/341-archive-segments-close-on-graph-rows-as/.stage/archive-segments-close-on-graph-rows-as/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict.",
+    "Preflight does not sign, fetch, push or mutate forge state. API permission and read access do not prove Git push authorization or protected-branch admission."
+  ],
+  "pr": {
+    "number": 343,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Archive segments close on graph quads as well as records, to bound memory",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/343",
+    "baseRefName": "main",
+    "baseRefOid": "b265f6124bccc60e9d78ec4c174af6cf3e469783",
+    "headRefName": "paudley/341-archive-segments-close-on-graph-rows-as",
+    "headRefOid": "3a22d4963d5dc07ff07c9bc4f448fb2a46d9c0da",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/269/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "3a22d4963d5dc07ff07c9bc4f448fb2a46d9c0da",
+    "branch": "paudley/341-archive-segments-close-on-graph-rows-as",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 343,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #343 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  },
+  "preflight": {
+    "git": "/usr/bin/git",
+    "python3": "/home/paudley/stage/root/bin/python3",
+    "stagectl": "/home/paudley/stage/root/bin/stagectl",
+    "bash": "/usr/bin/bash",
+    "readlink": "/home/paudley/stage/root/bin/readlink",
+    "sed": "/usr/bin/sed",
+    "awk": "/usr/bin/awk",
+    "ghprsq": "/home/paudley/stage/agents/bin/ghprsq",
+    "archive": {
+      "files": 43,
+      "bytes": 478484160,
+      "errors": [],
+      "limits": "Read-only selected-evidence admission; full newly reachable Git object closure is checked by ghprsq before push."
+    },
+    "signing": {
+      "format": "openpgp",
+      "key_configured": true,
+      "limits": "Configuration inspected; no signing operation was performed."
+    },
+    "forge_permissions": {
+      "admin": true,
+      "push": true,
+      "pull": true
+    },
+    "merge_candidate": {
+      "base": "b265f6124bccc60e9d78ec4c174af6cf3e469783",
+      "head": "3a22d4963d5dc07ff07c9bc4f448fb2a46d9c0da",
+      "status": "clean"
+    }
+  }
+}
