@@ -239,16 +239,16 @@ pub(crate) enum ArchiveError {
     Name(String),
     /// What was read back differs from what was written, or the tables do not decode.
     Verify { path: PathBuf, reason: String },
-    /// The archive directory is on the same device as the root filesystem, so the share that
-    /// should hold it is not mounted and the directory is an ordinary local one. Nothing was
-    /// written.
+    /// The archive directory is on the root filesystem's device, or on a local filesystem of
+    /// the same type as the root's, so the share that should hold it is not mounted and the
+    /// directory is an ordinary local one. `found` names which. Nothing was written.
     NotOnMount {
         path: PathBuf,
         filesystem_root: PathBuf,
-        device: u64,
+        found: String,
     },
-    /// The archive root does not hold this store's `STORE_ID`: an unmounted mount point, or
-    /// another store's archive.
+    /// The archive root is not this store's to use: another store's `STORE_ID`, or a directory
+    /// with content but no `STORE_ID`.
     Root { path: PathBuf, reason: String },
     /// A step ran at least `io_timeout_secs`. Nothing was committed; the next pass verifies
     /// the files already on the root and commits then.
@@ -270,12 +270,12 @@ impl fmt::Display for ArchiveError {
             Self::NotOnMount {
                 path,
                 filesystem_root,
-                device,
+                found,
             } => write!(
                 f,
-                "archive directory {} is not on its expected mount: it is on device {device}, \
-                 the same as {}, so the archive share is not mounted and the directory is on \
-                 the local disk; nothing was written",
+                "archive directory {} is not on its expected mount: {found} ({} is the local \
+                 root), so the archive share is not mounted and the directory is on the local \
+                 disk; nothing was written",
                 path.display(),
                 filesystem_root.display()
             ),
@@ -331,6 +331,16 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), ArchiveError> {
     file.sync_all().map_err(io_at("sync", path))
 }
 
+/// Publish `bytes` as `<dir>/<name>`: write `<name>.partial`, sync it and rename it into
+/// place. The caller syncs `dir`. A stale partial from a crashed pass is truncated by the
+/// create. The one publication step of the archive: segments and `STORE_ID` both use it.
+fn publish(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), ArchiveError> {
+    let target = dir.join(name);
+    let partial = dir.join(format!("{name}.partial"));
+    write_synced(&partial, bytes)?;
+    fs::rename(&partial, &target).map_err(io_at("rename into place", &target))
+}
+
 /// Write each file as `<name>.partial`, sync it, rename it into place and sync the store
 /// directory. A file already at its name is a retry of an earlier pass: it is kept and
 /// verified, never overwritten.
@@ -346,10 +356,7 @@ fn write_segment(
         if target.exists() {
             continue;
         }
-        // A stale partial from a crashed pass is truncated by the create.
-        let partial = store_dir.join(format!("{name}.partial"));
-        write_synced(&partial, bytes)?;
-        fs::rename(&partial, &target).map_err(io_at("rename into place", &target))?;
+        publish(store_dir, name, bytes)?;
     }
     sync_dir(flight, store_dir)
 }
@@ -384,47 +391,117 @@ fn verify_segment(
     })
 }
 
-/// The archive directory must not share a device with the root filesystem. The archive sits
-/// below a network mount point, so when the share is mounted its device is the share's, and
-/// when it is not, the mount point is an ordinary directory on the local disk and the device is
-/// the root's. The rule is a pure comparison of the two devices.
-fn require_own_device(
+/// Filesystem magic numbers (`statfs` `f_type`) of the network filesystems an archive share is
+/// mounted as: NFS, SMB (the legacy `smb`, CIFS and SMB2), Ceph, AFS, 9P, Lustre, NCP and
+/// Coda. FUSE is left out: it fronts local storage as often as a share.
+const NETWORK_FILESYSTEMS: &[(u64, &str)] = &[
+    (0x6969, "nfs"),
+    (0x517B, "smb"),
+    (0xFF53_4D42, "cifs"),
+    (0xFE53_4D42, "smb2"),
+    (0x00C3_6400, "ceph"),
+    (0x5346_414F, "afs"),
+    (0x0102_1997, "9p"),
+    (0x0BD0_0BD0, "lustre"),
+    (0x564C, "ncp"),
+    (0x7375_7245, "coda"),
+];
+
+/// The name of a network filesystem type, or `None` for any other.
+fn network_filesystem(f_type: u64) -> Option<&'static str> {
+    NETWORK_FILESYSTEMS
+        .iter()
+        .find_map(|&(magic, name)| (magic == f_type).then_some(name))
+}
+
+/// Where a path lives: its device and its filesystem type (`statfs` `f_type`).
+#[derive(Clone, Copy)]
+struct Placement {
+    device: u64,
+    f_type: u64,
+}
+
+/// The archive directory must be on its own mount. The archive sits below a network mount
+/// point; when the share is mounted the directory has the share's device and a network
+/// filesystem type, and when it is not, the mount point is an ordinary directory of some
+/// local filesystem. Two rules, pure over the values read from the directory and from `/`:
+///
+/// 1. the device must differ from the root filesystem's; and
+/// 2. the filesystem type must be a network filesystem or differ from the root's type. This
+///    catches an unmounted share whose parent is another local mount of the root's type (a
+///    btrfs subvolume under `/home`), which has a device of its own. A mount point inside a
+///    local filesystem of a type other than `/`'s is not caught here; the `STORE_ID` rule is
+///    the remaining line of defence there.
+fn require_own_mount(
     dir: &Path,
-    dir_device: u64,
+    found: Placement,
     filesystem_root: &Path,
-    root_device: u64,
+    root: Placement,
 ) -> Result<(), ArchiveError> {
-    if dir_device == root_device {
-        return Err(ArchiveError::NotOnMount {
-            path: dir.to_path_buf(),
-            filesystem_root: filesystem_root.to_path_buf(),
-            device: dir_device,
-        });
+    let refuse = |found: String| ArchiveError::NotOnMount {
+        path: dir.to_path_buf(),
+        filesystem_root: filesystem_root.to_path_buf(),
+        found,
+    };
+    if found.device == root.device {
+        return Err(refuse(format!(
+            "it is on device {}, the same as {}",
+            found.device,
+            filesystem_root.display()
+        )));
+    }
+    if network_filesystem(found.f_type).is_none() && found.f_type == root.f_type {
+        return Err(refuse(format!(
+            "its filesystem type is {:#x}, the same local type as {} and not a network filesystem",
+            found.f_type,
+            filesystem_root.display()
+        )));
     }
     Ok(())
 }
 
-/// Read the two devices and apply [`require_own_device`]. Read only.
+/// Read the two placements and apply [`require_own_mount`]. Read only.
 fn require_mounted(flight: &Flight, dir: &Path) -> Result<(), ArchiveError> {
     use std::os::unix::fs::MetadataExt;
-    let device = |path: &Path| {
+    let place = |path: &Path| {
         let _step = flight.step("read device", path);
-        fs::metadata(path)
+        let device = fs::metadata(path)
             .map(|metadata| metadata.dev())
-            .map_err(io_at("read device", path))
+            .map_err(io_at("read device", path))?;
+        let stat = rustix::fs::statfs(path)
+            .map_err(|errno| io_at("read filesystem type", path)(errno.into()))?;
+        // The kernel's word is signed on some targets; the magic numbers are 32-bit patterns.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let f_type = u64::from(stat.f_type as u32);
+        Ok::<_, ArchiveError>(Placement { device, f_type })
     };
-    require_own_device(
+    require_own_mount(
         dir,
-        device(dir)?,
+        place(dir)?,
         &flight.filesystem_root,
-        device(&flight.filesystem_root)?,
+        place(&flight.filesystem_root)?,
     )
 }
 
-/// The root must already hold this store's `STORE_ID`, which the operator writes once: an
-/// unmounted mount point is an empty directory on the local disk and has none. Read only; the
-/// worker never creates or changes it.
-fn require_store_id(flight: &Flight, root: &Path, store_id: &str) -> Result<(), ArchiveError> {
+/// Whether the root holds nothing an archive owns: no entry at all, apart from the
+/// `STORE_ID.partial` an earlier first pass may have left before its rename.
+fn is_empty_root(flight: &Flight, root: &Path) -> Result<bool, ArchiveError> {
+    let _step = flight.step("list archive root", root);
+    for entry in fs::read_dir(root).map_err(io_at("list archive root", root))? {
+        let entry = entry.map_err(io_at("list archive root", root))?;
+        if entry.file_name() != "STORE_ID.partial" {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The root must hold this store's `STORE_ID`. A root that is on its mount and empty of
+/// archive content gets it written here, durably, on the first pass; a root that holds any
+/// other entry but no `STORE_ID` is refused, never adopted, and an existing `STORE_ID` is
+/// never overwritten: it is accepted when it names this store and refused when it names
+/// another.
+fn ensure_store_id(flight: &Flight, root: &Path, store_id: &str) -> Result<(), ArchiveError> {
     let path = root.join("STORE_ID");
     let read = {
         let _step = flight.step("read STORE_ID", &path);
@@ -433,13 +510,21 @@ fn require_store_id(flight: &Flight, root: &Path, store_id: &str) -> Result<(), 
     let recorded = match read {
         Ok(recorded) => recorded,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            return Err(ArchiveError::Root {
-                path: root.to_path_buf(),
-                reason: "STORE_ID is missing. Either the archive is not mounted, or the \
-                         operator has not written the file yet: create it once, holding this \
-                         store's id and a newline, in the archive directory"
-                    .into(),
-            });
+            if !is_empty_root(flight, root)? {
+                return Err(ArchiveError::Root {
+                    path: root.to_path_buf(),
+                    reason: "STORE_ID is missing but the directory holds other entries, so it is \
+                             not an empty archive root and is not adopted. Point `[archive] dir` \
+                             at an empty directory, or write this store's id and a newline into \
+                             STORE_ID if the directory is this store's archive"
+                        .into(),
+                });
+            }
+            {
+                let _step = flight.step("write STORE_ID", &path);
+                publish(root, "STORE_ID", format!("{store_id}\n").as_bytes())?;
+            }
+            return sync_dir(flight, root);
         }
         Err(source) => return Err(io_at("read", &path)(source)),
     };
@@ -459,10 +544,10 @@ fn require_store_id(flight: &Flight, root: &Path, store_id: &str) -> Result<(), 
 
 /// Make one segment durable under `<root>/<store_id>/` and only then advance the watermark.
 ///
-/// `root` must already exist, be on a device other than the root filesystem's, and hold this
-/// store's `STORE_ID`: a missing or unmounted root is a failure, never a directory created on the
-/// local disk. Only `<root>/<store_id>` is
-/// created; nothing else in `root` is touched. A step that ran at least `io_timeout_secs`
+/// `root` must already exist and be on its own mount (see [`require_own_mount`]): a missing or
+/// unmounted root is a failure, never a directory created on the local disk. It must hold this
+/// store's `STORE_ID`, which an empty root is given here (see [`ensure_store_id`]). Only
+/// `<root>/<store_id>` and `<root>/STORE_ID` are created; nothing else in `root` is touched. A step that ran at least `io_timeout_secs`
 /// fails the pass with [`ArchiveError::Overran`] before the commit; the files stay, and the
 /// next pass verifies and commits them.
 pub(crate) fn archive_segment(
@@ -486,7 +571,7 @@ pub(crate) fn archive_segment(
         });
     }
     require_mounted(flight, root)?;
-    require_store_id(flight, root, store_id)?;
+    ensure_store_id(flight, root, store_id)?;
     let store_dir = root.join(store_id);
     let missing = {
         let _step = flight.step("find store directory", &store_dir);
@@ -672,9 +757,9 @@ mod tests {
         assert!(!missing.exists());
     }
 
-    /// INVARIANT: a root that is not this store's (an unmounted mount point with no `STORE_ID`,
-    /// or another store's archive) is refused, nothing is written into it and the watermark
-    /// stays.
+    /// INVARIANT: a root that is not this store's is refused, nothing is written into it and
+    /// the watermark stays: another store's `STORE_ID` is never overwritten, and a directory
+    /// that holds segments but no `STORE_ID` is not empty and is not adopted.
     #[test]
     fn the_watermark_stays_when_the_root_is_not_this_stores() {
         let dir = tempfile::tempdir().unwrap();
@@ -683,17 +768,94 @@ mod tests {
         let error = archive_segment(&flight(), &store, &other, "s", &segment).unwrap_err();
         assert!(matches!(error, ArchiveError::Root { .. }), "{error}");
         assert!(!other.join("s").exists());
-        let bare = dir.path().join("bare");
-        fs::create_dir(&bare).unwrap();
-        let error = archive_segment(&flight(), &store, &bare, "s", &segment).unwrap_err();
-        assert!(matches!(error, ArchiveError::Root { .. }), "{error}");
-        assert_eq!(fs::read_dir(&bare).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_to_string(other.join("STORE_ID")).unwrap(),
+            "another-store\n",
+            "the other store's id is not overwritten"
+        );
         assert_eq!(
             fs::read_dir(&other).unwrap().count(),
             1,
             "the other store's root holds only its STORE_ID"
         );
+        let stranger = dir.path().join("stranger");
+        fs::create_dir_all(stranger.join("s")).unwrap();
+        fs::write(stranger.join("s").join("0-1.gts"), b"segment").unwrap();
+        let error = archive_segment(&flight(), &store, &stranger, "s", &segment).unwrap_err();
+        assert!(matches!(error, ArchiveError::Root { .. }), "{error}");
+        assert!(error.to_string().contains("not adopted"), "{error}");
+        assert!(!stranger.join("STORE_ID").exists(), "never adopted");
         assert_eq!(through(&store), None);
+    }
+
+    /// INVARIANT: the first pass over an empty archive directory on its mount writes this
+    /// store's `STORE_ID` itself (`<id>` and a newline, no partial left behind), the segment
+    /// follows, and a second pass accepts the file it wrote without rewriting it.
+    #[test]
+    fn the_first_pass_writes_store_id_into_an_empty_directory_and_the_second_accepts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, segment) = archiving_store(&dir.path().join("store"));
+        let root = dir.path().join("nas");
+        fs::create_dir(&root).unwrap();
+        archive_segment(&flight(), &store, &root, "s", &segment).unwrap();
+        assert_eq!(fs::read_to_string(root.join("STORE_ID")).unwrap(), "s\n");
+        assert!(!root.join("STORE_ID.partial").exists());
+        assert_eq!(through(&store).as_deref(), Some(segment.through.as_str()));
+        let written = fs::metadata(root.join("STORE_ID"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        store.ingest("r2", "source", "log", b"c\nd\n", 2).unwrap();
+        let second = store
+            .archive_prepare(LATER)
+            .unwrap()
+            .expect("a second segment");
+        archive_segment(&flight(), &store, &root, "s", &second).unwrap();
+        assert_eq!(
+            fs::metadata(root.join("STORE_ID"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            written,
+            "an existing matching STORE_ID is accepted, not rewritten"
+        );
+    }
+
+    /// INVARIANT: the mount rules are pure over device and filesystem type: the same device
+    /// is refused whatever the type; a different device is accepted on a network filesystem
+    /// and on a local type unlike the root's, and refused on the root's own local type (an
+    /// unmounted share under another local subvolume), with the type named in the message.
+    #[test]
+    fn the_mount_rules_refuse_the_roots_device_and_its_local_filesystem_type() {
+        const NFS: u64 = 0x6969;
+        const BTRFS: u64 = 0x9123_683E;
+        const TMPFS: u64 = 0x0102_1994;
+        let placement = |device, f_type| Placement { device, f_type };
+        let root = placement(1, BTRFS);
+        let table = [
+            (placement(1, BTRFS), false),
+            (placement(1, NFS), false),
+            (placement(2, NFS), true),
+            (placement(2, 0xFF53_4D42), true),
+            (placement(2, TMPFS), true),
+            (placement(2, BTRFS), false),
+        ];
+        for (found, accepted) in table {
+            let verdict = require_own_mount(Path::new("/a"), found, Path::new("/"), root);
+            assert_eq!(
+                verdict.is_ok(),
+                accepted,
+                "device {} type {:#x}: {verdict:?}",
+                found.device,
+                found.f_type
+            );
+        }
+        let error = require_own_mount(Path::new("/a"), placement(2, BTRFS), Path::new("/"), root)
+            .unwrap_err();
+        assert!(matches!(error, ArchiveError::NotOnMount { .. }), "{error}");
+        assert!(error.to_string().contains("0x9123683e"), "{error}");
+        assert_eq!(network_filesystem(NFS), Some("nfs"));
+        assert_eq!(network_filesystem(BTRFS), None);
     }
 
     /// INVARIANT: an archive directory on the root filesystem's device (an unmounted share

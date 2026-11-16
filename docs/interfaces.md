@@ -471,13 +471,17 @@ Each file is written as `.gts.partial`, synced, renamed into place and the direc
 synced; it is then read back byte for byte, decoded with the PurRDF GTS reader (any
 diagnostic fails it) and only then does the worker advance `archive:through`. Any
 failure leaves the watermark where it was and is journaled with its cause; the next
-pass writes the segment again. `dir` must already exist and hold this store's
-`STORE_ID` file, which the operator writes once (this store's id and a newline); the worker
-only reads it. `dir` must also be on a device other than the root filesystem's: a directory
-on the same device is refused with the named error "archive directory ... is not on its
-expected mount" before anything is read or written, because an unmounted share leaves its
-mount point as an ordinary local directory. A missing root, a missing `STORE_ID` (an
-unmounted mount point) or another store's id is a
+pass writes the segment again. `dir` must already exist and be on its own mount: a device other than the root
+filesystem's, and a filesystem type that is a network filesystem (NFS, SMB/CIFS, Ceph, AFS, 9P,
+Lustre, NCP, Coda) or differs from the root's. Otherwise it is refused with the named error
+"archive directory ... is not on its expected mount", which names the device or type found,
+before anything is read or written, because an unmounted share leaves its mount point as an
+ordinary local directory. `dir` must hold this store's `STORE_ID` file (this store's id and a
+newline). The worker writes it on its first pass when `dir` is empty (no entry at all, apart
+from a leftover `STORE_ID.partial`), durably: temp file, fsync, rename, directory fsync. It
+accepts a matching file, never overwrites one, and refuses a directory that holds other
+entries but no `STORE_ID`. A missing root, another store's id or a non-empty directory
+without `STORE_ID` is a
 failure, never a directory made on the local disk, and nothing in `dir` outside
 `<store_id>/` is written. A record that cannot be archived (oversized, or its RDF
 projection failed at ingest) stops the watermark in front of it, is never deleted or
@@ -506,9 +510,10 @@ io_timeout_secs" once it returns: the segment is not committed on that pass, its
 stay, and the next pass verifies them and commits. The worker starts no other step
 meanwhile, and nothing is marked archived because of a timeout.
 
-The operator writes `STORE_ID` once, holding this store's id, into `dir`. Until it exists the
-archive refuses to write; a file naming another store means `dir` points at that store's
-archive or the wrong mount.
+The archive worker writes `STORE_ID`, holding this store's id, into `dir` on its first pass when
+`dir` is on its mount and empty. A directory that has content but no `STORE_ID` is refused, not
+adopted; a file naming another store means `dir` points at that store's archive or the wrong
+mount, and is never overwritten.
 
 Unknown fields are refused. Configuration checks are lexical: `dir` must be
 absolute, contain no `..`, and neither contain nor sit inside `data_dir`. The

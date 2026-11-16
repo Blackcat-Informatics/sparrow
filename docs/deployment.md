@@ -502,13 +502,25 @@ Sparrow backs up nothing except the age-out to GTS files on the NAS: the archive
 `backup_keep` were removed too. The server file refuses unknown keys, so a `server.toml` that still
 names either one fails to load with the parser's `unknown field` error: delete the lines.
 
-The archive worker also refuses to write when `[archive] dir` is on the same device as `/`. An
+The archive worker also refuses to write when `[archive] dir` is not on its own mount. An
 unmounted NFS share leaves its mount point as an ordinary directory on the local root disk, and
-writing archives there would fill it. The refusal is the named error "archive directory ... is not
-on its expected mount", is journaled on the pass failure line, and writes, moves and deletes
-nothing; the daemon itself starts and serves as before, and the worker retries on its next pass. The
-operator writes `STORE_ID` (this store's id and a newline) into the archive directory once; the
-worker only reads it.
+writing archives there would fill it. Two checks apply, in order: the directory's device must
+differ from `/`'s, and its filesystem type must be a network filesystem (NFS, SMB/CIFS, Ceph, AFS,
+9P, Lustre, NCP, Coda) or differ from `/`'s type. The second closes the case of an unmounted share
+whose parent is another local mount of the root's type, such as a btrfs subvolume under `/home`.
+The refusal is the named error "archive directory ... is not on its expected mount", which names
+the device or filesystem type found, is journaled on the pass failure line, and writes, moves and
+deletes nothing; the daemon itself starts and serves as before, and the worker retries on its next
+pass. A mount point inside a local filesystem of a type other than `/`'s is not caught by these
+two checks; `STORE_ID` is the remaining line of defence.
+
+The worker writes `STORE_ID` itself. On its first pass, a directory that is on its mount and
+empty (no entry at all, apart from a `STORE_ID.partial` left by an interrupted first pass) gets a
+`STORE_ID` holding this store's id and a newline, written durably (temp file, fsync, rename,
+directory fsync). An existing `STORE_ID` naming this store is accepted as is; one naming another
+store is refused and never overwritten. A directory that holds any other entry but no `STORE_ID`,
+such as segments whose id file was lost, is refused and not adopted: write the id by hand only
+once you have confirmed the directory is this store's archive.
 
 ## Switching the user unit's image
 

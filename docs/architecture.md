@@ -301,6 +301,10 @@ publication behind the watermark. Archive reads give way to waiting writers
 (`lock_page`) and hold the archive's own RDF read slot, separate from the query
 slot, so queries are served while a segment prepares. A prepare that outlasts
 the 60-second read lease is halved and the shortening is reported to the worker.
+The worker writes nothing until the archive directory is on its own mount (a device
+other than `/`'s, and a network filesystem type or one unlike `/`'s) and holds this
+store's `STORE_ID`, which it writes itself into an empty directory on the first pass and
+never overwrites or adopts into a directory that already has content.
 
 ## 5. Retention and named pins
 
