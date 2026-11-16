@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 340,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/340-ingest-refuses-a-json-artifact-with-rdf",
+  "branch": "paudley/340-ingest-refuses-a-json-artifact-with-rdf",
+  "slug": "ingest-refuses-a-json-artifact-with-rdf",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/340-ingest-refuses-a-json-artifact-with-rdf/.stage/ingest-refuses-a-json-artifact-with-rdf",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "b265f6124bccc60e9d78ec4c174af6cf3e469783",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/340-ingest-refuses-a-json-artifact-with-rdf",
+    "branch:paudley/340-ingest-refuses-a-json-artifact-with-rdf",
+    "ignored:3 files (3 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow/.worktrees/341-archive-segments-close-on-graph-rows-as caches into /home/paudley/Active/sparrow/.worktrees/340-ingest-refuses-a-json-artifact-with-rdf plus 21 dependency units from 1 other checkouts in 6.6s; 313 unchanged files keep their built mtimes; 0 other files take the seed time and rebuild; 3 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/340-ingest-refuses-a-json-artifact-with-rdf/.stage/ingest-refuses-a-json-artifact-with-rdf",
+    "issue:/home/paudley/Active/sparrow/.worktrees/340-ingest-refuses-a-json-artifact-with-rdf/.stage/ingest-refuses-a-json-artifact-with-rdf/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-16T10:53:20-0600",
+  "seed_error": ""
+}

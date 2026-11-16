@@ -1,0 +1,79 @@
+{
+  "issue": 340,
+  "pr_number": 342,
+  "branch": "paudley/340-ingest-refuses-a-json-artifact-with-rdf",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/340-ingest-refuses-a-json-artifact-with-rdf/.stage/ingest-refuses-a-json-artifact-with-rdf",
+  "observed_at": "2026-11-16T19:37:37.197317+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/340-ingest-refuses-a-json-artifact-with-rdf/.stage/ingest-refuses-a-json-artifact-with-rdf/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/340-ingest-refuses-a-json-artifact-with-rdf/.stage/ingest-refuses-a-json-artifact-with-rdf/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/340-ingest-refuses-a-json-artifact-with-rdf/.stage/ingest-refuses-a-json-artifact-with-rdf/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/340-ingest-refuses-a-json-artifact-with-rdf/.stage/ingest-refuses-a-json-artifact-with-rdf/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/340-ingest-refuses-a-json-artifact-with-rdf/.stage/ingest-refuses-a-json-artifact-with-rdf/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 342,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Count and journal RDF staging refusals, one line each, in status (part one)",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/342",
+    "baseRefName": "main",
+    "baseRefOid": "0dd0a5b2f3aea979f9bb09a4f147a6ea87958e21",
+    "headRefName": "paudley/340-ingest-refuses-a-json-artifact-with-rdf",
+    "headRefOid": "9c35735bcd8058de217986b2ea0af4786911e62e",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/271/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "9c35735bcd8058de217986b2ea0af4786911e62e",
+    "branch": "paudley/340-ingest-refuses-a-json-artifact-with-rdf",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 342,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #342 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}
