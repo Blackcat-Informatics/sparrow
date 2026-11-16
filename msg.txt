@@ -1,0 +1,18 @@
+Add sparrow-archive extract and remove restore (#327)
+
+Cause: the operator ruled there is no restore into Sparrow; a person must
+be able to take one artifact out of the archive on the NAS.
+
+Change: `sparrow-archive extract DIR ARTIFACT_ID` decodes every segment
+under DIR through the existing Segment decoder, joins the artifact's
+records in byte order across segments, and writes the bytes to stdout only
+when the records are contiguous and add up to the recorded byte_length
+(the decoder already checks each blob digest). A damaged segment, unknown
+id or missing record is a named error with empty stdout. `list` gains an
+additive `entries` array (id, source, received_at, byte_length) so ids can
+be found. Removed sparrow_archive::restore, RestoreReport, the
+ArchiveError::Store variant, Store::restore_artifact and the ingest
+Origin::Restore path that only it used, plus its test and docs text.
+
+Not verified: no BLAKE3 equality against the artifact payload id (by
+instruction); sparrow-core tests were not run apart from the hook.

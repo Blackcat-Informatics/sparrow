@@ -1,0 +1,18 @@
+Check each record's bytes against its link digest on decode (#327)
+
+Cause: review found the claim that extract's bytes are checked against an
+archived digest was false. The PurRDF reader stores a blob under its
+declared digest without hashing the decompressed bytes, and nothing compared
+them with the `payloadBlake3` link, so altered blob bytes in an internally
+consistent container would have extracted.
+
+Change: the decoder now hashes each record's bytes with digest_string and
+refuses the segment, naming the file, when it differs from the link digest;
+extract and verify both fail on it. Section 9 of docs/archive-format.md now
+says what the reader checks (per-record digest, contiguous records, total
+equal to byteLength, no whole-artifact BLAKE3 comparison), and the usage
+paragraph says a damaged segment anywhere blocks extraction. New test builds
+a consistent segment with PurRDF's public writer, honest and forged.
+
+Not verified: the `payloadSha256` link is still not compared; the stored
+format is unchanged.

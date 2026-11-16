@@ -1,0 +1,79 @@
+{
+  "issue": 327,
+  "pr_number": 329,
+  "branch": "paudley/327-sparrow-archive-extract-take-one",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/327-sparrow-archive-extract-take-one/.stage/sparrow-archive-extract-take-one",
+  "observed_at": "2026-11-16T08:23:11.458624+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/327-sparrow-archive-extract-take-one/.stage/sparrow-archive-extract-take-one/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/327-sparrow-archive-extract-take-one/.stage/sparrow-archive-extract-take-one/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/327-sparrow-archive-extract-take-one/.stage/sparrow-archive-extract-take-one/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/327-sparrow-archive-extract-take-one/.stage/sparrow-archive-extract-take-one/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/327-sparrow-archive-extract-take-one/.stage/sparrow-archive-extract-take-one/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 329,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "sparrow-archive extract: take one artifact out of the GTS archive; remove restore",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/329",
+    "baseRefName": "main",
+    "baseRefOid": "70d2f63c2c1731eafa9df3d9b684fe0583d4d683",
+    "headRefName": "paudley/327-sparrow-archive-extract-take-one",
+    "headRefOid": "25afeeab83f25b029ef8dd423d9978ae55a40153",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/254/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "25afeeab83f25b029ef8dd423d9978ae55a40153",
+    "branch": "paudley/327-sparrow-archive-extract-take-one",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 329,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #329 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}
