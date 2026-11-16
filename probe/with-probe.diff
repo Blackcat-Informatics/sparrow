@@ -1,0 +1,706 @@
+diff --git crates/sparrow-core/src/storage/archive_encode.rs crates/sparrow-core/src/storage/archive_encode.rs
+index a530dea..9ce420b 100644
+--- crates/sparrow-core/src/storage/archive_encode.rs
++++ crates/sparrow-core/src/storage/archive_encode.rs
+@@ -60,7 +60,8 @@ fn write_gts(dataset: &RdfDataset, blobs: Vec<Vec<u8>>) -> Result<Vec<u8>, Error
+ /// row the scope owns, so the read's cost per row cannot grow with the segment: a read that
+ /// costs more per row than the allowance (as the union read did, at quadratic cost) is refused
+ /// instead of running for minutes, while a record with a large content graph still prepares.
+-/// Each allowance is about twice the measured cost. The lease is the longest the read admits.
++/// Each allowance is about twice the measured cost. The read's slot renews its lease while it
++/// makes progress, so `lease_ms` is the longest it may go without reading, not its length.
+ fn archive_read(entries: usize) -> RdfReadLimits {
+     let entries = entries as u64;
+     RdfReadLimits {
+@@ -78,11 +79,12 @@ const REQUESTS_PER_ENTRY: u64 = 16;
+ /// Row-visit allowance for each record or artifact in a segment, apart from its graph rows;
+ /// measured cost is about eight.
+ const ROWS_PER_ENTRY: u64 = 16;
+-/// What each stored graph row in the scope adds to the ceilings. Measured in a release build:
+-/// 21 requests and 2.0 to 2.7 row visits per row, for 1,500 log records (18,020 rows) and for
+-/// one JSON record of 800 keys (12,043 rows) alike.
++/// What each stored graph row in the scope adds to the ceilings. Measured in a release build
++/// (#328): 2.9 requests and 2.1 row visits per row for 2,000 log records (276,040 rows), and
++/// 4.8 requests and 2.0 row visits per row for one JSON record of 800 keys (12,043 rows). The
++/// view verifies each dictionary identity once, not on every row naming it.
+ const ARCHIVE_ROW_ALLOWANCE: RowAllowance = RowAllowance {
+-    requests: 42,
++    requests: 10,
+     row_visits: 4,
+ };
+ /// Fixed request allowance for the scope's own setup.
+@@ -168,3 +170,62 @@ pub(super) fn encode(
+         .map_err(|error| Error::new(error.code, error.message.clone()))??;
+     Ok((write_gts(&dataset, blobs)?, absent))
+ }
++
++// PROBE(328): temporary request profile of a segment prepare; removed before commit.
++#[cfg(test)]
++mod probe_328 {
++    use crate::{ArchivePolicy, Config, Store};
++    const DAY: u64 = 86_400_000;
++    fn line(i: u64) -> String {
++        let mut x = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
++        let mut r = || {
++            x ^= x << 13;
++            x ^= x >> 7;
++            x ^= x << 17;
++            x
++        };
++        let units = ["sshd.service", "systemd-logind.service", "katamari-manager.service", "kernel", "dbus-broker.service"];
++        let msg = format!(
++            "request {:016x} from 10.{}.{}.{} completed in {} ms status {} bytes {}",
++            r(), r() % 255, r() % 255, r() % 255, r() % 5000, [200, 204, 404, 500][(r() % 4) as usize], r() % 100_000
++        );
++        format!(
++            "{{\"__REALTIME_TIMESTAMP\":\"{}\",\"_HOSTNAME\":\"katamari\",\"_SYSTEMD_UNIT\":\"{}\",\"PRIORITY\":\"{}\",\"_PID\":\"{}\",\"_BOOT_ID\":\"{:032x}\",\"MESSAGE\":\"{}\"}}\n",
++            1_700_000_000_000_000u64 + i * 997, units[(r() % 5) as usize], r() % 8, r() % 40_000, r(), msg
++        )
++    }
++    #[test]
++    fn probe_328_prepare_request_profile() {
++        let records: u64 = std::env::var("PROBE_RECORDS").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
++        let dir = tempfile::tempdir().unwrap();
++        let cfg = Config {
++            archive: Some(ArchivePolicy::default()),
++            disk_budget: 8 * 1024 * 1024 * 1024,
++            max_records: 400_000,
++            ..sparrow_test_support::storage_config!(Config)
++        };
++        let store = Store::open(dir.path(), cfg).unwrap();
++        if std::env::var("PROBE_SHAPE").as_deref() == Ok("json800") {
++            let body = format!("{{{}}}", (0..800).map(|k| format!("\"key{k}\":\"value {k} {}\"", k * 7919)).collect::<Vec<_>>().join(","));
++            store.ingest("probe", "katamari.stored", "json", body.as_bytes(), 1_000).unwrap();
++        } else {
++            let mut made = 0;
++            while made < records {
++                let n = 500.min(records - made);
++                let body: String = (made..made + n).map(line).collect();
++                store.ingest(&format!("probe-{made}"), "katamari.stored", "jsonl", body.as_bytes(), 1_000).unwrap();
++                made += n;
++            }
++        }
++        let _ = super::super::rdf_view::probe::take();
++        let t = std::time::Instant::now();
++        let segment = store.archive_prepare(1_000 + 31 * DAY).unwrap().expect("due");
++        let ms = t.elapsed().as_millis();
++        let counts = super::super::rdf_view::probe::take();
++        let rows = counts[2].1.max(1);
++        eprintln!("PROBE records={} artifacts={} prepare_ms={ms} halvings={} shortened={:?}", segment.records, segment.artifacts, store.archive_halvings(), segment.shortened);
++        for (name, n) in counts {
++            eprintln!("PROBE {name:28} {n:>10} per_named_row={:.3} per_record={:.3}", n as f64 / rows as f64, n as f64 / segment.records.max(1) as f64);
++        }
++    }
++}
+diff --git crates/sparrow-core/src/storage/rdf_view.rs crates/sparrow-core/src/storage/rdf_view.rs
+index bbb31b5..2541b46 100644
+--- crates/sparrow-core/src/storage/rdf_view.rs
++++ crates/sparrow-core/src/storage/rdf_view.rs
+@@ -22,7 +22,7 @@ mod query;
+ mod scope;
+ mod sparse;
+ mod text_relations;
+-use budget::{Budget, Reservation};
++use budget::{Budget, LeaseRenewal, Reservation};
+ pub use explanation::SparqlExplanationItem;
+ pub use pages::{
+     NativePageBody, SparqlExplanationPageBody, SparqlExplanationReadPage, SparqlGraphKind,
+@@ -43,6 +43,26 @@ pub const RDF_SOURCE_ADMISSION_PROFILE: &str = "sparrow-rdf-source-v4";
+ /// Sticky operational root cause shared by native readers and their guards.
+ pub type ReadError = Arc<Error>;
+ 
++// PROBE(328): temporary request counters by call site; removed before commit.
++#[allow(dead_code)]
++pub(crate) mod probe {
++    use std::sync::atomic::{AtomicU64, Ordering};
++    pub(crate) const NAMES: [&str; 14] = [
++        "quaditer_advance", "quaditer_verify_forward", "quaditer_rows_named", "quaditer_rows_union",
++        "quaditer_skip_owner", "graphiter_verify", "resolve_calls", "resolve_verify_forward",
++        "resolve_datatype_lookup", "lookup_reverse_point", "verified_forward_total", "point_in_charged",
++        "budget_request_total", "scoped_initialize_graphs",
++    ];
++    pub(crate) static COUNTS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
++    pub(crate) fn hit(site: usize) {
++        COUNTS[site].fetch_add(1, Ordering::Relaxed);
++    }
++    pub(crate) fn take() -> Vec<(&'static str, u64)> {
++        NAMES.iter().enumerate().map(|(i, n)| (*n, COUNTS[i].swap(0, Ordering::Relaxed))).collect()
++    }
++}
++
++
+ /// Independent occurrence metadata, normalized diagnostic and shared content layers.
+ /// Selection changes visible graph owners, never RDF semantics or evidence lifetime.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -135,8 +155,22 @@ pub struct StoredRdfView<'a> {
+     /// When set, each graph owner added to the scope raises the read ceilings by this cost
+     /// per stored row in its manifest.
+     row_allowance: Option<RowAllowance>,
++    /// Dictionary identities whose forward and reverse rows this view has already checked.
++    verified: std::sync::Mutex<VerifiedIds>,
+ }
+ 
++/// The dictionary identities one view has verified: a forward row present and a reverse row
++/// naming it back. The snapshot cannot change, so one check holds for the view's life, and
++/// every later row naming the identity skips the two point reads. Each entry is charged to
++/// the view's live bytes.
++struct VerifiedIds {
++    ordinals: purrdf_core::FastSet<u64>,
++    reservation: Reservation,
++}
++
++/// Live bytes charged per verified identity: the key and its share of the table's slack.
++const VERIFIED_ENTRY_BYTES: u64 = 32;
++
+ /// The receipt-time fallback facts one snapshot derives for selected record graphs that do
+ /// not store them. The view serves those facts with the stored rows; ingest stores none.
+ struct FallbackPending {
+@@ -248,12 +282,20 @@ fn input_capacity(value: &TermValue, depth: usize, remaining: &mut u64) -> Resul
+ }
+ 
+ impl<'a> StoredRdfView<'a> {
++    /// A view with a fixed lease and no cancellation, for tests of the stored index.
++    #[cfg(test)]
+     pub(super) fn new(
+         db: &'a DB,
+         limits: RdfReadLimits,
+         graph_ids: &[String],
+     ) -> Result<Self, ReadError> {
+-        Self::new_cancellable(db, limits, graph_ids, crate::QueryCancellation::default())
++        Self::new_cancellable(
++            db,
++            limits,
++            graph_ids,
++            crate::QueryCancellation::default(),
++            LeaseRenewal::Fixed,
++        )
+     }
+ 
+     fn new_cancellable(
+@@ -261,9 +303,14 @@ impl<'a> StoredRdfView<'a> {
+         limits: RdfReadLimits,
+         graph_ids: &[String],
+         cancellation: crate::QueryCancellation,
++        renewal: LeaseRenewal,
+     ) -> Result<Self, ReadError> {
+-        let budget = Budget::new_cancellable(limits, cancellation)?;
++        let budget = Budget::new_cancellable(limits, cancellation, renewal)?;
+         let scope = Arc::new(budget.reserve(4096 + (graph_ids.len() as u64).saturating_mul(256))?);
++        let verified = std::sync::Mutex::new(VerifiedIds {
++            ordinals: purrdf_core::FastSet::default(),
++            reservation: budget.reserve(0)?,
++        });
+         let mut view = Self {
+             snapshot: db.snapshot(),
+             reverse: rdf_index::reverse_family(db).map_err(|e| budget.fail(e))?,
+@@ -279,6 +326,7 @@ impl<'a> StoredRdfView<'a> {
+             scope_receipt: None,
+             text_scope: None,
+             row_allowance: None,
++            verified,
+         };
+         for key in ["rdf:term-count", "rdf:max-encoded"] {
+             let bytes = view.point(key.as_bytes(), 8)?.ok_or_else(|| {
+@@ -582,6 +630,7 @@ impl<'a> StoredRdfView<'a> {
+         charged: bool,
+     ) -> Result<Option<rocksdb::DBPinnableSlice<'_>>, ReadError> {
+         if charged {
++            probe::hit(11);
+             self.budget.request(key.len() as u64 + maximum, false)?;
+         }
+         let bytes = match family {
+@@ -634,6 +683,7 @@ impl<'a> StoredRdfView<'a> {
+                 .fail(Error::new("INVALID_ARGUMENT", e.to_string()))
+         })?;
+         let key = rdf_index::reverse_key(&bytes);
++        probe::hit(9);
+         let Some(stored) = self.reverse_point(key.as_bytes(), charged)? else {
+             let owed = self.fallback.as_ref().and_then(|pending| {
+                 pending
+@@ -672,12 +722,14 @@ impl<'a> StoredRdfView<'a> {
+         self.verified_forward_in(id, true)
+     }
+ 
+-    /// [`Self::verified_forward`], spending the request budget only when `charged`.
++    /// [`Self::verified_forward`], spending the request budget only when `charged`. The
++    /// reverse row is read only for an identity this view has not verified yet.
+     fn verified_forward_in(
+         &self,
+         id: GlobalTermId,
+         charged: bool,
+     ) -> Result<EncodedGuard<'_>, ReadError> {
++        probe::hit(10);
+         let reservation = self.budget.reserve(self.max_encoded + 1024)?;
+         let key = rdf_index::term_key(ordinal(id));
+         let bytes = self
+@@ -686,13 +738,16 @@ impl<'a> StoredRdfView<'a> {
+                 self.budget
+                     .fail(Error::new("STORAGE_FAILURE", "RDF term missing or foreign"))
+             })?;
+-        let reverse = rdf_index::reverse_key(&bytes);
+-        let stored = self.reverse_point(reverse.as_bytes(), charged)?;
+-        if stored.as_deref() != Some(ordinal(id).to_be_bytes().as_slice()) {
+-            return Err(self.budget.fail(Error::new(
+-                "STORAGE_FAILURE",
+-                "RDF reverse/forward identity mismatch",
+-            )));
++        if !self.verified(id)? {
++            let reverse = rdf_index::reverse_key(&bytes);
++            let stored = self.reverse_point(reverse.as_bytes(), charged)?;
++            if stored.as_deref() != Some(ordinal(id).to_be_bytes().as_slice()) {
++                return Err(self.budget.fail(Error::new(
++                    "STORAGE_FAILURE",
++                    "RDF reverse/forward identity mismatch",
++                )));
++            }
++            self.mark_verified(id)?;
+         }
+         Ok(EncodedGuard {
+             bytes,
+@@ -700,6 +755,47 @@ impl<'a> StoredRdfView<'a> {
+         })
+     }
+ 
++    /// Check that an index row's identity is a dictionary term of this snapshot, reading its
++    /// forward and reverse rows only the first time this view meets it.
++    fn verify(&self, id: GlobalTermId) -> Result<(), ReadError> {
++        if self.verified(id)? {
++            return Ok(());
++        }
++        self.verified_forward(id).map(drop)
++    }
++
++    fn verified_ids(&self) -> Result<std::sync::MutexGuard<'_, VerifiedIds>, ReadError> {
++        self.verified.lock().map_err(|_| {
++            self.budget.fail(Error::new(
++                "STORAGE_FAILURE",
++                "RDF verified identity set poisoned",
++            ))
++        })
++    }
++
++    fn verified(&self, id: GlobalTermId) -> Result<bool, ReadError> {
++        Ok(self.verified_ids()?.ordinals.contains(&ordinal(id)))
++    }
++
++    fn mark_verified(&self, id: GlobalTermId) -> Result<(), ReadError> {
++        let mut verified = self.verified_ids()?;
++        let VerifiedIds {
++            ordinals,
++            reservation,
++        } = &mut *verified;
++        if !ordinals.contains(&ordinal(id)) {
++            reservation.grow(VERIFIED_ENTRY_BYTES)?;
++            ordinals.try_reserve(1).map_err(|_| {
++                self.budget.fail(Error::new(
++                    "RESOURCE_LIMIT",
++                    "RDF verified identity allocation refused",
++                ))
++            })?;
++            ordinals.insert(ordinal(id));
++        }
++        Ok(())
++    }
++
+     fn rows(
+         &self,
+         stream: u8,
+@@ -926,6 +1022,7 @@ impl Iterator for QuadIter<'_> {
+     type Item = QuadIds<GlobalTermId>;
+     fn next(&mut self) -> Option<Self::Item> {
+         loop {
++            probe::hit(0);
+             self.view.budget.request(128, true).ok()?;
+             let item = self.iterator.as_mut()?.next()?;
+             let (key, value) = match item {
+@@ -961,6 +1058,7 @@ impl Iterator for QuadIter<'_> {
+                 return None;
+             }
+             if !self.view.owners.contains(&numbers[4]) {
++                probe::hit(4);
+                 continue;
+             }
+             let mut fields = [numbers[0]; 4];
+@@ -969,8 +1067,10 @@ impl Iterator for QuadIter<'_> {
+             }
+             let ids = fields.map(|id| global(id).expect("checked nonzero index identity"));
+             for id in ids {
+-                self.view.verified_forward(id).ok()?;
++                probe::hit(1);
++                self.view.verify(id).ok()?;
+             }
++            probe::hit(if self.union_default { 3 } else { 2 });
+             let row = QuadIds {
+                 s: ids[0],
+                 p: ids[1],
+@@ -1037,7 +1137,8 @@ impl GraphIter<'_> {
+                 return None;
+             }
+         };
+-        self.view.verified_forward(graph).ok()?;
++        probe::hit(5);
++        self.view.verify(graph).ok()?;
+         Some(graph)
+     }
+ }
+@@ -1089,7 +1190,7 @@ impl Iterator for GraphIter<'_> {
+             if !self.view.owners.contains(&owner) || self.previous == Some(graph) {
+                 continue;
+             }
+-            self.view.verified_forward(graph).ok()?;
++            self.view.verify(graph).ok()?;
+             self.previous = Some(graph);
+             return Some(graph);
+         }
+@@ -1130,12 +1231,14 @@ impl DatasetView for StoredRdfView<'_> {
+         self.rows(0, 0, [None; 3], GraphMatch::Any)
+     }
+     fn resolve(&self, id: GlobalTermId) -> Result<StoredTermGuard<'_>, ReadError> {
++        probe::hit(6);
+         let reservation = self
+             .budget
+             .reserve(self.max_owned_term_bytes().expect("persisted bound"))?;
+         let value = match self.owed_term(id) {
+             Some(term) => term.clone(),
+             None => {
++                probe::hit(7);
+                 let bytes = self.verified_forward(id)?;
+                 let limits = rdf_index::term_limits().map_err(|e| self.budget.fail(e))?;
+                 ProjectionTerm::from_canonical_json(&bytes.bytes, limits).map_err(|e| {
+@@ -1147,6 +1250,7 @@ impl DatasetView for StoredRdfView<'_> {
+         let mut links = [None; 3];
+         match &value {
+             ProjectionTerm::Literal { datatype, .. } => {
++                probe::hit(8);
+                 links[0] = Some(
+                     self.lookup(&ProjectionTerm::Iri {
+                         value: datatype.clone(),
+@@ -1372,6 +1476,7 @@ impl Store {
+             layers,
+             now,
+             limits,
++            renewal: slot.lease(),
+             allowance,
+             expired: None,
+         };
+@@ -1402,6 +1507,7 @@ impl Store {
+             layers,
+             now,
+             limits,
++            renewal,
+             allowance,
+             expired,
+         } = *scope;
+@@ -1409,7 +1515,13 @@ impl Store {
+         // expired targets, which must be as of the same moment.
+         let writer = self.lock().map_err(Arc::new)?;
+         let db = Arc::clone(&writer.db);
+-        let mut view = StoredRdfView::new(&db, limits, &[])?;
++        let mut view = StoredRdfView::new_cancellable(
++            &db,
++            limits,
++            &[],
++            crate::QueryCancellation::default(),
++            renewal,
++        )?;
+         view.scoped = true;
+         view.row_allowance = allowance;
+         let protected = match expired {
+@@ -1537,6 +1649,8 @@ struct ScopeCapture<'a> {
+     layers: RdfGraphLayers,
+     now: u64,
+     limits: RdfReadLimits,
++    /// How the read's lease ends, which its slot decides.
++    renewal: LeaseRenewal,
+     allowance: Option<RowAllowance>,
+     expired: Option<&'a BTreeSet<String>>,
+ }
+diff --git crates/sparrow-core/src/storage/rdf_view/budget.rs crates/sparrow-core/src/storage/rdf_view/budget.rs
+index a87666b..04f1800 100644
+--- crates/sparrow-core/src/storage/rdf_view/budget.rs
++++ crates/sparrow-core/src/storage/rdf_view/budget.rs
+@@ -8,11 +8,27 @@ use purrdf::dataset_view::{OwnedWorkspaceReservation, WorkspaceReservation};
+ use std::sync::{Arc, Mutex, MutexGuard};
+ use std::time::{Duration, Instant};
+ 
++/// How a read's lease of `lease_ms` ends.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum LeaseRenewal {
++    /// The lease ends `lease_ms` after the read starts, however far it has got: every
++    /// ordinary query read.
++    Fixed,
++    /// Every admitted read renews the lease for another `lease_ms`, so the read ends only
++    /// after `lease_ms` with no progress, never for its total length: the archive's segment
++    /// read, whose length follows the segment it encodes. Its request and row ceilings
++    /// still bound its total work.
++    OnProgress,
++}
++
+ pub(super) struct Budget {
+     state: Mutex<State>,
+     limits: RdfReadLimits,
+-    deadline: Instant,
++    renewal: LeaseRenewal,
+     cancellation: crate::QueryCancellation,
++    /// Test-only skew added to the monotonic clock, so a test moves time without sleeping.
++    #[cfg(test)]
++    skew: std::sync::atomic::AtomicU64,
+ }
+ 
+ struct State {
+@@ -20,6 +36,8 @@ struct State {
+     evidence: RdfReadEvidence,
+     /// Request and row-visit ceiling added by [`Budget::allow`].
+     allowance: (u64, u64),
++    /// When the lease ends unless [`LeaseRenewal::OnProgress`] renews it first.
++    deadline: Instant,
+ }
+ 
+ pub(super) struct Reservation {
+@@ -36,12 +54,13 @@ struct RetainedReservation {
+ impl Budget {
+     #[cfg(test)]
+     pub(super) fn new(limits: RdfReadLimits) -> Result<Arc<Self>, ReadError> {
+-        Self::new_cancellable(limits, crate::QueryCancellation::default())
++        Self::new_cancellable(limits, crate::QueryCancellation::default(), LeaseRenewal::Fixed)
+     }
+ 
+     pub(super) fn new_cancellable(
+         limits: RdfReadLimits,
+         cancellation: crate::QueryCancellation,
++        renewal: LeaseRenewal,
+     ) -> Result<Arc<Self>, ReadError> {
+         if limits.live_bytes == 0 || limits.lease_ms == 0 || limits.lease_ms > 60000 {
+             return Err(Arc::new(Error::new(
+@@ -54,13 +73,31 @@ impl Budget {
+                 error: None,
+                 evidence: RdfReadEvidence::default(),
+                 allowance: (0, 0),
++                deadline: Instant::now() + Duration::from_millis(limits.lease_ms),
+             }),
+             limits,
+-            deadline: Instant::now() + Duration::from_millis(limits.lease_ms),
++            renewal,
+             cancellation,
++            #[cfg(test)]
++            skew: std::sync::atomic::AtomicU64::new(0),
+         }))
+     }
+ 
++    fn now(&self) -> Instant {
++        let now = Instant::now();
++        #[cfg(test)]
++        let now = now
++            + Duration::from_millis(self.skew.load(std::sync::atomic::Ordering::Relaxed));
++        now
++    }
++
++    /// Move this budget's clock forward by `ms`, as if the read had spent that long.
++    #[cfg(test)]
++    pub(super) fn advance(&self, ms: u64) {
++        self.skew
++            .fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
++    }
++
+     fn state(&self) -> MutexGuard<'_, State> {
+         match self.state.lock() {
+             Ok(state) => state,
+@@ -81,7 +118,7 @@ impl Budget {
+         if let Err(error) = self.cancellation.checkpoint() {
+             state.error.get_or_insert_with(|| Arc::new(error));
+         }
+-        if Instant::now() >= self.deadline {
++        if self.now() >= state.deadline {
+             state.error.get_or_insert_with(|| {
+                 Arc::new(Error::new("RESULT_EXPIRED", "RDF read lease ended"))
+             });
+@@ -121,6 +158,9 @@ impl Budget {
+     }
+ 
+     fn admit(&self, bytes: u64, row: bool, request_count: u64) -> Result<(), ReadError> {
++        if request_count > 0 {
++            super::probe::hit(12);
++        }
+         let mut state = self.state();
+         self.ready(&mut state)?;
+         let requested = state
+@@ -157,6 +197,9 @@ impl Budget {
+         state.evidence.requests = requests;
+         state.evidence.admitted_bytes = admitted_bytes;
+         state.evidence.row_visits = row_visits;
++        if self.renewal == LeaseRenewal::OnProgress {
++            state.deadline = self.now() + Duration::from_millis(self.limits.lease_ms);
++        }
+         Ok(())
+     }
+ 
+@@ -311,13 +354,47 @@ mod tests {
+ 
+     #[test]
+     fn expired_lease_refuses_without_reading_or_waiting() {
+-        let mut budget = Budget::new(RdfReadLimits::default()).unwrap();
+-        Arc::get_mut(&mut budget).unwrap().deadline = Instant::now();
++        let budget = Budget::new(RdfReadLimits::default()).unwrap();
++        budget.advance(RdfReadLimits::default().lease_ms);
+         assert_eq!(budget.request(1, false).unwrap_err().code, "RESULT_EXPIRED");
+         assert_eq!(budget.checkpoint().1.requests, 0);
+         assert_eq!(budget.checkpoint().1.admitted_bytes, 0);
+     }
+ 
++    /// INVARIANT (#328): a renewing lease ends only after a lease's length without progress,
++    /// so a read that keeps admitting reads outlives any total length, and one that stops
++    /// expires with `RESULT_EXPIRED`; a fixed lease ends at its length however busy the read
++    /// is, which is what every ordinary query keeps. Time moves through the budget's clock.
++    #[test]
++    fn a_renewing_lease_ends_only_when_progress_stops_and_a_fixed_one_at_its_length() {
++        let limits = RdfReadLimits {
++            lease_ms: 100,
++            ..Default::default()
++        };
++        for (renewal, served) in [(LeaseRenewal::OnProgress, 20), (LeaseRenewal::Fixed, 1)] {
++            let budget = Budget::new_cancellable(
++                limits,
++                crate::QueryCancellation::default(),
++                renewal,
++            )
++            .unwrap();
++            // Twenty reads 60 ms apart: 1.2 s of progress against a 100 ms lease.
++            let admitted = (0..20)
++                .take_while(|_| {
++                    budget.advance(60);
++                    budget.request(1, true).is_ok()
++                })
++                .count();
++            assert_eq!(admitted, served, "{renewal:?}");
++            budget.advance(100);
++            assert_eq!(
++                budget.request(1, true).unwrap_err().code,
++                "RESULT_EXPIRED",
++                "{renewal:?}"
++            );
++        }
++    }
++
+     #[test]
+     fn cumulative_read_overflow_refuses_without_saturating_the_receipt() {
+         let budget = Budget::new(RdfReadLimits {
+diff --git crates/sparrow-core/src/storage/rdf_view/scope.rs crates/sparrow-core/src/storage/rdf_view/scope.rs
+index 38af8f3..99b1ba7 100644
+--- crates/sparrow-core/src/storage/rdf_view/scope.rs
++++ crates/sparrow-core/src/storage/rdf_view/scope.rs
+@@ -350,6 +350,18 @@ pub(crate) enum ReadSlot {
+     Archive,
+ }
+ 
++impl ReadSlot {
++    /// How a read in this slot ends its lease: a query at the lease's length, the archive's
++    /// segment read only after a lease's length without progress (#328), so a segment that
++    /// is still reading is never cut off for its size.
++    pub(super) fn lease(self) -> LeaseRenewal {
++        match self {
++            Self::Query => LeaseRenewal::Fixed,
++            Self::Archive => LeaseRenewal::OnProgress,
++        }
++    }
++}
++
+ /// The store's RDF snapshot slots, one owner per [`ReadSlot`].
+ #[derive(Debug, Default)]
+ pub(crate) struct ReadSlots {
+@@ -422,7 +434,13 @@ impl Store {
+         let _lease = self.rdf_read_lease(ReadSlot::Query)?;
+         let writer = self.lock().map_err(Arc::new)?;
+         let db = Arc::clone(&writer.db);
+-        let mut view = StoredRdfView::new_cancellable(&db, limits, &[], cancellation.clone())?;
++        let mut view = StoredRdfView::new_cancellable(
++            &db,
++            limits,
++            &[],
++            cancellation.clone(),
++            LeaseRenewal::Fixed,
++        )?;
+         view.scoped = scope.restricts_membership();
+         if correlation.is_some() {
+             // The correlation recipe never reads the backfilled facts.
+diff --git crates/sparrow-core/src/storage/rdf_view/sparse.rs crates/sparrow-core/src/storage/rdf_view/sparse.rs
+index 672a7ac..1911ba8 100644
+--- crates/sparrow-core/src/storage/rdf_view/sparse.rs
++++ crates/sparrow-core/src/storage/rdf_view/sparse.rs
+@@ -100,6 +100,7 @@ impl<'a> ScopedRows<'a> {
+             if cursor.peek().is_none() {
+                 continue;
+             }
++            super::probe::hit(13);
+             self.grow()?;
+             let index = self.cursors.len();
+             self.cursors.push(cursor);
+diff --git crates/sparrow-core/tests/archive_segment.rs crates/sparrow-core/tests/archive_segment.rs
+index 7548479..aa77bf4 100644
+--- crates/sparrow-core/tests/archive_segment.rs
++++ crates/sparrow-core/tests/archive_segment.rs
+@@ -205,8 +205,9 @@ fn a_segment_ending_between_an_artifact_and_its_record_still_holds_the_artifact(
+ /// segment's size, and a segment of more than 1,000 records prepares (the query selection
+ /// bound does not apply to it). The read ceilings are a fixed allowance per entry plus one
+ /// per stored graph row. The earlier union read cost about 2,800 requests per record already
+-/// at 5 records, against a measured 255 now, and its cost per record grew with the segment,
+-/// so it exceeds those ceilings at this size. A retried prepare of the same due
++/// at 5 records, and its cost per record grew with the segment, so it exceeds those ceilings
++/// at this size; so does a read that verifies each row's dictionary identities again on every
++/// row (19 requests per row, #328) instead of once per view. A retried prepare of the same due
+ /// backlog is byte-equal, so the archive worker never meets a different file at a name.
+ #[test]
+ fn a_segment_of_over_a_thousand_records_prepares_within_its_read_bound_and_repeats_byte_equal() {
+@@ -234,7 +235,7 @@ fn a_segment_of_over_a_thousand_records_prepares_within_its_read_bound_and_repea
+ #[test]
+ fn a_json_or_markdown_record_with_thousands_of_graph_rows_prepares() {
+     // 800 json keys store about 12,000 graph rows (15 per key, measured), and the read costs
+-    // about 250,000 requests, where a ceiling by entries alone allowed 11,024 (one record and
++    // about 58,000 requests, where a ceiling by entries alone allowed 11,024 (one record and
+     // its artifact).
+     let fields: Vec<String> = (0..800).map(|i| format!("\"k{i}\":\"v{i}\"")).collect();
+     let json = format!("{{{}}}\n", fields.join(","));
+diff --git docs/architecture.md docs/architecture.md
+index 28ca9ab..06cc288 100644
+--- docs/architecture.md
++++ docs/architecture.md
+@@ -299,8 +299,11 @@ blocking queries, ingest or maintenance. A store format fence keeps older
+ binaries away from an archiving store, and a clock-regression guard refuses
+ publication behind the watermark. Archive reads give way to waiting writers
+ (`lock_page`) and hold the archive's own RDF read slot, separate from the query
+-slot, so queries are served while a segment prepares. A prepare that outlasts
+-the 60-second read lease is halved and the shortening is reported to the worker.
++slot, so queries are served while a segment prepares. The archive read renews
++its 60-second lease while it makes progress, so a segment is never cut short
++for its length. A read that makes no progress for 60 seconds ends with
++`RESULT_EXPIRED`; the range is then halved and the shortening is reported to
++the worker. Ordinary query reads keep a fixed lease.
+ 
+ ## 5. Retention and named pins
+ 
+@@ -566,7 +569,10 @@ spelling.
+ 
+ Implement a storage-backed `DatasetView`/`FallibleDatasetView` over an immutable
+ RocksDB read snapshot. Persist forward/reverse term dictionaries and indexed quad
+-streams; resolve terms through bounded guards/cache entries. Reverse lookups
++streams; resolve terms through bounded guards/cache entries. A view checks
++each dictionary identity's forward and reverse rows once, the first time a row
++names it, and charges the identity to its live bytes; the snapshot cannot
++change, so later rows naming the identity skip both point reads. Reverse lookups
+ live in their own `rdf_reverse` column family with a whole-key Bloom filter:
+ they are the dictionary's only point reads that usually miss, and a filter over
+ the much larger scanned index keys would cost far more memory. Opening a store
+diff --git docs/archive-format.md docs/archive-format.md
+index aeaf13a..e4636b3 100644
+--- docs/archive-format.md
++++ docs/archive-format.md
+@@ -114,7 +114,9 @@ A record whose content projection failed at ingest is held the same way, because
+ its evidence cannot be read whole. `Store::archive_held` reports the held record
+ and the reason when it is the first unarchived entry. A segment that fails to
+ encode is halved until the failing entry stands alone, which is then named in
+-the error and in a warning. Every record and artifact a segment covers has its
++the error and in a warning. The segment's read renews its lease while it makes
++progress, so a long segment is not a failure; only a read that stalls for the
++lease's 60 seconds ends with `RESULT_EXPIRED` and is halved. Every record and artifact a segment covers has its
+ graph in the file (a record's parent artifact graph included); an artifact with
+ no graph, retired before the fence, is counted in `retired_artifacts`. The count of held records and the bytes waiting behind the first are not
+ scanned, because that would read every record row on each pass.

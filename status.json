@@ -1,0 +1,79 @@
+{
+  "issue": 328,
+  "pr_number": 335,
+  "branch": "paudley/328-archive-prepare-read-renews-its-lease",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/328-archive-prepare-read-renews-its-lease/.stage/archive-prepare-read-renews-its-lease",
+  "observed_at": "2026-11-16T15:02:26.771253+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/328-archive-prepare-read-renews-its-lease/.stage/archive-prepare-read-renews-its-lease/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/328-archive-prepare-read-renews-its-lease/.stage/archive-prepare-read-renews-its-lease/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/328-archive-prepare-read-renews-its-lease/.stage/archive-prepare-read-renews-its-lease/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/328-archive-prepare-read-renews-its-lease/.stage/archive-prepare-read-renews-its-lease/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/328-archive-prepare-read-renews-its-lease/.stage/archive-prepare-read-renews-its-lease/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 335,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Renew the archive read's lease while it progresses; verify each dictionary identity once",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/335",
+    "baseRefName": "main",
+    "baseRefOid": "f4ae7a1dea124d6c352258474006c78674660e7c",
+    "headRefName": "paudley/328-archive-prepare-read-renews-its-lease",
+    "headRefOid": "4557f90e412bb06d304e654a8d557afd23dbae09",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/262/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "4557f90e412bb06d304e654a8d557afd23dbae09",
+    "branch": "paudley/328-archive-prepare-read-renews-its-lease",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 335,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #335 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}

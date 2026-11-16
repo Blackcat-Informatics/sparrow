@@ -1,0 +1,25 @@
+Renew the archive read's lease while it progresses; verify each identity once
+
+A 10,000-record segment outlasted the archive read's fixed 60-second
+lease under the unit's CPU cap, so prepares were halved and their work
+thrown away (#328).
+
+Profile (400 and 2,000 katamari-shaped records, release): the scoped
+read already walks one cursor per owner graph. The cost was identity
+verification: every index row checked the forward and reverse
+dictionary rows of all four of its terms, in both the named pass and
+the default-union pass, about 16 of the 19 requests per stored row.
+A view now verifies each dictionary identity once, the first time a row
+names it, and charges the entry to its live bytes; the snapshot cannot
+change, so later rows skip both point reads. Requests fall to 2.9 per
+row for log records and 4.8 for an 800-key JSON record, and the
+archive's row allowance drops from 42 to 10 requests to match.
+
+The archive slot's read renews its lease on every admitted read, so it
+ends only after 60 seconds without progress. Query reads keep their
+fixed lease. A stalled prepare still ends with RESULT_EXPIRED, is
+halved and reports the shortening.
+
+Rehearsal, 50,000 records under CPUQuota=100% and MemoryHigh=2G to
+NFS: 6 segments, 0 halvings, prepare 145 s in total (was 2,098 s),
+worst segment 33 s for 10,000 records (was 204 s).
