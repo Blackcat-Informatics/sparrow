@@ -10,7 +10,7 @@
 //! resource to a blob, so the record to blob links are written here as quads in
 //! `urn:sparrow:graph:archive-links`; they go when PurRDF offers the link.
 
-use super::rdf_view::{RdfGraphLayers, RdfReadLimits, RowAllowance};
+use super::rdf_view::{RdfGraphLayers, RdfReadLimits, ReadSlot, RowAllowance};
 use super::{Error, Store};
 use purrdf::gts::writer::digest_string;
 use purrdf::gts_write::to_writer;
@@ -149,6 +149,7 @@ pub(super) fn encode(
     // deletion gate holds until a segment covers it.
     let (dataset, absent) = store
         .with_rdf_scope_ids(
+            ReadSlot::Archive,
             ids,
             artifact_ids,
             RdfGraphLayers::ALL,

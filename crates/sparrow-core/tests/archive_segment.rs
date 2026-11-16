@@ -285,13 +285,12 @@ impl<F: Fn() + Send + Sync + 'static> tracing::Subscriber for OnWarning<F> {
 /// REGRESSION: a prepare whose first encode fails is halved, and the segment it then returns
 /// says so: how many entries were selected, how many it kept and the code of the error that
 /// caused it, and the store counts the halving. Before, the error was dropped and a caller saw
-/// only a short segment. The failure is real: another reader holds the single RDF read slot
-/// during the first attempt, so the read is refused with `RESOURCE_LIMIT`; the slot is freed
+/// only a short segment. The failure is real: another archive read holds the archive's RDF
+/// read slot during the first attempt, so the read is refused with `RESOURCE_LIMIT`; the slot is freed
 /// when the halving's warning is emitted, so the retry over half the range succeeds. The
 /// hand-offs are channels, and time is the store's `now` argument.
 #[test]
 fn a_prepare_halved_by_an_encode_failure_reports_the_shortening_and_counts_it() {
-    use sparrow_core::{QueryCancellation, QueryScope, RdfGraphLayers, RdfReadLimits};
     use std::sync::{Mutex, mpsc};
 
     let dir = tempfile::tempdir().unwrap();
@@ -308,19 +307,11 @@ fn a_prepare_halved_by_an_encode_failure_reports_the_shortening_and_counts_it() 
     let reader = {
         let store = store.clone();
         std::thread::spawn(move || {
-            let scope = sparrow_test_support::record_scope!(QueryScope, "source", 1);
             store
-                .with_rdf_scope(
-                    &scope,
-                    RdfGraphLayers::ALL,
-                    now,
-                    RdfReadLimits::default(),
-                    &QueryCancellation::default(),
-                    |_, _| {
-                        held_tx.send(()).unwrap();
-                        release_rx.recv().unwrap();
-                    },
-                )
+                .with_archive_read_slot_for_tests(|| {
+                    held_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
                 .unwrap();
             freed_tx.send(()).unwrap();
         })
@@ -348,4 +339,58 @@ fn a_prepare_halved_by_an_encode_failure_reports_the_shortening_and_counts_it() 
     let rest = store.archive_prepare(now).unwrap().expect("remainder due");
     assert!(rest.shortened.is_none());
     assert_eq!(rest.records, 5);
+}
+
+/// INVARIANT: archiving does not perturb queries, and queries still exclude each other. While
+/// an archive read holds its own RDF read slot, an ordinary RDF query is served, not refused;
+/// a second query during a first is still refused with the retryable `RESOURCE_LIMIT`. Before,
+/// the archive took the one query slot, so every query was refused for the length of a prepare.
+/// The hand-offs are channels, and time is the store's `now` argument.
+#[test]
+fn a_query_is_served_during_an_archive_read_and_still_excludes_another_query() {
+    use sparrow_core::{QueryCancellation, QueryScope, RdfGraphLayers, RdfReadLimits};
+    use std::sync::mpsc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), archiving(ArchivePolicy::default())).unwrap();
+    store
+        .ingest("seg-slots", "source", "log", b"alpha\n", 1)
+        .unwrap();
+    let query = |store: &Store, inside: &dyn Fn()| {
+        let scope = sparrow_test_support::record_scope!(QueryScope, "source", 1);
+        store.with_rdf_scope(
+            &scope,
+            RdfGraphLayers::ALL,
+            2,
+            RdfReadLimits::default(),
+            &QueryCancellation::default(),
+            |_, _| inside(),
+        )
+    };
+
+    let (held_tx, held_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let archive = {
+        let store = store.clone();
+        std::thread::spawn(move || {
+            store
+                .with_archive_read_slot_for_tests(|| {
+                    held_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .unwrap();
+        })
+    };
+    held_rx.recv().unwrap();
+    // A query is served while the archive read is in progress; a second archive read is not.
+    query(&store, &|| {
+        let refused = store.with_archive_read_slot_for_tests(|| ()).unwrap_err();
+        assert_eq!(refused.code, "RESOURCE_LIMIT");
+        // A second query during this one is refused.
+        let nested = query(&store, &|| ()).unwrap_err();
+        assert_eq!(nested.code, "RESOURCE_LIMIT");
+    })
+    .unwrap();
+    release_tx.send(()).unwrap();
+    archive.join().unwrap();
 }

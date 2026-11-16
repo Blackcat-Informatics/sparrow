@@ -30,6 +30,7 @@ pub use pages::{
 };
 pub use query::{ScopedSparqlExplanation, ScopedSparqlResult, SparqlRead};
 pub use scope::RdfScopeCoverage;
+pub(crate) use scope::{ReadSlot, ReadSlots};
 use sparse::RowCursor;
 pub use text_relations::{
     STORED_TEXT_CORPUS_PROFILE, STORED_TEXT_RELATION_PROFILE, SparqlTextCapture,
@@ -1290,7 +1291,8 @@ impl Store {
     /// Capture scope under the serialized owner, then release it before execution.
     /// Snapshot reads cannot observe subsequent ingestion, pin changes or retirement,
     /// and the fail-aware boundary cannot publish a failed read prefix.
-    /// One RDF snapshot per store is admitted; concurrent requests refuse explicitly.
+    /// One query RDF snapshot per store is admitted; a concurrent query refuses explicitly. The
+    /// archive has its own slot.
     pub fn with_rdf_records<T>(
         &self,
         ids: &[String],
@@ -1318,9 +1320,16 @@ impl Store {
                 "RDF selection requires 1..1000 record IDs",
             )));
         }
-        self.with_rdf_scope_ids(ids, &[], layers, now, limits, None, |view, _| {
-            operation(view)
-        })
+        self.with_rdf_scope_ids(
+            ReadSlot::Query,
+            ids,
+            &[],
+            layers,
+            now,
+            limits,
+            None,
+            |view, _| operation(view),
+        )
     }
 
     /// The same capture with named artifacts' graphs added to the records'. The operation also
@@ -1340,6 +1349,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn with_rdf_scope_ids<T>(
         &self,
+        slot: ReadSlot,
         ids: &[String],
         artifacts: &[String],
         layers: RdfGraphLayers,
@@ -1354,7 +1364,7 @@ impl Store {
                 "RDF selection requires at least one record or artifact ID",
             )));
         }
-        let _lease = self.rdf_read_lease()?;
+        let _lease = self.rdf_read_lease(slot)?;
         let mut operation = Some(operation);
         let mut scope = ScopeCapture {
             ids,
