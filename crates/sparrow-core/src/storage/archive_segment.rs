@@ -599,18 +599,23 @@ impl Store {
         selection: Selection,
     ) -> Result<PreparedSegment, Error> {
         let mut contents = Vec::with_capacity(selection.encoded.len());
-        for record in &selection.encoded {
-            let length = record.byte_end.saturating_sub(record.byte_start);
-            let length = usize::try_from(length).map_err(|_| corrupt("record length overflows"))?;
-            // A record with no bytes still gets its (empty) blob and link, so a reader finds
-            // every covered record the same way.
-            let bytes = if length == 0 {
-                Vec::new()
-            } else {
-                let writer = self.lock_page()?;
-                record_bytes(&writer, record.chunks.clone(), 0, length)?
-            };
-            contents.push((record.id.clone(), bytes));
+        // One writer hold per batch of records, so the deferral to waiting writers
+        // (`lock_page`) is paid per batch, not per record.
+        for batch in selection.encoded.chunks(SELECT_BATCH) {
+            let writer = self.lock_page()?;
+            for record in batch {
+                let length = record.byte_end.saturating_sub(record.byte_start);
+                let length =
+                    usize::try_from(length).map_err(|_| corrupt("record length overflows"))?;
+                // A record with no bytes still gets its (empty) blob and link, so a reader
+                // finds every covered record the same way.
+                let bytes = if length == 0 {
+                    Vec::new()
+                } else {
+                    record_bytes(&writer, record.chunks.clone(), 0, length)?
+                };
+                contents.push((record.id.clone(), bytes));
+            }
         }
         let ids: Vec<String> = selection
             .encoded
