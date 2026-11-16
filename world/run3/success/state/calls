@@ -1,0 +1,12 @@
+is-active --quiet sparrow-ship.timer
+stop sparrow-ship.timer
+show -p ActiveState --value sparrow-ship.service
+show -p ActiveState --value sparrow-ship.service
+stop sparrow.service
+show -p ActiveState --value sparrow.service
+daemon-reload
+show -p LimitNOFILESoft --value sparrow.service
+start sparrow.service
+show -p ActiveState --value sparrow.service
+start sparrow-ship.timer
+is-active sparrow-ship.timer

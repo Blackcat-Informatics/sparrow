@@ -1,0 +1,21 @@
+#!/bin/bash
+# State files: STATE/NAME.active exists when NAME is active. STUB_SHIP_BUSY=1 keeps
+# sparrow-ship.service "activating" so the script's wait for the shipper fails.
+[[ $1 == --user ]] && shift
+echo "$*" >>"$STATE/calls"
+case $1 in
+    is-active)
+        shift; [[ $1 == --quiet ]] && shift
+        if [[ -e $STATE/$1.active ]]; then echo active; exit 0; fi
+        echo inactive; exit 3 ;;
+    show)
+        case $3 in
+            ActiveState)
+                if [[ $5 == sparrow-ship.service && ${STUB_SHIP_BUSY:-0} == 1 ]]; then echo activating
+                elif [[ -e $STATE/$5.active ]]; then echo active; else echo inactive; fi ;;
+            LimitNOFILESoft) echo 65536 ;;
+        esac ;;
+    start) shift; for u; do touch "$STATE/$u.active"; done ;;
+    stop) shift; for u; do rm -f -- "$STATE/$u.active"; done ;;
+esac
+exit 0

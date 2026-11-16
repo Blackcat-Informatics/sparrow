@@ -1,0 +1,4 @@
+data_dir = "/home/paudley/Active/sparrow/.worktrees/330-remove-the-online-store-backup-156-and/.stage/remove-the-online-store-backup-156-and/world/run1/abort-stopped/store"
+socket_path = "/home/paudley/Active/sparrow/.worktrees/330-remove-the-online-store-backup-156-and/.stage/remove-the-online-store-backup-156-and/world/run1/abort-stopped/rpc.sock"
+ingest_socket_path = "/home/paudley/Active/sparrow/.worktrees/330-remove-the-online-store-backup-156-and/.stage/remove-the-online-store-backup-156-and/world/run1/abort-stopped/intake/ingest.sock"
+backup_root =

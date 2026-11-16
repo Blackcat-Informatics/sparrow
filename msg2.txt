@@ -1,0 +1,20 @@
+Refuse stale backup keys before an upgrade and correct the docs (#330)
+
+Cause: review of the removal found that the live `server.toml` still sets
+`backup_root` and `backup_keep`, which the new image refuses, and the
+upgrade script no longer checked before it stopped the daemon. The revert
+text was wrong about shipper state, and `archive-format.md` still named the
+retired backup tree as the archive root.
+
+Change: `user-unit-upgrade.sh` refuses, before anything changes, a
+configuration that names either key, and says to delete those two lines; the
+`--help` text, the deploy README and the timer check say or cover the same.
+The cutover revert now separates a fenced store (no revert here, links must
+first point at an image that opens it) from an unfenced one, and states what
+is known about shipper state and what is untested. `archive-format.md` names
+`/net/synology/archives/sparrow-archive` and calls the old path the retired
+backup tree. The doubled sentence in `deployment.md` and the `UNSUPPORTED`
+wording (`READ_ONLY` for a query-only daemon) are fixed.
+
+Not verified: the shell changes ran only against stubs; the revert steps
+were not run on a host.

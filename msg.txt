@@ -1,0 +1,30 @@
+Remove the online store backup and guard the archive mount (#330)
+
+Cause: the operator ruled that Sparrow backs up nothing except the archive
+age-out to GTS files on the NAS. The online store backup (#156) is removed,
+and the archive worker must not fill the local root disk when its share is
+not mounted.
+
+Change: remove the `BackupEngine` path in `sparrow-core`, the server's
+backup worker and RPC wiring, the offline restore and `sparrowd
+--restore-backup`, the `sparrow backup` command and its status rendering,
+the `backup_root` and `backup_keep` keys (the server file refuses unknown
+fields, so an old file naming them fails with the parser's unknown field
+error), `sparrow-backup`, `verify-backup.sh`, `pre-upgrade-backup.sh`,
+`reconcile-inflight.sh`, `sparrow-measure-load`, the backup unit and timer,
+the matching unit, profile and script lines, the `online-store-backup`
+ledger row, and the tests and documents that only served them. The wire
+stays additive: the `backup` method (@53) and `Status.backup` (@55) keep
+their ordinals; the method answers `UNSUPPORTED` and the status field
+always reads unconfigured. The upgrade scripts no longer require a backup;
+`user-unit-upgrade.sh` and the deployment docs state that an upgrade relies
+on the kept previous image and the link swap, and that a format-changing
+upgrade has no undo. The archive worker refuses a directory on the same
+device as `/` with a named `NotOnMount` error before it reads or writes
+anything.
+
+Not verified: `make check` runs in this commit's hook; the shell scripts
+were checked with `bash -n` and the timer check against stubs, not on a
+host; the archive guard was tested with real directories and a stand-in
+root, not an NFS mount; dated records under `deploy/evidence` and the
+status documents still name the removed feature as history.

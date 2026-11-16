@@ -1,0 +1,292 @@
+18: #[tokio
+19: async fn capability_documents_share_cli_mcp_and_typed_transport_contracts() {
+208: #[tokio
+209: async fn log_timestamp_profiles_share_tcp_cli_unix_mcp_and_chronological_capture() {
+430: fn endpoint_args(endpoint impl AsRef<std
+442: fn test_endpoint(endpoint impl AsRef<std
+451: async fn tcp_client(
+462: fn configure_tcp_listener(config &Path) -> (std
+514: #[tokio
+515: async fn typed_tail_handoff_retires_original_checkpoint_over_tcp_and_replays_through_cli_mcp_and_reopen()
+634: #[tokio
+635: async fn explicit_tail_completion_preserves_partial_bytes_retry_clocks_and_retained_sources_across_reopen()
+819: #[tokio
+820: async fn tail_worker_waits_for_the_shared_operation_budget_without_advancing_or_dropping_input() {
+873: #[tokio
+874: async fn pending_tail_completion_recovers_bounded_drains_and_reports_changed_or_missing_generations()
+1018: #[tokio
+1019: async fn tail_capture_refusal_preserves_bytes_and_missing_recovery_reports_a_durable_gap() {
+1103: #[tokio
+1104: async fn a_full_generation_registry_still_tails_a_file_and_status_names_it() {
+1192: #[tokio
+1193: async fn a_full_source_mapping_registry_still_takes_a_batch_and_status_names_the_source() {
+1262: #[tokio
+1263: async fn active_tail_watches_preserve_partial_lines_rotated_descriptors_and_reopened_checkpoints() {
+1373: #[tokio
+1374: async fn file_generation_queries_preserve_raw_provenance_and_refuse_foreign_or_stale_schemas() {
+1583: #[tokio
+1584: async fn tcp_logging_worker_retains_pending_identity_across_outage_and_daemon_reopen() {
+1674: #[tokio
+1675: async fn remote_agent_adapters_share_all_query_and_mutation_paths_and_report_connection_failure() {
+1734: #[tokio
+1735: async fn public_tcp_requires_chap_for_reads_and_administration_but_not_ingestion() {
+1874: fn configure_ingest_socket(
+1900: #[tokio
+1901: async fn ingest_socket_records_peer_credentials_in_provenance() {
+2038: #[tokio
+2039: async fn ingest_socket_refuses_reads_and_administration() {
+2093: #[tokio
+2094: async fn an_ingest_peer_over_the_ceiling_waits_and_is_served_when_a_slot_frees() {
+2134: async fn status_until(
+2150: async fn begin_numbered_import(
+2198: #[tokio
+2199: async fn a_seventeenth_import_waits_for_a_slot_and_begins_when_one_is_reclaimed() {
+2243: #[tokio
+2244: async fn public_tcp_uses_the_same_typed_service_store_and_retry_receipts_as_unix() {
+2318: #[tokio
+2319: async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_failures() {
+2537: #[tokio
+2538: async fn syslog_connection_failure_stops_siblings_and_reopens_exact_durable_packet() {
+2663: #[tokio
+2664: async fn idle_rpc_connections_share_a_finite_transport_budget_independent_of_storage_work() {
+2814: #[tokio
+2815: async fn artifact_membership_scopes_share_wire_validation_and_frozen_agent_pages() {
+3065: #[tokio
+3066: async fn source_listing_exposes_declared_idle_and_occurrence_sources_through_shared_agents() {
+3274: #[tokio
+3275: async fn artifact_listing_shares_typed_pages_held_origins_and_agent_refusals() {
+3512: #[tokio
+3513: async fn bounded_discovery_and_status_do_not_read_corrupt_evidence_and_keys_refuses_it() {
+3568: #[tokio
+3569: async fn diagnostic_mappings_and_filters_share_typed_cli_and_mcp_evidence() {
+3666: #[tokio
+3667: async fn source_arrays_are_shared_by_generated_cli_and_mcp_queries() {
+3884: #[tokio
+3885: async fn daemon_expiry_holds_unarchived_evidence_at_the_archive_gate() {
+3956: fn journal_lines(daemon &mut Daemon) -> std
+3972: fn await_journal(lines &std
+3992: #[tokio
+3993: async fn daemon_pressure_worker_holds_unarchived_evidence_and_shares_typed_cli_mcp_status() {
+4083: fn archived_segments(nas &Path, store_id
+4097: #[tokio
+4098: async fn daemon_expiry_retires_evidence_only_after_its_segment_is_written() {
+4177: #[tokio
+4178: async fn daemon_pressure_worker_evicts_only_after_its_segment_is_written() {
+4229: fn watch_definition(
+4249: fn append_consume_config(
+4262: fn append_tail_config(config &Path, root
+4269: fn append_watch_config(config &Path, definition
+4283: async fn watch_until(
+4305: #[test]
+4306: fn consumption_configuration_requires_explicit_contract_and_disjoint_bounded_roots() {
+4349: #[tokio
+4350: async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_and_restart() {
+4452: #[tokio
+4453: async fn watch_put_refuses_a_root_inside_a_daemon_output_path() {
+4494: #[tokio
+4495: async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect_removed_authority()
+4719: #[tokio
+4720: async fn another_claims_publication_leaves_a_stuck_claims_failure_in_status() {
+4797: #[tokio
+4798: async fn reconcile_missing_exits_4_for_a_claim_with_no_attempt_recorded() {
+4886: #[tokio
+4887: async fn retire_claim_clears_only_an_unrecoverable_claim_and_lets_the_drain_reach_zero() {
+5104: #[tokio
+5105: async fn removed_watch_keeps_durable_claim_recovery_and_refuses_root_rebinding() {
+5225: fn rpc_failure<T capnp
+5244: #[tokio
+5245: async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migrates() {
+5486: #[test]
+5487: fn query_only_and_no_intake_refuse_conflicting_configuration() {
+5556: fn verify_backup(
+5567: fn verify_backup_with(
+5611: fn measure_env(dir &Path) -> Vec<(String, String)> {
+5687: fn verify_backup_measured(
+5705: fn backup_fixture(
+5719: fn backup_fixture_with(
+5802: fn write_backup_manifest(backup &Path) {
+5822: #[test]
+5823: fn verify_backup_fails_on_wrong_store_id() {
+5896: #[test]
+5897: fn verify_backup_refuses_an_image_without_query_only() {
+5938: #[test]
+5939: fn verify_backup_migration_measurement_refuses_to_start_below_its_disk_floor() {
+6059: fn traffic_fixture(
+6176: fn tree_snapshot(path &Path) -> Vec<(std
+6194: fn measure_value(stdout &str, prefix
+6216: #[test]
+6217: fn verify_backup_traffic_measurement_replays_privately_and_rehearses_the_rollback() {
+6383: #[test]
+6384: fn verify_backup_traffic_measurement_fails_on_each_gate_breach() {
+6515: #[test]
+6516: fn verify_backup_traffic_measurement_refuses_an_empty_or_unrooted_replay() {
+6568: #[test]
+6569: fn user_unit_upgrade_refuses_before_changing_anything() {
+6685: #[test]
+6686: fn backup_client_refuses_a_local_backup_root_before_asking_the_daemon() {
+6721: #[tokio
+6722: async fn daemon_backup_refuses_a_local_root_and_reports_it_in_status() {
+6798: #[test]
+6799: fn daemon_refuses_a_soft_open_file_limit_without_room_for_the_table_cache() {
+6820: #[test]
+6821: fn corrupt_durable_watch_catalog_is_a_hard_startup_failure() {
+6844: #[tokio
+6845: async fn watch_receipt_pressure_preserves_reserved_removal_capacity() {
+6934: #[tokio
+6935: async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopened_inputs() {
+7078: fn ship(config &Path) -> std
+7090: #[test]
+7091: fn shipper_reports_a_whole_file_above_the_import_bound_and_mirrors_it() {
+7151: #[test]
+7152: fn shipper_never_reships_a_file_whose_device_number_alone_changed() {
+7208: #[test]
+7209: fn shipper_refuses_a_source_overlapping_its_intake_or_state_tree() {
+7245: #[tokio
+7246: async fn oversized_single_json_ships_whole_ingests_and_reads_back_exactly() {
+7374: #[tokio
+7375: async fn configured_consumer_recovers_confirmed_journal_and_reports_late_write_without_retirement()
+7467: #[tokio
+7468: async fn consume_coverage_limit_and_root_replacement_fail_without_source_retirement() {
+7536: #[test]
+7537: fn anchored_claim_open_refuses_fifos_and_replaced_coordination_locks() {
+7592: #[tokio
+7593: async fn completed_tail_claim_worker_recovers_without_upload_and_preserves_replacements() {
+7813: #[tokio
+7814: async fn anchored_claim_recovery_publishes_exact_generation_and_never_deletes_replacements() {
+8137: #[tokio
+8138: async fn query_selection_is_shared_by_typed_cli_and_mcp_surfaces() {
+8356: fn delivery_event(text &str) -> sparrow_client
+8374: fn admit(delivery &sparrow_client
+8381: async fn delivery_barrier(
+8398: fn reached_delivery(
+8596: fn lease_cutting_relay(
+8621: #[tokio
+8622: async fn cli_ingest_resumes_across_lost_connections_and_cancels_a_stalled_import() {
+8705: fn relay(
+8737: #[tokio
+8738: async fn opened_completed_file_upload_keeps_claimed_generation_and_replacement_path() {
+8819: #[tokio
+8820: async fn producer_receipt_mismatch_never_certifies_or_retires_pending_input() {
+8985: #[tokio
+8986: async fn buffered_rpc_flush_sdk_cli_mcp_and_recovery_preserve_occurrence_identity() {
+9065: #[tokio
+9066: async fn tracing_layer_preserves_types_span_updates_and_durable_drop_accounting() {
+9213: #[tokio
+9214: async fn producer_delivery_recovers_a_lost_durable_reply_with_the_same_batch() {
+9310: #[tokio
+9311: async fn producer_delivery_retries_a_busy_refusal_on_the_same_connection() {
+9363: #[tokio
+9364: async fn producer_delivery_quarantines_a_permanent_refusal_without_blocking_later_events() {
+9371: async fn quarantine_permanent_refusal(code &'static str) {
+9437: #[tokio
+9438: async fn producer_delivery_keeps_a_refused_batch_when_the_quarantine_cannot_be_written() {
+9485: #[tokio
+9486: async fn producer_delivery_bounds_outage_backlog_and_reports_drops_after_recovery() {
+9563: #[tokio
+9564: async fn producer_delivery_refuses_store_replacement_and_retains_unknown_pending_input() {
+9612: #[tokio
+9613: async fn killed_owner_restarts_without_socket_unlink_and_preserves_durable_evidence() {
+9688: #[test]
+9689: fn endpoint_startup_preserves_files_symlinks_and_foreign_live_listeners() {
+9742: #[tokio
+9743: async fn startup_below_the_free_space_floor_waits_without_opening_the_store() {
+9791: #[tokio
+9792: async fn interrupt_during_startup_is_retained_until_owned_teardown() {
+9859: #[tokio
+9860: async fn shutdown_syslog_bind_refusal_cleans_owned_endpoint_and_allows_retry() {
+9923: #[tokio
+9924: async fn shutdown_terminal_worker_failure_preserves_primary_and_replacement_errors() {
+10011: fn append_syslog_config(
+10027: async fn start(config &Path, socket
+10031: async fn start_with_stderr(config &Path, socket
+10035: async fn start_with(config &Path, socket
+10058: fn rpc_error_code<T capnp
+10073: fn rpc_ok<'a, T capnp
+10082: fn upload_ref(mut out wire
+10087: async fn agent_import_checkpoint(
+10216: async fn agent_ingestion_status(
+10303: #[tokio
+10304: async fn typed_upload_resumes_chunks_and_native_preparation_after_daemon_crashes() {
+10475: #[tokio
+10476: async fn typed_events_keep_rust_values_context_source_time_and_retry_receipts() {
+10718: async fn exercise(endpoint impl AsRef<std
+11329: async fn mcp_exercise(
+12227: #[tokio
+12228: async fn mcp_cancellation_admission_and_partial_frames_do_not_lose_messages() {
+12337: #[tokio
+12338: async fn direct_promises_and_mcp_notifications_cancel_captures_without_closing_the_session() {
+12642: async fn mcp_pin_pages(socket &Path, store
+12866: fn cli(socket impl AsRef<std
+12880: #[tokio
+12881: async fn correlation_cli_mcp_and_typed_pages_retain_native_certainty_and_pin_scopes() {
+13084: #[tokio
+13085: async fn recordless_graph_metadata_and_independent_coverage_reach_cli_and_mcp() {
+13148: #[tokio
+13149: async fn graph_catalog_io_profile_preserves_three_hundred_occurrences_through_cli_and_mcp() {
+13244: #[tokio
+13245: async fn native_graph_pages_admit_repeated_projection_names_before_agent_rendering() {
+13328: #[tokio
+13329: async fn native_graph_queries_preserve_forms_certificates_and_leases_over_tcp_cli_and_mcp() {
+13420: #[tokio
+13421: async fn stored_text_graph_relations_preserve_corpus_spans_and_explanations_over_transports() {
+13570: #[tokio
+13571: async fn native_explanation_preserves_measured_work_over_tcp_cli_mcp_and_continuation() {
+13658: #[tokio
+13659: async fn typed_queries_and_exact_bytes_survive_daemon_crash() {
+13695: #[tokio
+13696: async fn artifact_diagnostic_scope_reports_unknown_membership_through_cli_and_mcp() {
+13831: #[tokio
+13832: async fn record_pages_share_frozen_ranked_receipts_after_pin_release_in_cli_and_mcp() {
+14053: #[tokio
+14054: async fn record_pages_enforce_agent_byte_ceilings_and_scan_refusal() {
+14131: #[tokio
+14132: async fn standalone_text_pages_freeze_native_ranking_and_refuse_cross_operation_cursors() {
+14345: #[tokio
+14346: async fn json_pages_replay_cli_mcp_counts_and_occurrences_and_bind_operations() {
+14540: #[tokio
+14541: async fn large_json_disk_pages_share_tcp_unix_cli_mcp_and_typed_limits() {
+14653: async fn live_artifact_continuations(
+14754: #[tokio
+14755: async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page() {
+15169: #[tokio
+15170: async fn context_capture_limits_and_byte_refusals_reach_typed_cli_and_mcp_callers() {
+15374: #[tokio
+15375: async fn key_paths_share_native_counts_cursor_binding_and_typed_cli_mcp_admission() {
+15589: #[tokio
+15590: async fn sources_listing_does_not_hold_the_writer_lock() {
+15678: #[tokio
+15679: async fn an_over_bound_declaration_is_permanent_named_advertised_and_counted() {
+15742: fn set_limits(units usize) -> sparrow_core
+15751: async fn set_harness(dir &Path) -> SetHarness {
+15856: fn chunk_line(index usize, pad
+15864: fn chunk_lines(first usize, count
+16062: #[tokio
+16063: async fn a_set_claims_source_stays_held_while_the_claim_is_pending() {
+16129: #[tokio
+16130: async fn a_set_part_without_an_archive_is_held_by_eviction_and_read_exactly_once() {
+16177: #[tokio
+16178: async fn a_restarted_attempt_under_grown_limits_skips_its_recorded_parts() {
+16261: fn set_part_request(claim &sparrow_server
+16268: fn stage_draft(harness &SetHarness, request
+16292: fn pending_text(error &sparrow_server
+16299: #[tokio
+16300: async fn a_frontier_draft_under_shrunk_limits_is_cancelled_and_recut_at_its_index() {
+16362: #[tokio
+16363: async fn a_frontier_refused_by_shrunk_limits_waits_for_reclaim_then_completes() {
+16424: #[tokio
+16425: async fn a_draft_at_index_zero_never_takes_the_single_path() {
+16474: #[tokio
+16475: async fn over_bound_consume_file_is_split_into_ordered_parts_and_removed() {
+16515: #[tokio
+16516: async fn over_bound_non_line_consume_file_is_taken_as_opaque_parts() {
+16558: #[tokio
+16559: async fn syslog_file_above_the_packet_limit_is_taken_as_ordered_opaque_parts() {
+16579: #[tokio
+16580: async fn syslog_file_at_the_packet_limit_keeps_the_single_path() {
+16613: #[tokio
+16614: async fn recorded_set_claim_with_a_missing_manifest_receipt_plans_uploads_and_begins_nothing() {
+16724: async fn watches_seen(client &wire
+16751: #[tokio
+16752: async fn held_watches_share_one_total_and_waiting_files_are_claimed_in_order_when_the_hold_clears()
+16901: #[tokio
+16902: async fn client_cut_parts_are_accepted_by_the_daemon_and_one_more_unit_is_refused() {

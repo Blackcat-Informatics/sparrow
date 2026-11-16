@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 330,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/330-remove-the-online-store-backup-156-and",
+  "branch": "paudley/330-remove-the-online-store-backup-156-and",
+  "slug": "remove-the-online-store-backup-156-and",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/330-remove-the-online-store-backup-156-and/.stage/remove-the-online-store-backup-156-and",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "2116021cb1acf8e3f24e21a52bc7981a1c11a359",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/330-remove-the-online-store-backup-156-and",
+    "branch:paudley/330-remove-the-online-store-backup-156-and",
+    "ignored:3 files (3 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow/.worktrees/323-index-artifacts-by-payload-id-the-store caches into /home/paudley/Active/sparrow/.worktrees/330-remove-the-online-store-backup-156-and plus 0 dependency units from 0 other checkouts in 10.4s; 295 unchanged files keep their built mtimes; 25 other files take the seed time and rebuild; 8 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/330-remove-the-online-store-backup-156-and/.stage/remove-the-online-store-backup-156-and",
+    "issue:/home/paudley/Active/sparrow/.worktrees/330-remove-the-online-store-backup-156-and/.stage/remove-the-online-store-backup-156-and/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-16T02:24:56-0600",
+  "seed_error": ""
+}

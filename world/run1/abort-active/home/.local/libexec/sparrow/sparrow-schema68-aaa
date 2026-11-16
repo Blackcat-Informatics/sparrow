@@ -1,0 +1,2 @@
+#!/bin/sh
+printf '{"store_id":"s1","schema_version":68,"store_format":"f","live_records":0,"pressure":{"phase":"ready","failure":null},"durability":{"failure":null},"query_only":false,"consume_watches":[]}\n'
