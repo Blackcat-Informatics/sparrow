@@ -1291,7 +1291,8 @@ impl Store {
     /// Capture scope under the serialized owner, then release it before execution.
     /// Snapshot reads cannot observe subsequent ingestion, pin changes or retirement,
     /// and the fail-aware boundary cannot publish a failed read prefix.
-    /// One RDF snapshot per store is admitted; concurrent requests refuse explicitly.
+    /// One query RDF snapshot per store is admitted; a concurrent query refuses explicitly. The
+    /// archive has its own slot.
     pub fn with_rdf_records<T>(
         &self,
         ids: &[String],

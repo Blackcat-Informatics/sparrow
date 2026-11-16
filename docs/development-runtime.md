@@ -5950,14 +5950,16 @@ the pressure worker already observes the native snapshot count. Snapshot release
 occurs when the callback exits, including failed execution. A callback that never
 returns is not preempted by the storage lease.
 
-One native RDF snapshot per store is admitted across all store clones; another
-request returns retryable `RESOURCE_LIMIT` rather than retaining another native
-version or waiting in an unbounded queue. This preserves the former single-query
-memory admission while allowing ingestion and maintenance to run during it.
-The admission slot is released on callback return or a typed error. The archive's
-segment read takes its own second slot, so archiving never refuses a query and a
-query never refuses it; at most one query snapshot and one archive snapshot are live,
-each charged to its own read budget.
+Two native RDF snapshots per store are admitted across all store clones: one
+query snapshot and one archive snapshot. Another request for the same slot
+returns retryable `RESOURCE_LIMIT` rather than retaining another native version
+or waiting in an unbounded queue, while ingestion and maintenance run during
+either. The archive's segment read takes its own slot, so archiving never
+refuses a query and a query never refuses it. Each snapshot charges its own read
+budget. The combined live-byte bound is the query limit (at most 128 MiB,
+enforced at `rpc/sparql.rs:117`) plus the archive's 2 GiB (`archive_encode.rs:67`),
+about 2.125 GiB, up from 2 GiB. Each slot is released on callback return or a
+typed error.
 
 The concurrency scenario releases the selected record's protection, retires it
 and ingests a new record from another thread while the callback is active. It

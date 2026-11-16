@@ -365,7 +365,7 @@ impl Store {
         let (owner, refusal) = match slot {
             ReadSlot::Query => (
                 &self.rdf_read.query,
-                "store already has an active RDF snapshot; retry after its lease ends",
+                "store already has an active query RDF snapshot; retry after its lease ends",
             ),
             ReadSlot::Archive => (
                 &self.rdf_read.archive,
