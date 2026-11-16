@@ -91,6 +91,7 @@ A segment closes at the first of these limits:
 | --- | --- | --- |
 | Raw payload bytes | 64 MiB (`max_segment_bytes`) | At least 1 MiB, at most 256 MiB. |
 | Eviction entries | 10,000 (`max_segment_records`) | At least 1. |
+| Quads | 3,000,000 (`max_segment_quads`) | At least 1. |
 | UTC day | End of the first entry's receipt day | Fixed. |
 | Horizon | Section 5 | Fixed. |
 
@@ -98,6 +99,17 @@ A segment closes at the first of these limits:
 an entry whose record bytes would take its payload past the target, unless the
 segment is still empty. An entry whose bytes alone exceed the target therefore
 forms a segment of its own, and the segment is never split inside a record.
+
+`max_segment_quads` bounds the memory a segment costs while it is encoded, which is
+up to 390 bytes a quad (measured, #336): 3,000,000 quads is 1.17 GB, and with the
+daemon's own 100 MB that is 59 per cent of a 2 GiB soft limit. A record's quads are
+known before encoding: twice the rows of its stored graph manifests (each row is a
+quad in its named graph and again in the default graph), plus two link quads, plus its
+artifact's graph the first time the segment meets it. A segment closes before an entry
+that would take it past the budget, unless the segment is still empty, and a record
+whose quads alone exceed the budget forms a segment of its own. The limit bounds how
+much one segment carries, not what is stored; a rebuilt segment keeps the range its
+intent recorded.
 
 Such an oversized record is a segment of its own, and its bytes stay a blob in
 the segment's GTS files like any other record's.

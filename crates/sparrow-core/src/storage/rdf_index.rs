@@ -167,6 +167,17 @@ impl Store {
     }
 }
 
+impl Writer {
+    /// Rows of the stored graph `id` across its streams; zero when it has no manifest, as for
+    /// an entry retired before the fence.
+    pub(super) fn graph_row_count(&self, id: &str) -> Result<u64, Error> {
+        let Some(bytes) = self.db.get(format!("rdf:graph:{id}"))? else {
+            return Ok(0);
+        };
+        Ok(manifest_stream_counts(&bytes)?.iter().sum())
+    }
+}
+
 fn manifest_counts(writer: &Writer, id: &str) -> Result<[u64; 3], Error> {
     let bytes = writer
         .db

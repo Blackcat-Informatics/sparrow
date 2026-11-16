@@ -123,6 +123,9 @@ pub struct ArchiveConfig {
     /// Eviction entries that close a segment.
     #[serde(default = "default_segment_records")]
     pub max_segment_records: u64,
+    /// Quads that close a segment.
+    #[serde(default = "default_segment_quads")]
+    pub max_segment_quads: u64,
     /// Seconds the archive worker waits after a pass that found nothing due, or failed, before
     /// it asks the store again. What is due is the store's call: `start_fraction`, 75 per cent
     /// of the retention window or data budget by default.
@@ -148,6 +151,9 @@ fn default_segment_bytes() -> u64 {
 fn default_segment_records() -> u64 {
     sparrow_core::ARCHIVE_SEGMENT_RECORDS
 }
+fn default_segment_quads() -> u64 {
+    sparrow_core::ARCHIVE_SEGMENT_QUADS
+}
 fn default_check_secs() -> u64 {
     60
 }
@@ -166,6 +172,7 @@ impl ArchiveConfig {
             start_fraction: self.start_fraction,
             max_segment_bytes: self.max_segment_bytes,
             max_segment_records: self.max_segment_records,
+            max_segment_quads: self.max_segment_quads,
         }
     }
 

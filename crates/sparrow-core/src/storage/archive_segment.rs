@@ -157,6 +157,51 @@ pub struct ArchiveHold {
     pub reason: HoldReason,
 }
 
+/// Quads each stored graph row becomes in the segment: the row in its named graph and again in
+/// the default graph, which is their union. Measured (#341) on the #336 shapes: 3,566 quads a
+/// record for 1,783 stored rows, against 3,570 counted in the written file.
+const QUADS_PER_STORED_ROW: u64 = 2;
+/// Link quads a record adds: the two payload digests.
+const LINK_QUADS: u64 = 2;
+
+/// Quads an entry adds to a segment, known before it is encoded: the stored rows of its
+/// record's metadata graph, content projection graph and diagnostic graph, plus those of its
+/// artifact's graph the first time the segment meets that artifact, each counted twice
+/// ([`QUADS_PER_STORED_ROW`]), and the record's link quads. A recordless artifact adds its own
+/// graph. The count is the row count of each graph manifest, which the store already keeps and
+/// reads here without decoding a row; the catalog holds no count, so reading the manifest is
+/// the cheapest exact figure and no stored field is added. A retired record or artifact has no
+/// graph and adds nothing.
+fn entry_quads(
+    writer: &Writer,
+    id: &str,
+    record: Option<&Record>,
+    artifacts: &std::collections::BTreeSet<String>,
+) -> Result<u64, Error> {
+    let Some(record) = record else {
+        return Ok(writer
+            .graph_row_count(id)?
+            .saturating_mul(QUADS_PER_STORED_ROW));
+    };
+    if record.evicted || record.retired {
+        return Ok(0);
+    }
+    let mut owners = vec![record.id.clone()];
+    if !record.rdf_projection_id.is_empty() {
+        owners.push(record.rdf_projection_id.clone());
+    }
+    owners.extend(super::diagnostic::graph_owner(record));
+    if !artifacts.contains(&record.artifact_id) {
+        owners.push(record.artifact_id.clone());
+    }
+    let rows = owners.iter().try_fold(0_u64, |total, owner| {
+        Ok::<_, Error>(total.saturating_add(writer.graph_row_count(owner)?))
+    })?;
+    Ok(rows
+        .saturating_mul(QUADS_PER_STORED_ROW)
+        .saturating_add(LINK_QUADS))
+}
+
 /// Index entries read under one hold of the writer. The selection takes the writer again for
 /// the next batch, deferring first to waiting writers, so ingestion waits for at most one
 /// batch however long the segment is. The unarchived range only grows at its end while a
@@ -202,6 +247,7 @@ fn select(
         artifact_ids: std::collections::BTreeSet::new(),
     };
     let mut payload = 0_u64;
+    let mut graph_rows = 0_u64;
     let mut first_day = 0;
     // Where the next batch resumes: the last entry handled, which begins as the watermark.
     let mut floor = through.clone().map(String::into_bytes);
@@ -278,9 +324,20 @@ fn select(
                 return Err(corrupt("intent covers a held record"));
             }
             let oversized = length > policy.max_segment_bytes;
+            // A rebuild covers the range its intent names and needs no figure: the closing
+            // rules do not apply to it, so the manifests are not read.
+            let quads = if rebuilding {
+                0
+            } else {
+                entry_quads(&writer, id, record.as_ref(), &selection.artifact_ids)?
+            };
+            let heavy = quads > policy.max_segment_quads;
             if !rebuilding
                 && count > 0
-                && (oversized || payload + length > policy.max_segment_bytes)
+                && (oversized
+                    || heavy
+                    || payload + length > policy.max_segment_bytes
+                    || graph_rows + quads > policy.max_segment_quads)
             {
                 break 'scan;
             }
@@ -290,6 +347,7 @@ fn select(
             }
             position.clone_into(&mut selection.last);
             payload += length;
+            graph_rows += quads;
             match record {
                 None => {
                     selection.artifacts += 1;
@@ -308,7 +366,7 @@ fn select(
             if intent.is_some_and(|intent| position == intent.last) {
                 break 'scan;
             }
-            if oversized {
+            if oversized || heavy {
                 break 'scan;
             }
         }
