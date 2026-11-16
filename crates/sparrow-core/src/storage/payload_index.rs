@@ -7,11 +7,13 @@
 //! One key per held artifact in the default family, `payload-id:<64 hex digest>:<artifact
 //! id>`, with an empty value. The artifact id is part of the key because the same bytes
 //! ingested under two requests make two artifacts; a prefix scan of one digest returns
-//! them all. An artifact is indexed exactly while it is complete: its entry exists and
-//! neither the entry nor its manifest retirement state marks it evicted. This is the same
-//! completeness the per-source counters use, so an artifact that pressure eviction retired
-//! leaves the index in the batch that retires it, and an artifact whose entry is deleted
-//! (expiry, recordless eviction) leaves it in the batch that deletes the entry. An
+//! them all. An artifact is indexed exactly while the store holds all of its bytes: its entry
+//! exists, the entry is not marked evicted, and its manifest retirement state has neither
+//! evicted it nor retired any chunk. Expiry and pressure eviction release the bytes before
+//! the entry is deleted (expiry keeps the entry a day past its deadline), so the key leaves
+//! the index in the batch that retires the bytes, not later with the entry. This is stricter
+//! than the per-source counters' completeness, which looks only at the evicted flags. An
+//! artifact whose entry is deleted (recordless eviction) leaves it in that batch too. An
 //! archived artifact stays indexed until then: the index describes what the store holds,
 //! not what the archive holds.
 //!
@@ -58,12 +60,7 @@ pub const MAX_LOOKUP_PAGE: usize = 1000;
 fn digest(payload_id: &str) -> Result<&str, Error> {
     payload_id
         .strip_prefix("blake3:")
-        .filter(|digest| {
-            digest.len() == 64
-                && digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
+        .filter(|_| super::import::valid_payload_id(payload_id))
         .ok_or_else(|| {
             Error::new(
                 "INVALID_ARGUMENT",
@@ -243,7 +240,7 @@ pub(super) fn apply(db: &DB, batch: &mut WriteBatch) -> Result<(), Error> {
     }
     let retired = |bytes: Option<Vec<u8>>| -> Result<bool, Error> {
         bytes
-            .map(|bytes| manifest_retire::evicted_flag(&bytes))
+            .map(|bytes| manifest_retire::releases_bytes(&bytes))
             .transpose()
             .map(|flag| flag.unwrap_or(false))
     };
@@ -316,7 +313,7 @@ fn page_of(db: &DB, limit: usize) -> Result<Option<(WriteBatch, bool)>, Error> {
             let entry = state(id, value)?;
             let retired = db
                 .get(format!("artifact-retirement:{id}"))?
-                .map(|bytes| manifest_retire::evicted_flag(&bytes))
+                .map(|bytes| manifest_retire::releases_bytes(&bytes))
                 .transpose()?
                 .unwrap_or(false);
             if let Some(key) = owned_key(id, Some(&entry), retired)? {
@@ -337,6 +334,7 @@ fn page_of(db: &DB, limit: usize) -> Result<Option<(WriteBatch, bool)>, Error> {
 
 /// One page of a payload lookup.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use]
 pub struct PayloadLookup {
     /// Held artifacts of the digest after the cursor, in artifact id order, at most one page.
     pub artifacts: Vec<String>,

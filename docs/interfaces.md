@@ -1321,9 +1321,12 @@ payload-id:<64 hex digest>:<artifact id>        value: empty
 
 The artifact id is part of the key because the same bytes ingested under two
 requests make two artifacts, and a prefix scan of one digest returns them all.
-An artifact is indexed exactly while it is complete, the completeness the
-per-source counters use: its entry exists and neither the entry nor its manifest
-retirement state is marked evicted. One owner observes every write batch before
+An artifact is indexed exactly while the store holds all of its bytes: its entry
+exists, the entry is not marked evicted, and its manifest retirement state has
+neither evicted it nor retired any chunk. This is stricter than the per-source
+counters' completeness, which looks only at the evicted flags: expiry retires an
+artifact's chunks at its deadline and keeps the entry a day longer, and the index
+already does not list it in that window. One owner observes every write batch before
 it is written and adds the key changes to the same batch, so no writer can
 create, retire or delete an artifact entry without its key, and a crash cannot
 leave a catalog row with no key or a key with no row. The `payload-index`
@@ -1335,10 +1338,11 @@ disagrees with the catalog is detectable.
 
 Every entry is removed in the batch that ends its completeness:
 
-- expiry deletes an artifact entry (an artifact with records, in the batch that
-  deletes its first due record; a recordless artifact, with its time-index key);
-- pressure eviction marks an artifact evicted through its manifest retirement
-  state, or deletes a recordless artifact entry;
+- expiry retires an artifact's chunks at its deadline (the manifest retirement
+  state records the retired chunks), and the key goes in that batch; the entry is
+  deleted a day later, or with its time-index key for a recordless artifact;
+- pressure eviction marks an artifact evicted or retires its chunks through its
+  manifest retirement state, or deletes a recordless artifact entry;
 - an import's reclamation deletes only import staging rows and the import
   manifest, never an artifact entry, so it changes no key.
 

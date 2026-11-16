@@ -106,7 +106,12 @@ fn every_age_out_removes_the_key_with_the_entry_and_keeps_other_holders() {
     assert_eq!(report.artifacts, vec![empty.id.clone()]);
     assert_eq!(held(&store, &empty.payload_id), (vec![], true));
     assert_eq!(held(&store, &old.payload_id), (vec![late.id.clone()], true));
-    // Expiry deletes the late artifact's entry thirty days and a day after receipt.
+    // Expiry retires the late artifact's chunks at its deadline, a day before it deletes the
+    // entry: its bytes are released, so the index must already not list it.
+    store.expire(40 * DAY + RETENTION_MS).unwrap();
+    assert_eq!(held(&store, &old.payload_id), (vec![], true));
+    counted(&store, 0);
+    // A day later expiry deletes the entry itself.
     store.expire(40 * DAY + RETENTION_MS + 2 * DAY).unwrap();
     assert_eq!(held(&store, &old.payload_id), (vec![], true));
     counted(&store, 0);

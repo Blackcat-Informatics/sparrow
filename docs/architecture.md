@@ -657,8 +657,8 @@ hash of all its own bytes, computed once in the ingest path, and the default fam
 holds one empty-valued key `payload-id:<64 hex digest>:<artifact id>` for each complete
 artifact, so a digest's holders are one prefix scan and "do I already hold this
 content" is a point read. One owner observes every write batch and adds the key
-changes to it: an artifact entry is never created, retired (evicted through its
-manifest retirement state) or deleted (expiry, recordless eviction) without its key
+changes to it: an artifact entry is never created, retired (its bytes released through its
+manifest retirement state, at expiry or eviction) or deleted (expiry, recordless eviction) without its key
 following in the same atomic batch, and an archived artifact stays indexed until
 then. A store counter row counts the keys through the one batch observer, so a count
 that disagrees with the complete artifacts is detectable. Tail checkpoints, whose
