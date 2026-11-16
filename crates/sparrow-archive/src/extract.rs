@@ -9,8 +9,8 @@ use crate::segment::{ArchivedArtifact, ArchivedRecord, Segment};
 /// One artifact's whole bytes, taken from the segments at `paths` (every segment under the
 /// archive directory). Its records are joined in byte order, wherever they were archived,
 /// and the result is returned only when its length equals the artifact's recorded
-/// `byte_length`. Each record's bytes were already checked by the decoder against the digest
-/// the archive carries for them (the blob digest named by its link quad). Nothing is
+/// `byte_length`. The decoder has already hashed each record's bytes and compared them
+/// with the digest the archive's link quad names for it. Nothing is
 /// written anywhere.
 ///
 /// Every segment is decoded, so a damaged segment fails the call by name even when it does

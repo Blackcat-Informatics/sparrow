@@ -68,6 +68,98 @@ fn archive_two(root: &Path) -> (Vec<String>, PathBuf) {
     (ids, paths[0].clone())
 }
 
+/// A one-record, one-artifact segment built with PurRDF's public writer. The record's link
+/// quad names the digest of `claimed`; the blob stored is `actual`, hashed honestly by the
+/// container, so the container is internally consistent whatever the two are.
+fn forged_segment(root: &Path, claimed: &[u8], actual: &[u8]) -> PathBuf {
+    use purrdf::gts::writer::digest_string;
+    use purrdf::gts_write::to_writer;
+    use purrdf::{RdfDatasetBuilder, RdfLiteral, RdfLookaside};
+    const NS: &str = "urn:sparrow:vocab:";
+    let at = sparrow_core::format_instant(T1).unwrap();
+    let mut builder = RdfDatasetBuilder::new();
+    let facts: [(&str, &str, String); 9] = [
+        ("artifact:aa", "sourceName", "host".to_owned()),
+        ("artifact:aa", "format", "log".to_owned()),
+        ("artifact:aa", "receivedAt", at.clone()),
+        ("artifact:aa", "byteLength", actual.len().to_string()),
+        ("record:bb", "sourceName", "host".to_owned()),
+        ("record:bb", "receivedAt", at),
+        ("record:bb", "sourceByteStart", "0".to_owned()),
+        ("record:bb", "sourceByteEnd", actual.len().to_string()),
+        ("record:bb", "payloadBlake3", digest_string(claimed)),
+    ];
+    for (subject, name, value) in facts {
+        let predicate = if name == "payloadBlake3" {
+            format!("urn:sparrow:vocab:{name}")
+        } else {
+            format!("{NS}{name}")
+        };
+        let subject = builder
+            .intern_iri(&format!("urn:sparrow:{subject}"))
+            .unwrap();
+        let predicate = builder.intern_iri(&predicate).unwrap();
+        let object = builder.intern_literal(RdfLiteral::simple(&value)).unwrap();
+        builder.push_quad(subject, predicate, object, None).unwrap();
+    }
+    let rdf_type = builder
+        .intern_iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+        .unwrap();
+    for (subject, class) in [("artifact:aa", "Artifact"), ("record:bb", "Record")] {
+        let subject = builder
+            .intern_iri(&format!("urn:sparrow:{subject}"))
+            .unwrap();
+        let class = builder.intern_iri(&format!("{NS}{class}")).unwrap();
+        builder.push_quad(subject, rdf_type, class, None).unwrap();
+    }
+    let artifact_link = builder.intern_iri(&format!("{NS}artifact")).unwrap();
+    let record = builder.intern_iri("urn:sparrow:record:bb").unwrap();
+    let artifact = builder.intern_iri("urn:sparrow:artifact:aa").unwrap();
+    builder
+        .push_quad(record, artifact_link, artifact, None)
+        .unwrap();
+    let dataset = builder.freeze().unwrap();
+    let mut writer = to_writer(&dataset, &RdfLookaside::default(), "sparrow-archive").unwrap();
+    writer
+        .add_blob_transformed(
+            actual.to_vec(),
+            Some("application/octet-stream"),
+            Some("record"),
+            &["zstd".to_owned()],
+            None,
+        )
+        .unwrap();
+    let path = root.join("segments").join("forged.gts");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, writer.into_bytes()).unwrap();
+    path
+}
+
+/// Value (#327): the per-record digest check is real. A hand-built segment whose container
+/// is internally consistent extracts when its record's bytes match the link digest, and the
+/// same segment with bytes that do not match is refused by `extract` (nonzero exit, empty
+/// stdout, the file named) and reported `"ok":false` by `verify`.
+#[test]
+fn a_record_whose_bytes_differ_from_its_link_digest_is_refused() {
+    let honest = tempfile::tempdir().unwrap();
+    forged_segment(honest.path(), b"alpha\n", b"alpha\n");
+    let output = extract(honest.path(), "artifact:aa");
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"alpha\n");
+
+    let forged = tempfile::tempdir().unwrap();
+    let path = forged_segment(forged.path(), b"alpha\n", b"bravo\n");
+    let output = extract(forged.path(), "artifact:aa");
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{error}");
+    assert!(output.stdout.is_empty());
+    assert!(error.contains(&path.display().to_string()), "{error}");
+    let verified = run(&["verify", forged.path().to_str().unwrap()]);
+    let text = String::from_utf8(verified.stdout).unwrap();
+    assert_eq!(verified.status.code(), Some(1), "{text}");
+    assert!(text.contains("\"ok\":false"), "{text}");
+}
+
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_sparrow-archive"))
         .args(args)

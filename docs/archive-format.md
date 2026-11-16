@@ -172,8 +172,10 @@ A link quad ties a record to its blob by the SHA-256 of the record's bytes:
 
 Artifact bytes are not copied separately. Every byte of an artifact with records
 belongs to one of its records, and a recordless artifact has no bytes. A reader
-rebuilds an artifact by joining its records' blobs in source order. It checks
-the result against the artifact's `byteLength` and its BLAKE3 `payload`.
+rebuilds an artifact by joining its records' blobs in source order. `sparrow-archive`
+hashes each record's bytes against the digest its link quad names, checks that the
+records are contiguous in byte order from zero, and checks that their total equals the
+artifact's `byteLength`. It does not compare the whole artifact with its BLAKE3 `payload`.
 
 An entry already retired before the store was fenced still has its catalog row
 until ordinary cleanup removes it. Its metadata is archived. Its missing bytes
@@ -348,7 +350,9 @@ each artifact's `id`, `source`, `received_at` (Unix milliseconds) and `byte_leng
 `sparrow-archive verify DIR` checks every segment; and
 `sparrow-archive extract DIR ARTIFACT_ID > file` joins the artifact's records from every
 segment under `DIR` in byte order, wherever they were archived, and writes them to stdout
-only after every segment decoded with its blob digests checked and the bytes add up to the
-artifact's recorded `byteLength`. A damaged segment, an unknown id or an artifact with a
+only after every segment decoded with each record's bytes matching its link digest, the
+records contiguous in byte order and their total equal to the artifact's recorded
+`byteLength`. A damaged segment anywhere under `DIR` blocks extraction; to extract from the
+rest, point `DIR` at a directory without it. A damaged segment, an unknown id or an artifact with a
 missing record exits nonzero, names the file or artifact on stderr and writes nothing to
 stdout. There is no restore into Sparrow.
