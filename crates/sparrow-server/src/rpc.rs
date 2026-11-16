@@ -103,8 +103,6 @@ pub struct Rpc {
     /// peer, or a CHAP-authenticated TCP peer. Absent, an admin operation that records its
     /// caller is refused.
     admin: Option<String>,
-    /// Whether this daemon takes online backups, and where (#156).
-    backup: crate::backup::Backup,
     /// The free-space pause's counters (#257), shared with the daemon's accept loops.
     pause: crate::floor_pause::FloorPause,
 }
@@ -193,7 +191,6 @@ impl Rpc {
             intake: None,
             ingest_socket: None,
             admin: None,
-            backup: crate::backup::Backup::Unconfigured,
         }
     }
 
@@ -219,21 +216,6 @@ impl Rpc {
     #[must_use]
     pub fn with_connections(mut self, ceiling: Arc<crate::admission::Ceiling>) -> Self {
         self.connections = Some(ceiling);
-        self
-    }
-
-    /// Take online backups into `target` (#156).
-    #[must_use]
-    pub fn with_backup(mut self, target: sparrow_core::BackupTarget) -> Self {
-        self.backup = crate::backup::Backup::Configured(target);
-        self
-    }
-
-    /// Refuse online backups: a `--no-intake` or `--private-intake` daemon serves a copy of a
-    /// store.
-    #[must_use]
-    pub fn without_backup_for_copy(mut self) -> Self {
-        self.backup = crate::backup::Backup::Copy;
         self
     }
 
@@ -1980,22 +1962,20 @@ impl wire::sparrow::Server for Rpc {
         Ok(())
     }
 
+    /// The online backup was removed. The method keeps its ordinal (the wire is additive-only)
+    /// and answers every caller with `UNSUPPORTED`.
     async fn backup(
         self: Rc<Self>,
-        params: wire::sparrow::BackupParams,
+        _params: wire::sparrow::BackupParams,
         mut results: wire::sparrow::BackupResults,
     ) -> capnp::Result<()> {
-        let store = params.get()?.get_store_id()?.to_str()?;
-        // Starting spawns the backup thread and returns; nothing here waits on the copy.
-        let result = self
-            .check_store(store)
-            .and_then(|()| self.backup.start(&self.store, now()?));
-        match result {
-            Ok(status) => self
-                .backup
-                .encode(results.get().init_result().init_ok(), &status),
-            Err(error) => failure(results.get().init_result(), error),
-        }
+        failure(
+            results.get().init_result(),
+            Error::new(
+                "UNSUPPORTED",
+                "the online store backup was removed; Sparrow backs up nothing except the archive age-out to GTS files",
+            ),
+        );
         Ok(())
     }
 
@@ -3236,8 +3216,14 @@ impl wire::sparrow::Server for Rpc {
                     out.reborrow().init_tail_registry_evidence(),
                     &self.store.tail_registry_evidence(),
                 );
-                self.backup
-                    .encode(out.reborrow().init_backup(), &self.store.backup_status());
+                // The removed backup's field keeps its ordinal and always reads as before for a
+                // daemon without one: unconfigured, no root, no failure.
+                {
+                    let mut backup = out.reborrow().init_backup();
+                    backup.set_phase(wire::BackupPhase::Unconfigured);
+                    backup.set_root("");
+                    backup.init_failure().set_absent(());
+                }
                 self.admission
                     .encode(out.reborrow().init_admission(), self.connections.as_deref());
                 self.pause.encode(out.reborrow().init_floor_pause());

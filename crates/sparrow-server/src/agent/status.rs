@@ -163,7 +163,6 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         .with("recompression", recompression(value.get_recompression()?)?)
         .with("migrations", migrations(value.get_migrations()?)?)
         .with("query_only", value.get_query_only())
-        .with("backup", super::backup::render(value.get_backup()?)?)
         .with(
             "stream_evidence_loss",
             stream_evidence_loss(value.get_stream_evidence_loss()?)?,

@@ -133,7 +133,7 @@ classify! {
         source_time_define: SourceTimeDefineParams, SourceTimeDefineResults;
         diagnostic_define: DiagnosticDefineParams, DiagnosticDefineResults;
         watch_claim_retire: WatchClaimRetireParams, WatchClaimRetireResults;
-        // Writes nothing to the store, but a query-only daemon takes no backup (#156).
+        // The removed backup method: a query-only daemon refuses it like a write.
         backup: BackupParams, BackupResults;
     }
 }

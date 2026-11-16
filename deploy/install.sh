@@ -132,8 +132,7 @@ host systemd-sysusers sparrow.conf
 # 2. /SPARROW, its modes and ACLs (re-asserted at every boot by systemd-tmpfiles).
 if put "$DEPLOY_DIR/config/tmpfiles-sparrow.conf" /etc/tmpfiles.d/sparrow.conf 0644; then :; fi
 host systemd-tmpfiles --create sparrow.conf
-# Copy-on-write off for the store (lib.sh, switch_off_copy_on_write). Backups go to the NAS only
-# (Patrick, 2026-11-08); nothing local holds them.
+# Copy-on-write off for the store (lib.sh, switch_off_copy_on_write).
 switch_off_copy_on_write /SPARROW/store
 
 # 3. /etc/sparrow: configuration templates, watch definitions, and the secret's location.
@@ -163,7 +162,7 @@ if ((PROFILE_CHANGED)); then
 fi
 
 # 6. Helpers run by the timers.
-for helper in sparrow-ship sparrow-backup katamari-journal-spool katamari-manager-spool; do
+for helper in sparrow-ship katamari-journal-spool katamari-manager-spool; do
     if put "$DEPLOY_DIR/libexec/$helper" "$PREFIX/libexec/sparrow/$helper" 0755; then :; fi
 done
 # The Katamari journal forwarders run as interim user units (docs/deployment.md, "Katamari's journal
@@ -212,7 +211,7 @@ if ((UNITS_CHANGED)); then
     host systemctl daemon-reload
 fi
 if ((ENABLE)); then
-    host systemctl enable sparrow.service sparrow-ship.timer sparrow-backup.timer
+    host systemctl enable sparrow.service sparrow-ship.timer
 fi
 
 # The commands under "ran" re-assert state on every run, and their effects are not itemized: on a

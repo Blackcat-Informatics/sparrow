@@ -435,14 +435,8 @@ under 60 seconds at open. The 2026-11-07 ruling that store format changes
 follow the online migration criterion of #18 replaces that target: the open
 fences the store and serves at once, and the `source-summary` migration runs in
 the maintenance duty afterwards (see "Per-source counters and artifact index"
-in the [interfaces](interfaces.md)). Its duration is measured with
-`deploy/verify-backup.sh --measure-migration` on a copy restored from the
-newest online backup, which reports `backfill_seconds`, done/total progress and
-`live_records`.
-
-That measurement is pending: it has not been run on the newest backup, so no
-duration is recorded here. It is recorded in this section with the image, its
-sha256 and the backup it ran on once it runs.
+in the [interfaces](interfaces.md)). Its duration on the live store is not recorded here: the
+tool that measured it on a restored backup was removed with the online backup (#330).
 
 ## Write stalls (issue 160)
 
@@ -499,7 +493,7 @@ stall at the live rate.
 
 Under the unit's limits, A and C ran again with the same base, load and duration. The
 driver ran in a transient scope with the limits of the user unit, applied as
-`deploy/verify-backup.sh` applies them: `systemd-run --user --scope --nice=10 -p
+the measurement run applied them: `systemd-run --user --scope --nice=10 -p
 CPUQuota=100% -p IOWeight=20 -p MemoryHigh=2G -p MemoryMax=4G`, with no I/O class. Each
 run's scope reported `CPUQuotaPerSecUSec=1s`, `IOWeight=20`, `MemoryHigh` 2 GiB and
 `MemoryMax` 4 GiB 30 seconds in, with the driver in its cgroup at nice 10.

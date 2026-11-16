@@ -11,8 +11,7 @@
 # grants (a deny wins over every allow). Its reads and writes are the ones a traced test instance
 # made (deploy/evidence/apparmor.md): its image and libraries, its configuration and credential,
 # the lexicon bundle, the store, the consume roots, its own /proc entries, the CPU list and
-# RocksDB's identity source, and the online backup root on the NAS (#156), which its backup
-# thread writes and its offline restore reads.
+# RocksDB's identity source.
 
 abi <abi/4.0>,
 include <tunables/global>
@@ -46,20 +45,12 @@ profile sparrow flags=(attach_disconnected) {
   # Consume roots: discovery, the claim (a rename into .sparrow-inflight), its lock and deletion.
   /SPARROW/intake/ r,
   /SPARROW/intake/** rwk,
-  # The online backup root (backup_root, #156): the engine's directory and STORE_ID.
-  /net/synology/archives/ r,
-  /net/synology/archives/sparrow/ rw,
-  /net/synology/archives/sparrow/** rwk,
-
   # Its own descriptors (consume observation through /proc/self/fd/N), thread names, the CPUs the
   # runtime sizes itself from, and RocksDB's identity source. Its maps and status are in
   # abstractions/base.
   @{PROC}/@{pid}/fd/ r,
   @{PROC}/@{pid}/task/@{tid}/comm rw,
   @{PROC}/sys/kernel/random/uuid r,
-  # The online backup reads the mount table to refuse a backup root that is not on a network
-  # filesystem apart from the store's (#156).
-  @{PROC}/@{pid}/mountinfo r,
   @{sys}/devices/system/cpu/{online,possible,present} r,
 
   # Time zones for timestamps.

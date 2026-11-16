@@ -30,14 +30,6 @@ buffered_flush_interval_ms = 2000
 # REV is the PurRDF revision in Cargo.toml. Replace REV with the installed directory's suffix.
 text_lexicon_dir = "/usr/local/share/sparrow/lexicons-REV/artifacts"
 
-# Online backups (#156): the daemon backs up its live store into this directory on the NAS on its
-# own lowest-priority thread, without stopping or slowing ingest. Startup checks only the path;
-# every backup fails, creating nothing, when the root is not on a network filesystem (nfs, nfs4,
-# cifs, smb3) or shares the store's filesystem: Sparrow never backs up to a local disk. The engine
-# keeps backup_keep backups. An image older than the online backup refuses these keys.
-backup_root = "/net/synology/archives/sparrow"
-backup_keep = 3
-
 # Consume watches live in the store's catalog; an entry here only seeds a missing catalog. Add
 # roots with `sparrow /SPARROW/store/rpc.sock watch put ...` (deploy/config/watch.toml.example).
 

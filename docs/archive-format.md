@@ -17,8 +17,9 @@ Patrick's rulings bind this design:
 - Sparrow never deletes unarchived evidence, even when the archive is down.
 - Archiving starts early, at 75% of the retention window or of the data budget.
   A record counts as archived only once its segment is written and verified.
-- The archive root is `/net/synology/archives/sparrow`. The `dir` setting is
-  required and has no built-in default.
+- The archive directory is `/net/synology/archives/sparrow-archive`, set by `[archive] dir`,
+  which is required and has no built-in default. `/net/synology/archives/sparrow` is the
+  retired online-backup tree (removed in #330) and is not an archive root.
 - An unreachable archive at startup starts the daemon degraded; it does not refuse to start.
 - When archiving is enabled on an existing store, the whole retained backlog is
   archived before anything is deleted.
@@ -139,7 +140,7 @@ segment-id = BLAKE3( frame("sparrow-archive/1")
 length followed by the bytes. Digests are the raw 32 bytes. Quarantine files
 appear in ascending entry index. The PurRDF codec is
 byte-deterministic, so the same range of the same store, encoded by the same
-PurRDF revision, always gives the same identity. A restored store backup
+PurRDF revision, always gives the same identity. A copy of a store
 therefore rebuilds and adopts its existing segments. A different PurRDF revision
 can give a different identity for the same range. Readers then see duplicates
 and remove them by record IRI (section 8).

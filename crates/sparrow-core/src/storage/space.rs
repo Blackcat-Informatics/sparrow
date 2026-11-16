@@ -362,11 +362,6 @@ impl SpaceFloor {
         }))
     }
 
-    /// The floor itself, in bytes.
-    pub(super) fn min_free(&self) -> u64 {
-        self.min_free
-    }
-
     /// Measured at the nearest existing ancestor, which shares the filesystem
     /// of a store directory that has not been created yet.
     fn free(&self) -> Result<u64, Error> {
