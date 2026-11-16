@@ -10,7 +10,7 @@
 //! resource to a blob, so the record to blob links are written here as quads in
 //! `urn:sparrow:graph:archive-links`; they go when PurRDF offers the link.
 
-use super::rdf_view::{RdfGraphLayers, RdfReadLimits};
+use super::rdf_view::{RdfGraphLayers, RdfReadLimits, RowAllowance};
 use super::{Error, Store};
 use purrdf::gts::writer::digest_string;
 use purrdf::gts_write::to_writer;
@@ -56,10 +56,11 @@ fn write_gts(dataset: &RdfDataset, blobs: Vec<Vec<u8>>) -> Result<Vec<u8>, Error
 
 /// Ceilings for the archive's own read: a segment's content projections can be large, so the
 /// default query limits would refuse an ordinary segment. The request and row ceilings are a
-/// per-record allowance plus a fixed base, so the read's cost per record cannot grow with the
-/// segment: a read that costs more per record than the allowance (as the union read did, at
-/// quadratic cost) is refused instead of running for minutes. The allowance is about twice
-/// the measured cost per record. The lease is the longest the read admits.
+/// fixed base, a fixed allowance per entry and [`ARCHIVE_ROW_ALLOWANCE`] for each stored graph
+/// row the scope owns, so the read's cost per row cannot grow with the segment: a read that
+/// costs more per row than the allowance (as the union read did, at quadratic cost) is refused
+/// instead of running for minutes, while a record with a large content graph still prepares.
+/// Each allowance is about twice the measured cost. The lease is the longest the read admits.
 fn archive_read(entries: usize) -> RdfReadLimits {
     let entries = entries as u64;
     RdfReadLimits {
@@ -71,10 +72,19 @@ fn archive_read(entries: usize) -> RdfReadLimits {
     }
 }
 
-/// Request allowance for each record or artifact in a segment; measured cost is about 255.
-const REQUESTS_PER_ENTRY: u64 = 512;
-/// Row-visit allowance for each record or artifact in a segment; measured cost is about 32.
-const ROWS_PER_ENTRY: u64 = 64;
+/// Request allowance for each record or artifact in a segment, apart from its graph rows;
+/// measured cost is about one.
+const REQUESTS_PER_ENTRY: u64 = 16;
+/// Row-visit allowance for each record or artifact in a segment, apart from its graph rows;
+/// measured cost is about eight.
+const ROWS_PER_ENTRY: u64 = 16;
+/// What each stored graph row in the scope adds to the ceilings. Measured in a release build:
+/// 21 requests and 2.0 to 2.7 row visits per row, for 1,500 log records (18,020 rows) and for
+/// one JSON record of 800 keys (12,043 rows) alike.
+const ARCHIVE_ROW_ALLOWANCE: RowAllowance = RowAllowance {
+    requests: 42,
+    row_visits: 4,
+};
 /// Fixed request allowance for the scope's own setup.
 const BASE_REQUESTS: u64 = 10_000;
 /// Fixed row-visit allowance for the scope's own setup.
@@ -144,6 +154,7 @@ pub(super) fn encode(
             RdfGraphLayers::ALL,
             0,
             archive_read(ids.len() + artifact_ids.len()),
+            Some(ARCHIVE_ROW_ALLOWANCE),
             |view, absent| {
                 let mut builder = purrdf::RdfDatasetBuilder::new();
                 DatasetImporter::try_new(&mut builder, view)

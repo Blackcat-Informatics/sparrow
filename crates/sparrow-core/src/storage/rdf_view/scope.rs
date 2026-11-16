@@ -155,7 +155,32 @@ impl StoredRdfView<'_> {
                 .expect("scope capture precedes owned query admission")
                 .grow(512)?;
             self.owners.insert(ordinal(owner));
+            self.allow_owner_rows(id)?;
         }
+        Ok(())
+    }
+
+    /// Raise the read ceilings by the allowance for each row of `id`'s stored graph, when the
+    /// view has one. The manifest is the rows the scope will read for this owner.
+    fn allow_owner_rows(&self, id: &str) -> Result<(), ReadError> {
+        let Some(allowance) = self.row_allowance else {
+            return Ok(());
+        };
+        let manifest = self
+            .snapshot
+            .get_pinned(format!("rdf:graph:{id}"))
+            .map_err(|e| self.budget.fail(e.into()))?;
+        let Some(manifest) = manifest else {
+            return Ok(());
+        };
+        let rows: u64 = rdf_index::manifest_stream_counts(&manifest)
+            .map_err(|e| self.budget.fail(e))?
+            .iter()
+            .sum();
+        self.budget.allow(
+            rows.saturating_mul(allowance.requests),
+            rows.saturating_mul(allowance.row_visits),
+        );
         Ok(())
     }
 

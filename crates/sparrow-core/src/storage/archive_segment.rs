@@ -140,28 +140,40 @@ pub struct ArchiveHold {
     pub reason: HoldReason,
 }
 
+/// Index entries read under one hold of the writer. The selection takes the writer again for
+/// the next batch, deferring first to waiting writers, so ingestion waits for at most one
+/// batch however long the segment is. The unarchived range only grows at its end while a
+/// segment is selected: its entries are held until a segment covers them, the one archive
+/// worker is the only mover of the watermark, and the horizon keeps the selection behind
+/// buffered publication. `archive_intend` re-counts the range under one hold regardless.
+const SELECT_BATCH: usize = 256;
+
 fn select(
-    writer: &Writer,
+    store: &Store,
     now: u64,
     intent: Option<&ArchiveIntent>,
     cap: Option<u64>,
 ) -> Result<Option<Selection>, Error> {
-    let policy =
-        writer.config.archive.as_ref().ok_or_else(|| {
+    let (policy, through, size_due, horizon) = {
+        let writer = store.lock()?;
+        let policy = writer.config.archive.clone().ok_or_else(|| {
             Error::new("UNSUPPORTED", "archiving is not configured for this store")
         })?;
-    let through = writer
-        .archive
-        .as_ref()
-        .and_then(|state| state.borrow().through.clone());
-    let size_due = (writer.linked_physical_bytes()? as f64)
-        >= policy.start_fraction
-            * writer
-                .config
-                .disk_budget
-                .saturating_sub(writer.config.maintenance_reserve) as f64;
-    let horizon = now
-        .saturating_sub(HORIZON_FLOOR_MS.max(u64::from(writer.config.buffered_flush_interval_ms)));
+        let through = writer
+            .archive
+            .as_ref()
+            .and_then(|state| state.borrow().through.clone());
+        let size_due = (writer.linked_physical_bytes()? as f64)
+            >= policy.start_fraction
+                * writer
+                    .config
+                    .disk_budget
+                    .saturating_sub(writer.config.maintenance_reserve) as f64;
+        let horizon = now.saturating_sub(
+            HORIZON_FLOOR_MS.max(u64::from(writer.config.buffered_flush_interval_ms)),
+        );
+        (policy, through, size_due, horizon)
+    };
     let entry_cap = cap.unwrap_or(policy.max_segment_records);
     let mut selection = Selection {
         first: String::new(),
@@ -174,104 +186,116 @@ fn select(
     };
     let mut payload = 0_u64;
     let mut first_day = 0;
-    for entry in writer.eviction_entries(through.as_deref().map(str::as_bytes)) {
-        let (key, _) = entry?;
-        let (empty, position) = match key.strip_prefix(super::recordless::PREFIX) {
-            Some(position) => (true, position),
-            None => (false, &key[b"time:".len()..]),
-        };
-        if through
-            .as_deref()
-            .is_some_and(|through| position <= through.as_bytes())
-        {
-            continue;
-        }
-        let position =
-            std::str::from_utf8(position).map_err(|_| corrupt("position is not UTF-8"))?;
-        let (Some(stamp), Some(id)) = (position.get(..20), position.get(21..)) else {
-            return Err(corrupt("position is malformed"));
-        };
-        let received_at: u64 = stamp
-            .parse()
-            .map_err(|_| corrupt("position is malformed"))?;
-        let count = selection.records + selection.artifacts;
-        let rebuilding = intent.is_some();
-        if !rebuilding {
-            if count == entry_cap || received_at > horizon {
-                break;
+    // Where the next batch resumes: the last entry handled, which begins as the watermark.
+    let mut floor = through.clone().map(String::into_bytes);
+    'scan: loop {
+        let writer = store.lock_page()?;
+        let mut handled = 0;
+        for entry in writer.eviction_entries(floor.as_deref()) {
+            let (key, _) = entry?;
+            if handled == SELECT_BATCH {
+                continue 'scan;
             }
-            if count > 0 && received_at / DAY_MS != first_day {
-                break;
+            handled += 1;
+            let (empty, position) = match key.strip_prefix(super::recordless::PREFIX) {
+                Some(position) => (true, position),
+                None => (false, &key[b"time:".len()..]),
+            };
+            if floor.as_deref().is_some_and(|floor| position <= floor) {
+                continue;
             }
-        }
-        let (expires_at, length, record) = if empty {
-            let artifact: Artifact = writer.get(id)?;
-            (artifact.expires_at, 0, None)
-        } else {
-            let record: Record = writer.get(id)?;
-            let length = encodable_length(&record);
-            (record.expires_at, length, Some(record))
-        };
-        if !rebuilding
-            && !due(
-                now,
-                received_at,
-                expires_at,
-                policy.start_fraction,
-                size_due,
-            )
-        {
-            break;
-        }
-        if let Some(record) = &record
-            && let Some(reason) = hold_reason(writer, record, length)?
-        {
-            if count == 0 {
-                // Neither archived nor deleted: the watermark never passes it.
-                tracing::warn!(
-                    record = id,
-                    bytes = length,
-                    reason = ?reason,
-                    "archive held: record cannot be archived; it is not archived and not deleted"
-                );
-                return Ok(None);
-            }
+            floor = Some(position.to_vec());
+            let position =
+                std::str::from_utf8(position).map_err(|_| corrupt("position is not UTF-8"))?;
+            let (Some(stamp), Some(id)) = (position.get(..20), position.get(21..)) else {
+                return Err(corrupt("position is malformed"));
+            };
+            let received_at: u64 = stamp
+                .parse()
+                .map_err(|_| corrupt("position is malformed"))?;
+            let count = selection.records + selection.artifacts;
+            let rebuilding = intent.is_some();
             if !rebuilding {
-                break;
-            }
-            return Err(corrupt("intent covers a held record"));
-        }
-        let oversized = length > policy.max_segment_bytes;
-        if !rebuilding && count > 0 && (oversized || payload + length > policy.max_segment_bytes) {
-            break;
-        }
-        if count == 0 {
-            selection.first = position.to_owned();
-            first_day = received_at / DAY_MS;
-        }
-        position.clone_into(&mut selection.last);
-        payload += length;
-        match record {
-            None => {
-                selection.artifacts += 1;
-                selection.artifact_ids.insert(id.to_owned());
-            }
-            Some(record) => {
-                selection.records += 1;
-                if record.evicted || record.retired {
-                    selection.retired += 1;
-                } else {
-                    selection.artifact_ids.insert(record.artifact_id.clone());
-                    selection.encoded.push(record);
+                if count == entry_cap || received_at > horizon {
+                    break 'scan;
+                }
+                if count > 0 && received_at / DAY_MS != first_day {
+                    break 'scan;
                 }
             }
+            let (expires_at, length, record) = if empty {
+                let artifact: Artifact = writer.get(id)?;
+                (artifact.expires_at, 0, None)
+            } else {
+                let record: Record = writer.get(id)?;
+                let length = encodable_length(&record);
+                (record.expires_at, length, Some(record))
+            };
+            if !rebuilding
+                && !due(
+                    now,
+                    received_at,
+                    expires_at,
+                    policy.start_fraction,
+                    size_due,
+                )
+            {
+                break 'scan;
+            }
+            if let Some(record) = &record
+                && let Some(reason) = hold_reason(&writer, record, length)?
+            {
+                if count == 0 {
+                    // Neither archived nor deleted: the watermark never passes it.
+                    tracing::warn!(
+                        record = id,
+                        bytes = length,
+                        reason = ?reason,
+                        "archive held: record cannot be archived; it is not archived and not deleted"
+                    );
+                    return Ok(None);
+                }
+                if !rebuilding {
+                    break 'scan;
+                }
+                return Err(corrupt("intent covers a held record"));
+            }
+            let oversized = length > policy.max_segment_bytes;
+            if !rebuilding
+                && count > 0
+                && (oversized || payload + length > policy.max_segment_bytes)
+            {
+                break 'scan;
+            }
+            if count == 0 {
+                selection.first = position.to_owned();
+                first_day = received_at / DAY_MS;
+            }
+            position.clone_into(&mut selection.last);
+            payload += length;
+            match record {
+                None => {
+                    selection.artifacts += 1;
+                    selection.artifact_ids.insert(id.to_owned());
+                }
+                Some(record) => {
+                    selection.records += 1;
+                    if record.evicted || record.retired {
+                        selection.retired += 1;
+                    } else {
+                        selection.artifact_ids.insert(record.artifact_id.clone());
+                        selection.encoded.push(record);
+                    }
+                }
+            }
+            if intent.is_some_and(|intent| position == intent.last) {
+                break 'scan;
+            }
+            if oversized {
+                break 'scan;
+            }
         }
-        if intent.is_some_and(|intent| position == intent.last) {
-            break;
-        }
-        if oversized {
-            break;
-        }
+        break 'scan;
     }
     if selection.records + selection.artifacts == 0 {
         return Ok(None);
@@ -280,29 +304,39 @@ fn select(
     // in it: an artifact sorts before its own records, so a segment can end between them.
     // Its graph must be in this segment or the gate would let it retire unarchived.
     let prefix = super::artifact_rdf::TIME.as_bytes();
-    let start = [prefix, through.as_deref().unwrap_or_default().as_bytes()].concat();
-    for row in writer
-        .db
-        .iterator(IteratorMode::From(&start, Direction::Forward))
-    {
-        let (key, _) = row?;
-        let Some(position) = key.strip_prefix(prefix) else {
-            break;
-        };
-        if position > selection.last.as_bytes() {
-            break;
-        }
-        if through
-            .as_deref()
-            .is_some_and(|through| position <= through.as_bytes())
+    let mut start = [prefix, through.as_deref().unwrap_or_default().as_bytes()].concat();
+    'artifacts: loop {
+        let writer = store.lock_page()?;
+        let mut handled = 0;
+        for row in writer
+            .db
+            .iterator(IteratorMode::From(&start, Direction::Forward))
         {
-            continue;
+            let (key, _) = row?;
+            let Some(position) = key.strip_prefix(prefix) else {
+                break 'artifacts;
+            };
+            if position > selection.last.as_bytes() {
+                break 'artifacts;
+            }
+            if handled == SELECT_BATCH {
+                start = key.to_vec();
+                continue 'artifacts;
+            }
+            handled += 1;
+            if through
+                .as_deref()
+                .is_some_and(|through| position <= through.as_bytes())
+            {
+                continue;
+            }
+            let id = std::str::from_utf8(position)
+                .ok()
+                .and_then(|position| position.get(21..))
+                .ok_or_else(|| corrupt("artifact index position is malformed"))?;
+            selection.artifact_ids.insert(id.to_owned());
         }
-        let id = std::str::from_utf8(position)
-            .ok()
-            .and_then(|position| position.get(21..))
-            .ok_or_else(|| corrupt("artifact index position is malformed"))?;
-        selection.artifact_ids.insert(id.to_owned());
+        break;
     }
     Ok(Some(selection))
 }
@@ -384,14 +418,19 @@ impl Store {
         let store_id = self.store_id()?;
         let mut cap = None;
         loop {
-            let (selection, inflight) = {
-                let writer = self.lock()?;
-                let state = writer.archive.as_ref().ok_or_else(|| {
+            // The guard ends with this block: `select` takes the writer itself, one batch at
+            // a time, and the mutex is not re-entrant.
+            let inflight = self
+                .lock()?
+                .archive
+                .as_ref()
+                .ok_or_else(|| {
                     Error::new("UNSUPPORTED", "archiving is not configured for this store")
-                })?;
-                let inflight = state.borrow().intent.clone();
-                (select(&writer, now, inflight.as_ref(), cap)?, inflight)
-            };
+                })?
+                .borrow()
+                .intent
+                .clone();
+            let selection = select(self, now, inflight.as_ref(), cap)?;
             let Some(selection) = selection else {
                 return Ok(None);
             };
@@ -444,7 +483,7 @@ impl Store {
             let bytes = if length == 0 {
                 Vec::new()
             } else {
-                let writer = self.lock()?;
+                let writer = self.lock_page()?;
                 record_bytes(&writer, record.chunks.clone(), 0, length)?
             };
             contents.push((record.id.clone(), bytes));

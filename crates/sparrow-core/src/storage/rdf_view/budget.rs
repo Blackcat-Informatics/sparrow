@@ -18,6 +18,8 @@ pub(super) struct Budget {
 struct State {
     error: Option<ReadError>,
     evidence: RdfReadEvidence,
+    /// Request and row-visit ceiling added by [`Budget::allow`].
+    allowance: (u64, u64),
 }
 
 pub(super) struct Reservation {
@@ -51,6 +53,7 @@ impl Budget {
             state: Mutex::new(State {
                 error: None,
                 evidence: RdfReadEvidence::default(),
+                allowance: (0, 0),
             }),
             limits,
             deadline: Instant::now() + Duration::from_millis(limits.lease_ms),
@@ -100,6 +103,14 @@ impl Budget {
         state.error.get_or_insert_with(|| Arc::new(error)).clone()
     }
 
+    /// Raise the request and row-visit ceilings, for a read whose cost follows the stored
+    /// rows it was found to cover.
+    pub(super) fn allow(&self, requests: u64, row_visits: u64) {
+        let mut state = self.state();
+        state.allowance.0 = state.allowance.0.saturating_add(requests);
+        state.allowance.1 = state.allowance.1.saturating_add(row_visits);
+    }
+
     pub(super) fn request(&self, bytes: u64, row: bool) -> Result<(), ReadError> {
         self.admit(bytes, row, 1)
     }
@@ -126,15 +137,18 @@ impl Budget {
             state.error = Some(error.clone());
             return Err(error);
         };
-        if requests > self.limits.requests
+        let (extra_requests, extra_rows) = state.allowance;
+        let request_ceiling = self.limits.requests.saturating_add(extra_requests);
+        let row_ceiling = self.limits.row_visits.saturating_add(extra_rows);
+        if requests > request_ceiling
             || admitted_bytes > self.limits.io_bytes
-            || row_visits > self.limits.row_visits
+            || row_visits > row_ceiling
         {
             let error = Arc::new(Error::new(
                 "RESOURCE_LIMIT",
                 format!(
                     "RDF read request, byte or row budget exhausted: attempted requests={requests}/{}, io_bytes={admitted_bytes}/{}, row_visits={row_visits}/{}",
-                    self.limits.requests, self.limits.io_bytes, self.limits.row_visits,
+                    request_ceiling, self.limits.io_bytes, row_ceiling,
                 ),
             ));
             state.error = Some(error.clone());

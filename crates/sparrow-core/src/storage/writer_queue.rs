@@ -10,6 +10,7 @@
 //! wait is bounded so the migration still progresses under a continuous stream of writers:
 //! a page defers at most the longer of [`MIN_DEFERRAL`] and the time its predecessor held
 //! the writer. The wait blocks on a condition variable that the last waiting writer signals.
+//! The archive's selection batches and record reads defer the same way before each page.
 
 use super::Error;
 use std::sync::{Condvar, Mutex, MutexGuard};
