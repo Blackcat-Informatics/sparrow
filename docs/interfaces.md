@@ -937,7 +937,10 @@ tail claim bound to another root identity, such as the original root's, does
 not refuse the open in this mode and is never recovered: each recovery refuses
 a claim of another root, which becomes the watch's failure. An active tail
 generation of another root is never resumed, adopted or given a gap; a file
-under the private root that reuses its file identity is refused. The configuration
+under the private root that reuses its file identity is refused. "Another root" is
+decided by the root inode alone, as everywhere a stored identity is compared: if
+`DIR/NAME` happens to have the original root's inode, the original's claims and
+generations are treated as the private root's own, within the disposable copy. The configuration
 may not set `consume`, `syslog`, `rpc_tcp_address` or `archive`, and the
 refusal names the key; `ingest_socket_path` is allowed. The mode cannot be
 combined with query-only mode. The startup line reports
@@ -2600,7 +2603,7 @@ days does not shorten a record that would ordinarily remain for another twenty.
 The core has `tail_start`, `tail_append`, `tail_generation` and
 `tail_discontinue`. An explicit declaration binds a stable start request,
 watch/revision, original root/parent directory identities, raw relative Unix
-path, source, line format and opened device/inode.
+path, source, line format and opened inode (the device number is recorded but never compared).
 The observer owns file-descriptor validation; these calls do not probe, rename
 or delete producer files. Reusing a declaration preserves its generation and
 current checkpoint; changing it conflicts. The stored registry holds at most 64 generations
@@ -2660,7 +2663,7 @@ fences preserve the prior consumption/watch/handoff family across upgrade.
 
 The storage core additionally supplies `tail_finish_start` and `tail_finish_get`.
 A stable finish request binds the original generation and watch revision to the
-producer's final device/inode, byte length and nanosecond modification/change
+producer's final inode, byte length and nanosecond modification/change
 clocks. The descriptor coordinator must certify this observation before first
 admission; the storage core performs no filesystem probes. Exact request retries
 recover the original durable admission before checking current authority.
@@ -2693,7 +2696,7 @@ checkpoint is not a whole-file artifact. The SDK certifies the original request,
 store, declaration, final size and terminal state before returning a receipt.
 
 First admission requires the original enabled `active_files_retain` watch
-revision, root binding and held device/inode. It checks the final descriptor
+revision, root binding and held inode. It checks the final descriptor
 size and nanosecond clocks before durably binding authority. Capture holds the
 same operation semaphore as ordinary tailing, RPC and syslog. Each bounded
 read must still match the admitted final observation before and after reading;
@@ -2724,7 +2727,7 @@ sparrow SOCKET file-finish-status INTENT.capnp
 ```
 
 Preparation observes a producer-supplied final file, verifies its original
-tracked device/inode/checkpoint and exclusively saves the synchronized intent
+tracked inode/checkpoint and exclusively saves the synchronized intent
 outside enabled intake roots. It never replaces an existing retry file.
 MCP `file_finish` and `file_finish_get` share the SDK admission/certification
 path. Inputs contain `store_id`, `request_id`, `generation_id`, decimal-string
@@ -2771,27 +2774,21 @@ and starts a new opaque generation. Same-length observed modification produces
 a declared read gap. This is an append-only producer contract; these observations
 do not certify detection of every rewrite or overwrite followed by growth.
 
-Restart attaches surviving in-root identities to original checkpoints. A stored
-active generation whose root device alone differs from the root's current device
-(its inode, watch revision, source and format are equal) is gapped as
-`identity_changed` at start, because a filesystem such as btrfs renumbers its
-devices at boot; the daemon writes one operator line naming the watch, the
-generation and both device numbers, and the file is then read again from the
-beginning under a new generation. Any other difference refuses the start. A
-pending finished-file claim is treated alike at start: a stored root or parent
-device that alone differs from the current one (the inode is equal) still names
-the same directory, so the daemon starts, the claim stays pending with its bytes
-kept, and one operator line names the watch and both root device numbers. A
-changed inode still refuses the start. The claim's recorded file device is not
-relaxed, and after a real reboot the file's own device has changed as well, so
-recovery of a claim whose file never moved fails at the check of the file
-against its recorded observation. The failure shows in the watch status and in
-`watch claims`, and the recovery is retried from 5 seconds up to a 15 minute
-ceiling with one log line per attempt, while the watch's other files keep
-flowing. Such a claim holds one of the shared journal slots and has no in-place
-way out until the stable-identity decision (issue #315). A claim whose file was
-already moved into the private claim directory likewise refuses its recovery
-and removal, and keeps the file. After a
+Restart attaches surviving in-root identities to original checkpoints. A file, a
+root and a parent directory are identified by their inode alone. The device number
+is stored as written but is never compared with a stored value, because it changes
+across a reboot on btrfs subvolumes, network, overlay and re-enumerated mounts; a
+descriptor held while the daemon runs already fixes the object. A stored active
+generation whose root inode, watch revision, source and format equal the current
+ones resumes whatever its stored device numbers say, and the file with the declared
+inode is attached to its checkpoint. A pending finished-file claim likewise stays
+bound to its stored root and parent inodes. A file smaller than its checkpoint still
+takes the `truncated` discontinuity, an mtime change at equal size within a run still
+takes `read_gap`, and a changed root inode still refuses the start. The known
+weakness is inode reuse after a delete and create: a new file given the old inode
+and larger than the old offset is read on from the checkpoint; the device number
+never detected that either, and closing it needs a content digest in the stored
+checkpoint, which is a stored-format change. After a
 complete reconciliation, unavailable active identities receive durable read gaps;
 no missing prefix is invented. Status exposes finite `tail_generation_ids`,
 `tail_read_bytes`, `tail_descriptors`, `tail_admission_waiting` and
@@ -3613,9 +3610,10 @@ to ordinary MCP search tools.
 
 Schema 16 provides `WatchHandoff` requests for explicit finished-file admission
 and read-only progress lookup. They carry the original store, stable request ID,
-watch and exact revision, relative Unix path as `Data`, and a typed device/inode,
+watch and exact revision, relative Unix path as `Data`, and a typed device and inode (the device informational only),
 byte-length, modification and change-clock generation. First admission requires
-the current enabled watch revision and matching anchored regular-file identity;
+the current enabled watch revision and matching anchored regular-file identity,
+with the opened file on the held root's filesystem by a live device check;
 it bypasses the quiet timer under the watch's explicit producer contract.
 The durable request binding and existing consumption reservation commit together,
 with a monotonic `sparrow.store/8` writer fence. Up to 128 bindings and 16 active
@@ -3643,7 +3641,7 @@ The SDK supplies `Client::import_open_file` and the generated-capability
 `import_open_file` helper for an already opened completed regular file. The
 caller retains descriptor ownership; upload reads positionally from byte zero and never
 reopens or deletes a path. `CompletedFileIdentity::capture` and `require` share
-the device/inode, length and nanosecond modification/change-clock guard used
+the inode, length and nanosecond modification/change-clock guard used
 by hashing, uploading, accepted-retry receipts and final publication replies.
 An observed source mutation refuses certification even if the daemon has
 already committed its original bytes. This observation is not a writer lock

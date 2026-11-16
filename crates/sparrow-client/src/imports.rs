@@ -439,9 +439,14 @@ fn import_reference(mut out: wire::import_ref::Builder<'_>, store: &str, id: &st
 }
 
 /// Opened-file generation and observed mutation clocks used by upload and future claims.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Equality is the inode, length and both clocks. The device number is carried for the wire
+/// and for same-boot checks against a live descriptor, but it is never identity: it changes
+/// across a reboot on btrfs subvolumes, network, overlay and re-enumerated mounts, so an
+/// observation persisted before a restart must still equal the same file observed after it.
+#[derive(Clone, Copy, Debug)]
 pub struct CompletedFileIdentity {
-    /// Filesystem device identity.
+    /// Filesystem device number, informational only; never compared.
     pub device: u64,
     /// Opened inode identity.
     pub inode: u64,
@@ -456,6 +461,38 @@ pub struct CompletedFileIdentity {
     /// Inode change clock fractional nanoseconds.
     pub changed_nanos: i64,
 }
+
+impl PartialEq for CompletedFileIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        // Destructured so a new field must be classified as identity or not.
+        let Self {
+            device: _,
+            inode,
+            length,
+            modified_seconds,
+            modified_nanos,
+            changed_seconds,
+            changed_nanos,
+        } = *self;
+        (
+            inode,
+            length,
+            modified_seconds,
+            modified_nanos,
+            changed_seconds,
+            changed_nanos,
+        ) == (
+            other.inode,
+            other.length,
+            other.modified_seconds,
+            other.modified_nanos,
+            other.changed_seconds,
+            other.changed_nanos,
+        )
+    }
+}
+
+impl Eq for CompletedFileIdentity {}
 
 impl CompletedFileIdentity {
     /// Capture one metadata observation without reopening any source path.
@@ -519,6 +556,52 @@ mod tests {
             Err(crate::Error::InvalidArgument(_))
         ));
         task.join().unwrap();
+    }
+
+    /// INVARIANT: a changed device number alone leaves a completed-file identity equal, so a
+    /// claim, finish intent or checkpoint persisted before a reboot still matches the same
+    /// file afterwards; a different inode, length or clock never does.
+    #[test]
+    fn completed_file_identity_ignores_the_device_and_nothing_else() {
+        let base = super::CompletedFileIdentity {
+            device: 1,
+            inode: 7,
+            length: 10,
+            modified_seconds: 100,
+            modified_nanos: 5,
+            changed_seconds: 200,
+            changed_nanos: 6,
+        };
+        let renumbered = super::CompletedFileIdentity { device: 2, ..base };
+        assert_eq!(base, renumbered);
+        for changed in [
+            super::CompletedFileIdentity {
+                inode: 8,
+                ..renumbered
+            },
+            super::CompletedFileIdentity {
+                length: 9,
+                ..renumbered
+            },
+            super::CompletedFileIdentity {
+                modified_seconds: 101,
+                ..renumbered
+            },
+            super::CompletedFileIdentity {
+                modified_nanos: 6,
+                ..renumbered
+            },
+            super::CompletedFileIdentity {
+                changed_seconds: 201,
+                ..renumbered
+            },
+            super::CompletedFileIdentity {
+                changed_nanos: 7,
+                ..renumbered
+            },
+        ] {
+            assert_ne!(base, changed);
+        }
     }
 
     #[test]

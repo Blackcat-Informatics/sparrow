@@ -37,8 +37,8 @@ pub(crate) struct TailRoot {
     root: File,
     binding: crate::consumption::RootBinding,
     claim: std::cell::OnceCell<crate::consumption::ClaimRoot>,
-    held: BTreeMap<(u64, u64), Held>,
-    next: Option<(u64, u64)>,
+    held: BTreeMap<u64, Held>,
+    next: Option<u64>,
     /// One inotify watch per held descriptor, on the file itself: an append to a generation
     /// whose name has left the watched directories (unlinked, or moved out of the root)
     /// raises no directory event, but still raises this one.
@@ -63,38 +63,13 @@ impl TailRoot {
             }
             let declared = generation.declaration;
             // A private root never holds the original root's active generations.
-            if foreign(binding, (identity.device, identity.inode), &declared) {
+            if foreign(binding, identity.inode, &declared) {
                 continue;
             }
-            match check_declaration(
-                &declared,
-                (identity.device, identity.inode),
-                config,
-                revision,
-            ) {
-                Declaration::Matches => {}
-                Declaration::DeviceRenumbered => {
-                    // The same directory under a renumbered device (btrfs hands out a new
-                    // anonymous st_dev per boot): the checkpoint cannot be proven continuous,
-                    // so it is gapped as `identity_changed` with its records kept, and the
-                    // open continues. A generation already gapped or completed never reaches
-                    // here, so a CONFLICT can only mean a concurrent change and fails loudly.
-                    store.tail_discontinue(
-                        &generation.id,
-                        generation.offset,
-                        "identity_changed",
-                        crate::now()?,
-                    )?;
-                    eprintln!(
-                        "sparrowd: watch={} tail generation={} root device changed from {} to {}; recorded identity_changed",
-                        config.id, generation.id, declared.directories.root_device, identity.device
-                    );
-                }
-                Declaration::Refused => {
-                    return Err(Error::State(
-                        "active file checkpoints require their original watch revision, root and interpretation; restore that definition before recovery",
-                    ));
-                }
+            if !declaration_matches(&declared, identity.inode, config, revision) {
+                return Err(Error::State(
+                    "active file checkpoints require their original watch revision, root and interpretation; restore that definition before recovery",
+                ));
             }
         }
         Ok(Self {
@@ -138,7 +113,7 @@ impl TailRoot {
 
     /// Stop holding one descriptor and drop its file watch. The kernel has already dropped
     /// the watch of a file that no longer exists, which `EINVAL` reports.
-    fn release(&mut self, key: (u64, u64)) -> Result<(), Error> {
+    fn release(&mut self, key: u64) -> Result<(), Error> {
         let Some(held) = self.held.remove(&key) else {
             return Ok(());
         };
@@ -149,10 +124,9 @@ impl TailRoot {
         }
     }
 
-    /// The held root's (device, inode), which every generation it may read declares.
-    fn root_identity(&self) -> Result<(u64, u64), Error> {
-        let identity = CompletedFileIdentity::capture(&self.root.metadata()?);
-        Ok((identity.device, identity.inode))
+    /// The held root's inode, which every generation it may read declares.
+    fn root_inode(&self) -> Result<u64, Error> {
+        Ok(CompletedFileIdentity::capture(&self.root.metadata()?).inode)
     }
 
     pub(crate) fn status(&self, watch: &str) -> Result<(Vec<String>, u64, u32, u64), Error> {
@@ -199,7 +173,7 @@ impl TailRoot {
     }
 
     pub(crate) fn finish(&mut self, intent: &TailFinishIntent) -> Result<TailGeneration, Error> {
-        let held = self.held.get_mut(&(intent.observed.device, intent.observed.inode))
+        let held = self.held.get_mut(&intent.observed.inode)
             .ok_or(Error::State("completion requires the original held generation; wait for reconciliation or inspect its durable gap"))?;
         if held.generation.id != intent.generation_id {
             return Err(Error::State(
@@ -224,13 +198,13 @@ impl TailRoot {
         let Some(expected) = self.observe(path)? else {
             return Ok(());
         };
-        let key = (expected.device, expected.inode);
+        let key = expected.inode;
         if self.held.contains_key(&key) {
             return Ok(());
         }
         // A private root reads only its own generations: a generation of the original root
-        // whose file (device, inode) a file below the private root reuses is never adopted.
-        let held_root = self.root_identity()?;
+        // whose file inode a file below the private root reuses is never adopted.
+        let held_root = self.root_inode()?;
         let generations = self
             .store
             .tail_generations(&config.id)?
@@ -239,7 +213,7 @@ impl TailRoot {
             .collect::<Vec<_>>();
         for row in &generations {
             if row.declaration.watch_revision != revision
-                || (row.declaration.device, row.declaration.inode) != key
+                || row.declaration.inode != key
                 || (!row.complete && row.gap.is_none())
             {
                 continue;
@@ -281,16 +255,17 @@ impl TailRoot {
             return Err(Error::State("tail source must be a regular file"));
         }
         let observed = CompletedFileIdentity::capture(&metadata);
-        if (observed.device, observed.inode) != key {
+        // Both sides are live observations of this boot. The path was re-resolved after
+        // `observe`, and a nested btrfs subvolume has its own device and inode numbering, so
+        // the device keeps a file from another one off this inode's checkpoint.
+        if (observed.device, observed.inode) != (expected.device, key) {
             return Err(Error::State(
                 "tail source changed during descriptor admission; reconcile before retry",
             ));
         }
-        let generation = generations.into_iter().find(|row| {
-            !row.complete
-                && row.gap.is_none()
-                && (row.declaration.device, row.declaration.inode) == key
-        });
+        let generation = generations
+            .into_iter()
+            .find(|row| !row.complete && row.gap.is_none() && row.declaration.inode == key);
         let generation = match generation {
             Some(generation) => generation,
             None => self.store.tail_start(
@@ -358,7 +333,7 @@ impl TailRoot {
             .get_mut(&key)
             .ok_or(Error::State("tail descriptor selection lost"))?;
         let before = CompletedFileIdentity::capture(&held.file.metadata()?);
-        if (before.device, before.inode) != key {
+        if before.inode != key {
             return Err(Error::State("held tail descriptor identity changed"));
         }
         let final_identity = held
@@ -488,16 +463,14 @@ impl TailRoot {
     }
 
     pub(crate) fn reconcile_missing(&mut self, watch: &str) -> Result<(), Error> {
-        let held_root = self.root_identity()?;
+        let held_root = self.root_inode()?;
         for generation in self.store.tail_generations(watch)? {
             // The original root's generations stay as the copy holds them: a private root
             // records no gap for a file it never held.
             if !generation.complete
                 && generation.gap.is_none()
                 && !foreign(self.binding, held_root, &generation.declaration)
-                && !self
-                    .held
-                    .contains_key(&(generation.declaration.device, generation.declaration.inode))
+                && !self.held.contains_key(&generation.declaration.inode)
             {
                 self.store.tail_discontinue(
                     &generation.id,
@@ -511,38 +484,20 @@ impl TailRoot {
     }
 }
 
-/// How a stored active generation's declaration relates to the watch as it is now.
-#[derive(Debug, PartialEq, Eq)]
-enum Declaration {
-    /// Every declared identity equals the current one.
-    Matches,
-    /// Only the root's device number differs; the inode, revision, source and format agree.
-    DeviceRenumbered,
-    /// The inode, revision, source or format differs, whatever the device says.
-    Refused,
-}
-
-/// Classify a stored active generation's declaration against the watch's current root,
-/// revision, source and format. The inode, revision, source and format are checked first, so a
-/// stale device never excuses another difference.
+/// Whether a stored active generation's declaration names the watch as it is now: the root
+/// inode, revision, source and format must all agree. The root's device number is stored but
+/// never compared; a reboot may renumber it without changing the directory.
 #[must_use]
-fn check_declaration(
+fn declaration_matches(
     declared: &TailStart,
-    root: (u64, u64),
+    root_inode: u64,
     config: &ConsumeWatch,
     revision: u64,
-) -> Declaration {
-    if declared.directories.root_inode != root.1
-        || declared.watch_revision != revision
-        || declared.source != config.source
-        || declared.format != config.format
-    {
-        Declaration::Refused
-    } else if declared.directories.root_device != root.0 {
-        Declaration::DeviceRenumbered
-    } else {
-        Declaration::Matches
-    }
+) -> bool {
+    declared.directories.root_inode == root_inode
+        && declared.watch_revision == revision
+        && declared.source == config.source
+        && declared.format == config.format
 }
 
 /// Whether a generation declared on another root than ROOT must be left alone: only under a
@@ -550,12 +505,9 @@ fn check_declaration(
 /// never resumed, adopted or closed.
 fn foreign(
     binding: crate::consumption::RootBinding,
-    root: (u64, u64),
+    root_inode: u64,
     declared: &TailStart,
 ) -> bool {
     binding == crate::consumption::RootBinding::Private
-        && (
-            declared.directories.root_device,
-            declared.directories.root_inode,
-        ) != root
+        && declared.directories.root_inode != root_inode
 }

@@ -17,18 +17,34 @@ const JOURNAL_BYTES: usize = 8192;
 pub(super) const FORMAT: &[u8] = b"sparrow.store/34";
 pub(super) const TAIL_FORMAT: &[u8] = b"sparrow.store/37";
 
-/// Directory identities anchoring the source namespace across recovery.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Directory identities anchoring the source namespace across recovery. Equality is the two
+/// inodes: the stored device numbers are kept as written but never compared, because a device
+/// number changes across a reboot on btrfs subvolumes, network, overlay and re-enumerated mounts.
+#[derive(Clone, Debug)]
 pub struct ConsumptionDirectories {
-    /// Watch-root filesystem device.
+    /// Watch-root filesystem device; informational, never compared.
     pub root_device: u64,
     /// Watch-root inode.
     pub root_inode: u64,
-    /// Original source-parent filesystem device.
+    /// Original source-parent filesystem device; informational, never compared.
     pub parent_device: u64,
     /// Original source-parent inode.
     pub parent_inode: u64,
 }
+
+impl PartialEq for ConsumptionDirectories {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            root_device: _,
+            root_inode,
+            parent_device: _,
+            parent_inode,
+        } = *self;
+        (root_inode, parent_inode) == (other.root_inode, other.parent_inode)
+    }
+}
+
+impl Eq for ConsumptionDirectories {}
 
 impl Catalog for ConsumptionDirectories {
     fn encode(&self) -> Value {
@@ -50,10 +66,11 @@ impl Catalog for ConsumptionDirectories {
 }
 
 /// One observed completed-file generation. The filesystem coordinator supplies
-/// these observations from its already opened regular-file descriptor.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// these observations from its already opened regular-file descriptor. Equality ignores the
+/// device number, which is stored as written but is not identity across a reboot.
+#[derive(Clone, Debug)]
 pub struct ConsumptionGeneration {
-    /// Filesystem device identity.
+    /// Filesystem device number; informational, never compared.
     pub device: u64,
     /// Opened inode identity.
     pub inode: u64,
@@ -64,6 +81,27 @@ pub struct ConsumptionGeneration {
     /// Inode-change time seconds and nanoseconds.
     pub changed: (i64, u32),
 }
+
+impl PartialEq for ConsumptionGeneration {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            device: _,
+            inode,
+            byte_length,
+            modified,
+            changed,
+        } = *self;
+        (inode, byte_length, modified, changed)
+            == (
+                other.inode,
+                other.byte_length,
+                other.modified,
+                other.changed,
+            )
+    }
+}
+
+impl Eq for ConsumptionGeneration {}
 
 impl Catalog for ConsumptionGeneration {
     fn encode(&self) -> Value {
@@ -537,9 +575,10 @@ impl ConsumptionJournal {
 
     fn validate(&self) -> Result<(), Error> {
         validate_source(&self.watch, &self.relative_path, &self.observed)?;
-        if self.directories.root_device != self.directories.parent_device
-            || self.directories.root_device != self.observed.device
-        {
+        // Both directory devices are captured together from live descriptors. The observed
+        // file's device may come from a retry saved before a reboot, so it is not compared
+        // here; the server checks the opened source against the held root instead.
+        if self.directories.root_device != self.directories.parent_device {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
                 "consumption requires source and anchored directories on the same filesystem",
@@ -562,7 +601,6 @@ impl ConsumptionJournal {
                 || declaration.watch != self.watch
                 || declaration.source != self.source
                 || declaration.format != self.format
-                || declaration.directories.root_device != self.directories.root_device
                 || declaration.directories.root_inode != self.directories.root_inode
                 || self.published_artifact.is_some()
             {
@@ -574,8 +612,7 @@ impl ConsumptionJournal {
         }
         if let Some(claimed) = &self.claimed {
             claimed.validate()?;
-            if claimed.device != self.observed.device
-                || claimed.inode != self.observed.inode
+            if claimed.inode != self.observed.inode
                 || claimed.byte_length != self.observed.byte_length
                 || claimed.modified != self.observed.modified
             {
@@ -1493,6 +1530,30 @@ mod tests {
             1_000,
         )
         .unwrap()
+    }
+
+    /// INVARIANT (issue 315): a stored journal is bound by inode, never by device number. A
+    /// reservation retried after a reboot that renumbered every device validates as the same
+    /// observation and directories, while a changed inode or source length is a different one.
+    #[test]
+    fn journal_identity_ignores_device_numbers_and_keeps_inodes() {
+        let journal = fixture();
+        let mut renumbered = journal.clone();
+        renumbered.observed.device += 5;
+        renumbered.directories.root_device += 5;
+        renumbered.directories.parent_device += 5;
+        assert_eq!(renumbered.observed, journal.observed);
+        assert_eq!(renumbered.directories, journal.directories);
+        renumbered.validate().unwrap();
+        let mut other = journal.clone();
+        other.observed.inode += 1;
+        assert_ne!(other.observed, journal.observed);
+        let mut other = journal.clone();
+        other.observed.byte_length += 1;
+        assert_ne!(other.observed, journal.observed);
+        let mut other = journal.clone();
+        other.directories.parent_inode += 1;
+        assert_ne!(other.directories, journal.directories);
     }
 
     /// INVARIANT (issue 160): a journal written before schema 71 has no history, and every
