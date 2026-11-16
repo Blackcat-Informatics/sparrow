@@ -172,7 +172,12 @@ fn manifest_counts(writer: &Writer, id: &str) -> Result<[u64; 3], Error> {
         .db
         .get(format!("rdf:graph:{id}"))?
         .ok_or_else(|| Error::new("STORAGE_FAILURE", "RDF graph manifest missing"))?;
-    let manifest = parse(&bytes)?;
+    manifest_stream_counts(&bytes)
+}
+
+/// Rows of a stored graph manifest by stream: primary, reifier and annotation.
+pub(super) fn manifest_stream_counts(bytes: &[u8]) -> Result<[u64; 3], Error> {
+    let manifest = parse(bytes)?;
     let rows = manifest
         .get("rows")
         .and_then(Value::as_array)

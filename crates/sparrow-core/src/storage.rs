@@ -1882,6 +1882,16 @@ impl Store {
         writer
     }
 
+    /// Take the writer lock for one page of a long background read that takes it again and
+    /// again (the archive's selection batches and record reads). The mutex is not fair, so a
+    /// page that asks again at once can win it back from a writer already waiting, page after
+    /// page; it first defers to waiting writers, as a migration page does, and does not
+    /// register as one.
+    fn lock_page(&self) -> Result<std::sync::MutexGuard<'_, Writer>, Error> {
+        self.unlocked.writers.defer_page();
+        self.lock_uncounted()
+    }
+
     /// Take the writer lock without registering as a waiting writer: migration pages,
     /// which defer to registered writers before they ask.
     fn lock_uncounted(&self) -> Result<std::sync::MutexGuard<'_, Writer>, Error> {

@@ -200,3 +200,63 @@ fn a_segment_ending_between_an_artifact_and_its_record_still_holds_the_artifact(
         .unwrap();
     assert_eq!(done.records, 1);
 }
+
+/// INVARIANT: preparing a segment costs a bounded amount of read per record, whatever the
+/// segment's size, and a segment of more than 1,000 records prepares (the query selection
+/// bound does not apply to it). The read ceilings are a fixed allowance per entry plus one
+/// per stored graph row. The earlier union read cost about 2,800 requests per record already
+/// at 5 records, against a measured 255 now, and its cost per record grew with the segment,
+/// so it exceeds those ceilings at this size. A retried prepare of the same due
+/// backlog is byte-equal, so the archive worker never meets a different file at a name.
+#[test]
+fn a_segment_of_over_a_thousand_records_prepares_within_its_read_bound_and_repeats_byte_equal() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), archiving(ArchivePolicy::default())).unwrap();
+    let body: String = (0..1100).map(|i| format!("line number {i:06}\n")).collect();
+    store
+        .ingest("seg-many", "source", "log", body.as_bytes(), 1)
+        .unwrap();
+    let now = 1 + 30 * DAY;
+    let first = store.archive_prepare(now).unwrap().expect("due");
+    assert_eq!(first.records, 1100);
+    let again = store.archive_prepare(now).unwrap().expect("rebuilt");
+    assert_eq!(first.segment_id, again.segment_id);
+    assert_eq!(first.files, again.files);
+    store.archive_commit(&first.segment_id).unwrap();
+}
+
+/// REGRESSION: the read ceiling follows the graph rows a record stores, not only the entry
+/// count, so a single json record and a single markdown record, each with thousands of graph
+/// rows, prepare and commit under the committed ceilings. A ceiling that counted entries
+/// alone refused such a record even when it stood alone, and the archive stuck behind it.
+/// The markdown document carries links, emphasis, lists, code, quotes and footnote citations,
+/// which the markdown projection turns into more kinds of row than json or log lines do.
+#[test]
+fn a_json_or_markdown_record_with_thousands_of_graph_rows_prepares() {
+    // 800 json keys store about 12,000 graph rows (15 per key, measured), and the read costs
+    // about 250,000 requests, where a ceiling by entries alone allowed 11,024 (one record and
+    // its artifact).
+    let fields: Vec<String> = (0..800).map(|i| format!("\"k{i}\":\"v{i}\"")).collect();
+    let json = format!("{{{}}}\n", fields.join(","));
+    let markdown: String = (0..300)
+        .map(|i| {
+            format!(
+                "## Section {i}\n\nA *claim* with a [link](https://example.org/{i}) and \
+                 `code {i}`.[^{i}]\n\n- item {i}a\n- item {i}b\n\n> quote {i}\n\n[^{i}]: note {i}\n\n"
+            )
+        })
+        .collect();
+    for (format, body) in [("json", json), ("markdown", markdown)] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), archiving(ArchivePolicy::default())).unwrap();
+        store
+            .ingest("seg-wide", "source", format, body.as_bytes(), 1)
+            .unwrap();
+        let segment = store
+            .archive_prepare(1 + 30 * DAY)
+            .unwrap_or_else(|error| panic!("{format} record did not prepare: {error:?}"))
+            .expect("due");
+        assert_eq!(segment.records, 1, "{format}");
+        store.archive_commit(&segment.segment_id).unwrap();
+    }
+}

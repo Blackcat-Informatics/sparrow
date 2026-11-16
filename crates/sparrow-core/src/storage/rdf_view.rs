@@ -131,6 +131,9 @@ pub struct StoredRdfView<'a> {
     max_encoded: u64,
     scope_receipt: Option<super::Value>,
     text_scope: Option<text_relations::TextScope>,
+    /// When set, each graph owner added to the scope raises the read ceilings by this cost
+    /// per stored row in its manifest.
+    row_allowance: Option<RowAllowance>,
 }
 
 /// The receipt-time fallback facts one snapshot derives for selected record graphs that do
@@ -274,6 +277,7 @@ impl<'a> StoredRdfView<'a> {
             max_encoded: 0,
             scope_receipt: None,
             text_scope: None,
+            row_allowance: None,
         };
         for key in ["rdf:term-count", "rdf:max-encoded"] {
             let bytes = view.point(key.as_bytes(), 8)?.ok_or_else(|| {
@@ -1308,12 +1312,32 @@ impl Store {
         limits: RdfReadLimits,
         operation: impl FnOnce(&StoredRdfView<'_>) -> T,
     ) -> Result<T, ReadError> {
-        self.with_rdf_scope_ids(ids, &[], layers, now, limits, |view, _| operation(view))
+        if ids.is_empty() || ids.len() > 1000 {
+            return Err(Arc::new(Error::new(
+                "INVALID_ARGUMENT",
+                "RDF selection requires 1..1000 record IDs",
+            )));
+        }
+        self.with_rdf_scope_ids(ids, &[], layers, now, limits, None, |view, _| {
+            operation(view)
+        })
     }
 
     /// The same capture with named artifacts' graphs added to the records'. The operation also
     /// receives the artifact ids that have no RDF ownership (retired before the store was
-    /// fenced) and so are absent from the view.
+    /// fenced) and so are absent from the view. The selection is not capped at the query bound
+    /// of 1,000 (`with_rdf_record_layers` keeps it): the archive reads a whole segment, whose
+    /// size its own selection bounds, and each id is charged to the scope's live bytes.
+    ///
+    /// The writer is held only to pin the snapshot, so a capture of any size does not pause
+    /// ingestion. A capture that finds expired evidence runs twice: the first pass names the
+    /// expired targets, and the second pins a new snapshot and reads the pins that protect
+    /// those targets under one hold of the writer, so the pins and the snapshot are as of the
+    /// same moment. Decoding and including then run on that snapshot without the writer, and
+    /// a record found expired there that the first pass did not name fails the capture with
+    /// the retryable `RESOURCE_LIMIT`, with nothing read.
+    /// `allowance` raises the read ceilings by a cost per stored row found in the scope.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn with_rdf_scope_ids<T>(
         &self,
         ids: &[String],
@@ -1321,19 +1345,90 @@ impl Store {
         layers: RdfGraphLayers,
         now: u64,
         limits: RdfReadLimits,
+        allowance: Option<RowAllowance>,
         operation: impl FnOnce(&StoredRdfView<'_>, &[String]) -> T,
     ) -> Result<T, ReadError> {
-        if (ids.is_empty() && artifacts.is_empty()) || ids.len() > 1000 || artifacts.len() > 1000 {
+        if ids.is_empty() && artifacts.is_empty() {
             return Err(Arc::new(Error::new(
                 "INVALID_ARGUMENT",
-                "RDF selection requires 1..1000 record IDs",
+                "RDF selection requires at least one record or artifact ID",
             )));
         }
         let _lease = self.rdf_read_lease()?;
+        let mut operation = Some(operation);
+        let mut scope = ScopeCapture {
+            ids,
+            artifacts,
+            layers,
+            now,
+            limits,
+            allowance,
+            expired: None,
+        };
+        let expired = match self.capture_scope(&scope, &mut operation)? {
+            Capture::Done(result) => return Ok(result),
+            Capture::Expired(expired) => expired,
+        };
+        scope.expired = Some(&expired);
+        match self.capture_scope(&scope, &mut operation)? {
+            Capture::Done(result) => Ok(result),
+            Capture::Expired(_) => Err(Arc::new(Error::new(
+                "STORAGE_FAILURE",
+                "RDF scope capture with the expired targets known did not run",
+            ))),
+        }
+    }
+
+    /// One capture and its operation, or the expired targets when the selection holds expired
+    /// evidence and `scope.expired` does not yet name them.
+    fn capture_scope<T>(
+        &self,
+        scope: &ScopeCapture<'_>,
+        operation: &mut Option<impl FnOnce(&StoredRdfView<'_>, &[String]) -> T>,
+    ) -> Result<Capture<T>, ReadError> {
+        let ScopeCapture {
+            ids,
+            artifacts,
+            layers,
+            now,
+            limits,
+            allowance,
+            expired,
+        } = *scope;
+        // The one writer hold: pin the snapshot and read the pins protecting the known
+        // expired targets, which must be as of the same moment.
         let writer = self.lock().map_err(Arc::new)?;
         let db = Arc::clone(&writer.db);
         let mut view = StoredRdfView::new(&db, limits, &[])?;
         view.scoped = true;
+        view.row_allowance = allowance;
+        let protected = match expired {
+            None => BTreeSet::new(),
+            Some(targets) => {
+                let maximum = writer
+                    .config
+                    .max_pin_members
+                    .saturating_mul(128)
+                    .saturating_add(4096);
+                writer
+                    .protected_matching(
+                        now,
+                        |member| targets.contains(member),
+                        || {
+                            view.budget
+                                .request(maximum as u64, false)
+                                .and_then(|_| {
+                                    view.budget.reserve((maximum as u64).saturating_mul(64))
+                                })
+                                .map_err(|error| Error::new(error.code, error.message.clone()))
+                        },
+                        Some(maximum),
+                        None,
+                    )
+                    .map_err(|e| view.budget.fail(e))?
+            }
+        };
+        drop(writer);
         let mut scope_bytes = 4096 + (ids.len() + artifacts.len()) as u64 * 2048;
         Arc::get_mut(&mut view._scope)
             .expect("scope capture precedes owned query admission")
@@ -1368,39 +1463,29 @@ impl Store {
                 .expect("scope capture precedes owned query admission")
                 .resize(scope_bytes)?;
             if record.expires_at <= now {
+                if expired.is_some_and(|known| !known.contains(&record.id)) {
+                    // Its pins were not read with this snapshot: neither protected nor
+                    // unprotected may be guessed.
+                    return Err(view.budget.fail(Error::new(
+                        "RESOURCE_LIMIT",
+                        "RDF selection changed between capture passes; retry",
+                    )));
+                }
                 targets.insert(record.id.clone());
                 targets.insert(record.artifact_id.clone());
             }
             records.push(record);
         }
-        let protected = if targets.is_empty() {
-            BTreeSet::new()
-        } else {
-            let maximum = writer
-                .config
-                .max_pin_members
-                .saturating_mul(128)
-                .saturating_add(4096);
-            writer
-                .protected_matching(
-                    now,
-                    |member| targets.contains(member),
-                    || {
-                        view.budget
-                            .request(maximum as u64, false)
-                            .and_then(|_| view.budget.reserve((maximum as u64).saturating_mul(64)))
-                            .map_err(|error| Error::new(error.code, error.message.clone()))
-                    },
-                    Some(maximum),
-                    None,
-                )
-                .map_err(|e| view.budget.fail(e))?
-        };
+        if expired.is_none() && !targets.is_empty() {
+            return Ok(Capture::Expired(targets));
+        }
         for record in records {
-            writer
-                .validate_event_record(&record)
-                .map_err(|error| view.budget.fail(error))?;
-            if !writer.live_record(&record, now, &protected) {
+            super::source_time::validate_event_record(
+                &super::store_counters::Reader::snapshot(&view.snapshot),
+                &record,
+            )
+            .map_err(|error| view.budget.fail(error))?;
+            if !super::live_record(&record, now, &protected) {
                 return Err(view.budget.fail(Error::new(
                     "EVIDENCE_UNAVAILABLE",
                     "RDF selection contains expired evidence",
@@ -1420,8 +1505,45 @@ impl Store {
                 absent.push(id.clone());
             }
         }
-        drop(writer);
+        let Some(operation) = operation.take() else {
+            return Err(view.budget.fail(Error::new(
+                "STORAGE_FAILURE",
+                "RDF scope operation was already consumed",
+            )));
+        };
         purrdf::dataset_view::checkpointed_drain(&view, |view| operation(view, &absent))
+            .map(Capture::Done)
             .map_err(|failure| failure.error)
     }
+}
+
+/// What one scope capture reads: the selection, its layers and limits, and the expired
+/// targets a first pass found (`None` on the first pass). The pins and the snapshot of a
+/// capture that names expired targets are read under one hold of the writer.
+#[derive(Clone, Copy)]
+struct ScopeCapture<'a> {
+    ids: &'a [String],
+    artifacts: &'a [String],
+    layers: RdfGraphLayers,
+    now: u64,
+    limits: RdfReadLimits,
+    allowance: Option<RowAllowance>,
+    expired: Option<&'a BTreeSet<String>>,
+}
+
+/// The outcome of one capture pass.
+enum Capture<T> {
+    /// The operation ran.
+    Done(T),
+    /// The selection holds expired evidence; these record and artifact ids need their pins.
+    Expired(BTreeSet<String>),
+}
+
+/// Read ceilings added for each stored graph row in a scope, on top of the base limits.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RowAllowance {
+    /// Requests allowed per stored row.
+    pub(super) requests: u64,
+    /// Row visits allowed per stored row.
+    pub(super) row_visits: u64,
 }
