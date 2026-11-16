@@ -1,0 +1,23 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 3deecfdc15583af5b1a942cc162d0a9d37acd265
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 325
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/325
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 9d339677efeb7621c31ac75ada454df9ffd45218
+GhpRsq-Head-Ref: paudley/321-archive-prepare-halves-the-segment-on
+GhpRsq-Head-OID: 3deecfdc15583af5b1a942cc162d0a9d37acd265
+GhpRsq-Result-Tree: 3fad921ff275cc5e86802a06251ffce0425ddf51
+GhpRsq-Result-Commit: 70d2f63c2c1731eafa9df3d9b684fe0583d4d683
+GhpRsq-Parent-Hashes: 3deecfdc15583af5b1a942cc162d0a9d37acd265
+GhpRsq-Squash-Notes-SHA256: 95097a60a680ff431f84683095cd4059ed5d269c5d92728db8f7e7559c3fe026
+GhpRsq-Stage-Tree: 912f7f39022a916672a2ddcfa164eecc13ed0bb6
+GhpRsq-Stage-Commit: 46c693221cde88d7ea41ff0322a53e1309f39584
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/46c693221cde88d7ea41ff0322a53e1309f39584
+GhpRsq-Stage-Ref: refs/ghprsq/pr/325/stage
+GhpRsq-Stage-Files: 13
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/46c693221cde88d7ea41ff0322a53e1309f39584
