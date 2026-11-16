@@ -99,7 +99,7 @@ impl<'a> RecordBatch<'a> {
             chunks: Vec::new(),
             projections: BTreeMap::new(),
             rdf_projections: BTreeMap::new(),
-            rdf: rdf_index::RdfWrite::new(&writer.db)?,
+            rdf: rdf_index::RdfWrite::counted(&writer.db, &writer.staging)?,
             profile: crate::projection::json_profile()?,
             markdown: crate::projection::markdown_profile()?,
             byte_count: 0,
@@ -142,6 +142,7 @@ impl<'a> RecordBatch<'a> {
         let end = start
             .checked_add(byte_length)
             .ok_or_else(|| Error::new("INVALID_ARGUMENT", "record byte range overflow"))?;
+        self.rdf.set_source(input.source);
         let now = input.received_at;
         let expires_at = input.expires_at;
         let source_time_profile = input.source_time_profile;

@@ -704,6 +704,37 @@ exceed the batch. An inline `ingest` is held to the same retirement check.
 Format #5 replaces the whole-row read and the single batch, and with them this
 bound.
 
+### RDF staging refusals are counted and named (#340)
+
+An intake stages its RDF in memory before commit: at most 32 MiB of new dictionary
+terms and 64 MiB of anticipated index and manifest writes per batch. A graph that
+would pass either is refused with `RESOURCE_LIMIT` ("RDF dictionary staging exceeds 32
+MiB", "RDF write staging exceeds 64 MiB"). The refusal is counted where the write
+raises it, so every intake path that stages through a counted write is covered:
+inline `ingest`, record batches and the import publication's artifact graph. A
+refused projection graph that an ingest absorbs into a failed projection state
+(the record is stored without its graph) is counted too, though no client sees an
+error. Upgrades and migrations stage uncounted.
+
+`Status.stagingRefusals` (field 62, additive; a reader that does not know it sees no
+change) carries `refusals` (every refused graph since the daemon started, in memory),
+and the latest refusal: `lastLimit` (`write` or `dictionary`), `lastSource` (the
+artifact's source), `lastGraph` (the record, artifact or projection identity) and
+`lastBytes` (the bytes the write anticipated). All are empty or 0 before the first.
+CLI and MCP status render them as `staging_refusals`; `Store::properties` carries
+them as `staging_refusals` and `staging_refused_last_*`.
+
+The daemon journals one stderr line per refusal, with no record bytes:
+
+```
+sparrowd: rdf staging refused limit=write source="app" graph="record:..." anticipated_bytes=70123456 refusals_total=3
+```
+
+The first sixteen refusals each write a line; after that only the 32nd, 64th and each
+doubling, so a loop of refused artifacts writes a logarithmic number of lines while the
+status counter stays exact. Whether to stage an artifact's RDF in pieces or store it with
+its graph deferred is separate work.
+
 ### Part sets for consume roots (#280)
 
 A consume-root file above what one artifact can hold is published as a part set

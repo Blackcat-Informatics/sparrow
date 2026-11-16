@@ -25935,3 +25935,61 @@ fn reclaim_keeps_the_staging_row_of_a_set_claim_without_its_manifest_receipt() {
     drop(store);
     assert!(import_row_present(dir.path(), &journal.import_id));
 }
+
+/// Value (#340): an intake whose RDF would exceed the staging limit is counted and named, not
+/// silent. Protects: a JSONL artifact of 100 records with 100 distinct keys each, the shape the
+/// #336 measurement found refused, is answered `RESOURCE_LIMIT`; the status counts the refusal
+/// where the write raised it and names its source, graph and anticipated size (over the 64 MiB
+/// limit); and the installed observer is told once per counted refusal, with the running total.
+/// Before, the refusal reached only the client.
+#[test]
+fn an_intake_refused_for_rdf_staging_is_counted_and_named_in_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), large_config()).unwrap();
+    let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    store
+        .observe_staging_refusals({
+            let told = std::sync::Arc::clone(&told);
+            std::sync::Arc::new(move |refusal, total| {
+                told.lock().unwrap().push((refusal.clone(), total));
+            })
+        })
+        .unwrap();
+    let before = store.properties().unwrap();
+    assert_eq!(before["staging_refusals"], "0");
+    let input = (0..100)
+        .map(|record| {
+            let keys = (0..100)
+                .map(|key| {
+                    format!(
+                        "\"k{record}_{key}\":\"value-{record}-{key}-{}\"",
+                        "x".repeat(40)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{keys}}}\n")
+        })
+        .collect::<String>();
+    let refused = store
+        .ingest("wide", "wide-source", "jsonl", input.as_bytes(), 1)
+        .unwrap_err();
+    assert_eq!(refused.code, "RESOURCE_LIMIT", "{refused:?}");
+    let status = store.properties().unwrap();
+    let told = told.lock().unwrap();
+    assert_eq!(
+        status["staging_refusals"].as_str().unwrap(),
+        told.len().to_string(),
+        "every counted refusal told the observer once"
+    );
+    let (last, total) = told.last().unwrap();
+    assert_eq!(*total, told.len() as u64);
+    assert_eq!(status["staging_refused_last_source"], "wide-source");
+    assert_eq!(status["staging_refused_last_limit"], last.limit);
+    assert_eq!(status["staging_refused_last_graph"], last.graph.as_str());
+    assert_eq!(status["staging_refused_last_bytes"], last.bytes.to_string());
+    assert!(
+        last.bytes > 32 * 1024 * 1024,
+        "anticipated size is named: {last:?}"
+    );
+}

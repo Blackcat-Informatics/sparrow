@@ -3,6 +3,7 @@
 
 //! Persistent RDF dictionaries and three distinct six-permutation quad streams.
 
+use super::staging_refusal::{StagingLedger, StagingRefusal};
 use super::{Error, Record, Store, Writer, integer, parse, read_field};
 use purrdf::{
     RdfDataset, TermValue,
@@ -430,11 +431,19 @@ pub(super) struct RdfWrite<'a> {
     owners: BTreeSet<String>,
     staged_bytes: usize,
     max_encoded: u64,
+    /// Where a staging refusal is counted; absent for upgrades and fixtures, which are not intake.
+    refusals: Option<&'a StagingLedger>,
+    /// Source of the artifact being staged and the graph being built, named by a refusal.
+    source: String,
+    graph: String,
 }
 
 impl<'a> RdfWrite<'a> {
     pub(super) fn new(db: &'a DB) -> Result<Self, Error> {
         Ok(Self {
+            refusals: None,
+            source: String::new(),
+            graph: String::new(),
             db,
             next: required_counter(db, "rdf:next")?,
             terms: BTreeMap::new(),
@@ -445,6 +454,33 @@ impl<'a> RdfWrite<'a> {
             staged_bytes: 0,
             max_encoded: required_counter(db, "rdf:max-encoded")?,
         })
+    }
+
+    /// A write whose staging refusals are counted in `ledger`.
+    pub(super) fn counted(db: &'a DB, ledger: &'a StagingLedger) -> Result<Self, Error> {
+        let mut write = Self::new(db)?;
+        write.refusals = Some(ledger);
+        Ok(write)
+    }
+
+    /// Name the source of what is staged next, for a refusal's journal line.
+    pub(super) fn set_source(&mut self, source: &str) {
+        if self.source != source {
+            source.clone_into(&mut self.source);
+        }
+    }
+
+    /// Count and build the `RESOURCE_LIMIT` for a staging that anticipated `bytes`.
+    fn refuse(&self, limit: &'static str, bytes: usize, message: &str) -> Error {
+        if let Some(ledger) = self.refusals {
+            ledger.record(StagingRefusal {
+                limit,
+                source: self.source.clone(),
+                graph: self.graph.clone(),
+                bytes: bytes as u64,
+            });
+        }
+        Error::new("RESOURCE_LIMIT", message)
     }
 
     fn lookup(&mut self, bytes: &[u8]) -> Result<Option<u64>, Error> {
@@ -482,8 +518,9 @@ impl<'a> RdfWrite<'a> {
         }
         self.staged_bytes = self.staged_bytes.saturating_add(bytes.len());
         if self.staged_bytes > MAX_STAGING {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
+            return Err(self.refuse(
+                "dictionary",
+                self.staged_bytes,
                 "RDF dictionary staging exceeds 32 MiB",
             ));
         }
@@ -549,6 +586,7 @@ impl<'a> RdfWrite<'a> {
         {
             return Ok(());
         }
+        id.clone_into(&mut self.graph);
         let provenance = (id.starts_with("record:") || id.starts_with("artifact:"))
             && self
                 .db
@@ -622,10 +660,7 @@ impl<'a> RdfWrite<'a> {
             .saturating_add(self.staged_bytes)
             .saturating_add(self.terms.len().saturating_mul(128));
         if anticipated > MAX_BATCH {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                "RDF write staging exceeds 64 MiB",
-            ));
+            return Err(self.refuse("write", anticipated, "RDF write staging exceeds 64 MiB"));
         }
         let references = terms
             .iter()

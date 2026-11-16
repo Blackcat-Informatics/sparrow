@@ -188,7 +188,16 @@ fn backfill(
 }
 
 pub(super) fn publish(db: &DB, batch: &mut WriteBatch, artifact: &Artifact) -> Result<(), Error> {
-    let mut rdf = rdf_index::RdfWrite::new(db)?;
+    publish_with(db, rdf_index::RdfWrite::new(db)?, batch, artifact)
+}
+
+/// Publish `artifact`'s graph through `rdf`, which decides whether a refusal is counted.
+pub(super) fn publish_with(
+    db: &DB,
+    mut rdf: rdf_index::RdfWrite<'_>,
+    batch: &mut WriteBatch,
+    artifact: &Artifact,
+) -> Result<(), Error> {
     stage(db, &mut rdf, batch, artifact)?;
     rdf.finish(batch)
 }
@@ -227,6 +236,7 @@ pub(super) fn stage(
             "artifact RDF owner already exists outside its atomic publication checkpoint",
         ));
     }
+    rdf.set_source(&artifact.source);
     rdf.graph(
         batch,
         &artifact.id,
