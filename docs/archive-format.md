@@ -31,9 +31,14 @@ Patrick's rulings bind this design:
   target.
 
 Phase status: the specification and the deletion gate with its store fence
-(phases P0 and P1) are implemented. Segment encoding (P2), the archive worker
-and NAS thread (P3), and the offline reader tools (P4) are not implemented yet.
-Until P3 lands, an archiving store retires nothing on its own. Expiry waits, and
+(phases P0 and P1) are implemented. So are segment encoding (P2,
+`Store::archive_prepare`), the archive worker and NAS thread (P3,
+`sparrow_server::archive::Worker`, started by `sparrowd` when `[archive]` is
+configured and the daemon is not query-only) and the offline reader (P4, the
+`sparrow-archive` crate with its `list` and `verify` commands and a `restore`
+function). Implemented does not mean running: the worker is not installed or
+running on the live daemon, so the live store retires nothing through it. Until
+a worker runs, an archiving store retires nothing on its own. Expiry waits, and
 under pressure ingest is refused with `STORAGE_PRESSURE`.
 
 ## 1. Layout
@@ -85,7 +90,7 @@ A segment closes at the first of these limits:
 | Limit | Default | Bounds |
 | --- | --- | --- |
 | Raw payload bytes | 64 MiB (`max_segment_bytes`) | At least 1 MiB, at most 256 MiB. |
-| Eviction entries | 50,000 (`max_segment_records`) | At least 1. |
+| Eviction entries | 10,000 (`max_segment_records`) | At least 1. |
 | UTC day | End of the first entry's receipt day | Fixed. |
 | Horizon | Section 5 | Fixed. |
 

@@ -281,8 +281,8 @@ filesystem quota's responsibility.
 
 Sparrow keeps a 30-day searchable window of disposable logs. It can also
 archive aged-out evidence to a large, slower store, such as a NAS, before
-deleting it. The archive uses PurRDF's GTS files with N-Quads manifests, as
-specified in [the archive format](archive-format.md). Archiving is optional and
+deleting it. The archive writes GTS segment files through PurRDF's GTS writer,
+as specified in [the archive format](archive-format.md). Archiving is optional and
 configured by an `[archive]` table. Once a store has been fenced for archiving,
 it never deletes unarchived evidence. That holds when the archive is down, while
 it lags, and for the backlog present when archiving was enabled.
@@ -297,7 +297,9 @@ pinned record survives until its pin ends. A dedicated archive thread performs
 every NAS operation, one at a time, so a hung NAS degrades archiving without
 blocking queries, ingest or maintenance. A store format fence keeps older
 binaries away from an archiving store, and a clock-regression guard refuses
-publication behind the watermark.
+publication behind the watermark. Archive reads give way to waiting writers
+(`lock_page`) and hold the single RDF read slot. A prepare that outlasts the
+60-second read lease is halved and the shortening is reported to the worker.
 
 ## 5. Retention and named pins
 

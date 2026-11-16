@@ -50,6 +50,23 @@ pub struct PreparedSegment {
     /// Artifacts of covered entries with no RDF graph (retired before the fence), absent from
     /// the files. Every other covered record and artifact has its graph in the file.
     pub retired_artifacts: u64,
+    /// Present when the segment is shorter than the range first selected because encoding
+    /// failed and the range was halved; absent otherwise.
+    pub shortened: Option<Shortened>,
+}
+
+/// How a prepare came to cover fewer entries than it first selected.
+///
+/// The entries left out stay after the watermark and are prepared by a later call, so
+/// nothing is lost, but a caller that sees a short segment can tell why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shortened {
+    /// Records and artifacts in the range first selected.
+    pub selected: u64,
+    /// Records and artifacts in the segment returned.
+    pub kept: u64,
+    /// Code of the first encode error that caused a halving, such as `RESULT_EXPIRED`.
+    pub code: &'static str,
 }
 
 impl PreparedSegment {
@@ -417,6 +434,7 @@ impl Store {
     pub fn archive_prepare(&self, now: u64) -> Result<Option<PreparedSegment>, Error> {
         let store_id = self.store_id()?;
         let mut cap = None;
+        let mut shortened: Option<(u64, &'static str)> = None;
         loop {
             // The guard ends with this block: `select` takes the writer itself, one batch at
             // a time, and the mutex is not re-entrant.
@@ -435,14 +453,33 @@ impl Store {
                 return Ok(None);
             };
             let entries = selection.records + selection.artifacts;
+            let attempt = std::time::Instant::now();
             match self.encode_selection(&store_id, selection) {
-                Ok(prepared) => return Ok(Some(prepared)),
+                Ok(mut prepared) => {
+                    prepared.shortened = shortened.map(|(selected, code)| Shortened {
+                        selected,
+                        kept: prepared.records + prepared.artifacts,
+                        code,
+                    });
+                    return Ok(Some(prepared));
+                }
                 // A segment that cannot be encoded is halved until the failing entry stands
                 // alone, so the error names it instead of repeating on the whole range.
                 Err((error, _))
                     if entries > 1 && inflight.is_none() && error.code != "UNSUPPORTED" =>
                 {
-                    cap = Some(entries / 2);
+                    let halved = entries / 2;
+                    self.note_archive_halving();
+                    tracing::warn!(
+                        code = error.code,
+                        message = %error.message,
+                        entries,
+                        cap = halved,
+                        elapsed_ms = u64::try_from(attempt.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        "archive segment encoding failed; the range is halved and retried"
+                    );
+                    shortened.get_or_insert((entries, error.code));
+                    cap = Some(halved);
                 }
                 Err((error, first)) => {
                     tracing::warn!(
@@ -457,6 +494,19 @@ impl Store {
                 }
             }
         }
+    }
+
+    fn note_archive_halving(&self) {
+        self.archive_halvings
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many times `archive_prepare` halved its range after an encode error since this
+    /// store was opened. Not stored: it restarts at zero with the process.
+    #[must_use]
+    pub fn archive_halvings(&self) -> u64 {
+        self.archive_halvings
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn encode_selection(
@@ -513,6 +563,7 @@ impl Store {
             artifacts: selection.artifacts,
             retired_records: selection.retired,
             retired_artifacts: absent,
+            shortened: None,
         })
     }
 }

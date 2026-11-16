@@ -260,3 +260,92 @@ fn a_json_or_markdown_record_with_thousands_of_graph_rows_prepares() {
         store.archive_commit(&segment.segment_id).unwrap();
     }
 }
+
+/// A subscriber that, on the first warning, runs `on_warning` and ignores everything else.
+/// The halving's warning is the one event a prepare emits between its failed attempt and its
+/// retry, so this is where a test can change the world deterministically.
+struct OnWarning<F: Fn() + Send + Sync + 'static>(F);
+
+impl<F: Fn() + Send + Sync + 'static> tracing::Subscriber for OnWarning<F> {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() == tracing::Level::WARN
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {
+        (self.0)();
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// REGRESSION: a prepare whose first encode fails is halved, and the segment it then returns
+/// says so: how many entries were selected, how many it kept and the code of the error that
+/// caused it, and the store counts the halving. Before, the error was dropped and a caller saw
+/// only a short segment. The failure is real: another reader holds the single RDF read slot
+/// during the first attempt, so the read is refused with `RESOURCE_LIMIT`; the slot is freed
+/// when the halving's warning is emitted, so the retry over half the range succeeds. The
+/// hand-offs are channels, and time is the store's `now` argument.
+#[test]
+fn a_prepare_halved_by_an_encode_failure_reports_the_shortening_and_counts_it() {
+    use sparrow_core::{QueryCancellation, QueryScope, RdfGraphLayers, RdfReadLimits};
+    use std::sync::{Mutex, mpsc};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), archiving(ArchivePolicy::default())).unwrap();
+    let body: String = (0..10).map(|i| format!("line {i}\n")).collect();
+    store
+        .ingest("seg-halved", "source", "log", body.as_bytes(), 1)
+        .unwrap();
+    let now = 1 + 30 * DAY;
+
+    let (held_tx, held_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (freed_tx, freed_rx) = mpsc::channel::<()>();
+    let reader = {
+        let store = store.clone();
+        std::thread::spawn(move || {
+            let scope = sparrow_test_support::record_scope!(QueryScope, "source", 1);
+            store
+                .with_rdf_scope(
+                    &scope,
+                    RdfGraphLayers::ALL,
+                    now,
+                    RdfReadLimits::default(),
+                    &QueryCancellation::default(),
+                    |_, _| {
+                        held_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    },
+                )
+                .unwrap();
+            freed_tx.send(()).unwrap();
+        })
+    };
+    held_rx.recv().unwrap();
+    let release_tx = Mutex::new(release_tx);
+    let freed_rx = Mutex::new(freed_rx);
+    let subscriber = OnWarning(move || {
+        release_tx.lock().unwrap().send(()).unwrap();
+        freed_rx.lock().unwrap().recv().unwrap();
+    });
+    assert_eq!(store.archive_halvings(), 0);
+    let segment = tracing::subscriber::with_default(subscriber, || {
+        store.archive_prepare(now).unwrap().expect("due")
+    });
+    reader.join().unwrap();
+
+    let short = segment.shortened.expect("reports the shortening");
+    assert_eq!((short.selected, short.kept), (10, 5));
+    assert_eq!(short.code, "RESOURCE_LIMIT");
+    assert_eq!(segment.records + segment.artifacts, short.kept);
+    assert_eq!(store.archive_halvings(), 1);
+    // The rest is not lost: it is prepared after this segment commits, unshortened.
+    store.archive_commit(&segment.segment_id).unwrap();
+    let rest = store.archive_prepare(now).unwrap().expect("remainder due");
+    assert!(rest.shortened.is_none());
+    assert_eq!(rest.records, 5);
+}

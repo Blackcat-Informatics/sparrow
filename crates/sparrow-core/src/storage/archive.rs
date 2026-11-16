@@ -28,7 +28,7 @@ pub const ARCHIVE_MAX_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
 /// its own segment.
 pub const ARCHIVE_MIN_SEGMENT_BYTES: u64 = 1024 * 1024;
 /// Default closing record count of one segment.
-pub const ARCHIVE_SEGMENT_RECORDS: u64 = 50_000;
+pub const ARCHIVE_SEGMENT_RECORDS: u64 = 10_000;
 
 /// Store-side archive policy. Its presence makes the store archive before it deletes.
 #[derive(Clone, Debug, PartialEq)]
