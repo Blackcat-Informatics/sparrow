@@ -66,15 +66,35 @@ impl TailRoot {
             if foreign(binding, (identity.device, identity.inode), &declared) {
                 continue;
             }
-            if declared.directories.root_device != identity.device
-                || declared.directories.root_inode != identity.inode
-                || declared.watch_revision != revision
-                || declared.source != config.source
-                || declared.format != config.format
-            {
-                return Err(Error::State(
-                    "active file checkpoints require their original watch revision, root and interpretation; restore that definition before recovery",
-                ));
+            match check_declaration(
+                &declared,
+                (identity.device, identity.inode),
+                config,
+                revision,
+            ) {
+                Declaration::Matches => {}
+                Declaration::DeviceRenumbered => {
+                    // The same directory under a renumbered device (btrfs hands out a new
+                    // anonymous st_dev per boot): the checkpoint cannot be proven continuous,
+                    // so it is gapped as `identity_changed` with its records kept, and the
+                    // open continues. A generation already gapped or completed never reaches
+                    // here, so a CONFLICT can only mean a concurrent change and fails loudly.
+                    store.tail_discontinue(
+                        &generation.id,
+                        generation.offset,
+                        "identity_changed",
+                        crate::now()?,
+                    )?;
+                    eprintln!(
+                        "sparrowd: watch={} tail generation={} root device changed from {} to {}; recorded identity_changed",
+                        config.id, generation.id, declared.directories.root_device, identity.device
+                    );
+                }
+                Declaration::Refused => {
+                    return Err(Error::State(
+                        "active file checkpoints require their original watch revision, root and interpretation; restore that definition before recovery",
+                    ));
+                }
             }
         }
         Ok(Self {
@@ -488,6 +508,40 @@ impl TailRoot {
             }
         }
         Ok(())
+    }
+}
+
+/// How a stored active generation's declaration relates to the watch as it is now.
+#[derive(Debug, PartialEq, Eq)]
+enum Declaration {
+    /// Every declared identity equals the current one.
+    Matches,
+    /// Only the root's device number differs; the inode, revision, source and format agree.
+    DeviceRenumbered,
+    /// The inode, revision, source or format differs, whatever the device says.
+    Refused,
+}
+
+/// Classify a stored active generation's declaration against the watch's current root,
+/// revision, source and format. The inode, revision, source and format are checked first, so a
+/// stale device never excuses another difference.
+#[must_use]
+fn check_declaration(
+    declared: &TailStart,
+    root: (u64, u64),
+    config: &ConsumeWatch,
+    revision: u64,
+) -> Declaration {
+    if declared.directories.root_inode != root.1
+        || declared.watch_revision != revision
+        || declared.source != config.source
+        || declared.format != config.format
+    {
+        Declaration::Refused
+    } else if declared.directories.root_device != root.0 {
+        Declaration::DeviceRenumbered
+    } else {
+        Declaration::Matches
     }
 }
 
