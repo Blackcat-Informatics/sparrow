@@ -29,6 +29,12 @@ pub const ARCHIVE_MAX_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
 pub const ARCHIVE_MIN_SEGMENT_BYTES: u64 = 1024 * 1024;
 /// Default closing record count of one segment.
 pub const ARCHIVE_SEGMENT_RECORDS: u64 = 10_000;
+/// Default closing size of one segment in quads. Encoding a segment costs at most 390 bytes
+/// per quad (measured, #336): 3,000,000 quads is 1.17 GB, and with the daemon's roughly 100 MB
+/// that is 1.27 GB, 59 per cent of the 2 GiB (2.15 GB) `MemoryHigh`, leaving 0.88 GB for the
+/// 64 MiB payload target and the allocator. A 10,000-record log segment (2.8 million quads
+/// measured) is unchanged.
+pub const ARCHIVE_SEGMENT_QUADS: u64 = 3_000_000;
 
 /// Store-side archive policy. Its presence makes the store archive before it deletes.
 #[derive(Clone, Debug, PartialEq)]
@@ -40,6 +46,9 @@ pub struct ArchivePolicy {
     pub max_segment_bytes: u64,
     /// Eviction entries that close a segment; at least one.
     pub max_segment_records: u64,
+    /// Quads that close a segment; at least one. A closing target, not a capacity: an entry
+    /// with more quads is archived in a segment of its own.
+    pub max_segment_quads: u64,
 }
 
 impl Default for ArchivePolicy {
@@ -48,6 +57,7 @@ impl Default for ArchivePolicy {
             start_fraction: ARCHIVE_START_FRACTION,
             max_segment_bytes: ARCHIVE_SEGMENT_BYTES,
             max_segment_records: ARCHIVE_SEGMENT_RECORDS,
+            max_segment_quads: ARCHIVE_SEGMENT_QUADS,
         }
     }
 }
@@ -73,6 +83,12 @@ impl ArchivePolicy {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
                 "archive max_segment_records must be positive",
+            ));
+        }
+        if self.max_segment_quads == 0 {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "archive max_segment_quads must be positive",
             ));
         }
         Ok(())

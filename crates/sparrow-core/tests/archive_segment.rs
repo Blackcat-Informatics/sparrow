@@ -395,3 +395,68 @@ fn a_query_is_served_during_an_archive_read_and_still_excludes_another_query() {
     release_tx.send(()).unwrap();
     archive.join().unwrap();
 }
+
+/// One jsonl line of `keys` string keys: about 33 quads a key once the stored rows are doubled
+/// into the default graph (about 3,300 quads for 100 keys).
+fn json_line(keys: u64) -> String {
+    let fields: Vec<String> = (0..keys).map(|k| format!("\"k{k}\":\"v{k}\"")).collect();
+    format!("{{{}}}\n", fields.join(","))
+}
+
+/// INVARIANT (#341): a segment closes on its quad count as well as its record count, so one
+/// JSON-heavy segment cannot grow past the memory its quads cost, and an entry with more quads
+/// than the budget is archived alone and never split or skipped. A segment of log-shaped
+/// records, small in quads, still closes at the record limit as before. The limits are scaled
+/// down from the defaults (10,000 records, 3,000,000 quads) so the table stays small: 40
+/// records and 15,000 quads, with the shapes' quads per record (about 330, 3,300 and 46,000).
+#[test]
+fn a_segment_closes_on_its_quads_and_an_oversized_record_goes_alone() {
+    let policy = ArchivePolicy {
+        max_segment_records: 40,
+        max_segment_quads: 15_000,
+        ..ArchivePolicy::default()
+    };
+    let small = json_line(7);
+    let heavy = json_line(100);
+    let huge = json_line(1_400);
+    // Each case is a list of artifacts received in order, and the records per segment expected.
+    let cases: [(&str, Vec<String>, Vec<u64>); 3] = [
+        (
+            "log-shaped: the record limit closes it, as without the quad budget",
+            vec![small.repeat(60)],
+            vec![40, 20],
+        ),
+        (
+            "json-heavy: the quad budget closes it early, four records at about 3,300 quads",
+            vec![heavy.repeat(10)],
+            vec![4, 4, 2],
+        ),
+        (
+            "oversized: the record past the budget stands alone between its neighbours",
+            vec![small.repeat(2), huge.clone(), small.repeat(2)],
+            vec![2, 1, 2],
+        ),
+    ];
+    for (name, artifacts, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), archiving(policy.clone())).unwrap();
+        for (n, body) in artifacts.iter().enumerate() {
+            store
+                .ingest(
+                    &format!("quads-{n}"),
+                    "source",
+                    "jsonl",
+                    body.as_bytes(),
+                    1 + n as u64,
+                )
+                .unwrap();
+        }
+        let now = 10 + 30 * DAY;
+        let mut records = Vec::new();
+        while let Some(segment) = store.archive_prepare(now).unwrap() {
+            records.push(segment.records);
+            store.archive_commit(&segment.segment_id).unwrap();
+        }
+        assert_eq!(records, expected, "{name}");
+    }
+}

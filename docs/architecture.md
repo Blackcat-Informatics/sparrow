@@ -301,7 +301,13 @@ publication behind the watermark. Archive reads give way to waiting writers
 (`lock_page`) and hold the archive's own RDF read slot, separate from the query
 slot, so queries are served while a segment prepares. The archive read renews
 its 60-second lease while it makes progress, so a segment is never cut short
-for its length. A read that makes no progress for 60 seconds ends with
+for its length. A segment closes on its quad count as well as its records and payload
+bytes (`max_segment_quads`, 3,000,000 by default), so one JSON-heavy segment cannot
+outgrow memory: encoding costs up to 390 bytes a quad, which puts a full segment at about
+1.27 GB with the daemon, under the 2 GiB soft limit. The count comes from the stored graph
+manifests before encoding (an upper bound: the manifest rows are exact, and a record with
+no known event time adds 4 fallback quads), and a record with more quads than the budget forms a segment of
+its own. A read that makes no progress for 60 seconds ends with
 `RESULT_EXPIRED`; the range is then halved and the shortening is reported to
 the worker. Ordinary query reads keep a fixed lease.
 The worker writes nothing until the archive directory is on its own mount (a device

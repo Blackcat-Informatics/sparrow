@@ -91,6 +91,7 @@ A segment closes at the first of these limits:
 | --- | --- | --- |
 | Raw payload bytes | 64 MiB (`max_segment_bytes`) | At least 1 MiB, at most 256 MiB. |
 | Eviction entries | 10,000 (`max_segment_records`) | At least 1. |
+| Quads | 3,000,000 (`max_segment_quads`) | At least 1. |
 | UTC day | End of the first entry's receipt day | Fixed. |
 | Horizon | Section 5 | Fixed. |
 
@@ -99,7 +100,22 @@ an entry whose record bytes would take its payload past the target, unless the
 segment is still empty. An entry whose bytes alone exceed the target therefore
 forms a segment of its own, and the segment is never split inside a record.
 
-Such an oversized record is a segment of its own, and its bytes stay a blob in
+`max_segment_quads` bounds the memory a segment costs while it is encoded, which is
+up to 390 bytes a quad (measured, #336): 3,000,000 quads is 1.17 GB, and with the
+daemon's own 100 MB that is 59 per cent of a 2 GiB soft limit. A record's quads are
+counted before encoding, as an upper bound: twice the rows of its stored graph manifests
+(each row is a quad in its named graph and again in the default graph) and two link
+quads, both exact; plus 4 quads for the event-time fallback when the record has no
+known source event time, a bound because the fallback facts are derived at encoding and
+no manifest holds them; plus its artifact's graph the first time the segment meets it.
+An artifact graph added only because its artifact sits inside the segment's range, with
+no record in it, is small and not counted. A segment closes before an entry
+that would take it past the budget, unless the segment is still empty, and a record
+whose quads alone exceed the budget forms a segment of its own. The limit bounds how
+much one segment carries, not what is stored; a rebuilt segment keeps the range its
+intent recorded.
+
+A record that is oversized in bytes is a segment of its own, and its bytes stay a blob in
 the segment's GTS files like any other record's.
 
 The GTS writer holds the whole segment in memory and costs about three times a
