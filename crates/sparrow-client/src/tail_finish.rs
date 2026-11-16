@@ -139,8 +139,7 @@ impl TailFinishReceipt {
             || value.get_store_id()?.to_str()? != expected.store_id
             || value.get_id()?.to_str()? != expected.generation_id
             || declared.get_watch_revision() != expected.watch_revision
-            || (declared.get_device(), declared.get_inode())
-                != (expected.observed.device, expected.observed.inode)
+            || declared.get_inode() != expected.observed.inode
             || value.get_offset() > expected.observed.length
             || value.get_records() > value.get_offset()
             || finished_at.is_some() != value.get_complete()

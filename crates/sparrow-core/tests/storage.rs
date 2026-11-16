@@ -1904,6 +1904,48 @@ fn completed_tail_claim_preserves_original_publication_after_checkpoint_expiry()
     );
 }
 
+/// INVARIANT (issue 315): a tail generation is identified by its inode, never its device
+/// number. After a reboot renumbers the device, a retried declaration returns the original
+/// generation, a second declaration for the same inode is refused as already active, and another
+/// inode is admitted.
+#[test]
+fn tail_generation_identity_ignores_a_renumbered_device_and_keeps_the_inode() {
+    use sparrow_core::TailStart;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let declaration = TailStart {
+        request_id: "renumber-start".into(),
+        watch: "tail".into(),
+        watch_revision: 1,
+        directories: CONSUMPTION_DIRECTORIES,
+        path: b"renumber.log".to_vec(),
+        source: "renumber-source".into(),
+        format: "log".into(),
+        device: 7,
+        inode: 42,
+    };
+    let generation = store.tail_start(&declaration, 1).unwrap();
+    let renumbered = TailStart {
+        device: 8,
+        ..declaration.clone()
+    };
+    assert_eq!(
+        store.tail_start(&renumbered, 2).unwrap().id,
+        generation.id,
+        "the retry is the same declaration"
+    );
+    let second = TailStart {
+        request_id: "renumber-second".into(),
+        ..renumbered
+    };
+    assert_eq!(store.tail_start(&second, 3).unwrap_err().code, "CONFLICT");
+    let other_inode = TailStart {
+        inode: 43,
+        ..second
+    };
+    store.tail_start(&other_inode, 4).unwrap();
+}
+
 #[test]
 fn completed_file_bytes_span_original_records_and_follow_full_cover_pin_eligibility() {
     use sparrow_core::TailStart;

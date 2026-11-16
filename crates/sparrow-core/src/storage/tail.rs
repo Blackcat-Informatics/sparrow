@@ -20,7 +20,8 @@ pub const MAX_TAIL_REGISTRY_BYTES: usize = 512 * 1024;
 pub(super) const KEY: &str = "tail-generation-registry";
 
 /// Explicit observer declaration; the filesystem coordinator owns descriptor validation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Equality ignores the device number (here and in the directories), which a reboot may change.
+#[derive(Clone, Debug)]
 pub struct TailStart {
     /// Stable retry identity for this generation declaration.
     pub request_id: String,
@@ -36,11 +37,48 @@ pub struct TailStart {
     pub source: String,
     /// One of the shared line formats, log or jsonl.
     pub format: String,
-    /// Opened regular file's device identity.
+    /// Opened regular file's device number; informational, never compared.
     pub device: u64,
     /// Opened regular file's inode identity.
     pub inode: u64,
 }
+
+impl PartialEq for TailStart {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            request_id,
+            watch,
+            watch_revision,
+            directories,
+            path,
+            source,
+            format,
+            device: _,
+            inode,
+        } = self;
+        (
+            request_id,
+            watch,
+            watch_revision,
+            directories,
+            path,
+            source,
+            format,
+            inode,
+        ) == (
+            &other.request_id,
+            &other.watch,
+            &other.watch_revision,
+            &other.directories,
+            &other.path,
+            &other.source,
+            &other.format,
+            &other.inode,
+        )
+    }
+}
+
+impl Eq for TailStart {}
 
 impl Catalog for TailStart {
     fn encode(&self) -> Value {
@@ -222,8 +260,7 @@ impl Catalog for TailGeneration {
             let observed = &finish.intent.observed;
             if finish.intent.generation_id != generation.id
                 || finish.intent.watch_revision != generation.declaration.watch_revision
-                || (observed.device, observed.inode)
-                    != (generation.declaration.device, generation.declaration.inode)
+                || observed.inode != generation.declaration.inode
                 || generation.offset > observed.byte_length
                 || finish.finished_at.is_some() != generation.complete
                 || (generation.complete && generation.offset != observed.byte_length)
@@ -659,8 +696,7 @@ impl Store {
             || row.gap.is_some()
             || row.finish.is_some()
             || row.declaration.watch_revision != intent.watch_revision
-            || (row.declaration.device, row.declaration.inode)
-                != (intent.observed.device, intent.observed.inode)
+            || row.declaration.inode != intent.observed.inode
             || row.offset > intent.observed.byte_length
         {
             return Err(Error::new(
@@ -747,7 +783,6 @@ impl Store {
                 !row.complete
                     && row.gap.is_none()
                     && row.declaration.watch == declaration.watch
-                    && row.declaration.device == declaration.device
                     && row.declaration.inode == declaration.inode
             })
         {

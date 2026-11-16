@@ -1334,6 +1334,10 @@ and production-volume/resource acceptance remain unfinished.
 
 ## Device-identity discontinuity and approved recovery
 
+Superseded by issue 315: the daemon no longer compares a stored device number, so a
+device-only change no longer stops the start or gaps a generation. This section stays
+as the record of the 2026-10-17 recovery.
+
 A startup attempt on 2026-10-17 exited with the native guard:
 `active file checkpoints require their original watch revision, root and interpretation; restore that definition before recovery`.
 The two active generations of the owned synthetic watch

@@ -166,29 +166,12 @@ pub enum RootBinding {
 #[cfg(test)]
 mod crash_tests;
 
-/// How a persisted (device, inode) directory identity relates to the directory held now.
-#[derive(Debug, PartialEq, Eq)]
-enum Bound {
-    Same,
-    /// The inode is the stored one and only the device number differs. A filesystem such as
-    /// btrfs renumbers its devices at boot, so a stored device alone cannot say the directory
-    /// was replaced.
-    Renumbered,
-    Replaced,
-}
-
-/// Decide whether a stored directory identity names the directory held now. Under the stored
-/// root the inode decides; under a private root the claims of the original root must stay
-/// foreign, so only the exact (device, inode) pair is bound.
+/// Whether a stored directory inode names the directory held now. The device number is never
+/// compared: it changes across a reboot on btrfs subvolumes, network, overlay and re-enumerated
+/// mounts, and the held descriptor already fixes the directory within one run.
 #[must_use]
-fn bound(binding: RootBinding, stored: (u64, u64), current: (u64, u64)) -> Bound {
-    if stored == current {
-        Bound::Same
-    } else if binding == RootBinding::Stored && stored.1 == current.1 {
-        Bound::Renumbered
-    } else {
-        Bound::Replaced
-    }
+fn bound(stored_inode: u64, current_inode: u64) -> bool {
+    stored_inode == current_inode
 }
 
 fn observation(file: &File) -> Result<ConsumptionGeneration, Error> {
@@ -238,7 +221,6 @@ pub struct ClaimRoot {
     root: File,
     inflight: File,
     lock: ClaimLock,
-    binding: RootBinding,
 }
 
 /// Explicitly release ownership even if a fork temporarily inherited the open description.
@@ -333,39 +315,18 @@ impl ClaimRoot {
     ) -> Result<Self, Error> {
         let root_identity = CompletedFileIdentity::capture(&root.metadata()?);
         let bound_here = |journal: &ConsumptionJournal| {
-            bound(
-                binding,
-                (
-                    journal.directories.root_device,
-                    journal.directories.root_inode,
-                ),
-                (root_identity.device, root_identity.inode),
-            )
+            bound(journal.directories.root_inode, root_identity.inode)
         };
         let pending = store
             .consumption_pending()?
             .into_iter()
             .filter(|journal| journal.watch == watch)
-            .filter(|journal| {
-                binding == RootBinding::Stored || bound_here(journal) != Bound::Replaced
-            })
+            .filter(|journal| binding == RootBinding::Stored || bound_here(journal))
             .collect::<Vec<_>>();
-        if pending
-            .iter()
-            .any(|journal| bound_here(journal) == Bound::Replaced)
-        {
+        if pending.iter().any(|journal| !bound_here(journal)) {
             return Err(Error::State(
                 "configured watch root was replaced while source recovery ownership remains",
             ));
-        }
-        if let Some(journal) = pending
-            .iter()
-            .find(|journal| bound_here(journal) == Bound::Renumbered)
-        {
-            eprintln!(
-                "sparrowd: watch={watch} root device changed from {} to {}; pending claims stay bound to the same root inode",
-                journal.directories.root_device, root_identity.device
-            );
         }
         match fs::mkdirat(&root, INFLIGHT, Mode::from_raw_mode(0o700)) {
             Ok(()) => root.sync_all()?,
@@ -429,7 +390,6 @@ impl ClaimRoot {
             root,
             inflight,
             lock,
-            binding,
         };
         owner.private_namespace()?;
         Ok(owner)
@@ -450,15 +410,7 @@ impl ClaimRoot {
             ));
         }
         let root = CompletedFileIdentity::capture(&self.root.metadata()?);
-        if bound(
-            self.binding,
-            (
-                journal.directories.root_device,
-                journal.directories.root_inode,
-            ),
-            (root.device, root.inode),
-        ) == Bound::Replaced
-        {
+        if !bound(journal.directories.root_inode, root.inode) {
             return Err(Error::State(
                 "watch root was replaced; preserve original claim ownership",
             ));
@@ -501,16 +453,8 @@ impl ClaimRoot {
         let parent = self.parent(relative)?;
         let current = self.directories(&parent)?;
         let stored = &journal.directories;
-        if bound(
-            self.binding,
-            (stored.root_device, stored.root_inode),
-            (current.root_device, current.root_inode),
-        ) == Bound::Replaced
-            || bound(
-                self.binding,
-                (stored.parent_device, stored.parent_inode),
-                (current.parent_device, current.parent_inode),
-            ) == Bound::Replaced
+        if !bound(stored.root_inode, current.root_inode)
+            || !bound(stored.parent_inode, current.parent_inode)
         {
             return Err(Error::State(
                 "original parent directory was replaced before the claim checkpoint; preserve the source for reconciliation",

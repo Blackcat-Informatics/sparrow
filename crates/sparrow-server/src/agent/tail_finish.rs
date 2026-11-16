@@ -115,10 +115,7 @@ impl Input {
                 let observed = sparrow_client::CompletedFileIdentity::capture(
                     &input.metadata().map_err(sparrow_client::Error::Io)?,
                 );
-                if (observed.device, observed.inode)
-                    != (declared.get_device(), declared.get_inode())
-                    || observed.length < row.get_offset()
-                {
+                if observed.inode != declared.get_inode() || observed.length < row.get_offset() {
                     return Err(invalid(
                         "completion file does not match the original generation and checkpoint",
                     ));
