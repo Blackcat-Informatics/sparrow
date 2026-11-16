@@ -20,8 +20,8 @@ pub use query::{
 };
 pub use storage::archive::{
     ARCHIVE_MAX_SEGMENT_BYTES, ARCHIVE_MIN_SEGMENT_BYTES, ARCHIVE_SEGMENT_BYTES,
-    ARCHIVE_SEGMENT_RECORDS, ARCHIVE_START_FRACTION, ARCHIVE_WATERMARK, ArchiveIntent,
-    ArchivePolicy, ArchiveState,
+    ARCHIVE_SEGMENT_QUADS, ARCHIVE_SEGMENT_RECORDS, ARCHIVE_START_FRACTION, ARCHIVE_WATERMARK,
+    ArchiveIntent, ArchivePolicy, ArchiveState,
 };
 pub use storage::archive_segment::{ArchiveHold, HoldReason, PreparedSegment, Shortened};
 pub use storage::artifact_read::{
