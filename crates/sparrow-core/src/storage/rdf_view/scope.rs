@@ -339,14 +339,42 @@ impl StoredRdfView<'_> {
     }
 }
 
+/// Which RDF snapshot slot a read takes. Each slot admits one snapshot at a time, and the two
+/// are independent: an archive prepare, which can run for tens of seconds, never refuses a
+/// query, and a query never refuses it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadSlot {
+    /// SPARQL and every other ordinary RDF read.
+    Query,
+    /// The archive's segment read.
+    Archive,
+}
+
+/// The store's RDF snapshot slots, one owner per [`ReadSlot`].
+#[derive(Debug, Default)]
+pub(crate) struct ReadSlots {
+    query: std::sync::Mutex<()>,
+    archive: std::sync::Mutex<()>,
+}
+
 impl Store {
-    pub(super) fn rdf_read_lease(&self) -> Result<std::sync::MutexGuard<'_, ()>, ReadError> {
-        self.rdf_read.try_lock().map_err(|error| {
+    pub(crate) fn rdf_read_lease(
+        &self,
+        slot: ReadSlot,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, ReadError> {
+        let (owner, refusal) = match slot {
+            ReadSlot::Query => (
+                &self.rdf_read.query,
+                "store already has an active query RDF snapshot; retry after its lease ends",
+            ),
+            ReadSlot::Archive => (
+                &self.rdf_read.archive,
+                "store already has an active archive RDF snapshot; retry after its lease ends",
+            ),
+        };
+        owner.try_lock().map_err(|error| {
             Arc::new(match error {
-                std::sync::TryLockError::WouldBlock => Error::new(
-                    "RESOURCE_LIMIT",
-                    "store already has an active RDF snapshot; retry after its lease ends",
-                ),
+                std::sync::TryLockError::WouldBlock => Error::new("RESOURCE_LIMIT", refusal),
                 std::sync::TryLockError::Poisoned(_) => {
                     Error::new("STORAGE_FAILURE", "RDF snapshot admission owner poisoned")
                 }
@@ -391,7 +419,7 @@ impl Store {
         let (scope, correlation, text) = selection;
         scope.validate().map_err(Arc::new)?;
         cancellation.checkpoint().map_err(Arc::new)?;
-        let _lease = self.rdf_read_lease()?;
+        let _lease = self.rdf_read_lease(ReadSlot::Query)?;
         let writer = self.lock().map_err(Arc::new)?;
         let db = Arc::clone(&writer.db);
         let mut view = StoredRdfView::new_cancellable(&db, limits, &[], cancellation.clone())?;

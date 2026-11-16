@@ -298,8 +298,9 @@ every NAS operation, one at a time, so a hung NAS degrades archiving without
 blocking queries, ingest or maintenance. A store format fence keeps older
 binaries away from an archiving store, and a clock-regression guard refuses
 publication behind the watermark. Archive reads give way to waiting writers
-(`lock_page`) and hold the single RDF read slot. A prepare that outlasts the
-60-second read lease is halved and the shortening is reported to the worker.
+(`lock_page`) and hold the archive's own RDF read slot, separate from the query
+slot, so queries are served while a segment prepares. A prepare that outlasts
+the 60-second read lease is halved and the shortening is reported to the worker.
 
 ## 5. Retention and named pins
 

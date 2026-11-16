@@ -582,7 +582,7 @@ pub struct Store {
     inner: Arc<Mutex<Writer>>,
     unlocked: Arc<Unlocked>,
     pin_reads: Arc<Mutex<pin_read::Reads>>,
-    rdf_read: Arc<Mutex<()>>,
+    rdf_read: Arc<rdf_view::ReadSlots>,
     artifact_reads: Arc<Mutex<artifact_read::Reads>>,
     source_reads: Arc<Mutex<source_read::Reads>>,
     record_reads: Arc<Mutex<record_read::Reads>>,
@@ -1803,7 +1803,7 @@ impl Store {
                 sparql_reads.ledger(),
             ]),
             pin_reads: Arc::new(Mutex::new(pin_reads)),
-            rdf_read: Arc::new(Mutex::new(())),
+            rdf_read: Arc::default(),
             artifact_reads: Arc::new(Mutex::new(artifact_reads)),
             source_reads: Arc::new(Mutex::new(source_reads)),
             record_reads: Arc::new(Mutex::new(record_reads)),
@@ -3205,6 +3205,19 @@ impl Store {
             self.inner.try_lock(),
             Err(std::sync::TryLockError::WouldBlock)
         )
+    }
+
+    /// Dev-only: run `operation` while this thread holds the archive's RDF read slot, as an
+    /// archive prepare does. A second archive read is refused meanwhile; a query is not.
+    #[cfg(feature = "test-support")]
+    pub fn with_archive_read_slot_for_tests<T>(
+        &self,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, Error> {
+        let _lease = self
+            .rdf_read_lease(rdf_view::ReadSlot::Archive)
+            .map_err(|error| Error::new(error.code, error.message.clone()))?;
+        Ok(operation())
     }
 
     /// Dev-only: poison the writer lock, as a writer that panicked while holding it does.
