@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 313,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/313-start-fails-after-a-reboot-tail",
+  "branch": "paudley/313-start-fails-after-a-reboot-tail",
+  "slug": "start-fails-after-a-reboot-tail",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/313-start-fails-after-a-reboot-tail/.stage/start-fails-after-a-reboot-tail",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "9ceec320e3979d42e86c2c02f05ba7ad385aa820",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/313-start-fails-after-a-reboot-tail",
+    "branch:paudley/313-start-fails-after-a-reboot-tail",
+    "ignored:3 files (3 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow/.worktrees/304-archive-prepare-read-cost-grows-with caches into /home/paudley/Active/sparrow/.worktrees/313-start-fails-after-a-reboot-tail plus 0 dependency units from 0 other checkouts in 10.4s; 312 unchanged files keep their built mtimes; 8 other files take the seed time and rebuild; 34 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/313-start-fails-after-a-reboot-tail/.stage/start-fails-after-a-reboot-tail",
+    "issue:/home/paudley/Active/sparrow/.worktrees/313-start-fails-after-a-reboot-tail/.stage/start-fails-after-a-reboot-tail/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-15T16:22:53-0600",
+  "seed_error": ""
+}

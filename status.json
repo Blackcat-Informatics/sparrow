@@ -1,0 +1,79 @@
+{
+  "issue": 313,
+  "pr_number": 316,
+  "branch": "paudley/313-start-fails-after-a-reboot-tail",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/313-start-fails-after-a-reboot-tail/.stage/start-fails-after-a-reboot-tail",
+  "observed_at": "2026-11-16T00:03:21.986237+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/313-start-fails-after-a-reboot-tail/.stage/start-fails-after-a-reboot-tail/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/313-start-fails-after-a-reboot-tail/.stage/start-fails-after-a-reboot-tail/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/313-start-fails-after-a-reboot-tail/.stage/start-fails-after-a-reboot-tail/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/313-start-fails-after-a-reboot-tail/.stage/start-fails-after-a-reboot-tail/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/313-start-fails-after-a-reboot-tail/.stage/start-fails-after-a-reboot-tail/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 316,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Start after a reboot that renumbered the device: gap tail checkpoints and keep pending claims bound (#313)",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/316",
+    "baseRefName": "main",
+    "baseRefOid": "9ceec320e3979d42e86c2c02f05ba7ad385aa820",
+    "headRefName": "paudley/313-start-fails-after-a-reboot-tail",
+    "headRefOid": "306103fc81a4c41e89fbb19860b1ee9b7b6a7788",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/246/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "306103fc81a4c41e89fbb19860b1ee9b7b6a7788",
+    "branch": "paudley/313-start-fails-after-a-reboot-tail",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 316,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #316 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}
