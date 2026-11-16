@@ -139,7 +139,7 @@ segment-id = BLAKE3( frame("sparrow-archive/1")
 length followed by the bytes. Digests are the raw 32 bytes. Quarantine files
 appear in ascending entry index. The PurRDF codec is
 byte-deterministic, so the same range of the same store, encoded by the same
-PurRDF revision, always gives the same identity. A restored store backup
+PurRDF revision, always gives the same identity. A copy of a store
 therefore rebuilds and adopts its existing segments. A different PurRDF revision
 can give a different identity for the same range. Readers then see duplicates
 and remove them by record IRI (section 8).

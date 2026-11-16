@@ -14,8 +14,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let now = sparrow_core::parse_instant(&args[2])?;
     let config = ServerConfig::read(Path::new(&args[0]))?;
-    // Opening may perform required format upgrades. Never run on the backup
-    // itself. No ConsumeWorker, listener, maintenance or source path is opened.
+    // Opening may perform required format upgrades. Never run on a store
+    // that must stay unchanged. No ConsumeWorker, listener, maintenance or source path is opened.
     let store = config.open_store()?;
     if store.store_id()? != args[1] {
         return Err("restored store identity differs from expected store".into());

@@ -59,7 +59,7 @@ pub(super) async fn finish(
         record_failure(&mut errors, "store flush", flushed);
         if closed {
             // Every worker has stopped and admission is closed, so nothing can change the count
-            // again; sparrow-backup records this line from the journal of the stop it performed.
+            // again; the journal line records the count at the stop.
             // While the store counters seed the count is not a total, so the line says pending.
             match (store.store_id(), store.unique_payload_chunks()) {
                 (Ok(id), Ok(Some(chunks))) => {

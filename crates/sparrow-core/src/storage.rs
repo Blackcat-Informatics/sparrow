@@ -17,7 +17,6 @@ pub(crate) mod archive;
 mod archive_encode;
 pub(crate) mod archive_segment;
 mod artifact_rdf;
-pub(crate) mod backup;
 mod event_fallback_rdf;
 pub(crate) mod forced_compaction;
 #[cfg(feature = "test-support")]
@@ -544,8 +543,6 @@ struct Unlocked {
     /// Source and artifact listings still reading what the source-summary migration owes.
     source_builds: Mutex<source_read::Builds>,
     artifact_builds: Mutex<artifact_read::Builds>,
-    /// The one online backup slot (#156); a backup never takes the writer lock.
-    backup: backup::Slot,
     /// Wakes the maintenance worker's retention duty after an event that changes what
     /// expiry may retire: a pin release or commit and an archive commit.
     retention_waker: Arc<Mutex<Option<RetentionWaker>>>,
@@ -1457,13 +1454,11 @@ impl Writer {
 
 /// The bytes the store occupies: every file under the database directory except
 /// the ones RocksDB no longer references. Obsolete table and blob files and
-/// write-ahead logs normally vanish as soon as they become obsolete; an online
-/// backup holds them until its copy ends (#156), and they must not count against
-/// the disk budget, or a backup would refuse writes and evict evidence. Table and
-/// blob files therefore count at most the bytes every family's versions still
-/// reference, and logs below the oldest one recovery needs do not count. The
-/// filesystem's free-space floor, which sees the held files, is guarded by the
-/// backup itself (backup::start).
+/// write-ahead logs normally vanish as soon as they become obsolete; while RocksDB
+/// holds them they must not count against the disk budget, or the store would
+/// refuse writes and evict evidence. Table and blob files therefore count at most
+/// the bytes every family's versions still reference, and logs below the oldest
+/// one recovery needs do not count.
 pub(super) fn linked_physical_bytes(db: &DB) -> Result<u64, Error> {
     /// RocksDB deletes obsolete WAL and SST files while the walk runs. A file
     /// removed between listing and inspection no longer occupies space, so it
@@ -1762,7 +1757,6 @@ impl Store {
                 recompression: recompression.published(),
                 source_builds: Mutex::default(),
                 artifact_builds: Mutex::default(),
-                backup: backup::Slot::default(),
                 retention_waker,
                 import_slot_waker: Mutex::new(None),
                 import_reclaim_waker: Mutex::new(None),
@@ -1833,31 +1827,6 @@ impl Store {
     #[must_use]
     pub fn open_phases(&self) -> &[OpenPhase] {
         &self.open_phases
-    }
-
-    /// Start an online backup into `target` on its own thread and return at once (#156). It
-    /// clones the database handle the unlocked readers share and never takes the writer lock,
-    /// so ingest, maintenance and reads continue throughout. A request while a backup runs is
-    /// refused with `CONFLICT`.
-    pub fn backup_start(
-        &self,
-        target: &backup::BackupTarget,
-        now: u64,
-    ) -> Result<backup::BackupStatus, Error> {
-        backup::start(
-            &self.unlocked.backup,
-            Arc::clone(&self.unlocked.db),
-            self.space.clone(),
-            self.id.to_string(),
-            target,
-            now,
-        )
-    }
-
-    /// The latest online backup since the store opened, without the writer lock.
-    #[must_use]
-    pub fn backup_status(&self) -> backup::BackupStatus {
-        self.unlocked.backup.status()
     }
 
     /// Return the immutable identity validated at open, without waiting for a writer.

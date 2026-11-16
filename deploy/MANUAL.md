@@ -104,26 +104,16 @@ sudo systemctl start sparrow.service
 
 ```bash
 sudo -u paudley sh -c 'umask 0077; exec /usr/local/libexec/sparrow/sparrow-ship /etc/sparrow/ship.toml'
-sudo /usr/local/libexec/sparrow/sparrow-backup /etc/sparrow/server.toml /SPARROW/intake /etc/sparrow /SPARROW/ship
 ```
 
-The backup client asks the running daemon for an online backup through the
-`sparrow` CLI, so it needs the daemon running and `sparrow` on `PATH`. It
-stops, signals and drains nothing and needs no systemd. The shipper needs only
-the daemon to be consuming.
-
-Until #22 moves production to the system unit, production runs as the user
-unit `sparrow.service`. Its backup unit runs the same helper as
-`~/.local/libexec/sparrow/sparrow-backup` with `SPARROW_PREFIX=$HOME/.local`
-and no `ExecStopPost` or `flock`; deploy/README.md, "Interim user unit", gives
-its lines.
+The shipper needs only the daemon to be consuming.
 
 ## The recovery probe
 
-The kept image `bin/sparrow-recovery-schemaN-REV` reads a restored store
+The kept image `bin/sparrow-recovery-schemaN-REV` reads a copy of a store
 without starting listeners or watches (docs/deployment.md, "Recovery
 qualification"):
 
 ```bash
-bin/sparrow-recovery-schemaN-REV restored.toml EXPECTED_STORE RFC3339 EVIDENCE_ID...
+bin/sparrow-recovery-schemaN-REV copy.toml EXPECTED_STORE RFC3339 EVIDENCE_ID...
 ```

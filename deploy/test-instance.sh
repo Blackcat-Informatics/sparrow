@@ -13,10 +13,6 @@
 # unprivileged user manager cannot apply: the user and group, the credential, the AppArmor
 # profile, the capability, the slice, negative nice and OOM adjustment. ProtectHome= becomes
 # read-only because the scratch directory is under /home. deploy/evidence/lifecycle.md records a run.
-#
-# pre-upgrade-backup.sh is not rehearsed here: an online backup goes only to a network filesystem
-# (#156), which a scratch instance does not have. SPARROW_BACKUPS names a scratch directory that
-# holds only the lifecycle scripts' lock (lib.sh, hold_backup_lock), never a backup.
 set -euo pipefail
 umask 077
 
@@ -46,7 +42,6 @@ environment() {
     printf 'export SPARROW_SCOPE=user SPARROW_UNIT=%s\n' "$UNIT"
     printf 'export SPARROW_PREFIX=%q SPARROW_CONFIG=%q\n' "$ROOT/usr/local" "$ROOT/etc/sparrow/server.toml"
     printf 'export SPARROW_BIN=%q\n' "${SPARROW_BIN:-$REPO_DIR/bin}"
-    printf 'export SPARROW_BACKUPS=%q SPARROW_INTAKE=%q\n' "$SCRATCH/backups" "$DATA/intake"
 }
 
 case $ACTION in

@@ -41,6 +41,9 @@ use std::{
 pub(crate) struct Flight {
     warn: Duration,
     timeout: Duration,
+    /// The directory whose device is the local root disk: `/`. An archive directory on this
+    /// device is not on its mount.
+    filesystem_root: PathBuf,
     state: Mutex<FlightState>,
 }
 
@@ -74,8 +77,17 @@ impl Flight {
         Self {
             warn,
             timeout,
+            filesystem_root: PathBuf::from("/"),
             state: Mutex::new(FlightState::default()),
         }
+    }
+
+    /// The same flight with another directory standing for the root filesystem, so a test
+    /// needs no mount.
+    #[cfg(test)]
+    fn rooted_at(mut self, filesystem_root: impl Into<PathBuf>) -> Self {
+        self.filesystem_root = filesystem_root.into();
+        self
     }
 
     fn state(&self) -> MutexGuard<'_, FlightState> {
@@ -227,6 +239,14 @@ pub(crate) enum ArchiveError {
     Name(String),
     /// What was read back differs from what was written, or the tables do not decode.
     Verify { path: PathBuf, reason: String },
+    /// The archive directory is on the same device as the root filesystem, so the share that
+    /// should hold it is not mounted and the directory is an ordinary local one. Nothing was
+    /// written.
+    NotOnMount {
+        path: PathBuf,
+        filesystem_root: PathBuf,
+        device: u64,
+    },
     /// The archive root does not hold this store's `STORE_ID`: an unmounted mount point, or
     /// another store's archive.
     Root { path: PathBuf, reason: String },
@@ -247,6 +267,18 @@ impl fmt::Display for ArchiveError {
             Self::Verify { path, reason } => {
                 write!(f, "read-back of {} failed: {reason}", path.display())
             }
+            Self::NotOnMount {
+                path,
+                filesystem_root,
+                device,
+            } => write!(
+                f,
+                "archive directory {} is not on its expected mount: it is on device {device}, \
+                 the same as {}, so the archive share is not mounted and the directory is on \
+                 the local disk; nothing was written",
+                path.display(),
+                filesystem_root.display()
+            ),
             Self::Root { path, reason } => {
                 write!(
                     f,
@@ -352,7 +384,44 @@ fn verify_segment(
     })
 }
 
-/// The root must already hold this store's `STORE_ID`, the file the backup engine writes: an
+/// The archive directory must not share a device with the root filesystem. The archive sits
+/// below a network mount point, so when the share is mounted its device is the share's, and
+/// when it is not, the mount point is an ordinary directory on the local disk and the device is
+/// the root's. The rule is a pure comparison of the two devices.
+fn require_own_device(
+    dir: &Path,
+    dir_device: u64,
+    filesystem_root: &Path,
+    root_device: u64,
+) -> Result<(), ArchiveError> {
+    if dir_device == root_device {
+        return Err(ArchiveError::NotOnMount {
+            path: dir.to_path_buf(),
+            filesystem_root: filesystem_root.to_path_buf(),
+            device: dir_device,
+        });
+    }
+    Ok(())
+}
+
+/// Read the two devices and apply [`require_own_device`]. Read only.
+fn require_mounted(flight: &Flight, dir: &Path) -> Result<(), ArchiveError> {
+    use std::os::unix::fs::MetadataExt;
+    let device = |path: &Path| {
+        let _step = flight.step("read device", path);
+        fs::metadata(path)
+            .map(|metadata| metadata.dev())
+            .map_err(io_at("read device", path))
+    };
+    require_own_device(
+        dir,
+        device(dir)?,
+        &flight.filesystem_root,
+        device(&flight.filesystem_root)?,
+    )
+}
+
+/// The root must already hold this store's `STORE_ID`, which the operator writes once: an
 /// unmounted mount point is an empty directory on the local disk and has none. Read only; the
 /// worker never creates or changes it.
 fn require_store_id(flight: &Flight, root: &Path, store_id: &str) -> Result<(), ArchiveError> {
@@ -366,10 +435,9 @@ fn require_store_id(flight: &Flight, root: &Path, store_id: &str) -> Result<(), 
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
             return Err(ArchiveError::Root {
                 path: root.to_path_buf(),
-                reason: "STORE_ID is missing. Either the archive is not mounted, or nothing has \
-                         written the file yet: the backup engine writes it on the first backup \
-                         to this root, so `[archive] dir` must be the backup root \
-                         (`backup_root`) and a backup must have completed there"
+                reason: "STORE_ID is missing. Either the archive is not mounted, or the \
+                         operator has not written the file yet: create it once, holding this \
+                         store's id and a newline, in the archive directory"
                     .into(),
             });
         }
@@ -382,7 +450,7 @@ fn require_store_id(flight: &Flight, root: &Path, store_id: &str) -> Result<(), 
             path: root.to_path_buf(),
             reason: format!(
                 "STORE_ID names {:?}, not {store_id}; this root belongs to another store. \
-                 Point `[archive] dir` at this store's backup root, or mount the right archive",
+                 Point `[archive] dir` at this store's archive directory, or mount the right archive",
                 recorded.trim_end()
             ),
         })
@@ -391,8 +459,9 @@ fn require_store_id(flight: &Flight, root: &Path, store_id: &str) -> Result<(), 
 
 /// Make one segment durable under `<root>/<store_id>/` and only then advance the watermark.
 ///
-/// `root` must already exist and hold this store's `STORE_ID`: a missing or unmounted root is
-/// a failure, never a directory created on the local disk. Only `<root>/<store_id>` is
+/// `root` must already exist, be on a device other than the root filesystem's, and hold this
+/// store's `STORE_ID`: a missing or unmounted root is a failure, never a directory created on the
+/// local disk. Only `<root>/<store_id>` is
 /// created; nothing else in `root` is touched. A step that ran at least `io_timeout_secs`
 /// fails the pass with [`ArchiveError::Overran`] before the commit; the files stay, and the
 /// next pass verifies and commits them.
@@ -416,6 +485,7 @@ pub(crate) fn archive_segment(
             source: io::Error::new(io::ErrorKind::NotFound, "not a directory; is it mounted?"),
         });
     }
+    require_mounted(flight, root)?;
     require_store_id(flight, root, store_id)?;
     let store_dir = root.join(store_id);
     let missing = {
@@ -572,7 +642,7 @@ mod tests {
         (store, segment)
     }
 
-    /// An archive root that holds `id` as its `STORE_ID`, as the backup engine leaves it.
+    /// An archive root that holds `id` as its `STORE_ID`, as the operator writes it.
     fn nas(dir: &Path, id: &str) -> PathBuf {
         let root = dir.join("nas");
         fs::create_dir(&root).unwrap();
@@ -581,7 +651,8 @@ mod tests {
     }
 
     fn flight() -> Flight {
-        Flight::new(Duration::from_secs(120), Duration::from_secs(900))
+        // `/proc` is a device of its own, so a test directory is never on the "root" device.
+        Flight::new(Duration::from_secs(120), Duration::from_secs(900)).rooted_at("/proc")
     }
 
     fn through(store: &Store) -> Option<String> {
@@ -623,6 +694,28 @@ mod tests {
             "the other store's root holds only its STORE_ID"
         );
         assert_eq!(through(&store), None);
+    }
+
+    /// INVARIANT: an archive directory on the root filesystem's device (an unmounted share
+    /// leaves its mount point as a local directory) is refused with the named `NotOnMount`
+    /// error, nothing is written into it and the watermark stays; a directory on another device
+    /// is accepted. A test directory stands for the root filesystem, so no mount is needed.
+    #[test]
+    fn an_archive_directory_on_the_root_device_is_refused_before_anything_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, segment) = archiving_store(&dir.path().join("store"));
+        let root = nas(dir.path(), "s");
+        let on_root =
+            Flight::new(Duration::from_secs(120), Duration::from_secs(900)).rooted_at(dir.path());
+        let error = archive_segment(&on_root, &store, &root, "s", &segment).unwrap_err();
+        assert!(matches!(error, ArchiveError::NotOnMount { .. }), "{error}");
+        assert!(
+            error.to_string().contains("not on its expected mount"),
+            "{error}"
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1, "only its STORE_ID");
+        assert_eq!(through(&store), None);
+        archive_segment(&flight(), &store, &root, "s", &segment).unwrap();
     }
 
     /// INVARIANT: a step in flight is reported once it passes `stall_warn_secs`, then at most

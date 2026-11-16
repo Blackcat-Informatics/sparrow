@@ -21,7 +21,7 @@ document above 128 MiB into raw records itself. A larger file is reported as a
 failure on every run and never queued, because Sparrow refuses it before upload.
 
 Feeding keeps the bytes waiting in all consume roots together within
-`max_pending_bytes`, so the backup's drain wait stays bounded however large a
+`max_pending_bytes`, so a store stop's drain wait stays bounded however large a
 source file is. An item larger than the budget is fed only when every consume
 root is empty, and then alone.
 
@@ -287,7 +287,7 @@ def run(config):
     intake = Path(config["intake_root"])
     state = Path(config["state_dir"])
     state.mkdir(parents=True, exist_ok=True)
-    # The backup holds this lock while it copies the intake roots, queues and ledgers.
+    # One shipper runs at a time.
     lock = open(state / "lock", "w")
     fcntl.flock(lock, fcntl.LOCK_EX)
     staging = state / ".staging"

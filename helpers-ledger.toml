@@ -4694,20 +4694,6 @@ fingerprints = []
 names = ['^(check_clock_regression|archive_clock_guard_again)$']
 
 [[job]]
-id = "online-store-backup"
-summary = "One owner takes the online backup (#156): RocksDB's BackupEngine on a dedicated lowest-priority thread over the database handle the unlocked readers share, never the writer lock, no flush, one backup at a time, with one free-space guard that releases the files the copy holds; one restore into an empty directory; one authoritative network-filesystem rule for the backup root from /proc/self/mountinfo. deploy/libexec/sparrow-backup repeats the rule with findmnt only to refuse before it asks the daemon. The daemon's RPC, configuration and offline restore route through it."
-home = "sparrow_core::storage::backup::start"
-entry_points = ["sparrow_core::storage::Store::backup_start", "sparrow_core::storage::backup::restore", "sparrow_core::storage::backup::BackupTarget::new", "sparrow_server::backup::Backup::start"]
-spec = "docs/interfaces.md: online backup; docs/deployment.md: backups."
-vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-core/src/storage/backup.rs", "crates/sparrow-server/tests/rpc.rs"]
-bench = []
-enforced = true
-[job.forbidden]
-constants = []
-fingerprints = []
-names = ['^(closed_store_backup|stop_for_backup|backup_under_writer_lock|flush_before_backup)$']
-
-[[job]]
 id = "part-set-cut-rule"
 summary = "One cut rule plans every part of a consume-root file above the import bound: the byte bound, the record limit and the joint retirement bound, read from discovery and charged per line as the layout charges."
 home = "sparrow_client::parts::next_cut"

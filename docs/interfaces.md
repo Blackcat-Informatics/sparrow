@@ -472,8 +472,12 @@ synced; it is then read back byte for byte, decoded with the PurRDF GTS reader (
 diagnostic fails it) and only then does the worker advance `archive:through`. Any
 failure leaves the watermark where it was and is journaled with its cause; the next
 pass writes the segment again. `dir` must already exist and hold this store's
-`STORE_ID` file, the one the backup engine writes; the worker only reads it. A missing
-root, a missing `STORE_ID` (an unmounted mount point) or another store's id is a
+`STORE_ID` file, which the operator writes once (this store's id and a newline); the worker
+only reads it. `dir` must also be on a device other than the root filesystem's: a directory
+on the same device is refused with the named error "archive directory ... is not on its
+expected mount" before anything is read or written, because an unmounted share leaves its
+mount point as an ordinary local directory. A missing root, a missing `STORE_ID` (an
+unmounted mount point) or another store's id is a
 failure, never a directory made on the local disk, and nothing in `dir` outside
 `<store_id>/` is written. A record that cannot be archived (oversized, or its RDF
 projection failed at ingest) stops the watermark in front of it, is never deleted or
@@ -482,7 +486,7 @@ count held and the bytes waiting behind it are reported as unknown.
 
 ```toml
 [archive]
-dir = "/net/synology/archives/sparrow"  # required, absolute, outside data_dir
+dir = "/net/synology/archives/sparrow-archive"  # required, absolute, outside data_dir
 start_fraction = 0.75                   # 0.5..0.95
 max_segment_bytes = 67108864            # 1 MiB..256 MiB; a larger entry gets its own segment
 max_segment_records = 10000             # at least 1
@@ -502,10 +506,9 @@ io_timeout_secs" once it returns: the segment is not committed on that pass, its
 stay, and the next pass verifies them and commits. The worker starts no other step
 meanwhile, and nothing is marked archived because of a timeout.
 
-`STORE_ID` is written by the backup engine on the first backup to its root. A fresh
-store therefore refuses to archive until that backup completes, and a `dir` that is not
-the backup root (`backup_root`) never gets the file. The refusal says so; a file naming
-another store means `dir` points at that store's archive or the wrong mount.
+The operator writes `STORE_ID` once, holding this store's id, into `dir`. Until it exists the
+archive refuses to write; a file naming another store means `dir` points at that store's
+archive or the wrong mount.
 
 Unknown fields are refused. Configuration checks are lexical: `dir` must be
 absolute, contain no `..`, and neither contain nor sit inside `data_dir`. The
@@ -899,8 +902,7 @@ behind.
 Schema 67 adds `Status.queryOnly`, true in this mode, and
 `Status.retentionSeconds`, how long an unpinned record is retained after it is
 received (`sparrow_core::RETENTION_MS`, 30 days). CLI and MCP status render them
-as `query_only` and `retention_seconds`, the latter as a decimal string. `deploy/verify-backup.sh` relies on the mode to verify a
-backup; see `deploy/RECOVERY.md`, "Verify a backup".
+as `query_only` and `retention_seconds`, the latter as a decimal string.
 
 `sparrowd --config FILE --no-intake` opens a store writable with its
 maintenance worker, so a disposable copy can run its online migrations, but
@@ -912,9 +914,7 @@ configuration key and cannot be combined with query-only mode. Reads and
 writes on its Unix socket are served as by a normal daemon, and
 `Status.queryOnly` is false. If its maintenance worker ends, the daemon exits
 with an error, as a normal daemon does. The startup line reports
-`query_only=false intake=false`. `deploy/verify-backup.sh --measure-migration`
-uses the mode; see [the deployment guide](deployment.md), "Measure the online
-migration".
+`query_only=false intake=false`.
 
 `sparrowd --config FILE --private-intake DIR` opens a disposable copy of a
 store writable with its maintenance worker and its watches. Every stored watch
@@ -938,14 +938,10 @@ not refuse the open in this mode and is never recovered: each recovery refuses
 a claim of another root, which becomes the watch's failure. An active tail
 generation of another root is never resumed, adopted or given a gap; a file
 under the private root that reuses its file identity is refused. The configuration
-may not set `consume`, `syslog`, `rpc_tcp_address`, `archive` or
-`backup_root`, and the refusal names the key; `ingest_socket_path` is allowed.
-A copy shares the live store's identity, so its online backup would land in
-the live backup root and purge its oldest sets. The mode cannot be
+may not set `consume`, `syslog`, `rpc_tcp_address` or `archive`, and the
+refusal names the key; `ingest_socket_path` is allowed. The mode cannot be
 combined with query-only mode. The startup line reports
-`query_only=false intake=private`. `deploy/verify-backup.sh --measure-migration
---with-traffic` uses the mode; see [the deployment guide](deployment.md),
-"Measure the online migration with intake and traffic".
+`query_only=false intake=private`.
 
 ### Receipt-time event fallback (schema 69)
 
@@ -1133,7 +1129,7 @@ until they are deleted. `unique_payload_chunks` and `unique_json_projections` ar
 counts. `active_pins` reads the pin rows, which the pin caps bound, and
 `physical_bytes` measures the database directory, except the files RocksDB
 no longer references (obsolete table and blob files and write-ahead logs below
-the oldest one recovery needs), which only an online backup holds for long. Flush and compaction
+the oldest one recovery needs), which RocksDB holds until a reader releases them. Flush and compaction
 output RocksDB does not reference yet is not counted either, so a large
 compaction can briefly occupy more than `disk_budget` on disk; the free-space
 floor still guards the filesystem. A status read
@@ -1308,9 +1304,8 @@ migration runs therefore delivers its rows no later than its next check after
 the migration completes, and a redundant pass stops competing with the
 migration's pages for CPU.
 
-The migration's duration on the live store is measured on a copy of the newest
-online backup, restored by `deploy/verify-backup.sh --measure-migration`, recorded
-in [load qualification](load-qualification.md).
+The migration's duration on the live store is recorded in
+[load qualification](load-qualification.md).
 
 ## 1. Common types and defaults
 
@@ -3129,7 +3124,7 @@ are bounded. Domain errors remain distinct from a broken RPC connection.
 | `keysList`, `valuesSearch`, `recordsSearch`, `recordsContext`, `sparqlQuery` | Shared native semantics, typed results, scope and query coverage; stored-text SPARQL relations remain required. |
 | `watchList`, `watchPut`, `watchRemove` | Durable revision-checked recursive consume/tail administration; removal preserves existing claims and active tail generations guard definition changes/removal. |
 | `watchClaimRetire` | Administration (schema 70): retire one claim that can never complete, recording the authenticated caller, time and reason; see "Retiring an unrecoverable claim". |
-| `backup` | Administration (schema 70): start an online backup of the store into the configured `backup_root`; see "Online backup". |
+| `backup` | Removed (#330). The method keeps its ordinal (@53) and answers `UNSUPPORTED`; see "Removed online backup". |
 | `watchClaims` | Read-only (schema 71): every pending claim and every completed or abandoned claim whose pending span overlaps a time window, with its history; see "Per-claim state listing". |
 | `ingestPartReceipt` | Read-only (schema 71, additive): one set part's receipt state by request id (absent, stored, evicted or evicting) with its artifact id, byte length and format, and no record scan while the artifact is stored (once it is evicted or absent, the records it names are read until one is still stored); used by the part walk of a pending claim. |
 | `watchHandoff`, `watchHandoffGet` | Immutable store/request/watch/revision/raw-path/file-generation handoff; durable admission and explicit reserved/claimed/published/removed progress. Stable retries recover the original binding before inspecting the current source path. |
@@ -3753,67 +3748,19 @@ retirement time. Absent times are null.
 sparrow SOCKET watch claims --since 2026-11-09T00:00:00Z
 ```
 
-### Online backup
+### Removed online backup
 
-`backup(storeId)` (CLI `sparrow SOCKET backup`, which takes the store id from
-discovery) starts one backup of the store into the daemon's `backup_root` and
-returns at once with the running `BackupStatus`; `status` reports the outcome.
-It is an administration operation: the ingest socket and anonymous TCP refuse
-it as they refuse other non-producer operations. Nothing is stopped, paused or
-drained. The backup runs on one thread named `sparrow-backup` at nice 19 (the
-kernel derives the lowest best-effort I/O priority from it, which the BFQ
-scheduler honors), and it holds a clone of the database handle the
-unlocked readers share, never the writer lock. RocksDB's `BackupEngine`,
-opened in `BACKUP_ROOT/engine` with one background operation and sync on,
-disables obsolete-file deletion for the copy, lists the live table, manifest
-and write-ahead log files (writing the log buffer to the operating system
-without a sync) and copies them. No memtable is flushed. The daemon then
-checks the file sizes of the new backup and purges the oldest backups beyond
-`backup_keep`. Table files are shared between backups, so every backup after
-the first copies only the tables written since. While a backup runs, RocksDB keeps
-the files that become obsolete until the copy ends. The held files do not count toward `physical_bytes`, the disk budget or eviction, so a backup never refuses a write or evicts evidence. A guard thread at the daemon's normal priority, which never touches the backup root, measures free space every second; once it falls below twice `min_free_bytes`, the guard re-enables file deletions, RocksDB deletes the held files at once, and the backup fails if it still needed one. A backup stalled on an unresponsive NAS therefore never brings ingest to the free-space floor. Records
-accepted after the engine lists the files are not in the backup.
+Sparrow backs up nothing except the archive age-out to GTS files on the NAS. The online store
+backup (#156) was removed in #330, with `sparrow-backup`, the restore, and the `backup_root` and
+`backup_keep` configuration keys. The server file refuses unknown fields, so a file that still
+names either key fails to load with the parser's `unknown field` error.
 
-`BACKUP_ROOT/STORE_ID` binds a root to one store; the operation refuses a root
-that names another. A daemon that shuts down during a backup abandons it, and
-the engine discards the partial files at its next open of the root.
-
-Configuration keys in the server file:
-
-| Key | Contract |
-| --- | --- |
-| `backup_root` | Optional path. Startup checks only the path and refuses a relative one, one with `.` or `..`, and one inside or containing `data_dir`; it never touches the root, so a daemon that starts before the NAS is mounted still serves its intake. Every backup then judges the root on its own thread, before it creates anything and again on the canonical path: the filesystem must be `nfs`, `nfs4`, `cifs` or `smb3` and not the store's (device number), read from `/proc/self/mountinfo` by the longest mount prefix. A local root fails the backup (phase `failed`, `failure` naming the root and its filesystem type) and creates nothing there. Sparrow never backs up to a local disk. |
-| `backup_keep` | Backups the engine keeps; default 3, at least 1. |
-
-`Status.backup` is a `BackupStatus` with `phase` (`unconfigured`, `idle`,
-`running`, `complete` or `failed`), `root`, `keep`, `startedAt`, `finishedAt`,
-`backupId`, `files`, `bytes` and `failure`. The phase is `unconfigured` under
-`--no-intake` or `--query-only`, and without `backup_root`. `--private-intake`
-refuses to start with `backup_root` set, so its phase is always `unconfigured`. Times are Unix
-milliseconds, 0 until set; `backupId`, `files` and `bytes` are 0 until a backup
-completes. The state is the latest backup since the daemon started. CLI and MCP
-status render the object as `backup` with `phase`, `root`, `keep`,
-`started_at` and `finished_at` (RFC 3339 or null), `backup_id`, `files`,
-`bytes` (a decimal string) and `failure`; `sparrow SOCKET backup` prints the
-same object in the running state.
-
-Refusals:
-
-| Condition | Error |
-| --- | --- |
-| Query-only daemon | `READ_ONLY` (the write gate) |
-| `--no-intake` or `--private-intake` daemon (it serves a copy; `backup_root` refuses a private-intake startup) | `UNSUPPORTED` |
-| No `backup_root` configured | `UNSUPPORTED` |
-| A backup is already running | `CONFLICT` |
-| `storeId` is not this store | `STORE_MISMATCH` |
-| Ingest socket or anonymous TCP | Refused like other non-producer operations |
-
-Restore is offline: `sparrowd --restore-backup BACKUP_ROOT [BACKUP_ID]
-EMPTY_DIR` restores the backup (the latest when the id is omitted) into an
-empty or absent directory, never into a store, and checks every file's
-checksum as it reads it. `deploy/libexec/sparrow-backup` wraps this operation
-for the nightly unit; see [the deployment guide](deployment.md), "Online
-backups".
+The wire stays additive-only, so no ordinal moved. `backup @53` stays in the schema and the
+server answers every call with `UNSUPPORTED` ("the online store backup was removed"); the `sparrow`
+CLI has no `backup` command. `Status.backup @55` stays too, and the daemon always reports it as
+before for a daemon without a backup: `phase` `unconfigured`, an empty `root` and no `failure`.
+`BackupStatus` and `BackupPhase` remain in the schema for those two. CLI and MCP status no longer
+render a `backup` object.
 
 ### Retiring an unrecoverable claim
 

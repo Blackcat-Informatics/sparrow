@@ -115,7 +115,7 @@ if [[ $SPARROW_SCOPE == system ]]; then
         denials=$(journalctl -k --since "$since" --no-pager -o cat | grep -c 'apparmor="DENIED".*profile="sparrow"' || true)
         if ((denials == 0)); then pass "no AppArmor denials since $since"; else fail "$denials AppArmor denial(s) since $since (RECOVERY.md)"; fi
     fi
-    for timer in sparrow-ship.timer sparrow-backup.timer; do
+    for timer in sparrow-ship.timer; do
         if systemctl is-active --quiet "$timer"; then
             pass "$timer active, next $(systemctl show -p NextElapseUSecRealtime --value "$timer")"
         else
