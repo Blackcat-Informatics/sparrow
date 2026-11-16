@@ -13,7 +13,7 @@
 # Its three differences from katamari-journal-spool, each on purpose:
 #   * its own cursor file, given by the caller and never the namespace forwarder's;
 #   * its own file names, SPOOL_DIR/katamari-manager-YYYYMMDDTHHMM.jsonl, so a bucket the other forwarder
-#     wrote is never appended to (sparrow-ship keys a file by device, inode, size and mtime and ships a
+#     wrote is never appended to (sparrow-ship keys a file by inode, size and mtime and ships a
 #     changed file again whole);
 #   * every record carries "source":"systemd-manager", and the unit's own process lines are dropped, so a record
 #     in these files is the manager's or another entry that names the unit (a coredump, for example).

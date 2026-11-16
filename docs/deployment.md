@@ -395,8 +395,11 @@ standard error is redirected; keep any such file outside every watch root.
 Each file is staged completely and checked against the original's size and
 identity before any part of it is queued. Its copies or chunks then enter the
 queue together, the queue directory is synchronized, and a per-source ledger
-under `state_dir` records the shipped identity (device, inode, size,
-modification time). A crash between the two queues the file again. Each run
+under `state_dir` records the shipped identity (inode, size,
+modification time). The device number is not part of it, because it can change
+at boot; older four-field ledger lines that lead with the device are read as the
+same entry. Inode reuse after a delete and create is not detected, and the
+device number never detected that either. A crash between the two queues the file again. Each run
 then feeds the oldest queued items into their roots while the bytes waiting in
 all roots together stay within `max_pending_bytes`; an item larger than that
 budget is fed only into empty roots. Each move synchronizes the root and the

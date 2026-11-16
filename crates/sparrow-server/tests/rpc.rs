@@ -7144,6 +7144,62 @@ fn shipper_reports_a_whole_file_above_the_import_bound_and_mirrors_it() {
     );
 }
 
+/// INVARIANT: a changed device number alone never ships a file again. The ledger key is
+/// inode, size and mtime; legacy four-field lines (a device number first, renumbered at
+/// every btrfs boot) are read as the same entry, mixed with new ones, and a changed size
+/// still ships the file again.
+#[test]
+fn shipper_never_reships_a_file_whose_device_number_alone_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let reports = dir.path().join("reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    std::fs::create_dir_all(dir.path().join("intake/reports")).unwrap();
+    let kept = reports.join("kept.json");
+    let other = reports.join("other.json");
+    std::fs::write(&kept, b"{\"a\":1}").unwrap();
+    std::fs::write(&other, b"{\"b\":2}").unwrap();
+    let config = dir.path().join("ship.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "intake_root = {:?}\nstate_dir = {:?}\nmax_chunk_bytes = 1048576\n\
+             max_chunk_lines = 50000\nmax_files_per_run = 64\n\
+             max_pending_bytes = 16777216\nmax_queue_bytes = 1073741824\n\n\
+             [[source]]\nname = \"reports\"\ndir = {:?}\npattern = \"*.json\"\n\
+             rule = \"settled\"\nformat = \"json\"\nsettle_seconds = 0\n",
+            dir.path().join("intake"),
+            dir.path().join("ship"),
+            reports,
+        ),
+    )
+    .unwrap();
+    let report = |output: &std::process::Output| {
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    assert!(report(&ship(&config)).contains("reports: queued 2"));
+    // Simulate a reboot's renumbering: every line gains a different leading device number,
+    // one file's line stays in the new form, so the ledger mixes both.
+    let ledger = dir.path().join("ship/reports.ledger");
+    let lines = std::fs::read_to_string(&ledger).unwrap();
+    let mixed: String = lines
+        .lines()
+        .map(|line| {
+            if line.ends_with("kept.json") {
+                format!("4242:{line}\n")
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect();
+    assert!(mixed.contains("\n4242:") || mixed.starts_with("4242:"));
+    std::fs::write(&ledger, mixed).unwrap();
+    assert!(report(&ship(&config)).contains("reports: queued 0"));
+    // A file that really changed is shipped again.
+    std::fs::write(&kept, b"{\"a\":1,\"c\":3}").unwrap();
+    assert!(report(&ship(&config)).contains("reports: queued 1"));
+}
+
 /// INVARIANT: the shipper refuses at configuration load, naming both paths, a source
 /// directory that equals, contains or lies inside `intake_root` or `state_dir`, including
 /// through a symlink, because it would otherwise ship its own queue and ledgers forever.

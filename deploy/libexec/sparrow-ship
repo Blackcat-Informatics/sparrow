@@ -25,8 +25,12 @@ Feeding keeps the bytes waiting in all consume roots together within
 source file is. An item larger than the budget is fed only when every consume
 root is empty, and then alone.
 
-A ledger per source records each shipped identity (device, inode, size and
-modification time) after all of its copies are durably queued. A crash between
+A ledger per source records each shipped identity (inode, size and modification
+time) after all of its copies are durably queued. The device number is not part
+of it, because it can change at boot (btrfs renumbers it), which would ship every
+file again. Older ledger lines carry the device as a fourth, leading field and
+are read as the same entry. Inode reuse after a delete and create is not
+detected, and the device number never detected that either. A crash between
 those steps queues the file again; an identical item already waiting in a root
 is recognized and dropped, and a different one waits until Sparrow consumes the
 earlier copy. A finished file that later changes has a new identity and is
@@ -98,7 +102,22 @@ def load_config(path):
 
 
 def identity(stat):
-    return f"{stat.st_dev}:{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}"
+    return f"{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def ledger_keys(ledger_path):
+    """Return the identities a ledger records, reading legacy `dev:` lines as the same entry."""
+    keys = set()
+    for number, line in enumerate(ledger_path.read_text().splitlines(), 1):
+        key = line.split("\t", 1)[0]
+        fields = key.split(":")
+        if len(fields) == 4:
+            fields = fields[1:]
+        elif len(fields) != 3:
+            fail(f"{ledger_path}:{number}: ledger key {key!r} must be inode:size:mtime_ns "
+                 "(or the older dev:inode:size:mtime_ns); repair or remove the line")
+        keys.add(":".join(fields))
+    return keys
 
 
 def is_regular(stat):
@@ -282,7 +301,7 @@ def run(config):
         ledger_path = state / f"{source['name']}.ledger"
         shipped = set()
         if ledger_path.exists():
-            shipped = {line.split("\t", 1)[0] for line in ledger_path.read_text().splitlines()}
+            shipped = ledger_keys(ledger_path)
         count = 0
         with open(ledger_path, "a") as ledger:
             for path, stat in finished(source, now):
