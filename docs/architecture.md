@@ -299,8 +299,11 @@ blocking queries, ingest or maintenance. A store format fence keeps older
 binaries away from an archiving store, and a clock-regression guard refuses
 publication behind the watermark. Archive reads give way to waiting writers
 (`lock_page`) and hold the archive's own RDF read slot, separate from the query
-slot, so queries are served while a segment prepares. A prepare that outlasts
-the 60-second read lease is halved and the shortening is reported to the worker.
+slot, so queries are served while a segment prepares. The archive read renews
+its 60-second lease while it makes progress, so a segment is never cut short
+for its length. A read that makes no progress for 60 seconds ends with
+`RESULT_EXPIRED`; the range is then halved and the shortening is reported to
+the worker. Ordinary query reads keep a fixed lease.
 
 ## 5. Retention and named pins
 
@@ -566,7 +569,10 @@ spelling.
 
 Implement a storage-backed `DatasetView`/`FallibleDatasetView` over an immutable
 RocksDB read snapshot. Persist forward/reverse term dictionaries and indexed quad
-streams; resolve terms through bounded guards/cache entries. Reverse lookups
+streams; resolve terms through bounded guards/cache entries. A view checks
+each dictionary identity's forward and reverse rows once, the first time a row
+names it, and charges the identity to its live bytes; the snapshot cannot
+change, so later rows naming the identity skip both point reads. Reverse lookups
 live in their own `rdf_reverse` column family with a whole-key Bloom filter:
 they are the dictionary's only point reads that usually miss, and a filter over
 the much larger scanned index keys would cost far more memory. Opening a store

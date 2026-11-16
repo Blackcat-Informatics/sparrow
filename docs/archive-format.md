@@ -114,7 +114,9 @@ A record whose content projection failed at ingest is held the same way, because
 its evidence cannot be read whole. `Store::archive_held` reports the held record
 and the reason when it is the first unarchived entry. A segment that fails to
 encode is halved until the failing entry stands alone, which is then named in
-the error and in a warning. Every record and artifact a segment covers has its
+the error and in a warning. The segment's read renews its lease while it makes
+progress, so a long segment is not a failure; only a read that stalls for the
+lease's 60 seconds ends with `RESULT_EXPIRED` and is halved. Every record and artifact a segment covers has its
 graph in the file (a record's parent artifact graph included); an artifact with
 no graph, retired before the fence, is counted in `retired_artifacts`. The count of held records and the bytes waiting behind the first are not
 scanned, because that would read every record row on each pass.
