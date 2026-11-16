@@ -514,8 +514,16 @@ impl ClaimRoot {
             .file_name()
             .ok_or(Error::State("source path has no filename"))?;
         let file = open(&parent, Path::new(name), OFlags::RDONLY, BENEATH)?;
-        if !file.metadata()?.is_file() {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
             return Err(Error::State("completed source must be a regular file"));
+        }
+        // The claim renames the source into the private directory, which needs one filesystem.
+        // Both devices are read live from descriptors held now, never from a stored value.
+        if metadata.dev() != self.root.metadata()?.dev() {
+            return Err(Error::State(
+                "completed source is not on the watch root's filesystem; move it onto that filesystem before handoff",
+            ));
         }
         expected.require(&file)?;
         file.sync_all()?;

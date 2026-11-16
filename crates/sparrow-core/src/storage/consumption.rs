@@ -575,9 +575,10 @@ impl ConsumptionJournal {
 
     fn validate(&self) -> Result<(), Error> {
         validate_source(&self.watch, &self.relative_path, &self.observed)?;
-        if self.directories.root_device != self.directories.parent_device
-            || self.directories.root_device != self.observed.device
-        {
+        // Both directory devices are captured together from live descriptors. The observed
+        // file's device may come from a retry saved before a reboot, so it is not compared
+        // here; the server checks the opened source against the held root instead.
+        if self.directories.root_device != self.directories.parent_device {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
                 "consumption requires source and anchored directories on the same filesystem",

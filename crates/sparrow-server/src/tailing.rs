@@ -255,7 +255,10 @@ impl TailRoot {
             return Err(Error::State("tail source must be a regular file"));
         }
         let observed = CompletedFileIdentity::capture(&metadata);
-        if observed.inode != key {
+        // Both sides are live observations of this boot. The path was re-resolved after
+        // `observe`, and a nested btrfs subvolume has its own device and inode numbering, so
+        // the device keeps a file from another one off this inode's checkpoint.
+        if (observed.device, observed.inode) != (expected.device, key) {
             return Err(Error::State(
                 "tail source changed during descriptor admission; reconcile before retry",
             ));

@@ -937,7 +937,10 @@ tail claim bound to another root identity, such as the original root's, does
 not refuse the open in this mode and is never recovered: each recovery refuses
 a claim of another root, which becomes the watch's failure. An active tail
 generation of another root is never resumed, adopted or given a gap; a file
-under the private root that reuses its file identity is refused. The configuration
+under the private root that reuses its file identity is refused. "Another root" is
+decided by the root inode alone, as everywhere a stored identity is compared: if
+`DIR/NAME` happens to have the original root's inode, the original's claims and
+generations are treated as the private root's own, within the disposable copy. The configuration
 may not set `consume`, `syslog`, `rpc_tcp_address` or `archive`, and the
 refusal names the key; `ingest_socket_path` is allowed. The mode cannot be
 combined with query-only mode. The startup line reports
@@ -3607,9 +3610,10 @@ to ordinary MCP search tools.
 
 Schema 16 provides `WatchHandoff` requests for explicit finished-file admission
 and read-only progress lookup. They carry the original store, stable request ID,
-watch and exact revision, relative Unix path as `Data`, and a typed inode (with its recorded device),
+watch and exact revision, relative Unix path as `Data`, and a typed device and inode (the device informational only),
 byte-length, modification and change-clock generation. First admission requires
-the current enabled watch revision and matching anchored regular-file identity;
+the current enabled watch revision and matching anchored regular-file identity,
+with the opened file on the held root's filesystem by a live device check;
 it bypasses the quiet timer under the watch's explicit producer contract.
 The durable request binding and existing consumption reservation commit together,
 with a monotonic `sparrow.store/8` writer fence. Up to 128 bindings and 16 active

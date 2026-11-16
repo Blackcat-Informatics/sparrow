@@ -1754,7 +1754,8 @@ fn tail_open_ignores_a_renumbered_device_and_refuses_a_changed_inode() {
 /// INVARIANT: a pending finished-file claim whose stored root, parent and file device numbers
 /// all differ from the ones now (a reboot renumbers them) stays bound: the watch root opens
 /// and recovery passes the scope checks and the file identity check, because only the inode
-/// binds. A claim stored under another root inode is still refused.
+/// binds, and a handoff intent saved under the old device is admitted and retried as the
+/// same journal. A claim stored under another root inode is still refused.
 #[test]
 fn consume_root_binds_by_inode_across_a_renumbered_device_and_refuses_a_changed_inode() {
     use std::os::unix::fs::MetadataExt;
@@ -1811,7 +1812,7 @@ fn consume_root_binds_by_inode_across_a_renumbered_device_and_refuses_a_changed_
     let owner = ClaimRoot::open(store.clone(), "renumbered", &producer).unwrap();
     let recovered = owner.recover(&journal.import_id, crate::now().unwrap());
     assert!(
-        !matches!(recovered, Err(crate::consumption::Error::State(_))),
+        matches!(recovered, Ok(crate::consumption::Recovery::Claimed(_))),
         "the renumbered root and file are bound by inode: {:?}",
         recovered.err()
     );
@@ -1819,4 +1820,34 @@ fn consume_root_binds_by_inode_across_a_renumbered_device_and_refuses_a_changed_
         !path.exists(),
         "the claimed source moved into the private claim directory"
     );
+
+    // A handoff intent saved before the reboot carries the old file device. Its first
+    // admission is accepted against the live root, and a retry observed under the current
+    // device returns the same journal.
+    store.watch_registry_replace(None, b"registered").unwrap();
+    let handed = producer.join("handed.log");
+    std::fs::write(&handed, b"handed\n").unwrap();
+    let mut stale = CompletedFileIdentity::capture(&std::fs::metadata(&handed).unwrap());
+    stale.device += 1;
+    let intent = |observed: CompletedFileIdentity| sparrow_core::ConsumptionHandoff {
+        request_id: "handoff-renumbered".into(),
+        watch: "renumbered".into(),
+        watch_revision: 1,
+        relative_path: b"handed.log".to_vec(),
+        observed: crate::consumption::generation(observed).unwrap(),
+        tail_generation_id: None,
+    };
+    let admitted = owner
+        .handoff(&intent(stale), "consume-boot", "log", crate::now().unwrap())
+        .unwrap();
+    let current = CompletedFileIdentity::capture(&std::fs::metadata(&handed).unwrap());
+    let retried = owner
+        .handoff(
+            &intent(current),
+            "consume-boot",
+            "log",
+            crate::now().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(retried.import_id, admitted.import_id);
 }
