@@ -59,9 +59,11 @@ Patrick's decisions for this deployment, 2026-11-01:
   never to a local disk (Patrick, 2026-11-08: "Sparrow and katamaria are FORBIDDEN from backing
   up to local disks"). The online store backup (#156) was removed in #330. The daemon's archive
   worker is not deployed by these files (Sparrow issues #15 to #17); it refuses a directory that
-  is on the root filesystem's device (an unmounted share), and one without a `STORE_ID` file
-  naming this store, which the operator writes once. A file naming another store means `dir` is
-  that store's archive or the wrong mount.
+  is on the root filesystem's device, or on a local filesystem of the root's type (an unmounted
+  share), and one whose `STORE_ID` names another store or which holds content but no `STORE_ID`.
+  It writes `STORE_ID` itself into an empty directory on its first pass. A file naming another
+  store means `dir` is that store's archive or the wrong mount. `dir` must be a directory inside
+  the share, never the mount point itself.
 - Restarts of the live service are approved and announced by the coordination
   session.
 

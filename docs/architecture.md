@@ -304,6 +304,10 @@ its 60-second lease while it makes progress, so a segment is never cut short
 for its length. A read that makes no progress for 60 seconds ends with
 `RESULT_EXPIRED`; the range is then halved and the shortening is reported to
 the worker. Ordinary query reads keep a fixed lease.
+The worker writes nothing until the archive directory is on its own mount (a device
+other than `/`'s, and a network filesystem type or one unlike `/`'s) and holds this
+store's `STORE_ID`, which it writes itself into an empty directory on the first pass and
+never overwrites or adopts into a directory that already has content.
 
 ## 5. Retention and named pins
 

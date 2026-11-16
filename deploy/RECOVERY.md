@@ -203,14 +203,16 @@ every watch in `consume_watches` names a root that exists.
 ## NAS archive unavailable
 
 - Symptom: the journal has `sparrowd: archive pass failed; the watermark did not move`
-  followed by an I/O error, a missing `STORE_ID`, or "archive directory ... is not on its
-  expected mount".
+  followed by an I/O error, a missing archive directory, a `STORE_ID` naming another store or a
+  directory with content but no `STORE_ID`, or "archive directory ... is not on its expected
+  mount".
 - Effect: none on ingestion. The archive worker runs on its own thread and the daemon starts and
   serves without the NAS; the store keeps what it could not archive and the watermark does not
   move, so nothing is retired before it is archived. The disk budget and the free-space floor
   then apply as usual.
-- "Not on its expected mount" means the archive directory is on the same device as `/`: the share
-  is not mounted and its mount point is an ordinary local directory. The worker wrote, moved and
+- "Not on its expected mount" means the archive directory is on the same device as `/`, or on a local
+  filesystem of the same type as `/`'s (the message names which): the share is not mounted and
+  its mount point is an ordinary local directory. The worker wrote, moved and
   deleted nothing. Never create the archive on the local disk instead.
 - Diagnose: `findmnt -T /net/synology/archives/sparrow-archive` must show `nfs4` from
   `192.168.1.1:/volume1/archives`.
