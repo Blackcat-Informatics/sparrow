@@ -4195,8 +4195,8 @@ async fn daemon_expiry_retires_evidence_only_after_its_segment_is_written() {
             let dir = tempfile::tempdir().unwrap();
             let data = dir.path().join("store");
             let socket = data.join("rpc.sock");
-            // The archive directory must be off the root filesystem's device (the mount guard);
-            // /dev/shm is a device of its own.
+            // The mount guard needs the archive directory on a device other than `/`'s and on a
+            // network type or one unlike `/`'s; /dev/shm (tmpfs) is both.
             let shm = tempfile::tempdir_in("/dev/shm").unwrap();
             let nas = shm.path().join("nas");
             std::fs::create_dir(&nas).unwrap();
@@ -4277,8 +4277,8 @@ async fn daemon_pressure_worker_evicts_only_after_its_segment_is_written() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("store");
         let socket = data.join("rpc.sock");
-        // The archive directory must be off the root filesystem's device (the mount guard);
-        // /dev/shm is a device of its own.
+        // The mount guard needs the archive directory on a device other than `/`'s and on a
+        // network type or one unlike `/`'s; /dev/shm (tmpfs) is both.
         let shm = tempfile::tempdir_in("/dev/shm").unwrap();
         let nas = shm.path().join("nas");
         std::fs::create_dir(&nas).unwrap();

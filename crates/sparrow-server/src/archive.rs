@@ -41,8 +41,8 @@ use std::{
 pub(crate) struct Flight {
     warn: Duration,
     timeout: Duration,
-    /// The directory whose device is the local root disk: `/`. An archive directory on this
-    /// device is not on its mount.
+    /// The directory standing for the local root disk: `/`. An archive directory on its
+    /// device, or on a local filesystem of its type, is not on its mount.
     filesystem_root: PathBuf,
     state: Mutex<FlightState>,
 }
@@ -400,7 +400,7 @@ const NETWORK_FILESYSTEMS: &[(u64, &str)] = &[
     (0xFF53_4D42, "cifs"),
     (0xFE53_4D42, "smb2"),
     (0x00C3_6400, "ceph"),
-    (0x5346_414F, "afs"),
+    (0x6B41_4653, "afs"),
     (0x0102_1997, "9p"),
     (0x0BD0_0BD0, "lustre"),
     (0x564C, "ncp"),
@@ -429,9 +429,13 @@ struct Placement {
 /// 1. the device must differ from the root filesystem's; and
 /// 2. the filesystem type must be a network filesystem or differ from the root's type. This
 ///    catches an unmounted share whose parent is another local mount of the root's type (a
-///    btrfs subvolume under `/home`), which has a device of its own. A mount point inside a
-///    local filesystem of a type other than `/`'s is not caught here; the `STORE_ID` rule is
-///    the remaining line of defence there.
+///    btrfs subvolume under `/home`), which has a device of its own. It also refuses a
+///    second local disk of the root's type mounted as the archive. A mount point inside a
+///    local filesystem of a type other than `/`'s passes both rules, and when it is empty
+///    [`ensure_store_id`] adopts it and the segments go to the local disk. `STORE_ID` stops
+///    only a directory that has content or another store's id. The configured `dir` must
+///    therefore be a directory inside the share, never the mount point itself: an
+///    unmounted share leaves no such subdirectory, so the root is then missing and refused.
 fn require_own_mount(
     dir: &Path,
     found: Placement,
@@ -547,7 +551,8 @@ fn ensure_store_id(flight: &Flight, root: &Path, store_id: &str) -> Result<(), A
 /// `root` must already exist and be on its own mount (see [`require_own_mount`]): a missing or
 /// unmounted root is a failure, never a directory created on the local disk. It must hold this
 /// store's `STORE_ID`, which an empty root is given here (see [`ensure_store_id`]). Only
-/// `<root>/<store_id>` and `<root>/STORE_ID` are created; nothing else in `root` is touched. A step that ran at least `io_timeout_secs`
+/// `<root>/<store_id>` and `<root>/STORE_ID` are created; nothing else in `root` is touched.
+/// A step that ran at least `io_timeout_secs`
 /// fails the pass with [`ArchiveError::Overran`] before the commit; the files stay, and the
 /// next pass verifies and commits them.
 pub(crate) fn archive_segment(
@@ -708,6 +713,7 @@ fn run(flight: &Flight, store: &Store, root: &Path, every: Duration, stopped: &m
 mod tests {
     use super::*;
     use sparrow_core::Config;
+    use std::os::unix::fs::MetadataExt;
 
     /// A time after every window and horizon, so the store reports its backlog due.
     const LATER: u64 = 4_000_000_000;
@@ -727,7 +733,7 @@ mod tests {
         (store, segment)
     }
 
-    /// An archive root that holds `id` as its `STORE_ID`, as the operator writes it.
+    /// An archive root that already holds `id` as its `STORE_ID`, as an earlier pass left it.
     fn nas(dir: &Path, id: &str) -> PathBuf {
         let root = dir.join("nas");
         fs::create_dir(&root).unwrap();
@@ -801,10 +807,7 @@ mod tests {
         assert_eq!(fs::read_to_string(root.join("STORE_ID")).unwrap(), "s\n");
         assert!(!root.join("STORE_ID.partial").exists());
         assert_eq!(through(&store).as_deref(), Some(segment.through.as_str()));
-        let written = fs::metadata(root.join("STORE_ID"))
-            .unwrap()
-            .modified()
-            .unwrap();
+        let written = fs::metadata(root.join("STORE_ID")).unwrap().ino();
         store.ingest("r2", "source", "log", b"c\nd\n", 2).unwrap();
         let second = store
             .archive_prepare(LATER)
@@ -812,13 +815,24 @@ mod tests {
             .expect("a second segment");
         archive_segment(&flight(), &store, &root, "s", &second).unwrap();
         assert_eq!(
-            fs::metadata(root.join("STORE_ID"))
-                .unwrap()
-                .modified()
-                .unwrap(),
+            fs::metadata(root.join("STORE_ID")).unwrap().ino(),
             written,
             "an existing matching STORE_ID is accepted, not rewritten"
         );
+    }
+
+    /// INVARIANT: a `STORE_ID.partial` left by an interrupted first pass does not make the
+    /// directory non-empty: the next pass writes `STORE_ID` and no partial remains.
+    #[test]
+    fn a_leftover_store_id_partial_does_not_block_the_first_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, segment) = archiving_store(&dir.path().join("store"));
+        let root = dir.path().join("nas");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("STORE_ID.partial"), b"half").unwrap();
+        archive_segment(&flight(), &store, &root, "s", &segment).unwrap();
+        assert_eq!(fs::read_to_string(root.join("STORE_ID")).unwrap(), "s\n");
+        assert!(!root.join("STORE_ID.partial").exists());
     }
 
     /// INVARIANT: the mount rules are pure over device and filesystem type: the same device

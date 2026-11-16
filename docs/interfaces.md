@@ -466,7 +466,8 @@ deletes it. The format, schedule and write protocol are in
 [the archive format](archive-format.md). Phase P1 implements the store side:
 the deletion gate, the watermark and the writer fence. The daemon's archive
 worker (`sparrow-archive` thread) takes each prepared segment, writes its files
-under `<dir>/<store_id>/` as `<from>-<through>.gts`, never anywhere else in `dir`.
+under `<dir>/<store_id>/` as `<from>-<through>.gts`, never anywhere else in `dir` except
+the `STORE_ID` file below.
 Each file is written as `.gts.partial`, synced, renamed into place and the directory
 synced; it is then read back byte for byte, decoded with the PurRDF GTS reader (any
 diagnostic fails it) and only then does the worker advance `archive:through`. Any
@@ -483,7 +484,7 @@ accepts a matching file, never overwrites one, and refuses a directory that hold
 entries but no `STORE_ID`. A missing root, another store's id or a non-empty directory
 without `STORE_ID` is a
 failure, never a directory made on the local disk, and nothing in `dir` outside
-`<store_id>/` is written. A record that cannot be archived (oversized, or its RDF
+`<store_id>/` and `STORE_ID` is written. A record that cannot be archived (oversized, or its RDF
 projection failed at ingest) stops the watermark in front of it, is never deleted or
 skipped, and is journaled on every pass with its id, reason, bytes and position; the
 count held and the bytes waiting behind it are reported as unknown.

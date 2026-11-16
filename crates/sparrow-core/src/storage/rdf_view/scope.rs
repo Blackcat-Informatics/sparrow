@@ -350,6 +350,18 @@ pub(crate) enum ReadSlot {
     Archive,
 }
 
+impl ReadSlot {
+    /// How a read in this slot ends its lease: a query at the lease's length, the archive's
+    /// segment read only after a lease's length without progress (#328), so a segment that
+    /// is still reading is never cut off for its size.
+    pub(super) fn lease(self) -> LeaseRenewal {
+        match self {
+            Self::Query => LeaseRenewal::Fixed,
+            Self::Archive => LeaseRenewal::OnProgress,
+        }
+    }
+}
+
 /// The store's RDF snapshot slots, one owner per [`ReadSlot`].
 #[derive(Debug, Default)]
 pub(crate) struct ReadSlots {
@@ -422,7 +434,13 @@ impl Store {
         let _lease = self.rdf_read_lease(ReadSlot::Query)?;
         let writer = self.lock().map_err(Arc::new)?;
         let db = Arc::clone(&writer.db);
-        let mut view = StoredRdfView::new_cancellable(&db, limits, &[], cancellation.clone())?;
+        let mut view = StoredRdfView::new_cancellable(
+            &db,
+            limits,
+            &[],
+            cancellation.clone(),
+            LeaseRenewal::Fixed,
+        )?;
         view.scoped = scope.restricts_membership();
         if correlation.is_some() {
             // The correlation recipe never reads the backfilled facts.

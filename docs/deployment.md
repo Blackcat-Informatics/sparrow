@@ -511,8 +511,12 @@ whose parent is another local mount of the root's type, such as a btrfs subvolum
 The refusal is the named error "archive directory ... is not on its expected mount", which names
 the device or filesystem type found, is journaled on the pass failure line, and writes, moves and
 deletes nothing; the daemon itself starts and serves as before, and the worker retries on its next
-pass. A mount point inside a local filesystem of a type other than `/`'s is not caught by these
-two checks; `STORE_ID` is the remaining line of defence.
+pass. A second local btrfs disk mounted as the archive is refused too, with no override. A mount
+point inside a local filesystem of a type other than `/`'s passes both checks, and when it is
+empty the worker adopts it by writing `STORE_ID`, so segments would go to the local disk;
+`STORE_ID` stops only a directory with content or another store's id. Set `[archive] dir` to a
+directory inside the share (as `/net/synology/archives/sparrow-archive` is), never to the mount
+point itself: an unmounted share leaves no such subdirectory, so the root is missing and refused.
 
 The worker writes `STORE_ID` itself. On its first pass, a directory that is on its mount and
 empty (no entry at all, apart from a `STORE_ID.partial` left by an interrupted first pass) gets a
