@@ -163,15 +163,25 @@ pub struct ArchiveHold {
 const QUADS_PER_STORED_ROW: u64 = 2;
 /// Link quads a record adds: the two payload digests.
 const LINK_QUADS: u64 = 2;
+/// Quads the owed event-time fallback adds to a record with no source event time: the two
+/// facts, `eventTimeFallback` and `eventTimeBasis`, each in the named graph and again in the
+/// default graph. Newer graphs never store them, so no manifest holds them; a graph that does
+/// store them is counted twice, which only makes the bound safer.
+const FALLBACK_QUADS: u64 = 4;
 
-/// Quads an entry adds to a segment, known before it is encoded: the stored rows of its
-/// record's metadata graph, content projection graph and diagnostic graph, plus those of its
-/// artifact's graph the first time the segment meets that artifact, each counted twice
-/// ([`QUADS_PER_STORED_ROW`]), and the record's link quads. A recordless artifact adds its own
-/// graph. The count is the row count of each graph manifest, which the store already keeps and
-/// reads here without decoding a row; the catalog holds no count, so reading the manifest is
-/// the cheapest exact figure and no stored field is added. A retired record or artifact has no
-/// graph and adds nothing.
+/// An upper bound on the quads an entry adds to a segment, known before it is encoded. Three
+/// parts make it up. The manifest rows are exact: the stored rows of the record's metadata
+/// graph, content projection graph and diagnostic graph, plus those of its artifact's graph
+/// the first time the segment meets that artifact, each counted twice
+/// ([`QUADS_PER_STORED_ROW`]); the store already keeps the row count of each graph manifest
+/// and it is read here without decoding a term, so no stored field is added. The two link
+/// quads are exact. The event-time fallback is a bound: [`FALLBACK_QUADS`] for a record that
+/// does not have a known source event time, and it is zero otherwise. A recordless artifact
+/// adds its own graph. A retired record or artifact has no graph and adds nothing.
+///
+/// Not counted: an artifact graph the post-scan loop adds because the artifact sits at or
+/// before the segment's last position without a record in it (one that shares the boundary's
+/// receipt stamp, or arrived before its records). It is small metadata, tens of rows.
 fn entry_quads(
     writer: &Writer,
     id: &str,
@@ -197,9 +207,15 @@ fn entry_quads(
     let rows = owners.iter().try_fold(0_u64, |total, owner| {
         Ok::<_, Error>(total.saturating_add(writer.graph_row_count(owner)?))
     })?;
+    let fallback = if matches!(record.event_time, crate::EventTime::Known { .. }) {
+        0
+    } else {
+        FALLBACK_QUADS
+    };
     Ok(rows
         .saturating_mul(QUADS_PER_STORED_ROW)
-        .saturating_add(LINK_QUADS))
+        .saturating_add(LINK_QUADS)
+        .saturating_add(fallback))
 }
 
 /// Index entries read under one hold of the writer. The selection takes the writer again for
@@ -247,7 +263,7 @@ fn select(
         artifact_ids: std::collections::BTreeSet::new(),
     };
     let mut payload = 0_u64;
-    let mut graph_rows = 0_u64;
+    let mut quads_total = 0_u64;
     let mut first_day = 0;
     // Where the next batch resumes: the last entry handled, which begins as the watermark.
     let mut floor = through.clone().map(String::into_bytes);
@@ -337,7 +353,7 @@ fn select(
                 && (oversized
                     || heavy
                     || payload + length > policy.max_segment_bytes
-                    || graph_rows + quads > policy.max_segment_quads)
+                    || quads_total + quads > policy.max_segment_quads)
             {
                 break 'scan;
             }
@@ -347,7 +363,7 @@ fn select(
             }
             position.clone_into(&mut selection.last);
             payload += length;
-            graph_rows += quads;
+            quads_total += quads;
             match record {
                 None => {
                     selection.artifacts += 1;

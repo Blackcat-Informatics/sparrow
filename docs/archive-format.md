@@ -103,15 +103,19 @@ forms a segment of its own, and the segment is never split inside a record.
 `max_segment_quads` bounds the memory a segment costs while it is encoded, which is
 up to 390 bytes a quad (measured, #336): 3,000,000 quads is 1.17 GB, and with the
 daemon's own 100 MB that is 59 per cent of a 2 GiB soft limit. A record's quads are
-known before encoding: twice the rows of its stored graph manifests (each row is a
-quad in its named graph and again in the default graph), plus two link quads, plus its
-artifact's graph the first time the segment meets it. A segment closes before an entry
+counted before encoding, as an upper bound: twice the rows of its stored graph manifests
+(each row is a quad in its named graph and again in the default graph) and two link
+quads, both exact; plus 4 quads for the event-time fallback when the record has no
+known source event time, a bound because the fallback facts are derived at encoding and
+no manifest holds them; plus its artifact's graph the first time the segment meets it.
+An artifact graph added only because its artifact sits inside the segment's range, with
+no record in it, is small and not counted. A segment closes before an entry
 that would take it past the budget, unless the segment is still empty, and a record
 whose quads alone exceed the budget forms a segment of its own. The limit bounds how
 much one segment carries, not what is stored; a rebuilt segment keeps the range its
 intent recorded.
 
-Such an oversized record is a segment of its own, and its bytes stay a blob in
+A record that is oversized in bytes is a segment of its own, and its bytes stay a blob in
 the segment's GTS files like any other record's.
 
 The GTS writer holds the whole segment in memory and costs about three times a

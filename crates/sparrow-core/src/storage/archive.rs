@@ -31,7 +31,7 @@ pub const ARCHIVE_MIN_SEGMENT_BYTES: u64 = 1024 * 1024;
 pub const ARCHIVE_SEGMENT_RECORDS: u64 = 10_000;
 /// Default closing size of one segment in quads. Encoding a segment costs at most 390 bytes
 /// per quad (measured, #336): 3,000,000 quads is 1.17 GB, and with the daemon's roughly 100 MB
-/// that is 1.27 GB, 59 per cent of the 2 GiB (2.15 GB) `MemoryHigh`, leaving 0.87 GB for the
+/// that is 1.27 GB, 59 per cent of the 2 GiB (2.15 GB) `MemoryHigh`, leaving 0.88 GB for the
 /// 64 MiB payload target and the allocator. A 10,000-record log segment (2.8 million quads
 /// measured) is unchanged.
 pub const ARCHIVE_SEGMENT_QUADS: u64 = 3_000_000;
