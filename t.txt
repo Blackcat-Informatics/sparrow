@@ -1,0 +1,44 @@
+        // The payload index fence lifts every store counter family, keeps its switches and
+        // every earlier fence, and no older binary knows its identities.
+        for index in 0..BASE.len() {
+            for (counters, payload) in STORE_COUNTERS.iter().zip(PAYLOAD_INDEX.iter()) {
+                assert_eq!(
+                    enable_payload_index(counters[index]).unwrap(),
+                    payload[index]
+                );
+                for enable in [
+                    enable_payload_index,
+                    enable_store_counters,
+                    enable_source_summary,
+                    enable_owner_graphs,
+                    enable_event_fallback,
+                ] {
+                    assert_eq!(enable(payload[index]).unwrap(), payload[index]);
+                }
+                assert!(has_payload_index(payload[index]) && has_store_counters(payload[index]));
+                assert!(!has_payload_index(counters[index]));
+            }
+            assert!(enable_payload_index(SOURCE_SUMMARY_TRACING[index]).is_err());
+            assert_eq!(
+                enable_archive(PAYLOAD_INDEX_LOG_TIME[index]).unwrap(),
+                PAYLOAD_INDEX_ARCHIVE[index]
+            );
+            assert_eq!(
+                enable_intake(PAYLOAD_INDEX_ARCHIVE[index]).unwrap(),
+                PAYLOAD_INDEX_INTAKE_ARCHIVE[index]
+            );
+        }
+        for identity in PAYLOAD_INDEX.iter().flatten() {
+            assert!(
+                [
+                    BASE, RDF, ALL_RDF, PROVENANCE, TRACING, LOG_TIME, ARCHIVE, INTAKE
+                ]
+                .iter()
+                .chain(LIFTED.iter())
+                .chain(FALLBACK.iter())
+                .chain(OWNER_GRAPH.iter())
+                .chain(SOURCE_SUMMARY.iter())
+                .chain(STORE_COUNTERS.iter())
+                .all(|family| !family.contains(identity))
+            );
+        }

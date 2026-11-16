@@ -1,0 +1,15 @@
+#!/bin/bash
+set -e
+f=writer_format.rs
+perl -0pi -e '
+s{fn lower\(format: &\[u8\]\) -> &\[u8\] \{\n    let format = position\(&STORE_COUNTERS, format\)}{fn lower(format: &[u8]) -> &[u8] {\n    let format = position(&PAYLOAD_INDEX, format)\n        .map_or(format, |(family, index)| STORE_COUNTERS[family][index]);\n    let format = position(&STORE_COUNTERS, format)};
+s{    if has_store_counters\(current\) \{\n        enable_store_counters\(next\)\n    \} else \{\n        Ok\(next\)\n    \}\n\}}{    let next = if has_store_counters(current) {\n        enable_store_counters(next)?\n    } else {\n        next\n    };\n    if has_payload_index(current) {\n        enable_payload_index(next)\n    } else {\n        Ok(next)\n    }\n}};
+s{pub\(super\) fn has_store_counters\(format: &\[u8\]\) -> bool \{\n    position\(&STORE_COUNTERS, format\).is_some\(\)\n\}}{pub(super) fn has_store_counters(format: &[u8]) -> bool {\n    position(&STORE_COUNTERS, format).is_some() || has_payload_index(format)\n}\n\npub(super) fn has_payload_index(format: &[u8]) -> bool {\n    position(&PAYLOAD_INDEX, format).is_some()\n}\n\n/// Fence a current store counter family for the payload id index (#323); idempotent.\npub(super) fn enable_payload_index(format: &[u8]) -> Result<&\x27static [u8], Error> {\n    position(&PAYLOAD_INDEX, format)\n        .or_else(|| position(&STORE_COUNTERS, format))\n        .map(|(family, index)| PAYLOAD_INDEX[family][index])\n        .ok_or_else(|| {\n            Error::new(\n                "STORAGE_FAILURE",\n                "the payload id index requires a store counter authority family",\n            )\n        })\n}};
+s{(pub\(super\) fn enable_store_counters\(format: &\[u8\]\) -> Result<&\x27static \[u8\], Error> \{\n)}{$1    if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {\n        return Ok(PAYLOAD_INDEX[family][index]);\n    }\n};
+s{(pub\(super\) fn enable_source_summary\(format: &\[u8\]\) -> Result<&\x27static \[u8\], Error> \{\n)}{$1    if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {\n        return Ok(PAYLOAD_INDEX[family][index]);\n    }\n};
+s{(pub\(super\) fn enable_owner_graphs\(format: &\[u8\]\) -> Result<&\x27static \[u8\], Error> \{\n)}{$1    if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {\n        return Ok(PAYLOAD_INDEX[family][index]);\n    }\n};
+s{(pub\(super\) fn enable_event_fallback\(format: &\[u8\]\) -> Result<&\x27static \[u8\], Error> \{\n)}{$1    if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {\n        return Ok(PAYLOAD_INDEX[family][index]);\n    }\n};
+s{        \.chain\(STORE_COUNTERS\.iter\(\)\.flatten\(\)\)\n\}}{        .chain(STORE_COUNTERS.iter().flatten())\n        .chain(PAYLOAD_INDEX.iter().flatten())\n}};
+s{            \.chain\(STORE_COUNTERS\.iter\(\)\.flatten\(\)\)\n            \.position}{            .chain(STORE_COUNTERS.iter().flatten())\n            .chain(PAYLOAD_INDEX.iter().flatten())\n            .position};
+' $f
+grep -n "PAYLOAD_INDEX\b" $f | head -40

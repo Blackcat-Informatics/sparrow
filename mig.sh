@@ -1,0 +1,12 @@
+#!/bin/bash
+set -e
+f=migration.rs
+perl -0pi -e 's/    Error, Store, Writer, catalog_upgrade, rdf_index, source_context, source_summary, writer_format,\n\};/    Error, Store, Writer, catalog_upgrade, payload_index, rdf_index, source_context, source_summary,\n    writer_format,\n};/' $f
+perl -0pi -e 's/    SourceContext,\n\}\n\nimpl Migration \{/    SourceContext,\n    \/\/\/ The payload id index: one key per held artifact, from the digest of its bytes (#323).\n    PayloadIndex,\n}\n\nimpl Migration {/' $f
+perl -0pi -e 's/pub const ALL: \[Self; 4\] = \[\n        Self::StoreCounters,\n        Self::OwnerGraphIndex,\n        Self::SourceSummary,\n        Self::SourceContext,\n    \];/pub const ALL: [Self; 5] = [\n        Self::StoreCounters,\n        Self::OwnerGraphIndex,\n        Self::SourceSummary,\n        Self::SourceContext,\n        Self::PayloadIndex,\n    ];/' $f
+perl -0pi -e 's/pub\(crate\) const RUN_ORDER: \[Self; 4\] = \[\n        Self::StoreCounters,\n        Self::SourceSummary,\n        Self::OwnerGraphIndex,\n        Self::SourceContext,\n    \];/pub(crate) const RUN_ORDER: [Self; 5] = [\n        Self::StoreCounters,\n        Self::SourceSummary,\n        Self::PayloadIndex,\n        Self::OwnerGraphIndex,\n        Self::SourceContext,\n    ];/' $f
+perl -0pi -e 's/            Self::SourceContext => "source-context",\n/            Self::SourceContext => "source-context",\n            Self::PayloadIndex => "payload-index",\n/' $f
+perl -0pi -e 's/            Self::SourceContext => &\[Counter::Records\],\n/            Self::SourceContext => &[Counter::Records],\n            Self::PayloadIndex => &[Counter::Artifacts],\n/' $f
+perl -0pi -e 's/(                    source_context::watermark\(\|key\| reader.get\(key.as_bytes\(\)\)\)\?,\n                \),\n)/$1                Migration::PayloadIndex => (\n                    values[&Counter::PayloadIndexDone],\n                    payload_index::progress(|key| reader.get(key.as_bytes()))?.watermark(),\n                ),\n/' $f
+perl -0pi -e 's/(                Migration::SourceContext => !source_context::pending\(&self.db\)\?,\n)/$1                Migration::PayloadIndex => {\n                    payload_index::progress(|key| Ok(self.db.get(key)?))?\n                        .watermark()\n                        .is_none()\n                }\n/' $f
+perl -0pi -e 's/(            Migration::SourceContext => source_context::page\(&self.db\)\?,\n)/$1            Migration::PayloadIndex => payload_index::page(&self.db)?,\n/' $f

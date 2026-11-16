@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/323-index-artifacts-by-payload-id-the-store",
+  "branch": "paudley/323-index-artifacts-by-payload-id-the-store",
+  "base_ref": "origin/main",
+  "head": "cd12825e2dbfccc11e72d99771b88737dffb4bd7",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/323-index-artifacts-by-payload-id-the-store/.stage/index-artifacts-by-payload-id-the-store/sync/20261116T113259-ec6807c07a684e53b82ef063891a8f1a",
+  "conflicts": [],
+  "status": "completed",
+  "base": "770876f3d7fea46015a9f90b3d582afb3aa72d2a",
+  "merge_bases": [
+    "70d2f63c2c1731eafa9df3d9b684fe0583d4d683"
+  ],
+  "merge_index": "804333d0aa01e5f77f57d116213ac8c22b3c11efe33edc9003f039a47e1e7aff",
+  "candidate_tree": "c14d86efc3bf21b9f3893457800c8e1aca2b8aba",
+  "candidate_patch": "candidate-30d6a32453cc4c80926424421e531e32.patch",
+  "validation_records": [],
+  "commit": "a245c2d82674c3ea272079ce2646982077155ee8",
+  "tree": "c14d86efc3bf21b9f3893457800c8e1aca2b8aba"
+}

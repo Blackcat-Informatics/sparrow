@@ -1,0 +1,3 @@
+#!/bin/bash
+set -e
+perl -0pi -e 's/    let _ = store.evict_oldest\(41 \* DAY, EvictionLimits::default\(\)\).unwrap\(\);\n    assert_eq!\(held\(&store, b""\), \(vec!\[\], true\)\);\n    assert!\(!report.artifacts.contains\(&empty.id\) \|\| true\);\n/    \/\/ The next oldest unit is the recordless artifact: eviction deletes its entry.\n    let report = store\n        .evict_oldest(\n            41 * DAY,\n            EvictionLimits {\n                max_records: 1,\n                ..EvictionLimits::default()\n            },\n        )\n        .unwrap();\n    assert_eq!(report.artifacts, vec![empty.id.clone()]);\n    assert_eq!(held(&store, b""), (vec![], true));\n    assert_eq!(held(&store, b"shared\\n"), (vec![late.id.clone()], true));\n/' payload_index.rs

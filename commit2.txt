@@ -1,0 +1,17 @@
+Stop listing an artifact as held once expiry has released its bytes (#323)
+
+Review finding. Expiry retires an artifact's chunks at its deadline and keeps
+the entry a day longer. The payload index looked only at the evicted flags, so
+for that day a lookup listed an artifact whose bytes were already released.
+
+Change. One predicate, manifest_retire::releases_bytes (evicted, or any chunk
+retired), decides the index key in both the batch owner and the migration page.
+The age-out test now expires the artifact at its deadline, before the extra day,
+and checks the lookup is empty and the payload-index counter equals its recount.
+payload_index::digest now goes through import::valid_payload_id instead of a
+second validator, and PayloadLookup is must_use. The module doc and the
+architecture and interfaces text now say the index is stricter than the
+per-source counters, whose completeness looks only at the evicted flags and has
+the same day-long gap; they are not changed here.
+
+Not verified. The full gate beyond the commit hook.

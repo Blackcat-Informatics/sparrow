@@ -1,0 +1,50 @@
+Index artifacts by payload id so the store can answer whether it holds a content (#323)
+
+The store could not answer "do I already hold this content": an artifact's
+payload_id is the BLAKE3 of its bytes, but nothing indexed it, so proving a
+re-queued file was already ingested took a page walk over a source's artifacts.
+
+Change. One empty-valued key per complete artifact in the default family,
+payload-id:<64 hex>:<artifact id>. One owner (payload_index::apply, run by
+Writer::apply before the store counters) adds the key puts and deletes to the
+same batch as every change to an artifact entry or its manifest retirement
+state, so a key is written with its entry, and removed with the entry's
+deletion (expiry, recordless eviction) or retirement (pressure eviction). An
+archived artifact stays indexed until then. A store-counter row
+(payload-index) counts the keys through the one batch observer and a done row
+tracks the migration. The online payload-index migration seeds older stores:
+open fences with a new writer family (sparrow.store/352 to 406) and seeds the
+checkpoint; the maintenance worker runs 1,024-artifact pages through the
+ordinary write path with the other migrations' wait for writers; a restart
+resumes after the last committed page; status reports it. New additive wire
+method payloadLookup @56 (schema stays 71), CLI "payload STORE_ID PAYLOAD_ID
+[--cursor C] [--page-size N]" and read-only MCP tool payload_lookup: a page of
+artifact ids, exact when the migration is complete, pending before (what is
+listed is held, what is not listed is unknown).
+
+Paths. Every Artifact entry comes from inline ingestion (tail checkpoints,
+whose artifact is exactly its checkpointed range, and zero-byte recordless
+artifacts carry the digest of all their bytes) or from import publication,
+which verifies the hash of the whole artifact. A part of a consume-root set is
+its own artifact under its own digest; the digest of the whole source file is
+never an artifact payload_id. Evicted artifacts are not indexed.
+
+Measured on scratch stores in release, 100,000 artifacts, host load average
+about 40-60 throughout (not quiet; figures are indicative):
+ - key: 117 logical bytes (11,700,000 for 100,000); about 112 physical bytes
+   per artifact on disk against about 4,600 per artifact in all (30,000
+   artifacts: 142,109,827 bytes with, 138,844,092 without)
+ - lookup, 20,000 present and 20,000 absent digests: p50 4 us, p99 10 us
+ - rebuild of 100,000 artifacts: 3.92 s in 99 pages (mean page 39.6 ms,
+   max 297 ms) while ingest continued; ingest during the rebuild p50 2.1 ms,
+   p99 32.8 ms, max 102.6 ms
+ - memory: resident set 217 MB after ingest with the index (144 MB in the
+   100,000 baseline run), 288 MB at peak during the rebuild
+ - ingest cost, 30,000 artifacts, two alternating pairs, trimmed mean:
+   859 and 1,382 us with, 895 and 1,297 us without; under this load the
+   difference is inside the noise, so no cost is claimed beyond that bound
+Logs and the probe: .stage/evidence-keep/323/.
+
+Not verified. No quiet-host run; the daemon's maintenance worker scheduling
+of the migration page was not run, only the page and migrate_step paths; the
+whole make check outside the hook; a live or restored production store.

@@ -1,0 +1,112 @@
+{
+  "issue": 323,
+  "pr_number": 334,
+  "branch": "paudley/323-index-artifacts-by-payload-id-the-store",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/323-index-artifacts-by-payload-id-the-store/.stage/index-artifacts-by-payload-id-the-store",
+  "observed_at": "2026-11-16T13:03:49.682337+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews",
+    "merge_candidate"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/323-index-artifacts-by-payload-id-the-store/.stage/index-artifacts-by-payload-id-the-store/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/323-index-artifacts-by-payload-id-the-store/.stage/index-artifacts-by-payload-id-the-store/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/323-index-artifacts-by-payload-id-the-store/.stage/index-artifacts-by-payload-id-the-store/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/323-index-artifacts-by-payload-id-the-store/.stage/index-artifacts-by-payload-id-the-store/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/323-index-artifacts-by-payload-id-the-store/.stage/index-artifacts-by-payload-id-the-store/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict.",
+    "Preflight does not sign, fetch, push or mutate forge state. API permission and read access do not prove Git push authorization or protected-branch admission."
+  ],
+  "pr": {
+    "number": 334,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Index artifacts by payload id so the store can answer whether it holds a content",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/334",
+    "baseRefName": "main",
+    "baseRefOid": "408ef0215e54a3cbf087fe9eaa21bad14298bf31",
+    "headRefName": "paudley/323-index-artifacts-by-payload-id-the-store",
+    "headRefOid": "e5cd505dcf934f6dcbd30c4a7313622458f5e3e4",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/260/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "e5cd505dcf934f6dcbd30c4a7313622458f5e3e4",
+    "branch": "paudley/323-index-artifacts-by-payload-id-the-store",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 334,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #334 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  },
+  "preflight": {
+    "git": "/usr/bin/git",
+    "python3": "/home/paudley/stage/root/bin/python3",
+    "stagectl": "/home/paudley/stage/root/bin/stagectl",
+    "bash": "/usr/bin/bash",
+    "readlink": "/home/paudley/stage/root/bin/readlink",
+    "sed": "/usr/bin/sed",
+    "awk": "/usr/bin/awk",
+    "ghprsq": "/home/paudley/stage/agents/bin/ghprsq",
+    "archive": {
+      "files": 154,
+      "bytes": 1472117009,
+      "errors": [],
+      "limits": "Read-only selected-evidence admission; full newly reachable Git object closure is checked by ghprsq before push."
+    },
+    "signing": {
+      "format": "openpgp",
+      "key_configured": true,
+      "limits": "Configuration inspected; no signing operation was performed."
+    },
+    "forge_permissions": {
+      "admin": true,
+      "push": true,
+      "pull": true
+    },
+    "merge_candidate": {
+      "base": "408ef0215e54a3cbf087fe9eaa21bad14298bf31",
+      "head": "e5cd505dcf934f6dcbd30c4a7313622458f5e3e4",
+      "status": "clean"
+    }
+  }
+}

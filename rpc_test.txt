@@ -1,0 +1,77 @@
+/// INVARIANT (#323): the same bytes ingested under two requests are both found by their
+/// payload id through the CLI and the MCP tool, which share one lookup; a digest nothing holds
+/// answers an exact empty page; a cursor resumes after the last artifact listed.
+#[tokio::test(flavor = "current_thread")]
+async fn payload_lookup_finds_every_artifact_of_a_digest_through_cli_and_mcp() {
+    use purrdf_lex::json::Object;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let _daemon = start(&config, &socket).await;
+            let store = cli(&socket, &["status"])["store_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let payload = dir.path().join("same.log");
+            std::fs::write(&payload, b"held twice\n").unwrap();
+            let mut ids = Vec::new();
+            let mut payload_id = String::new();
+            for request in ["lookup-one", "lookup-two"] {
+                let artifact = cli(
+                    &socket,
+                    &["ingest", request, "lookup-source", "log", payload.to_str().unwrap()],
+                );
+                ids.push(artifact["artifact_id"].as_str().unwrap().to_owned());
+                payload_id = artifact["payload_id"].as_str().unwrap().to_owned();
+            }
+            ids.sort();
+            let found = cli(&socket, &["payload", &store, &payload_id]);
+            assert_eq!(found["answer_certainty"].as_str(), Some("exact"));
+            let listed: Vec<&str> = found["artifact_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_str().unwrap())
+                .collect();
+            assert_eq!(listed, ids.iter().map(String::as_str).collect::<Vec<_>>());
+            assert!(found["next_cursor"].is_null());
+            let first = cli(&socket, &["payload", &store, &payload_id, "--page-size", "1"]);
+            let cursor = first["next_cursor"].as_str().unwrap();
+            let rest = cli(
+                &socket,
+                &["payload", &store, &payload_id, "--page-size", "1", "--cursor", cursor],
+            );
+            assert_eq!(rest["artifact_ids"][0].as_str(), Some(ids[1].as_str()));
+            assert!(rest["next_cursor"].is_null());
+            let mut mcp = Mcp::start(socket.to_str().unwrap());
+            mcp.initialize(1).await;
+            let result = mcp
+                .tool(
+                    2,
+                    "payload_lookup",
+                    Object::new()
+                        .with("store_id", store.clone())
+                        .with("payload_id", payload_id.clone())
+                        .into(),
+                )
+                .await;
+            assert_eq!(
+                result["result"]["structuredContent"]["artifact_ids"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2,
+                "{result:?}"
+            );
+            let absent = format!("blake3:{}", "0".repeat(64));
+            let empty = cli(&socket, &["payload", &store, &absent]);
+            assert_eq!(empty["answer_certainty"].as_str(), Some("exact"));
+            assert!(empty["artifact_ids"].as_array().unwrap().is_empty());
+            mcp.close(true).await;
+        })
+        .await;
+}
+
