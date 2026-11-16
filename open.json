@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 332,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/332-archive-worker-writes-store-id-on-its",
+  "branch": "paudley/332-archive-worker-writes-store-id-on-its",
+  "slug": "archive-worker-writes-store-id-on-its",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/332-archive-worker-writes-store-id-on-its/.stage/archive-worker-writes-store-id-on-its",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "f4ae7a1dea124d6c352258474006c78674660e7c",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/332-archive-worker-writes-store-id-on-its",
+    "branch:paudley/332-archive-worker-writes-store-id-on-its",
+    "ignored:3 files (3 reflinked, 0 written)",
+    "rust-caches:skipping busy source /opt/.cargo/12/5221f9948e5966: /opt/.cargo/12/5221f9948e5966/release/.cargo-build-lock; reflinked /home/paudley/Active/sparrow/.worktrees/315-design-stop-persisting-the-device caches into /home/paudley/Active/sparrow/.worktrees/332-archive-worker-writes-store-id-on-its plus 0 dependency units from 0 other checkouts in 8.5s; 302 unchanged files keep their built mtimes; 11 other files take the seed time and rebuild; 29 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/332-archive-worker-writes-store-id-on-its/.stage/archive-worker-writes-store-id-on-its",
+    "issue:/home/paudley/Active/sparrow/.worktrees/332-archive-worker-writes-store-id-on-its/.stage/archive-worker-writes-store-id-on-its/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-16T08:49:19-0600",
+  "seed_error": ""
+}
