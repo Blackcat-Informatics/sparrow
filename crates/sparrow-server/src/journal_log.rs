@@ -50,9 +50,10 @@ impl<'a, W: Write + 'a, F: Fn() -> W> MakeWriter<'a> for OneLine<F> {
 }
 
 /// Writes one formatted event, replacing a line break inside it (a multi-line error message)
-/// with a visible `\n` so the event stays whole. The formatter delivers an event in one write
-/// that ends with its own newline, which is kept. A write that fails is ignored by the
-/// formatter, so a closed stderr cannot panic the thread that logged.
+/// with a visible `\n`, and any other control character (NUL, ESC, DEL) with `\u{NN}`, so the
+/// event stays whole and cannot move a terminal or hide text in the journal. The formatter
+/// delivers an event in one write that ends with its own newline, which is kept. A write that
+/// fails is ignored by the formatter, so a closed stderr cannot panic the thread that logged.
 struct Escaped<W>(W);
 
 impl<W: Write> Write for Escaped<W> {
@@ -66,6 +67,9 @@ impl<W: Write> Write for Escaped<W> {
             match byte {
                 b'\n' => line.extend_from_slice(b"\\n"),
                 b'\r' => line.extend_from_slice(b"\\r"),
+                0..=0x1f | 0x7f => {
+                    line.extend(char::from(byte).escape_unicode().map(|c| c as u8));
+                }
                 other => line.push(other),
             }
         }
@@ -110,7 +114,8 @@ mod tests {
             tracing::warn!(
                 target: "sparrow_core::storage::archive_segment",
                 code = "RESOURCE_LIMIT",
-                detail = %"first\nsecond",
+                detail = %"first\nsecond\u{0}\u{1b}[31m",
+                cause = "say \"hi\"\u{0}\u{1b}".to_owned().as_str(),
                 entries = 10_u64,
                 "archive segment encoding failed; the range is halved and retried"
             );
@@ -124,12 +129,16 @@ mod tests {
             "WARN",
             "sparrow_core::storage::archive_segment",
             "code=\"RESOURCE_LIMIT\"",
-            "first\\nsecond",
+            "first\\nsecond\\u{0}\\u{1b}[31m",
+            "cause=\"say \\\"hi\\\"\\0\\u{1b}\"",
             "entries=10",
             "the range is halved",
         ] {
             assert!(text.contains(part), "{part} missing from {text:?}");
         }
-        assert!(!text.contains('\u{1b}'), "no colour codes");
+        assert!(
+            !text.chars().any(|c| c != '\n' && c.is_control()),
+            "no raw control character: {text:?}"
+        );
     }
 }

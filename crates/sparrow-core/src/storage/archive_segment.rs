@@ -327,8 +327,10 @@ fn select(
                 && let Some(reason) = hold_reason(&writer, record, length)?
             {
                 if count == 0 {
-                    // Neither archived nor deleted: the watermark never passes it.
-                    tracing::warn!(
+                    // Neither archived nor deleted: the watermark never passes it. This runs
+                    // under the writer lock, so the event is debug (off in the daemon) and the
+                    // worker journals the hold once, after the lock, from `archive_held`.
+                    tracing::debug!(
                         record = id,
                         bytes = length,
                         reason = ?reason,
@@ -548,17 +550,20 @@ impl Store {
                     self.note_archive_halving();
                     tracing::warn!(
                         code = error.code,
-                        cause = %error.message,
+                        cause = error.message.as_str(),
                         entries,
                         cap = halved,
-                        elapsed_ms = u64::try_from(attempt.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        elapsed_ms =
+                            u64::try_from(attempt.elapsed().as_millis()).unwrap_or(u64::MAX),
                         "archive segment encoding failed; the range is halved and retried"
                     );
                     shortened.get_or_insert((entries, error.code));
                     cap = Some(halved);
                 }
                 Err((error, first)) => {
-                    tracing::warn!(
+                    // The returned error names the entry and the code, and the worker journals
+                    // it once as the failed pass; this event would repeat it.
+                    tracing::debug!(
                         entry = first,
                         code = error.code,
                         "archive held: entry cannot be encoded; it is not archived and not deleted"
