@@ -205,6 +205,100 @@ async fn capability_documents_share_cli_mcp_and_typed_transport_contracts() {
         .await;
 }
 
+/// INVARIANT (#323): the same bytes ingested under two requests are both found by their
+/// payload id through the CLI and the MCP tool, which share one lookup; a digest nothing holds
+/// answers an exact empty page; a cursor resumes after the last artifact listed.
+#[tokio::test(flavor = "current_thread")]
+async fn payload_lookup_finds_every_artifact_of_a_digest_through_cli_and_mcp() {
+    use purrdf_lex::json::Object;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let _daemon = start(&config, &socket).await;
+            let store = cli(&socket, &["status"])["store_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let payload = dir.path().join("same.log");
+            std::fs::write(&payload, b"held twice\n").unwrap();
+            let mut ids = Vec::new();
+            let mut payload_id = String::new();
+            for request in ["lookup-one", "lookup-two"] {
+                let artifact = cli(
+                    &socket,
+                    &[
+                        "ingest",
+                        request,
+                        "lookup-source",
+                        "log",
+                        payload.to_str().unwrap(),
+                    ],
+                );
+                ids.push(artifact["artifact_id"].as_str().unwrap().to_owned());
+                payload_id = artifact["payload_id"].as_str().unwrap().to_owned();
+            }
+            ids.sort();
+            let found = cli(&socket, &["payload", &store, &payload_id]);
+            assert_eq!(found["answer_certainty"].as_str(), Some("exact"));
+            let listed: Vec<&str> = found["artifact_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_str().unwrap())
+                .collect();
+            assert_eq!(listed, ids.iter().map(String::as_str).collect::<Vec<_>>());
+            assert!(found["next_cursor"].is_null());
+            let first = cli(
+                &socket,
+                &["payload", &store, &payload_id, "--page-size", "1"],
+            );
+            let cursor = first["next_cursor"].as_str().unwrap();
+            let rest = cli(
+                &socket,
+                &[
+                    "payload",
+                    &store,
+                    &payload_id,
+                    "--page-size",
+                    "1",
+                    "--cursor",
+                    cursor,
+                ],
+            );
+            assert_eq!(rest["artifact_ids"][0].as_str(), Some(ids[1].as_str()));
+            assert!(rest["next_cursor"].is_null());
+            let mut mcp = Mcp::start(socket.to_str().unwrap());
+            mcp.initialize(1).await;
+            let result = mcp
+                .tool(
+                    2,
+                    "payload_lookup",
+                    Object::new()
+                        .with("store_id", store.clone())
+                        .with("payload_id", payload_id.clone())
+                        .into(),
+                )
+                .await;
+            assert_eq!(
+                result["structuredContent"]["artifact_ids"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2,
+                "{result:?}"
+            );
+            let absent = format!("blake3:{}", "0".repeat(64));
+            let empty = cli(&socket, &["payload", &store, &absent]);
+            assert_eq!(empty["answer_certainty"].as_str(), Some("exact"));
+            assert!(empty["artifact_ids"].as_array().unwrap().is_empty());
+            mcp.close(true).await;
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn log_timestamp_profiles_share_tcp_cli_unix_mcp_and_chronological_capture() {
     use purrdf_lex::json::{self, Object};
@@ -273,7 +367,7 @@ async fn log_timestamp_profiles_share_tcp_cli_unix_mcp_and_chronological_capture
             assert_eq!(artifact["record_ids"].as_array().unwrap().len(), 3);
             assert_eq!(
                 cli(&endpoint, &["status"])["store_format"].as_str(),
-                Some("sparrow.store/310")
+                Some("sparrow.store/365")
             );
             let first = cli(
                 &endpoint,
@@ -625,7 +719,7 @@ async fn typed_tail_handoff_retires_original_checkpoint_over_tcp_and_replays_thr
         assert_eq!(client.bytes(&generation, 0, 10).await.unwrap(), b"first\nlast");
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement stays independent");
         let status = cli(&socket, &["status"]);
-        assert_eq!(status["store_format"].as_str(), Some("sparrow.store/301"));
+        assert_eq!(status["store_format"].as_str(), Some("sparrow.store/356"));
         assert_eq!(status["live_records"].as_str(), Some("2"));
         assert_eq!(cli(&socket, &["records", "--source", "consume-acceptance"])["rows"], original_records);
     }).await;
@@ -4445,7 +4539,7 @@ async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_a
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement must remain\n");
         let response = client.capability().status_request().send().promise.await.unwrap();
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
-        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/300");
+        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/355");
         assert_eq!(status.get_live_records(), 2);
         assert!(status.get_consume_watches().unwrap().is_empty());
         drop(client); drop(daemon);
@@ -4707,7 +4801,7 @@ async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect
             );
             assert_eq!(
                 cli(&socket, &["status"])["store_format"].as_str(),
-                Some("sparrow.store/299")
+                Some("sparrow.store/354")
             );
         })
         .await;
@@ -5304,7 +5398,7 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
             assert_eq!(status["counts"].as_str(), Some("pending"));
             assert_eq!(status["live_records"].as_str(), Some("0"));
             let migrations = status["migrations"].as_array().unwrap();
-            assert_eq!(migrations.len(), 4, "{migrations:?}");
+            assert_eq!(migrations.len(), 5, "{migrations:?}");
             for migration in migrations {
                 assert_eq!(migration["done"].as_str(), Some("0"), "{migration:?}");
                 assert_eq!(
@@ -5829,7 +5923,7 @@ async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopene
                 Some("5")
             );
             assert_eq!(status["live_records"].as_str(), Some("5"));
-            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/299"));
+            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/354"));
             rustix::process::kill_process(
                 rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
                 rustix::process::Signal::INT,
@@ -10123,7 +10217,7 @@ async fn mcp_exercise(
     mcp.initialize(2).await;
     let tools = mcp.call(3, "tools/list", Object::new().into()).await;
     let definitions = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(definitions.len(), 39);
+    assert_eq!(definitions.len(), 40);
     for (name, read_only) in [
         ("sparql_explain", true),
         ("correlate", true),
@@ -10137,6 +10231,7 @@ async fn mcp_exercise(
         ("result_release", false),
         ("syslog_listener_get", true),
         ("receiver_window_get", true),
+        ("payload_lookup", true),
     ] {
         assert_eq!(
             definitions

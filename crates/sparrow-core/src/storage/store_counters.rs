@@ -12,6 +12,8 @@
 //!   `artifacts`, `graph-declarations` (`rdf:g:`), `record-graphs`
 //!   (`provenance-rdf:record:`), `payload-chunks` (`ref:`) and `json-projections`
 //!   (`projection-ref:`);
+//! - `payload-index` counts the `payload-id:` keys of the payload id index (#323), which
+//!   [`super::payload_index`] writes in the batch of the artifact change each follows;
 //! - one `done:<migration>` counter per data migration counts the keys of its source
 //!   prefixes at or before the position its committed checkpoint names.
 //!
@@ -30,7 +32,7 @@
 //! its bound covers. Until seeding completes, readers report the rows as pending: exact
 //! through the seeding watermark, never a total. Nothing recounts at run time.
 
-use super::{Error, rdf_index, read_field, source_context, source_summary};
+use super::{Error, payload_index, rdf_index, read_field, source_context, source_summary};
 use rocksdb::{DB, Direction, IteratorMode, WriteBatch};
 use source_summary::failure;
 use std::cmp::Ordering;
@@ -52,7 +54,16 @@ const RECORD_GRAPH: &[u8] = b"provenance-rdf:record:";
 const PAYLOAD: &[u8] = b"ref:";
 const PROJECTION: &[u8] = b"projection-ref:";
 /// Counted prefixes, in seeding order.
-const SEEDED: [&[u8]; 6] = [RECORD, ARTIFACT, GRAPH, RECORD_GRAPH, PAYLOAD, PROJECTION];
+const PAYLOAD_INDEX: &[u8] = payload_index::PREFIX;
+const SEEDED: [&[u8]; 7] = [
+    RECORD,
+    ARTIFACT,
+    GRAPH,
+    RECORD_GRAPH,
+    PAYLOAD,
+    PROJECTION,
+    PAYLOAD_INDEX,
+];
 
 /// Which keys of a prefix a term counts.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -71,6 +82,7 @@ enum Follows {
     SourceSummaryArtifacts,
     SourceSummaryRecords,
     SourceContext,
+    PayloadIndexMigration,
 }
 
 struct Term {
@@ -92,10 +104,12 @@ pub(super) enum Counter {
     OwnerGraphIndexDone,
     SourceSummaryDone,
     SourceContextDone,
+    PayloadIndex,
+    PayloadIndexDone,
 }
 
 impl Counter {
-    pub(super) const ALL: [Self; 10] = [
+    pub(super) const ALL: [Self; 12] = [
         Self::Records,
         Self::RetainedRecords,
         Self::Artifacts,
@@ -106,6 +120,8 @@ impl Counter {
         Self::OwnerGraphIndexDone,
         Self::SourceSummaryDone,
         Self::SourceContextDone,
+        Self::PayloadIndex,
+        Self::PayloadIndexDone,
     ];
 
     fn name(self) -> &'static str {
@@ -120,6 +136,8 @@ impl Counter {
             Self::OwnerGraphIndexDone => "done:owner-graph-index",
             Self::SourceSummaryDone => "done:source-summary",
             Self::SourceContextDone => "done:source-context",
+            Self::PayloadIndex => "payload-index",
+            Self::PayloadIndexDone => "done:payload-index",
         }
     }
 
@@ -130,8 +148,8 @@ impl Counter {
     fn terms(self) -> &'static [Term] {
         use Filter::{Any, Retained};
         use Follows::{
-            OwnerGraphIndex, Population, SourceContext, SourceSummaryArtifacts,
-            SourceSummaryRecords,
+            OwnerGraphIndex, PayloadIndexMigration, Population, SourceContext,
+            SourceSummaryArtifacts, SourceSummaryRecords,
         };
         match self {
             Self::Records => &[Term {
@@ -190,6 +208,16 @@ impl Counter {
                 prefix: RECORD,
                 filter: Any,
                 follows: SourceContext,
+            }],
+            Self::PayloadIndex => &[Term {
+                prefix: PAYLOAD_INDEX,
+                filter: Any,
+                follows: Population,
+            }],
+            Self::PayloadIndexDone => &[Term {
+                prefix: ARTIFACT,
+                filter: Any,
+                follows: PayloadIndexMigration,
             }],
         }
     }
@@ -320,6 +348,7 @@ pub(super) struct Positions {
     owner: Bound,
     summary: (Bound, Bound),
     context: Bound,
+    payload: Bound,
 }
 
 /// The checkpoint keys [`Positions`] reads.
@@ -328,6 +357,7 @@ fn checkpoint_key(name: &[u8]) -> bool {
         || name == rdf_index::OWNER_GRAPH_UPGRADE.as_bytes()
         || name == source_summary::CHECKPOINT.as_bytes()
         || name == source_context::CHECKPOINT.as_bytes()
+        || name == payload_index::CHECKPOINT.as_bytes()
 }
 
 impl Positions {
@@ -351,17 +381,22 @@ impl Positions {
                 Bound::after(after.map(String::into_bytes)),
             ),
         };
-        let context = super::catalog_upgrade::read_progress(source_context::CHECKPOINT, read)?;
+        let context = super::catalog_upgrade::read_progress(source_context::CHECKPOINT, &mut read)?;
         let context = if context.complete {
             Bound::Everything
         } else {
             Bound::after(context.after.map(String::into_bytes))
+        };
+        let payload = match payload_index::bound_progress(&mut read)? {
+            None => Bound::Everything,
+            Some(after) => Bound::after(after),
         };
         Ok(Self {
             seed,
             owner,
             summary,
             context,
+            payload,
         })
     }
 
@@ -384,6 +419,7 @@ impl Positions {
             Follows::SourceSummaryArtifacts => self.summary.0.clone(),
             Follows::SourceSummaryRecords => self.summary.1.clone(),
             Follows::SourceContext => self.context.clone(),
+            Follows::PayloadIndexMigration => self.payload.clone(),
         };
         follows.min(self.seed.bound(term.prefix))
     }
@@ -589,6 +625,14 @@ pub(super) fn fence(db: &DB, batch: &mut WriteBatch) -> Result<(), Error> {
         .encode(),
     );
     Ok(())
+}
+
+/// Zero the payload index rows into `batch`, as its fence seeds them: the caller seeds the
+/// checkpoint in the same batch and commits it directly, outside [`apply`].
+pub(super) fn seed_payload_index(batch: &mut WriteBatch) {
+    for counter in [Counter::PayloadIndex, Counter::PayloadIndexDone] {
+        batch.put(counter.key(), 0_u64.to_be_bytes());
+    }
 }
 
 /// Zero one migration's `done` row into `batch`, for a migration reset at open: the caller

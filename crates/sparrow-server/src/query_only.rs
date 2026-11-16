@@ -105,6 +105,7 @@ classify! {
         receiver_window_get: ReceiverWindowGetParams, ReceiverWindowGetResults;
         ingest_status: IngestStatusParams, IngestStatusResults;
         ingest_part_receipt: IngestPartReceiptParams, IngestPartReceiptResults;
+        payload_lookup: PayloadLookupParams, PayloadLookupResults;
         import_get: ImportGetParams, ImportGetResults;
         retention_metrics: RetentionMetricsParams, RetentionMetricsResults;
         sparql_query: SparqlQueryParams, SparqlQueryResults;

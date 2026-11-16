@@ -34,7 +34,8 @@
 
 use super::store_counters::{self, Counter, Positions, Reader};
 use super::{
-    Error, Store, Writer, catalog_upgrade, rdf_index, source_context, source_summary, writer_format,
+    Error, Store, Writer, catalog_upgrade, payload_index, rdf_index, source_context,
+    source_summary, writer_format,
 };
 use rocksdb::{DB, WriteBatch};
 
@@ -57,17 +58,20 @@ pub enum Migration {
     /// The source timeline cache record context reads, rebuilt only when the open found it
     /// stale (#149).
     SourceContext,
+    /// The payload id index: one key per held artifact, from the digest of its bytes (#323).
+    PayloadIndex,
 }
 
 impl Migration {
     /// Every migration, in the order `status`, the latched failures and [`Migration::index`]
     /// use. The maintenance worker runs them in its own run order: the counters, the source
     /// summary, the owner index, then the source timeline cache (#176).
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::StoreCounters,
         Self::OwnerGraphIndex,
         Self::SourceSummary,
         Self::SourceContext,
+        Self::PayloadIndex,
     ];
 
     /// The order the maintenance worker runs the migrations: the counters first, so the
@@ -75,9 +79,10 @@ impl Migration {
     /// state makes every `sources` and live `artifacts` listing read what it still owes
     /// (#176), then the owner index, since its pages are few and cheap. The migrations are
     /// independent: each reads and checkpoints its own keys.
-    pub(crate) const RUN_ORDER: [Self; 4] = [
+    pub(crate) const RUN_ORDER: [Self; 5] = [
         Self::StoreCounters,
         Self::SourceSummary,
+        Self::PayloadIndex,
         Self::OwnerGraphIndex,
         Self::SourceContext,
     ];
@@ -90,6 +95,7 @@ impl Migration {
             Self::OwnerGraphIndex => "owner-graph-index",
             Self::SourceSummary => "source-summary",
             Self::SourceContext => "source-context",
+            Self::PayloadIndex => "payload-index",
         }
     }
 
@@ -113,6 +119,7 @@ impl Migration {
             Self::OwnerGraphIndex => &[Counter::GraphDeclarations],
             Self::SourceSummary => &[Counter::Artifacts, Counter::Records],
             Self::SourceContext => &[Counter::Records],
+            Self::PayloadIndex => &[Counter::Artifacts],
         }
     }
 }
@@ -191,10 +198,12 @@ pub(super) fn fence(db: &DB) -> Result<(), Error> {
     // Last, so its zero rows and start position describe every checkpoint seeded above.
     if !writer_format::has_store_counters(&format) {
         store_counters::fence(db, &mut batch)?;
-        batch.put(
-            "store_format",
-            writer_format::enable_store_counters(&format)?,
-        );
+        format = writer_format::enable_store_counters(&format)?.to_vec();
+        batch.put("store_format", &format);
+    }
+    // After the counters, whose zero rows it extends with its own.
+    if !writer_format::has_payload_index(&format) {
+        payload_index::fence(db, &format, &mut batch)?;
     }
     if !batch.is_empty() {
         catalog_upgrade::commit(db, batch)?;
@@ -251,6 +260,10 @@ pub(super) fn report(
                     values[&Counter::SourceContextDone],
                     source_context::watermark(|key| reader.get(key.as_bytes()))?,
                 ),
+                Migration::PayloadIndex => (
+                    values[&Counter::PayloadIndexDone],
+                    payload_index::progress(|key| reader.get(key.as_bytes()))?.watermark(),
+                ),
             };
             // The source-context rebuild latches corrupt metadata durably, not per session.
             let failure = match (&failures[migration.index()], migration) {
@@ -289,6 +302,9 @@ impl Writer {
                         .is_none()
                 }
                 Migration::SourceContext => !source_context::pending(&self.db)?,
+                Migration::PayloadIndex => payload_index::progress(|key| Ok(self.db.get(key)?))?
+                    .watermark()
+                    .is_none(),
             };
             if !complete {
                 return Ok(Some(*migration));
@@ -305,6 +321,7 @@ impl Writer {
             Migration::OwnerGraphIndex => rdf_index::owner_graph_page(&self.db, OWNER_GRAPH_PAGE)?,
             Migration::SourceSummary => source_summary::page(&self.db)?,
             Migration::SourceContext => source_context::page(&self.db)?,
+            Migration::PayloadIndex => payload_index::page(&self.db)?,
         };
         let Some((batch, complete)) = staged else {
             return Ok(true);

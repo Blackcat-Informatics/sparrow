@@ -356,7 +356,7 @@ impl ImportManifest {
     }
 }
 
-fn valid_payload_id(id: &str) -> bool {
+pub(super) fn valid_payload_id(id: &str) -> bool {
     id.strip_prefix("blake3:")
         .and_then(hex::decode_32_canonical)
         .is_some()
