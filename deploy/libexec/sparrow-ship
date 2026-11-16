@@ -31,7 +31,7 @@ of it, because it can change at boot (btrfs renumbers it), which would ship ever
 file again. Older ledger lines carry the device as a fourth, leading field and
 are read as the same entry. Inode reuse after a delete and create is not
 detected, and the device number never detected that either. A crash between
-those steps queues the file again; an identical item already waiting in a root
+queueing and recording the identity queues the file again; an identical item already waiting in a root
 is recognized and dropped, and a different one waits until Sparrow consumes the
 earlier copy. A finished file that later changes has a new identity and is
 shipped again whole.
@@ -108,7 +108,13 @@ def identity(stat):
 def ledger_keys(ledger_path):
     """Return the identities a ledger records, reading legacy `dev:` lines as the same entry."""
     keys = set()
-    for number, line in enumerate(ledger_path.read_text().splitlines(), 1):
+    # The writer ends lines with "\n" only. Neither splitlines() nor universal-newline
+    # reading may split a file name that holds a carriage return or another separator.
+    with open(ledger_path, newline="") as handle:
+        lines = handle.read().split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    for number, line in enumerate(lines, 1):
         key = line.split("\t", 1)[0]
         fields = key.split(":")
         if len(fields) == 4:

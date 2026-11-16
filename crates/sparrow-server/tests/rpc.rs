@@ -7158,6 +7158,8 @@ fn shipper_never_reships_a_file_whose_device_number_alone_changed() {
     let other = reports.join("other.json");
     std::fs::write(&kept, b"{\"a\":1}").unwrap();
     std::fs::write(&other, b"{\"b\":2}").unwrap();
+    // A name with a carriage return must not split its ledger line.
+    std::fs::write(reports.join("odd\rname.json"), b"{\"c\":3}").unwrap();
     let config = dir.path().join("ship.toml");
     std::fs::write(
         &config,
@@ -7177,7 +7179,7 @@ fn shipper_never_reships_a_file_whose_device_number_alone_changed() {
         assert!(output.status.success(), "{output:?}");
         String::from_utf8_lossy(&output.stdout).into_owned()
     };
-    assert!(report(&ship(&config)).contains("reports: queued 2"));
+    assert!(report(&ship(&config)).contains("reports: queued 3"));
     // Simulate a reboot's renumbering: every line gains a different leading device number,
     // one file's line stays in the new form, so the ledger mixes both.
     let ledger = dir.path().join("ship/reports.ledger");

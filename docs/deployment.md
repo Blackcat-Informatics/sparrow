@@ -399,7 +399,8 @@ under `state_dir` records the shipped identity (inode, size,
 modification time). The device number is not part of it, because it can change
 at boot; older four-field ledger lines that lead with the device are read as the
 same entry. Inode reuse after a delete and create is not detected, and the
-device number never detected that either. A crash between the two queues the file again. Each run
+device number never detected that either. A crash between queueing and recording
+the identity queues the file again. Each run
 then feeds the oldest queued items into their roots while the bytes waiting in
 all roots together stay within `max_pending_bytes`; an item larger than that
 budget is fed only into empty roots. Each move synchronizes the root and the
@@ -445,7 +446,7 @@ found there, not in Sparrow). The manager forwarder drops the unit's own
 process, so a record in a `katamari-manager-*` file comes from the manager or from another journal entry that names the unit (a coredump, for example); `source` says which journal it came from, not which process.
 
 The manager lines use their own file prefix and cursor, never the node's.
-`sparrow-ship` keys a file by device, inode, size and modification time and
+`sparrow-ship` keys a file by inode, size and modification time and
 ships a changed file again whole, so appending to a bucket the other forwarder
 wrote would send it twice. A manager bucket can still be appended to after it
 shipped when a line arrives more than `settle_seconds` after the previous one in
