@@ -3340,6 +3340,7 @@ impl wire::sparrow::Server for Rpc {
                     staging.set_last_graph(&field::<String>(&value, "staging_refused_last_graph")?);
                     staging.set_last_bytes(number(&value, "staging_refused_last_bytes")?);
                 }
+                out.set_archive_halvings(number(&value, "archive_halvings")?);
                 out.set_pin_read_handles(number(&value, "pin_read_handles")?);
                 out.set_pin_read_bytes(number(&value, "pin_read_bytes")?);
                 out.set_max_pin_read_handles(number(&value, "max_pin_read_handles")?);

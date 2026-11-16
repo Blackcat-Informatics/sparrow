@@ -51,9 +51,6 @@ pub(crate) struct Flight {
 struct FlightState {
     current: Option<Current>,
     overran: bool,
-    /// Prepares that returned fewer entries than they selected, since the worker started.
-    /// In-process only: the daemon's status does not carry it.
-    shortened: u64,
 }
 
 struct Current {
@@ -147,13 +144,6 @@ impl Flight {
     /// Forget an overrun from an earlier pass; a pass is judged on its own steps.
     fn start_pass(&self) {
         self.state().overran = false;
-    }
-
-    /// Count one shortened prepare and return the running total.
-    fn note_shortened(&self) -> u64 {
-        let mut state = self.state();
-        state.shortened += 1;
-        state.shortened
     }
 
     fn overran(&self) -> bool {
@@ -612,16 +602,16 @@ fn drain(
     let mut committed = 0;
     while let Some(segment) = store.archive_prepare(now).map_err(ArchiveError::Store)? {
         if let Some(short) = segment.shortened {
-            let total = flight.note_shortened();
+            let halvings_total = store.archive_halvings();
             eprintln!(
-                "sparrowd: archive prepare shortened selected={} kept={} code={} shortened_total={total}",
-                short.selected, short.kept, short.code
+                "sparrowd: archive prepare shortened selected={} kept={} first_code={} halvings_total={halvings_total}",
+                short.selected, short.kept, short.first_code
             );
             tracing::warn!(
                 selected = short.selected,
                 kept = short.kept,
-                code = short.code,
-                shortened_total = total,
+                first_code = short.first_code,
+                halvings_total,
                 "archive prepare returned fewer entries than it selected"
             );
         }

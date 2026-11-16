@@ -307,9 +307,12 @@ outgrow memory: encoding costs up to 390 bytes a quad, which puts a full segment
 1.27 GB with the daemon, under the 2 GiB soft limit. The count comes from the stored graph
 manifests before encoding (an upper bound: the manifest rows are exact, and a record with
 no known event time adds 4 fallback quads), and a record with more quads than the budget forms a segment of
-its own. A read that makes no progress for 60 seconds ends with
-`RESULT_EXPIRED`; the range is then halved and the shortening is reported to
-the worker. Ordinary query reads keep a fixed lease.
+its own. Only the RDF read is leased: an archive RDF read that makes no progress for 60 seconds ends with
+`RESULT_EXPIRED`. Any encode error except `UNSUPPORTED` halves the range (so does a read
+refused because a query holds the RDF slot) and the prepare retries over the first half; a rebuild of a segment already in
+flight is not halved. Each halving is counted (`Status.archiveHalvings`), warned with its code,
+and the segment returned says it is shortened, with the code of the first halving. Ordinary
+query reads keep a fixed lease.
 The worker writes nothing until the archive directory is on its own mount (a device
 other than `/`'s, and a network filesystem type or one unlike `/`'s) and holds this
 store's `STORE_ID`, which it writes itself into an empty directory on the first pass and

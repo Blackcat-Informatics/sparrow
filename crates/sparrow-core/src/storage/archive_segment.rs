@@ -65,8 +65,10 @@ pub struct Shortened {
     pub selected: u64,
     /// Records and artifacts in the segment returned.
     pub kept: u64,
-    /// Code of the first encode error that caused a halving, such as `RESULT_EXPIRED`.
-    pub code: &'static str,
+    /// Code of the first encode error that caused a halving, such as `RESULT_EXPIRED`. A
+    /// later halving of the same prepare may have had another code; every halving is counted
+    /// in `Store::archive_halvings` and warned with its own code.
+    pub first_code: &'static str,
 }
 
 impl PreparedSegment {
@@ -530,10 +532,10 @@ impl Store {
             let attempt = std::time::Instant::now();
             match self.encode_selection(&store_id, selection) {
                 Ok(mut prepared) => {
-                    prepared.shortened = shortened.map(|(selected, code)| Shortened {
+                    prepared.shortened = shortened.map(|(selected, first_code)| Shortened {
                         selected,
                         kept: prepared.records + prepared.artifacts,
-                        code,
+                        first_code,
                     });
                     return Ok(Some(prepared));
                 }
@@ -546,7 +548,7 @@ impl Store {
                     self.note_archive_halving();
                     tracing::warn!(
                         code = error.code,
-                        message = %error.message,
+                        cause = %error.message,
                         entries,
                         cap = halved,
                         elapsed_ms = u64::try_from(attempt.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -576,7 +578,8 @@ impl Store {
     }
 
     /// How many times `archive_prepare` halved its range after an encode error since this
-    /// store was opened. Not stored: it restarts at zero with the process.
+    /// store was opened (each halving counts, so one prepare can add several). Not stored: it
+    /// restarts at zero with the process. Status carries it as `archive_halvings`.
     #[must_use]
     pub fn archive_halvings(&self) -> u64 {
         self.archive_halvings

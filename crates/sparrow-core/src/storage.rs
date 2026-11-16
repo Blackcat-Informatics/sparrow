@@ -1063,6 +1063,7 @@ fn store_properties(
     config: &Config,
     imports: &import::ImportLedger,
     staging: &staging_refusal::StagingLedger,
+    archive_halvings: u64,
 ) -> Result<Object, Error> {
     let (refused, last) = staging.snapshot();
     let last = last.unwrap_or(StagingRefusal {
@@ -1116,6 +1117,7 @@ fn store_properties(
         .with("staging_refused_last_source", last.source)
         .with("staging_refused_last_graph", last.graph)
         .with("staging_refused_last_bytes", last.bytes.to_string())
+        .with("archive_halvings", archive_halvings.to_string())
         .with("max_raw_record_bytes", imports.raw_split().to_string())
         .with("retire_row_budget", imports.row_budget().to_string())
         .with(
@@ -2938,6 +2940,7 @@ impl Store {
             &self.unlocked.config,
             &self.unlocked.import_ledger,
             &self.unlocked.staging,
+            self.archive_halvings(),
         )?
         .into())
     }
@@ -3145,6 +3148,7 @@ impl Store {
             &self.unlocked.config,
             &self.unlocked.import_ledger,
             &self.unlocked.staging,
+            self.archive_halvings(),
         )?
         .with("source_read_handles", source_handles.to_string())
         .with("source_read_bytes", source_bytes.to_string())
