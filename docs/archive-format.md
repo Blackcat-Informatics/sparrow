@@ -23,7 +23,8 @@ Patrick's rulings bind this design:
 - An unreachable archive at startup starts the daemon degraded; it does not refuse to start.
 - When archiving is enabled on an existing store, the whole retained backlog is
   archived before anything is deleted.
-- An entry that cannot be encoded is quarantined, and archiving continues.
+- An entry that cannot be archived is held, never skipped or deleted: archiving stops
+  before it and reports it (section 6).
 - Content projection graphs are archived.
 - Sparrow has no configurable per-artifact byte limit (2026-11-01: "Remove the
   limit"). Entries are records. New layouts cap a record at 128 MiB, but stores
@@ -44,38 +45,34 @@ under pressure ingest is refused with `STORAGE_PRESSURE`.
 ## 1. Layout
 
 ```text
-<root>/<store-hex>/STORE.nq
-<root>/<store-hex>/segments/YYYY/MM/DD/<segment-id>/<segment files, GTS>
-<root>/<store-hex>/segments/YYYY/MM/DD/<segment-id>/manifest.nq
-<root>/<store-hex>/quarantine/YYYY/MM/DD/<segment-id>/<n>.bin
-<root>/<store-hex>/.staging/<staging-id>/
+<root>/STORE_ID
+<root>/<store-id>/<first-position>-<last-position>.gts
 ```
 
-- `<store-hex>` is the hexadecimal part of the store identity `store:<hex>`.
-  One root can hold several stores.
-- `YYYY/MM/DD` is the UTC receipt date of the segment's first entry.
-- `<segment-id>` is the lowercase hexadecimal segment identity (section 3).
-- The segment files are written by PurRDF's GTS writer. The encoder is the one
-  module that knows their names and layout; nothing else in Sparrow assumes it.
-- `quarantine/` holds raw bytes of quarantined entries (section 6), grouped by
-  the segment that covers them. `<n>` is the entry's decimal index in that
-  segment's manifest.
-- `.staging/` holds partial writes. Readers ignore it, and the writer removes
-  stale staging directories before it starts a new write.
+- `<root>` is the `[archive] dir`. It must already exist, be on its own mount and be empty
+  (apart from a leftover `STORE_ID.partial`) before the first segment, or already hold this
+  store's `STORE_ID`. The worker creates nothing else in `<root>`.
+- `STORE_ID` holds the store identity, `store:<hex>`, and a newline. The worker writes it
+  once, on the first pass into an empty root, through a `STORE_ID.partial` that is synced
+  and renamed. It is never overwritten: a root whose `STORE_ID` names another store, or
+  that holds other entries but no `STORE_ID`, is refused and not adopted. One root holds one
+  store.
+- `<store-id>` is the whole store identity including its `store:` prefix, so the directory
+  is named `store:<hex>`. The worker creates it on the first segment.
+- A segment is one file, `<first-position>-<last-position>.gts`, directly in the store
+  directory. The positions are the eviction positions of the segment's first and last
+  entries (section 2), `{received_at:020}:{id}` or `{received_at:020}:artifact:<hex>`, so
+  the files sort in eviction order. There are no date directories, no subdirectories and no
+  separate manifest.
+- A segment file is written by PurRDF's GTS writer (profile `sparrow-archive`). The encoder
+  is the one module that knows its layout; the offline reader has one decoder module.
+- A file being written has the suffix `.partial` until it is synced and renamed into
+  place. A stale `.partial` from a crashed pass is truncated by the next write of the same
+  name. Readers ignore it, because they read only `*.gts`.
 
-Segments are immutable. Nothing in a committed segment directory is rewritten,
-appended to or deleted by Sparrow.
-
-`STORE.nq` binds the directory to one store and is written once, when the
-archive is first used:
-
-```text
-<urn:sparrow:archive:store:HEX> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:sparrow:vocab:ArchiveStore> .
-<urn:sparrow:archive:store:HEX> <urn:sparrow:vocab:storeId> "store:HEX" .
-<urn:sparrow:archive:store:HEX> <urn:sparrow:vocab:archiveFormat> "sparrow-archive/1" .
-```
-
-Startup compares it with the opened store and refuses a mismatch.
+Segments are immutable. Sparrow never rewrites, appends to or deletes a committed segment
+file. A file already at its name when a pass writes it is a retry of an earlier pass: it is
+kept and checked, not overwritten (section 8).
 
 ## 2. Segment boundaries
 
@@ -130,7 +127,7 @@ A record whose content projection failed at ingest is held the same way, because
 its evidence cannot be read whole. `Store::archive_held` reports the held record
 and the reason when it is the first unarchived entry. A segment that fails to
 encode is halved until the failing entry stands alone, which is then named in
-the error and in a warning. The segment's read renews its lease while it makes
+the error; the worker journals that failed pass and the watermark does not move. The segment's read renews its lease while it makes
 progress, so a long segment is not a failure; only a read that stalls for the
 lease's 60 seconds ends with `RESULT_EXPIRED` and is halved. Every record and artifact a segment covers has its
 graph in the file (a record's parent artifact graph included); an artifact with
@@ -148,20 +145,19 @@ figure is an estimate to measure.
 segment-id = BLAKE3( frame("sparrow-archive/1")
                    ‖ frame(store-id)
                    ‖ frame(first-position) ‖ frame(last-position)
-                   ‖ for each segment file in write order:
-                     frame(file-name) ‖ frame(BLAKE3(file))
-                   ‖ frame(u64_le(quarantine-count))
-                   ‖ frame(BLAKE3(0.bin)) ‖ … )
+                   ‖ frame(file-name) ‖ frame(BLAKE3(file))
+                   ‖ frame(u64_le(0)) )
 ```
 
 `frame` is PurRDF's `purrdf_hash::frame::frame_le`: an eight-byte little-endian
-length followed by the bytes. Digests are the raw 32 bytes. Quarantine files
-appear in ascending entry index. The PurRDF codec is
+length followed by the bytes. Digests are the raw 32 bytes. A segment has one file. The
+final term is the quarantine count, which is always zero: nothing is quarantined (section 6).
+The identity is not stored in the archive; it is the name a commit uses (section 7). The PurRDF codec is
 byte-deterministic, so the same range of the same store, encoded by the same
 PurRDF revision, always gives the same identity. A copy of a store
 therefore rebuilds and adopts its existing segments. A different PurRDF revision
 can give a different identity for the same range. Readers then see duplicates
-and remove them by record IRI (section 8).
+and remove them by record IRI (section 10).
 
 ## 4. Content
 
@@ -175,7 +171,7 @@ in its range, with its dependencies:
 
 | Content | Where |
 | --- | --- |
-| Record bytes `[byte_start, byte_end)` | One blob per record in the segment's GTS files, keyed by lowercase hexadecimal SHA-256. A record's chunks are joined in order. |
+| Record bytes `[byte_start, byte_end)` | One blob per record in the segment's GTS file, keyed by its BLAKE3 digest string `blake3:<hex>`, compressed with zstd (independent 64 KiB zstd frames from 8 MiB up). A record's chunks are joined in order. |
 | Record metadata graph `urn:sparrow:graph:record:<hex>` | the segment's GTS files, including its provenance and tracing facts. |
 | Diagnostic graph | the segment's GTS files, under its recorded graph IRI. |
 | Artifact graph `urn:sparrow:graph:artifact:<hex>` | the segment's GTS files of the segment whose covered range contains the artifact's position. When artifacts share a millisecond, that can be an earlier segment that holds none of the artifact's records. The gate treats the artifact as archived once that segment commits. |
@@ -183,22 +179,25 @@ in its range, with its dependencies:
 | Link quads | One per record with bytes, in the graph `urn:sparrow:graph:archive-links`. |
 | Reifiers and annotations of these graphs | the segment's GTS files. |
 
-A link quad ties a record to its blob by the SHA-256 of the record's bytes:
+Two link quads tie a record to its blob, one carrying the SHA-256 of the record's bytes
+(64 hexadecimal digits) and one the BLAKE3 digest string that keys the blob:
 
 ```text
 <urn:sparrow:record:HEX> <urn:sparrow:vocab:payloadSha256> "64 hex digits" <urn:sparrow:graph:archive-links> .
+<urn:sparrow:record:HEX> <urn:sparrow:vocab:payloadBlake3> "blake3:64 hex digits" <urn:sparrow:graph:archive-links> .
 ```
 
 Artifact bytes are not copied separately. Every byte of an artifact with records
 belongs to one of its records, and a recordless artifact has no bytes. A reader
 rebuilds an artifact by joining its records' blobs in source order. `sparrow-archive`
-hashes each record's bytes against the digest its link quad names, checks that the
+hashes each record's bytes against the `payloadBlake3` digest its link quad names, checks that the
 records are contiguous in byte order from zero, and checks that their total equals the
 artifact's `byteLength`. It does not compare the whole artifact with its BLAKE3 `payload`.
 
 An entry already retired before the store was fenced still has its catalog row
-until ordinary cleanup removes it. Its metadata is archived. Its missing bytes
-or projection go through the quarantine path, with the reason `retired`.
+until ordinary cleanup removes it. Its metadata is archived and it has no bytes to
+write: a record with no bytes still gets an empty blob and its links, and an artifact
+with no graph is counted in the prepared segment's `retired_artifacts`.
 
 The archive leaves out text postings, term dictionaries, tail ranges, pins,
 request and retry rows, journals, import staging and catalog JSON. These are
@@ -223,25 +222,22 @@ derived or operational state. Readers rebuild indexes from the archived graphs.
 Pins do not affect archiving. A pinned entry is archived in order like any
 other entry; its pin only delays deletion.
 
-## 6. Quarantine
+## 6. Held entries
 
-An entry the encoder cannot represent is quarantined, so it does not block
-retention. This covers metadata the codec rejects, a projection that failed
-during ingestion, and bytes retired before the fence. The rest of the segment
-is encoded normally:
+Nothing is quarantined: the format has no quarantine files and no quarantine records.
+An entry that cannot be archived is held, so it does not leave the store unarchived and
+unreported:
 
-- The entry's available raw bytes go to `quarantine/…/<segment-id>/<n>.bin`
-  without any graph.
-- The segment manifest records a `QuarantineEntry` with the evidence IRI, the
-  reason, the file's BLAKE3 and SHA-256 digests and its length.
-- The segment still covers the entry's position, so the watermark stays
-  contiguous.
-- The store keeps a bounded quarantine listing, which status and an operator
-  listing operation report (P3). Quarantine is visible, never silent.
-
-Reasons are `encode` (the codec refused the entry), `projection` (a recorded
-projection failure left part of its content unrepresented) and `retired` (its
-bytes or projection were retired before the store was fenced).
+- A record whose bytes exceed 128 MiB (`TooLarge`), or whose content projection failed at
+  ingest (`ProjectionFailed`), is held at selection. Selection stops before it, so the
+  watermark never passes it and nothing after it is archived or deleted until it is
+  resolved. `Store::archive_held` reports the held record and the reason when it is the
+  first unarchived entry, and the worker journals it.
+- An entry the encoder refuses is found by halving the segment until it stands alone. The
+  prepare then fails with the error naming that entry and its code, the worker journals
+  the failed pass, and the watermark does not move. The entry is retried on the next pass.
+- In every case the entry stays in the store, unarchived and undeleted, until it is
+  archived by a later pass.
 
 ## 7. Deletion gate and store fence
 
@@ -290,75 +286,58 @@ from a store is not supported in this version.
 
 ## 8. Write protocol
 
-The worker runs every archive operation on one dedicated thread,
-`sparrow-archive-nas`, with at most one operation in flight:
+The worker runs every archive operation on one dedicated thread, `sparrow-archive`, with at
+most one operation in flight, and a second thread watches the step in flight. For each
+prepared segment it:
 
-1. Write each staged table into a fresh
-   `.staging/<staging-id>/` directory and fsync it.
-2. Write `manifest.nq` last and fsync it.
-3. Fsync the staging directory.
-4. Create the missing parent directories, fsyncing each one and its parent.
-5. Rename the staging directory to its final path. An existing non-empty target
-   refuses the rename. NFS has no `RENAME_NOREPLACE`, so the check and the
-   rename are separate steps under the single-writer rule.
-6. Fsync the parent directory.
-7. Read every file back past the client cache and check its BLAKE3.
+1. Checks that `<root>` is a directory on its own mount (a different device from `/`, and a
+   network filesystem type or a type different from `/`'s), and that it holds this store's
+   `STORE_ID`, writing it on the first pass into an empty root (section 1).
+2. Creates `<root>/<store-id>` if it is missing and syncs `<root>`.
+3. Writes each segment file as `<name>.partial`, syncs it and renames it to `<name>`. A file
+   already at `<name>` is kept as is. Then it syncs the store directory.
+4. Reads every file back and requires it byte-equal to what it prepared, then lets the
+   decoder verify the set (the same decoder `sparrow-archive verify` uses).
+5. Refuses to commit if any step ran at least `io_timeout_secs`: the files stay, and the
+   next pass verifies and commits them.
+6. Commits: `archive_commit` names the segment identity and advances the watermark
+   (section 7).
 
-If the target already exists and verifies, the write counts as done. If it
-exists and does not verify, the write fails hard and the watermark does not
-move. Only a verified segment is committed. A Synology NFS export must use
-synchronous writes (`sync`); with `async` exports fsync proves nothing.
+If the target already exists and equals the prepared bytes, the write counts as done. If
+it exists and differs, the pass fails with a verify error and the watermark does not move.
+Only a verified segment is committed. A Synology NFS export must use synchronous writes
+(`sync`); with `async` exports fsync proves nothing.
 
 Crash recovery follows from the intent:
 
 | Crash point | Recovery |
 | --- | --- |
 | Before the intent | Nothing to recover. |
-| After the intent | Rebuild the identical segment from the intent's range in a new staging directory. |
-| After the rename | Verify and adopt the existing segment, then commit. |
+| After the intent | The next prepare rebuilds the identical segment from the intent's range, truncating a stale `.partial`. |
+| After the rename, before the commit | The next pass finds the file, checks it against the rebuilt bytes and commits. |
 | Range content differs from the intent | `STORAGE_FAILURE`; nothing is deleted. |
 
-## 9. Manifest
+## 9. No manifest
 
-`manifest.nq` is N-Quads written by PurRDF's N-Quads serializer, in the default
-graph. It holds no wall-clock time, so identical inputs give identical bytes.
-The segment subject is `urn:sparrow:archive:segment:<segment-id>`. Terms use
-the `urn:sparrow:vocab:` namespace, written `sp:` below.
-
-| Subject | Predicate | Object |
-| --- | --- | --- |
-| Segment | `rdf:type` | `sp:ArchiveSegment` |
-| Segment | `sp:archiveFormat` | `"sparrow-archive/1"` |
-| Segment | `sp:compression` | `"zstd"` |
-| Segment | `sp:storeId` | `"store:<hex>"` |
-| Segment | `sp:rdfProfile` | The store's recorded RDF profile identity. |
-| Segment | `sp:purrdfRevision` | The full PurRDF commit that encoded the tables. |
-| Segment | `sp:firstPosition`, `sp:lastPosition` | Eviction positions, as strings. |
-| Segment | `sp:receivedFrom`, `sp:receivedThrough` | `xsd:dateTime` receipt instants of the first and last entries. |
-| Segment | `sp:recordCount`, `sp:artifactCount`, `sp:blobCount`, `sp:quarantineCount` | `xsd:nonNegativeInteger` counts. |
-| Segment | `sp:table` | One file IRI, `<segment>#<file name>`, per segment file. |
-| Table | `rdf:type` | `sp:ArchiveTable` |
-| Table | `sp:fileName` | The segment file's name. |
-| Table | `sp:blake3` | Lowercase hexadecimal BLAKE3 of the file. |
-| Table | `sp:byteLength` | `xsd:nonNegativeInteger`. |
-| Segment | `sp:quarantined` | One entry IRI, `<segment>#quarantine-<n>`, per entry. |
-| Entry | `rdf:type` | `sp:QuarantineEntry` |
-| Entry | `sp:evidence` | The record or artifact IRI. |
-| Entry | `sp:quarantineReason` | `"encode"`, `"projection"` or `"retired"`. |
-| Entry | `sp:fileName`, `sp:blake3`, `sp:payloadSha256`, `sp:byteLength` | The quarantine file and its digests. |
+The archive writes no manifest. A segment's contents are its GTS file: the graphs of its
+records and artifacts, the link quads and the record blobs. The per-segment facts that
+other tools need are in that file or are derived from it: `sparrow-archive list` prints each
+segment's record, artifact and blob counts and its artifacts' `id`, `source`, `received_at`
+and `byte_length`. The store's own progress is in its catalog, not in the archive
+(section 7).
 
 ## 10. Readers
 
-PurRDF's GTS reader reads a segment directly and returns the validated dataset
-and its content; every blob is checked against its SHA-256 digest. Readers
-verify each file's BLAKE3 against the manifest first. Every record's link
-digest names a blob. To find a record's bytes, follow the link quad
-(predicate IRI `urn:sparrow:vocab:payloadSha256`) to the blob with that digest.
+PurRDF's GTS reader reads a segment directly and checks its frame hash chain; it does not
+hash a blob's decompressed bytes, so the decoder hashes each record's bytes and compares
+them with the digest its link quad names. To find a record's bytes, follow the link quad
+(predicate IRI `urn:sparrow:vocab:payloadBlake3`) to the blob with that digest. A file the
+reader refuses, or with no segment head, is a refusal and never a partial read.
 
 Duplicates can appear after a PurRDF revision change (section 3). Readers keep
 one copy per record IRI and report duplicates rather than merging conflicting
 content. The offline `sparrow-archive list|verify DIR` tool (crate `sparrow-archive`)
-walks `DIR` for segment files, decodes each in memory through one decoder module, and
+walks `DIR` for `*.gts` files (never a `.staging` directory), decodes each in memory through one decoder module, and
 prints one JSON line per segment with its record, artifact and blob counts. `verify`
 also fails any segment the decoder refuses, with `"ok":false` and exit 1. The tool never
 opens a live store and writes nothing.
