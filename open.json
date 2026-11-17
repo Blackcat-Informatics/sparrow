@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 347,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/347-flaky-test-an-ingest-peer-over-the",
+  "branch": "paudley/347-flaky-test-an-ingest-peer-over-the",
+  "slug": "flaky-test-an-ingest-peer-over-the",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/347-flaky-test-an-ingest-peer-over-the/.stage/flaky-test-an-ingest-peer-over-the",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "9ed59439576f25579395d6d699d7dca2179f84cd",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/347-flaky-test-an-ingest-peer-over-the",
+    "branch:paudley/347-flaky-test-an-ingest-peer-over-the",
+    "ignored:3 files (3 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow/.worktrees/324-archive-prepare-reporting-follow-ups caches into /home/paudley/Active/sparrow/.worktrees/347-flaky-test-an-ingest-peer-over-the plus 0 dependency units from 0 other checkouts in 9.3s; 316 unchanged files keep their built mtimes; 0 other files take the seed time and rebuild; 34 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/347-flaky-test-an-ingest-peer-over-the/.stage/flaky-test-an-ingest-peer-over-the",
+    "issue:/home/paudley/Active/sparrow/.worktrees/347-flaky-test-an-ingest-peer-over-the/.stage/flaky-test-an-ingest-peer-over-the/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-16T18:19:24-0600",
+  "seed_error": ""
+}

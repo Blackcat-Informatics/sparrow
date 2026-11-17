@@ -1,0 +1,79 @@
+{
+  "issue": 347,
+  "pr_number": 350,
+  "branch": "paudley/347-flaky-test-an-ingest-peer-over-the",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/347-flaky-test-an-ingest-peer-over-the/.stage/flaky-test-an-ingest-peer-over-the",
+  "observed_at": "2026-11-17T01:08:08.240069+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/347-flaky-test-an-ingest-peer-over-the/.stage/flaky-test-an-ingest-peer-over-the/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/347-flaky-test-an-ingest-peer-over-the/.stage/flaky-test-an-ingest-peer-over-the/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/347-flaky-test-an-ingest-peer-over-the/.stage/flaky-test-an-ingest-peer-over-the/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/347-flaky-test-an-ingest-peer-over-the/.stage/flaky-test-an-ingest-peer-over-the/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/347-flaky-test-an-ingest-peer-over-the/.stage/flaky-test-an-ingest-peer-over-the/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 350,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Wait for the ingest socket before the ingest-socket tests connect (#347)",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/350",
+    "baseRefName": "main",
+    "baseRefOid": "9ed59439576f25579395d6d699d7dca2179f84cd",
+    "headRefName": "paudley/347-flaky-test-an-ingest-peer-over-the",
+    "headRefOid": "80b3240650ba6d8986de0892651ff5575c818d4a",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/280/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "80b3240650ba6d8986de0892651ff5575c818d4a",
+    "branch": "paudley/347-flaky-test-an-ingest-peer-over-the",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 350,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #350 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}
