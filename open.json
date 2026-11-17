@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 324,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/324-archive-prepare-reporting-follow-ups",
+  "branch": "paudley/324-archive-prepare-reporting-follow-ups",
+  "slug": "archive-prepare-reporting-follow-ups",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/324-archive-prepare-reporting-follow-ups/.stage/archive-prepare-reporting-follow-ups",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "9ed59439576f25579395d6d699d7dca2179f84cd",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/324-archive-prepare-reporting-follow-ups",
+    "branch:paudley/324-archive-prepare-reporting-follow-ups",
+    "ignored:3 files (3 reflinked, 0 written)",
+    "rust-caches:already present",
+    "stage:/home/paudley/Active/sparrow/.worktrees/324-archive-prepare-reporting-follow-ups/.stage/archive-prepare-reporting-follow-ups",
+    "issue:/home/paudley/Active/sparrow/.worktrees/324-archive-prepare-reporting-follow-ups/.stage/archive-prepare-reporting-follow-ups/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-16T18:19:12-0600",
+  "seed_error": ""
+}
