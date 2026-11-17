@@ -1,0 +1,79 @@
+{
+  "issue": 324,
+  "pr_number": 346,
+  "branch": "paudley/324-archive-prepare-reporting-follow-ups",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/324-archive-prepare-reporting-follow-ups/.stage/archive-prepare-reporting-follow-ups",
+  "observed_at": "2026-11-17T00:17:09.190518+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/324-archive-prepare-reporting-follow-ups/.stage/archive-prepare-reporting-follow-ups/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/324-archive-prepare-reporting-follow-ups/.stage/archive-prepare-reporting-follow-ups/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/324-archive-prepare-reporting-follow-ups/.stage/archive-prepare-reporting-follow-ups/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/324-archive-prepare-reporting-follow-ups/.stage/archive-prepare-reporting-follow-ups/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/324-archive-prepare-reporting-follow-ups/.stage/archive-prepare-reporting-follow-ups/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 346,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Install a journal tracing subscriber and count archive halvings in status (#324)",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/346",
+    "baseRefName": "main",
+    "baseRefOid": "51d06dcdeb5ca665b8f7e892c6e0d58f6bc15938",
+    "headRefName": "paudley/324-archive-prepare-reporting-follow-ups",
+    "headRefOid": "d089fe7be59781d71e1e7d85270fdae87fc8551e",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/278/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "d089fe7be59781d71e1e7d85270fdae87fc8551e",
+    "branch": "paudley/324-archive-prepare-reporting-follow-ups",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 346,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #346 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}

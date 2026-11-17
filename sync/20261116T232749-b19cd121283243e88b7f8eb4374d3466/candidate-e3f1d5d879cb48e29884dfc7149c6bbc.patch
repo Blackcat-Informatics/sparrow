@@ -1,0 +1,94 @@
+diff --git crates/sparrow-core/src/storage/archive_segment.rs crates/sparrow-core/src/storage/archive_segment.rs
+index 489d3a8..9dcb99a 100644
+--- crates/sparrow-core/src/storage/archive_segment.rs
++++ crates/sparrow-core/src/storage/archive_segment.rs
+@@ -220,14 +220,20 @@ fn entry_quads(
+         .saturating_add(fallback))
+ }
+ 
+-/// Index entries read under one hold of the writer. The selection takes the writer again for
+-/// the next batch, deferring first to waiting writers, so ingestion waits for at most one
+-/// batch however long the segment is. The unarchived range only grows at its end while a
++/// Index entries, or records whose bytes are read, under one hold of the writer; a record
++/// batch also ends at [`BATCH_BYTES`]. The next batch takes the writer again, deferring first
++/// to waiting writers, so ingestion waits for at most one batch (bounded by entries or records
++/// and by bytes) however long the segment is. The unarchived range only grows at its end while a
+ /// segment is selected: its entries are held until a segment covers them, the one archive
+ /// worker is the only mover of the watermark, and the horizon keeps the selection behind
+ /// buffered publication. `archive_intend` re-counts the range under one hold regardless.
+ const SELECT_BATCH: usize = 256;
+ 
++/// Record bytes read under one hold of the writer: a batch ends at this many bytes or
++/// [`SELECT_BATCH`] records, whichever comes first. A record larger than this forms a batch
++/// of its own.
++const BATCH_BYTES: u64 = 1024 * 1024;
++
+ fn select(
+     store: &Store,
+     now: u64,
+@@ -607,18 +613,37 @@ impl Store {
+         selection: Selection,
+     ) -> Result<PreparedSegment, Error> {
+         let mut contents = Vec::with_capacity(selection.encoded.len());
+-        for record in &selection.encoded {
+-            let length = record.byte_end.saturating_sub(record.byte_start);
+-            let length = usize::try_from(length).map_err(|_| corrupt("record length overflows"))?;
+-            // A record with no bytes still gets its (empty) blob and link, so a reader finds
+-            // every covered record the same way.
+-            let bytes = if length == 0 {
+-                Vec::new()
+-            } else {
+-                let writer = self.lock_page()?;
+-                record_bytes(&writer, record.chunks.clone(), 0, length)?
+-            };
+-            contents.push((record.id.clone(), bytes));
++        // One writer hold per batch of records or bytes, so the deferral to waiting writers
++        // (`lock_page`) is paid per batch, not per record.
++        let mut next = 0;
++        while next < selection.encoded.len() {
++            let mut end = next;
++            let mut bytes = 0_u64;
++            while end < selection.encoded.len() && end - next < SELECT_BATCH {
++                let length = selection.encoded[end]
++                    .byte_end
++                    .saturating_sub(selection.encoded[end].byte_start);
++                if end > next && bytes.saturating_add(length) > BATCH_BYTES {
++                    break;
++                }
++                bytes = bytes.saturating_add(length);
++                end += 1;
++            }
++            let writer = self.lock_page()?;
++            for record in &selection.encoded[next..end] {
++                let length = record.byte_end.saturating_sub(record.byte_start);
++                let length =
++                    usize::try_from(length).map_err(|_| corrupt("record length overflows"))?;
++                // A record with no bytes still gets its (empty) blob and link, so a reader
++                // finds every covered record the same way.
++                let bytes = if length == 0 {
++                    Vec::new()
++                } else {
++                    record_bytes(&writer, record.chunks.clone(), 0, length)?
++                };
++                contents.push((record.id.clone(), bytes));
++            }
++            next = end;
+         }
+         let ids: Vec<String> = selection
+             .encoded
+diff --git docs/architecture.md docs/architecture.md
+index 747cee3..41032d2 100644
+--- docs/architecture.md
++++ docs/architecture.md
+@@ -298,8 +298,9 @@ every NAS operation, one at a time, so a hung NAS degrades archiving without
+ blocking queries, ingest or maintenance. A store format fence keeps older
+ binaries away from an archiving store, and a clock-regression guard refuses
+ publication behind the watermark. Archive reads give way to waiting writers
+-(`lock_page`) and hold the archive's own RDF read slot, separate from the query
+-slot, so queries are served while a segment prepares. The archive read renews
++(`lock_page`, once per batch of 256 index entries or records, and for record bytes also
++per 1 MiB, not per record) and hold the archive's own RDF read slot, separate from the
++query slot, so queries are served while a segment prepares. The archive read renews
+ its 60-second lease while it makes progress, so a segment is never cut short
+ for its length. A segment closes on its quad count as well as its records and payload
+ bytes (`max_segment_quads`, 3,000,000 by default), so one JSON-heavy segment cannot

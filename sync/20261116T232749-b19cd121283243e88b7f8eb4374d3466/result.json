@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/324-archive-prepare-reporting-follow-ups",
+  "branch": "paudley/324-archive-prepare-reporting-follow-ups",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "9a51cb59ec49d0261e1fdb06c9470d280b206d95",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/324-archive-prepare-reporting-follow-ups/.stage/archive-prepare-reporting-follow-ups/sync/20261116T232749-b19cd121283243e88b7f8eb4374d3466",
+  "conflicts": [],
+  "status": "completed",
+  "base": "51d06dcdeb5ca665b8f7e892c6e0d58f6bc15938",
+  "merge_bases": [
+    "0ca5e058ea64d21167e3ddbd8e8fa52cbc645d2d"
+  ],
+  "merge_index": "b8e2fea8ba5329e3e51d93adfc874729c8823d8c498304d70a29155128532f79",
+  "candidate_tree": "8a980863aeafd84a5ad8ec854127ee615b78d567",
+  "candidate_patch": "candidate-afe118429f6d4627b5cb925272f60ddd.patch",
+  "validation_records": [],
+  "commit": "d089fe7be59781d71e1e7d85270fdae87fc8551e",
+  "tree": "8a980863aeafd84a5ad8ec854127ee615b78d567"
+}

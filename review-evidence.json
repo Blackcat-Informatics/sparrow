@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "head": null,
+  "items": [],
+  "coverage": {
+    "comments": "complete",
+    "reviews": "complete",
+    "inline_comments": "complete",
+    "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+  }
+}
