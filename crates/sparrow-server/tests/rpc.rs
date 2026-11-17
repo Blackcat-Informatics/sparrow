@@ -1988,6 +1988,22 @@ fn configure_ingest_socket(
     (socket, gid)
 }
 
+/// Start the daemon and return once its ingest socket is bound. `start` returns when the private
+/// RPC socket accepts, and `sparrowd` binds the ingest socket after that (see `main.rs`), so a
+/// connect straight after `start` can find no ingest socket (#347). Status is served only after
+/// both sockets are bound and reports the ingest socket, so one status round trip is the
+/// daemon's own readiness signal: no clock, and no probe connection to spend an ingest slot.
+async fn start_with_ingest(config: &Path, socket: &Path, ingest: &Path) -> Daemon {
+    let daemon = start(config, socket).await;
+    let status = cli(socket, &["status"]);
+    assert_eq!(
+        status["ingest_socket"]["path"].as_str(),
+        ingest.to_str(),
+        "status does not report the ingest socket"
+    );
+    daemon
+}
+
 /// INVARIANT: evidence accepted on the ingest socket carries the caller's kernel-reported
 /// uid, gid and pid in its typed intake, its CLI rendering and its metadata graphs, and
 /// the socket inherits the configured group with mode 0660.
@@ -2001,7 +2017,7 @@ async fn ingest_socket_records_peer_credentials_in_provenance() {
             let socket = data.join("rpc.sock");
             let config = write_server_config(dir.path(), &data, &socket);
             let (ingest, gid) = configure_ingest_socket(dir.path(), &config, 4);
-            let daemon = start(&config, &socket).await;
+            let daemon = start_with_ingest(&config, &socket, &ingest).await;
             let metadata = std::fs::metadata(&ingest).unwrap();
             assert_eq!((metadata.gid(), metadata.permissions().mode() & 0o7777), (gid, 0o660));
 
@@ -2138,7 +2154,7 @@ async fn ingest_socket_refuses_reads_and_administration() {
             let socket = data.join("rpc.sock");
             let config = write_server_config(dir.path(), &data, &socket);
             let (ingest, _) = configure_ingest_socket(dir.path(), &config, 4);
-            let daemon = start(&config, &socket).await;
+            let daemon = start_with_ingest(&config, &socket, &ingest).await;
             let producer = sparrow_client::Client::connect(&ingest).await.unwrap();
             let gate = producer.capability();
             let status = gate.status_request().send().promise.await.unwrap();
@@ -2193,7 +2209,7 @@ async fn an_ingest_peer_over_the_ceiling_waits_and_is_served_when_a_slot_frees()
             let socket = data.join("rpc.sock");
             let config = write_server_config(dir.path(), &data, &socket);
             let (ingest, gid) = configure_ingest_socket(dir.path(), &config, 1);
-            let daemon = start(&config, &socket).await;
+            let daemon = start_with_ingest(&config, &socket, &ingest).await;
             let held = sparrow_client::Client::connect(&ingest).await.unwrap();
             let over = tokio::task::spawn_local({
                 let ingest = ingest.clone();
