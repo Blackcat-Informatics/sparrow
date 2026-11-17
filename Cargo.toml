@@ -23,7 +23,7 @@ purrdf-core = "=4"
 getrandom = "0.3"
 rustix = { version = "1.1.5", features = ["fs"] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std", "fmt"] }
 capnp = "0.27"
 capnp-rpc = "0.27"
 capnpc = "0.27"

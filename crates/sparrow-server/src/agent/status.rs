@@ -160,6 +160,7 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             "staging_refusals",
             staging_refusals(value.get_staging_refusals()?)?,
         )
+        .with("archive_halvings", value.get_archive_halvings().to_string())
         .with(
             "pressure",
             crate::pressure::decode(value.get_pressure_status()?)?,

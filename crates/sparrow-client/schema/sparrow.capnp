@@ -318,6 +318,10 @@ struct Status {
   # latest one. One refused intake can add several, see `StagingRefusalStatus`. A reader that
   # does not know this field sees no change.
   stagingRefusals @62 :StagingRefusalStatus;
+  # Additive (#324): times an archive prepare halved its range after an encode error since the
+  # daemon started. In memory, so it restarts at zero. A reader that does not know this field
+  # sees no change.
+  archiveHalvings @63 :UInt64;
 }
 # RDF staging refusals since the daemon started: `refusals` counts every refused graph, not
 # refused intakes. A projection graph an ingest absorbs into a failed projection counts, and the

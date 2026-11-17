@@ -10,6 +10,7 @@ mod config;
 mod correlation_wire;
 mod diagnostics;
 pub mod floor_pause;
+pub mod journal_log;
 mod source_file;
 pub mod staging_refusal;
 pub mod syslog_listener;

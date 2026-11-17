@@ -741,6 +741,27 @@ panicking, because it is written while the store's writer lock is held, and a fa
 stderr write is dropped (the counter still holds the fact). Whether to stage an artifact's RDF in pieces or store it with
 its graph deferred is separate work.
 
+### Archive prepare halvings and the daemon's library warnings (#324)
+
+`Status.archiveHalvings` (field 63, additive; a reader that does not know it sees no
+change) counts the times an archive prepare halved its range after an encode error since
+the daemon started. Each halving counts, so one prepare can add several. It is in memory
+and restarts at zero. CLI and MCP status render it as `archive_halvings`; `Store::properties`
+carries it under the same name.
+
+When a prepare returns fewer entries than it selected, the worker writes one stderr line:
+
+```
+sparrowd: archive prepare shortened selected=10000 kept=5000 first_code=RESULT_EXPIRED halvings_total=3
+```
+
+`first_code` is the code of the first halving of that prepare; a later halving may have had
+another, and each halving is warned with its own code. The daemon installs a `tracing`
+subscriber that writes warnings and errors from the storage library (`sparrow_core`) to
+stderr, one event per line with no timestamp (the journal adds one) and with line breaks in
+a field written as `\n`. The daemon's own warnings are not written by it; they have the
+`sparrowd:` lines above.
+
 ### Part sets for consume roots (#280)
 
 A consume-root file above what one artifact can hold is published as a part set

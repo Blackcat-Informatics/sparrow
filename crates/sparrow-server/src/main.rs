@@ -105,6 +105,7 @@ async fn worker_health(
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    sparrow_server::journal_log::install()?;
     let args: Vec<_> = std::env::args().skip(1).collect();
     let (path, mode) = arguments(&args)?;
     let mut config = ServerConfig::read(Path::new(path))?;

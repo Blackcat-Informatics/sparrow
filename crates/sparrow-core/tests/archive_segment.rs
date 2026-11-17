@@ -262,7 +262,7 @@ fn a_json_or_markdown_record_with_thousands_of_graph_rows_prepares() {
     }
 }
 
-/// A subscriber that, on the first warning, runs `on_warning` and ignores everything else.
+/// A subscriber that runs `on_warning` on every warning and ignores everything else.
 /// The halving's warning is the one event a prepare emits between its failed attempt and its
 /// retry, so this is where a test can change the world deterministically.
 struct OnWarning<F: Fn() + Send + Sync + 'static>(F);
@@ -332,9 +332,10 @@ fn a_prepare_halved_by_an_encode_failure_reports_the_shortening_and_counts_it() 
 
     let short = segment.shortened.expect("reports the shortening");
     assert_eq!((short.selected, short.kept), (10, 5));
-    assert_eq!(short.code, "RESOURCE_LIMIT");
+    assert_eq!(short.first_code, "RESOURCE_LIMIT");
     assert_eq!(segment.records + segment.artifacts, short.kept);
     assert_eq!(store.archive_halvings(), 1);
+    assert_eq!(store.properties().unwrap()["archive_halvings"], "1");
     // The rest is not lost: it is prepared after this segment commits, unshortened.
     store.archive_commit(&segment.segment_id).unwrap();
     let rest = store.archive_prepare(now).unwrap().expect("remainder due");
