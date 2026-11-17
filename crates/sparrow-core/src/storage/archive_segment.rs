@@ -220,13 +220,19 @@ fn entry_quads(
         .saturating_add(fallback))
 }
 
-/// Index entries read under one hold of the writer. The selection takes the writer again for
-/// the next batch, deferring first to waiting writers, so ingestion waits for at most one
-/// batch however long the segment is. The unarchived range only grows at its end while a
+/// Index entries, or records whose bytes are read, under one hold of the writer; a record
+/// batch also ends at [`BATCH_BYTES`]. The next batch takes the writer again, deferring first
+/// to waiting writers, so ingestion waits for at most one batch (bounded by entries or records
+/// and by bytes) however long the segment is. The unarchived range only grows at its end while a
 /// segment is selected: its entries are held until a segment covers them, the one archive
 /// worker is the only mover of the watermark, and the horizon keeps the selection behind
 /// buffered publication. `archive_intend` re-counts the range under one hold regardless.
 const SELECT_BATCH: usize = 256;
+
+/// Record bytes read under one hold of the writer: a batch ends at this many bytes or
+/// [`SELECT_BATCH`] records, whichever comes first. A record larger than this forms a batch
+/// of its own.
+const BATCH_BYTES: u64 = 1024 * 1024;
 
 fn select(
     store: &Store,
@@ -607,18 +613,37 @@ impl Store {
         selection: Selection,
     ) -> Result<PreparedSegment, Error> {
         let mut contents = Vec::with_capacity(selection.encoded.len());
-        for record in &selection.encoded {
-            let length = record.byte_end.saturating_sub(record.byte_start);
-            let length = usize::try_from(length).map_err(|_| corrupt("record length overflows"))?;
-            // A record with no bytes still gets its (empty) blob and link, so a reader finds
-            // every covered record the same way.
-            let bytes = if length == 0 {
-                Vec::new()
-            } else {
-                let writer = self.lock_page()?;
-                record_bytes(&writer, record.chunks.clone(), 0, length)?
-            };
-            contents.push((record.id.clone(), bytes));
+        // One writer hold per batch of records or bytes, so the deferral to waiting writers
+        // (`lock_page`) is paid per batch, not per record.
+        let mut next = 0;
+        while next < selection.encoded.len() {
+            let mut end = next;
+            let mut bytes = 0_u64;
+            while end < selection.encoded.len() && end - next < SELECT_BATCH {
+                let length = selection.encoded[end]
+                    .byte_end
+                    .saturating_sub(selection.encoded[end].byte_start);
+                if end > next && bytes.saturating_add(length) > BATCH_BYTES {
+                    break;
+                }
+                bytes = bytes.saturating_add(length);
+                end += 1;
+            }
+            let writer = self.lock_page()?;
+            for record in &selection.encoded[next..end] {
+                let length = record.byte_end.saturating_sub(record.byte_start);
+                let length =
+                    usize::try_from(length).map_err(|_| corrupt("record length overflows"))?;
+                // A record with no bytes still gets its (empty) blob and link, so a reader
+                // finds every covered record the same way.
+                let bytes = if length == 0 {
+                    Vec::new()
+                } else {
+                    record_bytes(&writer, record.chunks.clone(), 0, length)?
+                };
+                contents.push((record.id.clone(), bytes));
+            }
+            next = end;
         }
         let ids: Vec<String> = selection
             .encoded
