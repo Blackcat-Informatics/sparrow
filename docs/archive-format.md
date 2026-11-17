@@ -37,8 +37,8 @@ Phase status: the specification and the deletion gate with its store fence
 `Store::archive_prepare`), the archive worker and NAS thread (P3,
 `sparrow_server::archive::Worker`, started by `sparrowd` when `[archive]` is
 configured and the daemon is not query-only) and the offline reader (P4, the
-`sparrow-archive` crate with its `list`, `verify` and `extract` commands). Implemented does not mean running: the worker is not installed or
-running on the live daemon, so the live store retires nothing through it. Until
+`sparrow-archive` crate with its `list`, `verify` and `extract` commands). Implemented does not mean running: whether a daemon runs the worker is
+operational state, set by its `[archive]` table and shown in its journal. Until
 a worker runs, an archiving store retires nothing on its own. Expiry waits, and
 under pressure ingest is refused with `STORAGE_PRESSURE`.
 
@@ -129,9 +129,11 @@ and the reason when it is the first unarchived entry. A segment that fails to
 encode is halved until the failing entry stands alone, which is then named in
 the error; the worker journals that failed pass and the watermark does not move. The segment's read renews its lease while it makes
 progress, so a long segment is not a failure; only a read that stalls for the
-lease's 60 seconds ends with `RESULT_EXPIRED` and is halved. Every record and artifact a segment covers has its
-graph in the file (a record's parent artifact graph included); an artifact with
-no graph, retired before the fence, is counted in `retired_artifacts`. The count of held records and the bytes waiting behind the first are not
+lease's 60 seconds ends with `RESULT_EXPIRED` and is halved. Every live record a segment covers has its graph in the file (its parent
+artifact graph included), and every artifact the segment covers has its graph unless it was retired
+before the fence, in which case it is counted in `retired_artifacts`. A record that was
+evicted or retired before the fence is counted in `retired_records` and is absent from the file:
+no graph, blob or link quad. The count of held records and the bytes waiting behind the first are not
 scanned, because that would read every record row on each pass.
 
 The 256 MiB ceiling and the hold bound are memory limits of the GTS writer. They
@@ -155,9 +157,12 @@ final term is the quarantine count, which is always zero: nothing is quarantined
 The identity is not stored in the archive; it is the name a commit uses (section 7). The PurRDF codec is
 byte-deterministic, so the same range of the same store, encoded by the same
 PurRDF revision, always gives the same identity. A copy of a store
-therefore rebuilds and adopts its existing segments. A different PurRDF revision
-can give a different identity for the same range. Readers then see duplicates
-and remove them by record IRI (section 10).
+therefore rebuilds and adopts its existing segments. A different PurRDF revision can give
+a different identity for the same range. The file name depends only on the range, so no
+second file is written: a rebuild against an intent already in flight is refused with
+`CONFLICT`, and one against a file already in place fails the byte-equal check in
+section 8. Either way every later pass fails until an operator resolves it, and the
+watermark does not move.
 
 ## 4. Content
 
@@ -176,7 +181,7 @@ in its range, with its dependencies:
 | Diagnostic graph | the segment's GTS files, under its recorded graph IRI. |
 | Artifact graph `urn:sparrow:graph:artifact:<hex>` | the segment's GTS files of the segment whose covered range contains the artifact's position. When artifacts share a millisecond, that can be an earlier segment that holds none of the artifact's records. The gate treats the artifact as archived once that segment commits. |
 | Content projection graphs | the segment's GTS files, under each projection's graph IRI. A projection shared by records in several segments appears in each of them. |
-| Link quads | One per record with bytes, in the graph `urn:sparrow:graph:archive-links`. |
+| Link quads | Two per encoded record, zero-length ones included (below), in the graph `urn:sparrow:graph:archive-links`. |
 | Reifiers and annotations of these graphs | the segment's GTS files. |
 
 Two link quads tie a record to its blob, one carrying the SHA-256 of the record's bytes
@@ -195,9 +200,11 @@ records are contiguous in byte order from zero, and checks that their total equa
 artifact's `byteLength`. It does not compare the whole artifact with its BLAKE3 `payload`.
 
 An entry already retired before the store was fenced still has its catalog row
-until ordinary cleanup removes it. Its metadata is archived and it has no bytes to
-write: a record with no bytes still gets an empty blob and its links, and an artifact
-with no graph is counted in the prepared segment's `retired_artifacts`.
+until ordinary cleanup removes it. A record evicted or retired before the fence has no
+metadata or bytes to read: selection counts it in the prepared segment's `retired_records`
+and writes nothing for it, and an artifact with no graph is counted in `retired_artifacts`.
+Only a live record with zero bytes gets an empty blob and its two link quads, so a reader
+finds every encoded record the same way.
 
 The archive leaves out text postings, term dictionaries, tail ranges, pins,
 request and retry rows, journals, import staging and catalog JSON. These are
@@ -208,16 +215,16 @@ derived or operational state. Readers rebuild indexes from the archived graphs.
 - **By age**: an entry is due once `now ≥ received_at + start_fraction ·
   (expires_at − received_at)`. With the defaults, that is day 22.5 of 30.
 - **By size**: everything is due, oldest first, once
-  `linked_physical_bytes ≥ start_fraction · (disk_budget − maintenance_reserve)`,
-  or whenever pressure maintenance has been requested.
+  `linked_physical_bytes ≥ start_fraction · (disk_budget − maintenance_reserve)`.
 - **Backlog**: an existing store that turns archiving on is fenced with nothing
   archived. Its whole retained backlog is archived, oldest first, before any of
   it is deleted.
-- **Horizon**: no segment extends past the earliest of
-  `now − max(10 minutes, buffered_flush_interval)`, the receipt time of the
-  oldest open import preparation, and the oldest unsynchronized buffered entry.
-  A publication behind the horizon is refused as a clock regression
-  (section 7), so the horizon must trail every publication still in flight.
+- **Horizon**: no new segment extends past `now − max(10 minutes, buffered_flush_interval)`.
+  Nothing else moves it: an open import preparation or an unsynchronized buffered entry
+  does not hold it back. A publication at or behind the watermark or the in-flight segment's end is
+  refused with `ARCHIVE_WATERMARK` (section 7), so an import that outlives the horizon is
+  refused, not waited for. A rebuild of an in-flight segment follows the intent's range and
+  applies no horizon, size or day limit.
 
 Pins do not affect archiving. A pinned entry is archived in order like any
 other entry; its pin only delays deletion.
@@ -233,8 +240,9 @@ unreported:
   watermark never passes it and nothing after it is archived or deleted until it is
   resolved. `Store::archive_held` reports the held record and the reason when it is the
   first unarchived entry, and the worker journals it.
-- An entry the encoder refuses is found by halving the segment until it stands alone. The
-  prepare then fails with the error naming that entry and its code, the worker journals
+- An entry the encoder refuses is found by halving the segment until it stands alone (a
+  rebuild of an in-flight segment, and an `UNSUPPORTED` error, are not halved: the error
+  then names the range's first entry). The prepare fails with the error naming that entry and its code, the worker journals
   the failed pass, and the watermark does not move. The entry is retried on the next pass.
 - In every case the entry stays in the store, unarchived and undeleted, until it is
   archived by a later pass.
@@ -271,11 +279,13 @@ the intent in one synchronized batch. The commit resets the pressure cursor, so
 the next pressure pass starts again from the beginning of the eviction order.
 
 A publication batch whose earliest position is at or before the watermark or the
-in-flight intent's end is refused with `STORAGE_FAILURE`. The message names
-both positions and says to correct the clock. Without this guard, a backwards
+in-flight intent's end is refused with `ARCHIVE_WATERMARK`, a code typed apart from
+`STORAGE_FAILURE` so a caller that stamped the batch early can offer it again with a later
+instant. The message names the position and the watermark and says that the clock moved
+backwards or an import outlived the archive horizon. Without this guard, a backwards
 clock step could publish evidence the archive would never cover.
 
-Archiving fences the store format with the `sparrow.store/99` to `/109` family, or `/121` to `/131` once the store is also fenced for intake provenance. A store fenced for receipt-time event fallback RDF (schema 69) uses `/154` to `/164` and `/176` to `/186` respectively. A store that also carries the owner-to-graph index uses `/209` to `/219` and `/231` to `/241` respectively.
+Archiving fences the store format with the `sparrow.store/99` to `/109` family, or `/121` to `/131` once the store is also fenced for intake provenance. A store fenced for receipt-time event fallback RDF (schema 69) uses `/154` to `/164` and `/176` to `/186` respectively. A store that also carries the owner-to-graph index uses `/209` to `/219` and `/231` to `/241` respectively; the source summary adds `/264` to `/274` and `/286` to `/296`; the store counters add `/319` to `/329` and `/341` to `/351`; and the payload index adds `/374` to `/384` and `/396` to `/406` (the first range of each pair without intake provenance, the second with it). A store opened by the current binary is lifted into the payload-index families.
 It sits above every earlier authority family and keeps the underlying authority
 through later transitions. It includes the log time law, so stores in this
 family always carry that law marker. Binaries without the gate do not know these
@@ -296,8 +306,13 @@ prepared segment it:
 2. Creates `<root>/<store-id>` if it is missing and syncs `<root>`.
 3. Writes each segment file as `<name>.partial`, syncs it and renames it to `<name>`. A file
    already at `<name>` is kept as is. Then it syncs the store directory.
-4. Reads every file back and requires it byte-equal to what it prepared, then lets the
-   decoder verify the set (the same decoder `sparrow-archive verify` uses).
+4. Reads every file back and requires it byte-equal to what it prepared, then runs the
+   worker's own check (`sparrow-server/src/archive/decode.rs`): the set is exactly one
+   `.gts` file and PurRDF's GTS reader reports no diagnostic, which covers the frame hash
+   chain. It does not hash a record's bytes against its link quad and does not read the
+   record or artifact metadata; `sparrow-archive verify` does both, offline, and the
+   worker does not link to it. A blob corrupted before the write is therefore caught by
+   `verify` or `extract`, not before the commit.
 5. Refuses to commit if any step ran at least `io_timeout_secs`: the files stay, and the
    next pass verifies and commits them.
 6. Commits: `archive_commit` names the segment identity and advances the watermark
@@ -313,9 +328,9 @@ Crash recovery follows from the intent:
 | Crash point | Recovery |
 | --- | --- |
 | Before the intent | Nothing to recover. |
-| After the intent | The next prepare rebuilds the identical segment from the intent's range, truncating a stale `.partial`. |
+| After the intent | The next prepare rebuilds the segment from the intent's range, and the worker's next write truncates a stale `.partial`. |
 | After the rename, before the commit | The next pass finds the file, checks it against the rebuilt bytes and commits. |
-| Range content differs from the intent | `STORAGE_FAILURE`; nothing is deleted. |
+| Range content differs from the intent | A rebuild whose identity or counts differ is refused by `archive_intend` with `CONFLICT`; an intent that now covers a held record fails with `STORAGE_FAILURE`. Nothing is deleted either way. |
 
 ## 9. No manifest
 
@@ -334,10 +349,11 @@ them with the digest its link quad names. To find a record's bytes, follow the l
 (predicate IRI `urn:sparrow:vocab:payloadBlake3`) to the blob with that digest. A file the
 reader refuses, or with no segment head, is a refusal and never a partial read.
 
-Duplicates can appear after a PurRDF revision change (section 3). Readers keep
-one copy per record IRI and report duplicates rather than merging conflicting
-content. The offline `sparrow-archive list|verify DIR` tool (crate `sparrow-archive`)
-walks `DIR` for `*.gts` files (never a `.staging` directory), decodes each in memory through one decoder module, and
+No reader detects duplicate segments: `list` and `verify` treat each file alone, and
+`extract` drops a repeated record id silently after sorting an artifact's records by byte
+position. The offline `sparrow-archive list|verify DIR` tool (crate `sparrow-archive`)
+walks `DIR` for `*.gts` files (it also skips a directory named `.staging`, which this
+format does not write), decodes each in memory through one decoder module, and
 prints one JSON line per segment with its record, artifact and blob counts. `verify`
 also fails any segment the decoder refuses, with `"ok":false` and exit 1. The tool never
 opens a live store and writes nothing.
