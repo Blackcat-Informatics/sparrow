@@ -44,7 +44,7 @@ The archive is implemented on `main` and is not running on the live daemon.
 - Not running: the live daemon has no `[archive]` table, so it runs no archive
   worker and its store carries no archive policy.
 
-The live store deletes nothing today, because the live daemon runs no archive worker and so nothing is retired. Running the worker on the live daemon is a separate condition, behind issue 352 and an authorized image switch.
+The live store deletes nothing today, because the live daemon runs no archive worker and so nothing is retired. Running the worker on the live daemon waits on an authorized image switch.
 
 Implemented does not mean running: whether a daemon runs the worker is
 operational state, set by its `[archive]` table and shown in its journal. Until
@@ -169,9 +169,10 @@ byte-deterministic, so the same range of the same store, encoded by the same
 PurRDF revision, always gives the same identity. A copy of a store
 therefore rebuilds and adopts its existing segments. A different PurRDF revision can give
 a different identity for the same range. The file name depends only on the range, so no
-second file is written: a rebuild against an intent already in flight is refused with
-`CONFLICT`, and one against a file already in place fails the byte-equal check in
-section 8. Either way every later pass fails until an operator resolves it, and the
+second file is written. A rebuild of the same range under another identity replaces the
+uncommitted intent (section 7), and one against a file already in place that the decoder
+did not refuse fails the byte-equal check in section 8: that pass fails, and every later pass
+fails the same way, until an operator moves that file aside (the journal line names it); the
 watermark does not move.
 
 ## 4. Content
@@ -282,8 +283,10 @@ enters the gate.
 An intent is recorded before the segment is written. Its range must start at
 the first entry after the watermark and match the catalog's counts, or it is
 refused with `CONFLICT`. A range larger than `max_segment_records` is refused
-with `RESOURCE_LIMIT`. An identical retry succeeds, while a different intent
-is refused until the one in flight commits. A commit names the segment
+with `RESOURCE_LIMIT`. An identical retry succeeds, and an intent over the same first and
+last positions replaces the uncommitted one (a rebuild under another identity), after the
+same range and count checks. An intent over a different range is refused until the one
+in flight commits. A commit names the segment
 identity. It advances the watermark to the intent's last position and deletes
 the intent in one synchronized batch. The commit resets the pressure cursor, so
 the next pressure pass starts again from the beginning of the eviction order.
@@ -316,13 +319,12 @@ prepared segment it:
 2. Creates `<root>/<store-id>` if it is missing and syncs `<root>`.
 3. Writes each segment file as `<name>.partial`, syncs it and renames it to `<name>`. A file
    already at `<name>` is kept as is. Then it syncs the store directory.
-4. Reads every file back and requires it byte-equal to what it prepared, then runs the
-   worker's own check (`sparrow-server/src/archive/decode.rs`): the set is exactly one
-   `.gts` file and PurRDF's GTS reader reports no diagnostic, which covers the frame hash
-   chain. It does not hash a record's bytes against its link quad and does not read the
-   record or artifact metadata; `sparrow-archive verify` does both, offline, and the
-   worker does not link to it. A blob corrupted before the write is therefore caught by
-   `verify` or `extract`, not before the commit.
+4. Reads every file back and requires it byte-equal to what it prepared, then decodes the
+   set with the decoder `sparrow-archive verify` and `extract` run (`sparrow_archive::verify`,
+   called from `sparrow-server/src/archive/decode.rs`): the set is exactly one `.gts` file,
+   PurRDF's GTS reader reports no diagnostic (which covers the frame hash chain), the record
+   and artifact metadata is well formed, and each record's bytes hash to the digest its link
+   quad names. A blob corrupted before the write is refused here, before the commit.
 5. Refuses to commit if any step ran at least `io_timeout_secs`: the files stay, and the
    next pass verifies and commits them.
 6. Commits: `archive_commit` names the segment identity and advances the watermark
@@ -330,7 +332,16 @@ prepared segment it:
 
 If the target already exists and equals the prepared bytes, the write counts as done. If
 it exists and differs, the pass fails with a verify error and the watermark does not move.
-Only a verified segment is committed. A Synology NFS export must use synchronous writes
+Only a verified segment is committed: verification decodes the segment with the same
+decoder as `sparrow-archive verify`, so each record's bytes must hash to the digest its
+link quad names. When the decoder refuses a segment, the worker renames the file to
+`<name>.<segment id hex>.refused` (kept for inspection, never deleted; the identity covers
+the bytes, so refusals of different bytes never collide and the same bytes refused again
+leave one copy), the watermark stays and the intent
+stays. The next pass rebuilds the range; bytes of another identity replace the intent and take
+the freed name, and the same bytes are refused again. A valid file a crash left under the
+range's name, followed by a rebuild under another identity, fails the byte-equal check; the
+journal line names the file, and the operator moves it aside. A Synology NFS export must use synchronous writes
 (`sync`); with `async` exports fsync proves nothing.
 
 Crash recovery follows from the intent:
@@ -340,7 +351,7 @@ Crash recovery follows from the intent:
 | Before the intent | Nothing to recover. |
 | After the intent | The next prepare rebuilds the segment from the intent's range, and the worker's next write truncates a stale `.partial`. |
 | After the rename, before the commit | The next pass finds the file, checks it against the rebuilt bytes and commits. |
-| Range content differs from the intent | A rebuild whose identity or counts differ is refused by `archive_intend` with `CONFLICT`; an intent that now covers a held record fails with `STORAGE_FAILURE`. Nothing is deleted either way. |
+| Range content differs from the intent | A rebuild over the same range replaces the uncommitted intent after the range and count checks; a different range is refused by `archive_intend` with `CONFLICT`; an intent that now covers a held record fails with `STORAGE_FAILURE`. Nothing is deleted either way. |
 
 ## 9. No manifest
 

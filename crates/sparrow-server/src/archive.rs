@@ -5,7 +5,8 @@
 //!
 //! One named thread takes each prepared segment from the store, writes its files directly
 //! under `<root>/<store_id>/` as `<from>-<through>.gts`, syncs the files and the
-//! directories, reads every file back byte-equal and passes the set to `decode::verify`, and
+//! directories, reads every file back byte-equal and passes the set to `decode::verify` (the
+//! reader's decoder, which also hashes each record's bytes against its link digest), and
 //! only then commits the store's `archive:through` watermark. A failure at any step leaves
 //! the watermark where it was and is journaled with its cause; the next pass writes the
 //! same segment again.
@@ -365,20 +366,49 @@ fn verify_segment(
             fs::read(&path).map_err(io_at("read back", &path))?
         };
         if read != *expected {
-            return Err(ArchiveError::Verify {
-                path,
-                reason: format!(
-                    "{} bytes read, {} written, or contents differ",
-                    read.len(),
-                    expected.len()
-                ),
-            });
+            let reason = format!(
+                "{} bytes read, {} written, or contents differ; if an earlier pass left \
+                 a valid file under another identity, move {} aside",
+                read.len(),
+                expected.len(),
+                path.display()
+            );
+            return Err(ArchiveError::Verify { path, reason });
         }
     }
-    decode::verify(&segment.files).map_err(|reason| ArchiveError::Verify {
-        path: store_dir.to_path_buf(),
-        reason,
+    decode::verify(&segment.files).map_err(|reason| {
+        // The bytes were written as prepared and the decoder refuses them. Move each file
+        // aside to `<name>.<segment id hex>.refused` and keep it for inspection, so a rebuild
+        // of the same range under another identity can take the name. The identity covers the
+        // bytes, so refused files of different bytes never collide; the same bytes refused
+        // again replace one identical copy. The watermark has not moved, nothing is deleted,
+        // and the decoder's reason survives any failure to set the file aside.
+        let reason = match set_aside(flight, store_dir, segment) {
+            Ok(()) => reason,
+            Err(failure) => format!("{reason}; {failure}"),
+        };
+        ArchiveError::Verify {
+            path: store_dir.to_path_buf(),
+            reason,
+        }
     })
+}
+
+/// Rename each refused file to `<name>.<segment id hex>.refused`, then sync the directory.
+fn set_aside(flight: &Flight, store_dir: &Path, segment: &PreparedSegment) -> Result<(), String> {
+    for (name, _) in &segment.files {
+        let path = store_dir.join(name);
+        let aside = store_dir.join(format!("{name}.{}.refused", segment.id_hex()));
+        let _step = flight.step("set a refused segment aside", &path);
+        fs::rename(&path, &aside).map_err(|error| {
+            format!(
+                "setting {} aside as {} failed: {error}",
+                path.display(),
+                aside.display()
+            )
+        })?;
+    }
+    sync_dir(flight, store_dir).map_err(|error| error.to_string())
 }
 
 /// Filesystem magic numbers (`statfs` `f_type`) of the network filesystems an archive share is
@@ -925,6 +955,181 @@ mod tests {
         let error = archive_segment(&flight(), &store, &root, "s", &segment).unwrap_err();
         assert!(matches!(error, ArchiveError::Verify { .. }), "{error}");
         assert_eq!(through(&store), None);
+    }
+
+    /// INVARIANT (#352): a segment whose record bytes do not hash to the digest their link
+    /// names is refused before the commit, so the watermark stays and the originals stay
+    /// unretired. The container is internally consistent (only the per-record check can
+    /// tell). The refused file is set aside, and a rebuild of the same range under another
+    /// identity replaces the intent and commits. The fixture's mismatch surfaces as a record
+    /// with no blob under its link's digest, not as a hash comparison.
+    #[test]
+    fn a_record_whose_bytes_differ_from_its_link_digest_is_refused_before_the_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mut segment) = archiving_store(&dir.path().join("store"));
+        let root = nas(dir.path(), "s");
+        decode::verify(&[(
+            segment.files[0].0.clone(),
+            sparrow_test_support::forged_segment(b"alpha\n", b"alpha\n"),
+        )])
+        .unwrap();
+        let genuine = segment.files[0].1.clone();
+        segment.files[0].1 = sparrow_test_support::forged_segment(b"alpha\n", b"bravo\n");
+        let error = archive_segment(&flight(), &store, &root, "s", &segment).unwrap_err();
+        assert!(
+            matches!(&error, ArchiveError::Verify { reason, .. } if reason.contains("does not decode: record record:bb")),
+            "{error}"
+        );
+        assert_eq!(through(&store), None);
+
+        // Recovery: the refused bytes are set aside for inspection (nothing is deleted), the
+        // intent stays, and the originals stay unretired. The encoder then yields good bytes,
+        // so the rebuilt segment has another identity over the same range: the store replaces
+        // the intent and the worker writes the rebuilt segment and commits it.
+        let target = root.join("s").join(&segment.files[0].0);
+        let aside_of = |segment: &PreparedSegment| {
+            root.join("s").join(format!(
+                "{}.{}.refused",
+                segment.files[0].0,
+                segment.id_hex()
+            ))
+        };
+        let aside = aside_of(&segment);
+        assert!(!target.exists(), "the name is free for the rebuild");
+        assert_eq!(
+            fs::read(&aside).unwrap(),
+            sparrow_test_support::forged_segment(b"alpha\n", b"bravo\n")
+        );
+        assert_eq!(
+            store
+                .archive_state()
+                .unwrap()
+                .unwrap()
+                .intent
+                .map(|i| i.segment_id),
+            Some(segment.segment_id)
+        );
+        // A second refusal with different bytes keeps the first refused file.
+        let mut second = segment.clone();
+        second.segment_id = [6; 32];
+        second.files[0].1 = sparrow_test_support::forged_segment(b"alpha\n", b"charlie\n");
+        archive_segment(&flight(), &store, &root, "s", &second).unwrap_err();
+        assert_eq!(
+            fs::read(&aside).unwrap(),
+            sparrow_test_support::forged_segment(b"alpha\n", b"bravo\n"),
+            "the earlier refused file is kept"
+        );
+        assert_eq!(
+            fs::read(aside_of(&second)).unwrap(),
+            sparrow_test_support::forged_segment(b"alpha\n", b"charlie\n")
+        );
+        let rebuilt = PreparedSegment {
+            segment_id: [7; 32],
+            files: vec![(segment.files[0].0.clone(), genuine.clone())],
+            ..segment.clone()
+        };
+        store
+            .archive_intend(&sparrow_core::ArchiveIntent {
+                segment_id: rebuilt.segment_id,
+                first: rebuilt.from.clone(),
+                last: rebuilt.through.clone(),
+                records: rebuilt.records,
+                artifacts: rebuilt.artifacts,
+            })
+            .unwrap();
+        assert_eq!(through(&store), None, "replacing the intent moves nothing");
+        archive_segment(&flight(), &store, &root, "s", &rebuilt).unwrap();
+        assert_eq!(through(&store).as_deref(), Some(segment.through.as_str()));
+        assert_eq!(fs::read(&target).unwrap(), genuine);
+    }
+
+    /// INVARIANT (operators depend on it): a pass that finds files an earlier pass left, whether
+    /// it crashed after the rename and before the commit, died with a stale `.partial`, or
+    /// overran its I/O budget before the commit, recovers by itself. It keeps an identical
+    /// final file (neither rewrites nor refuses it), replaces a stale partial, verifies,
+    /// commits and moves the watermark exactly once; the next identical pass does nothing.
+    #[test]
+    fn a_pass_after_a_crash_between_the_rename_and_the_commit_recovers_by_itself() {
+        use std::os::unix::fs::PermissionsExt;
+        let overrun = || Flight::new(Duration::from_secs(120), Duration::ZERO).rooted_at("/proc");
+        // (case, leftover the earlier pass left in the store directory)
+        for case in ["final file", "stale partial", "overran before the commit"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (store, segment) = archiving_store(&dir.path().join("store"));
+            let root = nas(dir.path(), "s");
+            let store_dir = root.join("s");
+            let (name, bytes) = segment.files[0].clone();
+            let target = store_dir.join(&name);
+            fs::create_dir(&store_dir).unwrap();
+            match case {
+                "final file" => {
+                    // The state after a crash after the rename: exact bytes at the final name.
+                    // Read-only, so a worker that rewrote it (a rename of a fresh 0600 file)
+                    // would change its mode, and one that refused it would fail the pass.
+                    fs::write(&target, &bytes).unwrap();
+                    fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
+                }
+                "stale partial" => {
+                    fs::write(store_dir.join(format!("{name}.partial")), b"half a seg").unwrap();
+                }
+                _ => {
+                    let error = drain(&overrun(), &store, &root, "s", LATER).unwrap_err();
+                    assert!(matches!(error, ArchiveError::Overran), "{case}: {error}");
+                    assert_eq!(through(&store), None, "{case}: an overrun never commits");
+                    fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
+                }
+            }
+            let before = fs::metadata(&target)
+                .ok()
+                .map(|m| (m.ino(), m.mtime_nsec(), m.mode()));
+
+            let committed = drain(&flight(), &store, &root, "s", LATER).unwrap();
+            assert_eq!(committed, 1, "{case}: one commit");
+            assert_eq!(
+                through(&store).as_deref(),
+                Some(segment.through.as_str()),
+                "{case}"
+            );
+            assert_eq!(
+                fs::read(&target).unwrap(),
+                bytes,
+                "{case}: the segment's bytes"
+            );
+            let after = fs::metadata(&target).unwrap();
+            if before.is_some() {
+                assert_eq!(
+                    before,
+                    Some((after.ino(), after.mtime_nsec(), after.mode())),
+                    "{case}: an identical file is kept, not rewritten"
+                );
+            }
+            let listing = || {
+                let mut names: Vec<_> = fs::read_dir(&store_dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name())
+                    .collect();
+                names.sort();
+                names
+            };
+            assert_eq!(
+                listing(),
+                [std::ffi::OsString::from(&name)],
+                "{case}: no partial left"
+            );
+
+            let settled = (through(&store), listing(), after.ino(), after.mtime_nsec());
+            assert_eq!(
+                drain(&flight(), &store, &root, "s", LATER).unwrap(),
+                0,
+                "{case}: nothing due"
+            );
+            let again = fs::metadata(&target).unwrap();
+            assert_eq!(
+                (through(&store), listing(), again.ino(), again.mtime_nsec()),
+                settled,
+                "{case}: the second pass changes nothing"
+            );
+        }
     }
 
     /// INVARIANT: a segment written, synced, read back and decoded advances the watermark to

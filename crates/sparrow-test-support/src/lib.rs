@@ -294,6 +294,87 @@ pub fn remove_artifact_rdf_upgrade(db: &rocksdb::DB) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// The bytes of a one-record, one-artifact archive segment built with PurRDF's public writer.
+/// The record's link quad names the digest of `claimed`; the blob stored is `actual`, hashed
+/// honestly by the container, so the container is internally consistent whatever the two are.
+/// The one forged-segment builder for the reader's and the worker's digest-check tests.
+///
+/// # Panics
+/// On a PurRDF writer failure, which a fixture cannot recover from.
+#[must_use]
+pub fn forged_segment(claimed: &[u8], actual: &[u8]) -> Vec<u8> {
+    use purrdf::gts::writer::digest_string;
+    use purrdf::gts_write::to_writer;
+    use purrdf::{RdfDatasetBuilder, RdfLiteral, RdfLookaside};
+    const NS: &str = "urn:sparrow:vocab:";
+    const AT: u64 = 1_700_000_000_000;
+    let at = sparrow_core::format_instant(AT).expect("fixture instant formats");
+    let mut builder = RdfDatasetBuilder::new();
+    let facts: [(&str, &str, String); 9] = [
+        ("artifact:aa", "sourceName", "host".to_owned()),
+        ("artifact:aa", "format", "log".to_owned()),
+        ("artifact:aa", "receivedAt", at.clone()),
+        ("artifact:aa", "byteLength", actual.len().to_string()),
+        ("record:bb", "sourceName", "host".to_owned()),
+        ("record:bb", "receivedAt", at),
+        ("record:bb", "sourceByteStart", "0".to_owned()),
+        ("record:bb", "sourceByteEnd", actual.len().to_string()),
+        ("record:bb", "payloadBlake3", digest_string(claimed)),
+    ];
+    for (subject, name, value) in facts {
+        let predicate = format!("{NS}{name}");
+        let subject = builder
+            .intern_iri(&format!("urn:sparrow:{subject}"))
+            .expect("fixture subject");
+        let predicate = builder.intern_iri(&predicate).expect("fixture predicate");
+        let object = builder
+            .intern_literal(RdfLiteral::simple(&value))
+            .expect("fixture literal");
+        builder
+            .push_quad(subject, predicate, object, None)
+            .expect("fixture quad");
+    }
+    let rdf_type = builder
+        .intern_iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+        .expect("fixture type");
+    for (subject, class) in [("artifact:aa", "Artifact"), ("record:bb", "Record")] {
+        let subject = builder
+            .intern_iri(&format!("urn:sparrow:{subject}"))
+            .expect("fixture subject");
+        let class = builder
+            .intern_iri(&format!("{NS}{class}"))
+            .expect("fixture class");
+        builder
+            .push_quad(subject, rdf_type, class, None)
+            .expect("fixture quad");
+    }
+    let artifact_link = builder
+        .intern_iri(&format!("{NS}artifact"))
+        .expect("fixture link");
+    let record = builder
+        .intern_iri("urn:sparrow:record:bb")
+        .expect("fixture record");
+    let artifact = builder
+        .intern_iri("urn:sparrow:artifact:aa")
+        .expect("fixture artifact");
+    builder
+        .push_quad(record, artifact_link, artifact, None)
+        .expect("fixture quad");
+    let dataset = builder.freeze().expect("fixture dataset");
+    let mut writer =
+        to_writer(&dataset, &RdfLookaside::default(), "sparrow-archive").expect("fixture writer");
+    writer
+        .add_blob_transformed(
+            actual.to_vec(),
+            Some("application/octet-stream"),
+            Some("record"),
+            &["zstd".to_owned()],
+            None,
+        )
+        .expect("fixture blob");
+    writer.into_bytes()
+}
+
 #[cfg(test)]
 mod observer_tests {
     #[test]

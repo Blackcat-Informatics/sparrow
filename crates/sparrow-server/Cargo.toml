@@ -20,6 +20,7 @@ path = "src/bin/sparrow.rs"
 
 [dependencies]
 sparrow-core = { path = "../sparrow-core" }
+sparrow-archive = { path = "../sparrow-archive" }
 sparrow-client = { path = "../sparrow-client" }
 rustix = { workspace = true, features = ["process", "net"] }
 purrdf-lex.workspace = true

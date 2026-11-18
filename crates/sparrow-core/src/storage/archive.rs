@@ -412,7 +412,9 @@ impl Store {
             .map(|state| state.borrow().clone()))
     }
 
-    /// Durably record the segment about to be written. Identical retries are idempotent.
+    /// Durably record the segment about to be written. Identical retries are idempotent, and
+    /// an uncommitted intent over the same first and last positions is replaced, so a segment
+    /// the worker refused can be rebuilt under a new identity.
     ///
     /// The range must start at the first entry after the watermark and its counts
     /// must match the retained catalog. Publication behind its end is refused from
@@ -432,6 +434,10 @@ impl Store {
         let current = state.borrow().clone();
         match &current.intent {
             Some(existing) if existing == intent => return Ok(()),
+            // The same frozen range rebuilt under another identity (the encoder changed after
+            // the worker refused the first bytes): the intent is replaced after the same range
+            // and count validation. Nothing was committed, so nothing is deleted.
+            Some(existing) if existing.first == intent.first && existing.last == intent.last => {}
             Some(_) => {
                 return Err(Error::new(
                     "CONFLICT",

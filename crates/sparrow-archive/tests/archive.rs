@@ -68,70 +68,12 @@ fn archive_two(root: &Path) -> (Vec<String>, PathBuf) {
     (ids, paths[0].clone())
 }
 
-/// A one-record, one-artifact segment built with PurRDF's public writer. The record's link
-/// quad names the digest of `claimed`; the blob stored is `actual`, hashed honestly by the
-/// container, so the container is internally consistent whatever the two are.
+/// A one-record, one-artifact segment written to `<root>/segments/forged.gts`; see
+/// `sparrow_test_support::forged_segment` for what `claimed` and `actual` mean.
 fn forged_segment(root: &Path, claimed: &[u8], actual: &[u8]) -> PathBuf {
-    use purrdf::gts::writer::digest_string;
-    use purrdf::gts_write::to_writer;
-    use purrdf::{RdfDatasetBuilder, RdfLiteral, RdfLookaside};
-    const NS: &str = "urn:sparrow:vocab:";
-    let at = sparrow_core::format_instant(T1).unwrap();
-    let mut builder = RdfDatasetBuilder::new();
-    let facts: [(&str, &str, String); 9] = [
-        ("artifact:aa", "sourceName", "host".to_owned()),
-        ("artifact:aa", "format", "log".to_owned()),
-        ("artifact:aa", "receivedAt", at.clone()),
-        ("artifact:aa", "byteLength", actual.len().to_string()),
-        ("record:bb", "sourceName", "host".to_owned()),
-        ("record:bb", "receivedAt", at),
-        ("record:bb", "sourceByteStart", "0".to_owned()),
-        ("record:bb", "sourceByteEnd", actual.len().to_string()),
-        ("record:bb", "payloadBlake3", digest_string(claimed)),
-    ];
-    for (subject, name, value) in facts {
-        let predicate = if name == "payloadBlake3" {
-            format!("urn:sparrow:vocab:{name}")
-        } else {
-            format!("{NS}{name}")
-        };
-        let subject = builder
-            .intern_iri(&format!("urn:sparrow:{subject}"))
-            .unwrap();
-        let predicate = builder.intern_iri(&predicate).unwrap();
-        let object = builder.intern_literal(RdfLiteral::simple(&value)).unwrap();
-        builder.push_quad(subject, predicate, object, None).unwrap();
-    }
-    let rdf_type = builder
-        .intern_iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
-        .unwrap();
-    for (subject, class) in [("artifact:aa", "Artifact"), ("record:bb", "Record")] {
-        let subject = builder
-            .intern_iri(&format!("urn:sparrow:{subject}"))
-            .unwrap();
-        let class = builder.intern_iri(&format!("{NS}{class}")).unwrap();
-        builder.push_quad(subject, rdf_type, class, None).unwrap();
-    }
-    let artifact_link = builder.intern_iri(&format!("{NS}artifact")).unwrap();
-    let record = builder.intern_iri("urn:sparrow:record:bb").unwrap();
-    let artifact = builder.intern_iri("urn:sparrow:artifact:aa").unwrap();
-    builder
-        .push_quad(record, artifact_link, artifact, None)
-        .unwrap();
-    let dataset = builder.freeze().unwrap();
-    let mut writer = to_writer(&dataset, &RdfLookaside::default(), "sparrow-archive").unwrap();
-    writer
-        .add_blob_transformed(
-            actual.to_vec(),
-            Some("application/octet-stream"),
-            Some("record"),
-            &["zstd".to_owned()],
-            None,
-        )
-        .unwrap();
     let path = root.join("segments").join("forged.gts");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, writer.into_bytes()).unwrap();
+    std::fs::write(&path, sparrow_test_support::forged_segment(claimed, actual)).unwrap();
     path
 }
 

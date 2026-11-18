@@ -21453,6 +21453,31 @@ fn archive_gate_holds_expiry_until_a_committed_segment_covers_the_evidence() {
     };
     store.archive_intend(&intent).unwrap();
     store.archive_intend(&intent).unwrap();
+    // The same frozen range rebuilt under another identity (after the worker refused the
+    // first bytes) replaces the uncommitted intent and moves nothing else; a different range
+    // is refused while one is in flight.
+    let rebuilt = ArchiveIntent {
+        segment_id: [9; 32],
+        ..intent.clone()
+    };
+    store.archive_intend(&rebuilt).unwrap();
+    let state = store.archive_state().unwrap().unwrap();
+    assert_eq!((state.through, state.intent), (None, Some(rebuilt)));
+    assert_eq!(
+        store.archive_commit(&intent.segment_id).unwrap_err().code,
+        "CONFLICT"
+    );
+    let narrower = ArchiveIntent {
+        segment_id: [8; 32],
+        last: covered[0].clone(),
+        records: 1,
+        ..intent.clone()
+    };
+    assert_eq!(
+        store.archive_intend(&narrower).unwrap_err().code,
+        "CONFLICT"
+    );
+    store.archive_intend(&intent).unwrap();
     // An in-flight segment does not authorize deletion.
     let pending = store
         .expire_bounded(later, EvictionLimits::default())
