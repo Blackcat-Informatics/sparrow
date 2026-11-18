@@ -1,0 +1,14 @@
+[
+  {
+    "path": "deploy/README.md",
+    "kind": "file",
+    "executable": false,
+    "content": "proposed/0.bin"
+  },
+  {
+    "path": "docs/development-runtime.md",
+    "kind": "file",
+    "executable": false,
+    "content": "proposed/1.bin"
+  }
+]

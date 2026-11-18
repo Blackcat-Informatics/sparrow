@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/356-purpose-section-glossary-and-the-cruft",
+  "branch": "paudley/356-purpose-section-glossary-and-the-cruft",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "0f62a955c741de872454d6a5ec69766abd86b67f",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/356-purpose-section-glossary-and-the-cruft/.stage/purpose-section-glossary-and-the-cruft/sync/20261118T044726-72868aed57614433a75ea49461016956",
+  "conflicts": [
+    "deploy/README.md",
+    "docs/development-runtime.md"
+  ],
+  "status": "completed",
+  "base": "2ed17514f51c3b3d79f7dc4628516f5669b86a85",
+  "merge_bases": [
+    "ec9e0c64fe422b2c8c6c1dcbf6aa35bde6b9cbc4"
+  ],
+  "merge_index": "0ba1924360e28a27b70afb0889a6a50263d488100bf77edbf679c50948aee432",
+  "reused_paths": [],
+  "rerere_output": "Recorded preimage for 'deploy/README.md'\nRecorded preimage for 'docs/development-runtime.md'\n",
+  "candidate_tree": "fef971f57b0140f55581f216e06a341b0f3fcb35",
+  "candidate_patch": "candidate-490f6cd525c4443c8ca517ccd7c97bd6.patch",
+  "stdout_log": "commit-490f6cd525c4443c8ca517ccd7c97bd6.stdout.log",
+  "stderr_log": "commit-490f6cd525c4443c8ca517ccd7c97bd6.stderr.log",
+  "validation_records": [],
+  "commit_duration_seconds": 141.73946401500143,
+  "commit": "21a1b7dae08143a5db147ceb2e4693df752a260a",
+  "tree": "fef971f57b0140f55581f216e06a341b0f3fcb35",
+  "exit_code": 0
+}

@@ -1,0 +1,14 @@
+[
+  {
+    "path": "deploy/README.md",
+    "kind": "file",
+    "executable": false,
+    "content": "accepted-88d3861101234138b21b9889a45755b9/0.bin"
+  },
+  {
+    "path": "docs/development-runtime.md",
+    "kind": "file",
+    "executable": false,
+    "content": "accepted-88d3861101234138b21b9889a45755b9/1.bin"
+  }
+]

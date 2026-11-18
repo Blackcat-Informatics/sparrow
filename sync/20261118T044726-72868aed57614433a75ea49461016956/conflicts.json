@@ -1,0 +1,42 @@
+{
+  "deploy/README.md": [
+    {
+      "mode": "100644",
+      "oid": "1279ac3417fd090d9ee95a29d23c10296d6930a6",
+      "stage": 1,
+      "content": "inputs/0-1.bin"
+    },
+    {
+      "mode": "100644",
+      "oid": "8017444aefab7e3f838bbe94e1081e9684521ea8",
+      "stage": 2,
+      "content": "inputs/0-2.bin"
+    },
+    {
+      "mode": "100644",
+      "oid": "d1748cfdd4170e1572774cbec6d270c3b70d29ef",
+      "stage": 3,
+      "content": "inputs/0-3.bin"
+    }
+  ],
+  "docs/development-runtime.md": [
+    {
+      "mode": "100644",
+      "oid": "0776fb7c0b62ba8369afb297e7dd4d6c10269058",
+      "stage": 1,
+      "content": "inputs/1-1.bin"
+    },
+    {
+      "mode": "100644",
+      "oid": "258fa7228f2691d12a5023d7130ad75c7b258331",
+      "stage": 2,
+      "content": "inputs/1-2.bin"
+    },
+    {
+      "mode": "100644",
+      "oid": "f3c157ff28f2660529df7327b62991afdfe73320",
+      "stage": 3,
+      "content": "inputs/1-3.bin"
+    }
+  ]
+}
