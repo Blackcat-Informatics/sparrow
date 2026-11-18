@@ -53,8 +53,10 @@ and over the kept images in `./bin`.
   directory does not implement it.
 - Sparrow backs up nothing except the age-out to GTS files on the NAS: the archive worker
   writes aged-out segments under `[archive] dir` (`/net/synology/archives/sparrow-archive`) and
-  never to a local disk; no Sparrow backup is ever written to a local disk. The online store backup (#156) was removed in #330. The daemon's archive
-  worker is not deployed by these files (Sparrow issues #15 to #17); it refuses a directory that
+  never to a local disk; no Sparrow backup is ever written to a local disk. The online store backup (#156) was removed in #330. The archive
+  worker is implemented, and these files do not enable it: the shipped configuration has no
+  `[archive]` table, so the live daemon runs no worker (see
+  [Archive status](../docs/archive-format.md#archive-status)). Once enabled, it refuses a directory that
   is on the root filesystem's device, or on a local filesystem of the root's type (an unmounted
   share), and one whose `STORE_ID` names another store or which holds content but no `STORE_ID`.
   It writes `STORE_ID` itself into an empty directory on its first pass. A file naming another

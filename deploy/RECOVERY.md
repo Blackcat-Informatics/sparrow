@@ -217,7 +217,7 @@ every watch in `consume_watches` names a root that exists.
 - Diagnose: `findmnt -T /net/synology/archives/sparrow-archive` must show `nfs4` from
   `192.168.1.1:/volume1/archives`.
 - Recover: restore the mount; the next pass retries by itself. The unit and the profile
-  grant no archive path yet. Sparrow issues #15 to #17 add the archive worker's deployment.
+  grant no archive path yet. The archive worker is implemented; it runs on the live daemon only once it is enabled (see `docs/archive-format.md`, "Archive status").
 
 ## Revert the cutover to the user unit
 

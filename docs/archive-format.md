@@ -5,7 +5,7 @@ SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 # Sparrow archive format: `sparrow-archive/1`
 
-Sparrow keeps a searchable 30-day window of disposable logs. Before it deletes
+Sparrow keeps disposable logs searchable until their 30-day deadline. Before it deletes
 aged-out evidence, it can write that evidence to a large, slower archive, such
 as a NAS. This document defines the archive's on-disk format, the write
 protocol, and the rules that keep deletion behind the archive. Tools written
@@ -31,15 +31,26 @@ These requirements bind this design:
   closing target, so a segment must be able to hold an entry larger than its
   target.
 
-Phase status: the specification and the deletion gate with its store fence
-(phases P0 and P1) are implemented. So are segment encoding (P2,
-`Store::archive_prepare`), the archive worker and NAS thread (P3,
-`sparrow_server::archive::Worker`, started by `sparrowd` when `[archive]` is
-configured and the daemon is not query-only) and the offline reader (P4, the
-`sparrow-archive` crate with its `list`, `verify` and `extract` commands). Implemented does not mean running: whether a daemon runs the worker is
+## Archive status
+
+The archive is implemented on `main` and is not running on the live daemon.
+
+- Implemented: the specification and the deletion gate with its store fence
+  (phases P0 and P1), segment encoding (P2, `Store::archive_prepare`), the
+  archive worker and NAS thread (P3, `sparrow_server::archive::Worker`, started
+  by `sparrowd` when `[archive]` is configured and the daemon is not
+  query-only) and the offline reader (P4, the `sparrow-archive` crate with its
+  `list`, `verify` and `extract` commands).
+- Not running: the live daemon has no `[archive]` table, so it runs no archive
+  worker and its store carries no archive policy.
+
+The live store deletes nothing today, because the live daemon runs no archive worker and so nothing is retired. Running the worker on the live daemon is a separate condition, behind issue 352 and an authorized image switch.
+
+Implemented does not mean running: whether a daemon runs the worker is
 operational state, set by its `[archive]` table and shown in its journal. Until
-a worker runs, an archiving store retires nothing on its own. Expiry waits, and
-under pressure ingest is refused with `STORAGE_PRESSURE`.
+a worker runs, a store retires nothing on its own. Expiry waits, and under
+pressure ingest is refused with `STORAGE_PRESSURE`. Other documents link to this
+section for the state of the archive.
 
 ## 1. Layout
 

@@ -24,7 +24,18 @@ Sparrow is a high-density, temporal diagnostic log and data server. It turns
 scattered operational artifacts into retained evidence that agents can discover,
 inspect, correlate, and query as a semantic graph.
 
-**Status: implemented and running; measured limits apply.** A RocksDB daemon, Cap'n Proto RPC,
+## Purpose
+
+The charter (what Sparrow is, its method, consumers, suppliers and what it is
+not) is the Purpose section of [AGENTS.md](AGENTS.md#purpose). In short, Sparrow
+is a low-assurance, high-throughput, searchable log store that optimizes only
+for speed and storage efficiency; anything irreplaceable, and all assurance,
+privacy, encryption and validation work, belongs to Katamari. The
+[glossary](docs/glossary.md) names each term and the document that governs it.
+
+## Status
+
+**Implemented and running; measured limits apply.** A RocksDB daemon, Cap'n Proto RPC,
 CLI with resumable typed file imports and bounded oversized-record preparation,
 stdio MCP, JSON field discovery, immutable JSON source-time and diagnostic profiles,
 mapped service/host/severity/trace/span filters,
@@ -39,7 +50,8 @@ WAL flush controls, and helper-census tooling are implemented. Active tailing
 with explicit completed-generation retirement, typed public TCP
 ingestion, and syslog are implemented. Stored-view SELECT, ASK, CONSTRUCT,
 DESCRIBE, measured EXPLAIN and native stored-text rank/span relations are
-implemented and deployed in schema 62. See [Development runtime](docs/development-runtime.md) for
+implemented. The wire schema is version 71. The archive is implemented and not
+yet running on the live daemon ([Archive status](docs/archive-format.md#archive-status)). See [Development runtime](docs/development-runtime.md) for
 present commands, verified behavior and limits.
 
 The production deployment is the system unit in [`deploy/`](deploy/README.md),
@@ -59,10 +71,14 @@ large directories of JSONL and `.log` files. Sustained throughput, import bursts
 and total storage density have finite workload measurements, not a production
 capacity guarantee; see the [acceptance boundary](docs/implementation-plan.md#current-acceptance-boundary).
 
-The default retention window is **up to 30 days from server acceptance**. Source
-timestamps remain queryable but do not determine expiry. A configured disk budget
-can cause earlier eviction of the oldest unpinned data. When protected data or
-unreclaimed storage prevents another write, ingestion applies backpressure.
+An unpinned item is due at `received_at + 30 days` (server acceptance) and is
+retired then once the archive holds it. Source timestamps remain queryable but
+do not determine expiry. Disk pressure can retire archived, unpinned items
+earlier. A pin keeps an item until the pin ends. The deletion gate keeps every
+unarchived item past its deadline, so with no archive running (the live daemon
+today) nothing retires and ingest is refused with `STORAGE_PRESSURE` at the
+budget less the reserve or below the free-space floor. When protected data or unreclaimed storage prevents another write,
+ingestion applies backpressure.
 
 Agents can retain selected evidence in named, expiring collections. For example:
 

@@ -61,7 +61,7 @@ grew to 10.1 GB in a day. The mentation source was stopped and retired:
   in the intake root.
 - Watch removal then ran with zero pending claims and recorded revision 13.
 - Its watch definition file was deleted. Mentation artifacts already stored
-  remain until retention expires.
+  remain, because nothing retires while no archive worker runs.
 
 The unit gained `CPUQuota=100%`, `IOWeight=20` and `Nice=10`. Under those
 limits the drain held the daemon near 40 percent of one core, with host I/O
