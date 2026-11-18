@@ -1,0 +1,23 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 55d9ebd6b6631d981f7043d5a806e1b8e9d3d309
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 354
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/354
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 517ff4e22f57adc04bc2e409eb2420c5a942ee53
+GhpRsq-Head-Ref: paudley/348-flaky-test-expiry-below-the-floor-hands
+GhpRsq-Head-OID: 55d9ebd6b6631d981f7043d5a806e1b8e9d3d309
+GhpRsq-Result-Tree: 2a71f2b71281f628c97dcc1b4a68e5c014af3a48
+GhpRsq-Result-Commit: 9ff21741d889d79d24039657499de13224d4c62a
+GhpRsq-Parent-Hashes: 55d9ebd6b6631d981f7043d5a806e1b8e9d3d309
+GhpRsq-Squash-Notes-SHA256: 923c3a6d168462569d40892c2c380bca746511e3371132488eced5c1f1a88bc0
+GhpRsq-Stage-Tree: 9757aeab0a23d94552fbe21875db189507e81446
+GhpRsq-Stage-Commit: 2a22ccdabda07fda7b8cb8359f90a36815ff5d6e
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/2a22ccdabda07fda7b8cb8359f90a36815ff5d6e
+GhpRsq-Stage-Ref: refs/ghprsq/pr/354/stage
+GhpRsq-Stage-Files: 4
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/2a22ccdabda07fda7b8cb8359f90a36815ff5d6e
