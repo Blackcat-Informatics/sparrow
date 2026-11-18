@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 348,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/348-flaky-test-expiry-below-the-floor-hands",
+  "branch": "paudley/348-flaky-test-expiry-below-the-floor-hands",
+  "slug": "flaky-test-expiry-below-the-floor-hands",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/348-flaky-test-expiry-below-the-floor-hands/.stage/flaky-test-expiry-below-the-floor-hands",
+  "stage_tracked": true,
+  "base": "origin/main",
+  "base_oid": "9ed59439576f25579395d6d699d7dca2179f84cd",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/348-flaky-test-expiry-below-the-floor-hands",
+    "branch:paudley/348-flaky-test-expiry-below-the-floor-hands",
+    "ignored:3 files (3 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow/.worktrees/347-flaky-test-an-ingest-peer-over-the caches into /home/paudley/Active/sparrow/.worktrees/348-flaky-test-expiry-below-the-floor-hands plus 0 dependency units from 0 other checkouts in 22.3s; 315 unchanged files keep their built mtimes; 1 other files take the seed time and rebuild; 35 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/348-flaky-test-expiry-below-the-floor-hands/.stage/flaky-test-expiry-below-the-floor-hands",
+    "issue:/home/paudley/Active/sparrow/.worktrees/348-flaky-test-expiry-below-the-floor-hands/.stage/flaky-test-expiry-below-the-floor-hands/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-16T19:03:32-0600",
+  "seed_error": ""
+}
