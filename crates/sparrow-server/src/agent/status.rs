@@ -513,7 +513,7 @@ fn floor_pause(status: wire::floor_pause_status::Reader<'_>) -> Value {
 
 /// The archive worker's phase, watermark and last failure (#365); a daemon that predates them
 /// reports `not_configured`, an empty watermark and no failure.
-fn archive_worker(status: wire::archive_worker_status::Reader<'_>) -> capnp::Result<Value> {
+fn archive_worker(status: wire::archive_worker_status::Reader<'_>) -> Result<Value> {
     let phase = match status.get_phase()? {
         wire::ArchivePhase::NotConfigured => "not_configured",
         wire::ArchivePhase::Idle => "idle",
@@ -530,7 +530,13 @@ fn archive_worker(status: wire::archive_worker_status::Reader<'_>) -> capnp::Res
                 .with("code", failure.get_code()?.to_str()?)
                 .with("segment", failure.get_segment()?.to_str()?)
                 .with("reason", failure.get_reason()?.to_str()?)
-                .with("since", failure.get_since().to_string())
+                .with(
+                    "since",
+                    match failure.get_since()?.which()? {
+                        wire::optional_instant::Absent(()) => Value::Null,
+                        wire::optional_instant::Value(instant) => super::instant(instant?)?.into(),
+                    },
+                )
                 .into()
         }
     };

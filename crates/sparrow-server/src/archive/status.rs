@@ -41,8 +41,8 @@ pub(crate) struct Failure {
     pub(crate) segment: String,
     /// The cause, cut to a bounded length.
     pub(crate) reason: String,
-    /// Unix milliseconds the failure began; 0 when the clock itself failed.
-    pub(crate) since: u64,
+    /// Unix milliseconds the failure began; absent while the clock could not be read.
+    pub(crate) since: Option<u64>,
 }
 
 /// A copy of the published state.
@@ -95,13 +95,20 @@ impl ArchiveStatus {
         state.failure = None;
     }
 
-    /// A pass failed at `now`. A failure with the same code and segment as the one standing
-    /// keeps its start, so `since` dates the trouble and not the latest retry.
-    pub(crate) fn pass_failed(&self, code: &'static str, segment: &str, reason: &str, now: u64) {
+    /// A pass failed at `now`, when the clock could be read. A failure with the same code and
+    /// segment as the one standing keeps its start, so `since` dates the trouble and not the
+    /// latest retry; a start missing for want of a clock is filled in once `now` is known.
+    pub(crate) fn pass_failed(
+        &self,
+        code: &'static str,
+        segment: &str,
+        reason: &str,
+        now: Option<u64>,
+    ) {
         let mut state = self.lock();
         let since = match &state.failure {
             Some(standing) if standing.code == code && standing.segment == segment => {
-                standing.since
+                standing.since.or(now)
             }
             _ => now,
         };
@@ -133,7 +140,11 @@ impl ArchiveStatus {
                 value.set_code(failure.code);
                 value.set_segment(&failure.segment);
                 value.set_reason(&failure.reason);
-                value.set_since(failure.since);
+                let mut since = value.init_since();
+                match failure.since {
+                    None => since.set_absent(()),
+                    Some(millis) => since.init_value().set_unix_millis(millis),
+                }
             }
         }
     }

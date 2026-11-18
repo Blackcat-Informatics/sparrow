@@ -821,7 +821,7 @@ hung mount still reports where it stopped.
 | Field | Ordinal | Meaning |
 | --- | --- | --- |
 | `phase` | 0 | `ArchivePhase`: `notConfigured` (no worker runs), `idle`, `preparing`, `writing` (root checks and file writes), `verifying` (read-back, decode and commit) or `holding` (the last pass failed and the worker waits to retry). |
-| `through` | 1 | The durable `archive:through` watermark; empty before the first commit. |
+| `through` | 1 | The durable `archive:through` watermark; empty before the first commit. The worker reads it, with `intentInFlight`, from the store when it starts and at the top of every pass, so status is right after a restart and on passes that fail before they choose a segment. |
 | `intentInFlight` | 2 | A prepared segment is recorded and not yet committed. |
 | `failure` | 3 | `OptionalArchiveFailure`: absent, or the last failed pass. |
 
@@ -829,11 +829,12 @@ hung mount still reports where it stopped.
 `ARCHIVE_NOT_ON_MOUNT`, `ARCHIVE_OVERRAN`, `INVALID_ARGUMENT`, or the store's own code such as
 `STORAGE_PRESSURE`), `segment` (1: the segment file name, empty when the failure came before a
 segment was chosen), `reason` (2: the cause, cut to 512 characters; the journal line holds it
-whole) and `since` (3: Unix milliseconds the failure began, kept while the same code and
-segment keep failing, 0 when the clock itself failed). A pass that ends without error clears
+whole) and `since` (3: an `OptionalInstant`, when the failure began, kept while the same code and
+segment keep failing; absent while the clock could not be read, and filled in on the first pass
+that reads it). A pass that ends without error clears
 the failure and returns the phase to `idle`. CLI and MCP status render the field as
 `archive_worker` with `phase`, `through`, `intent_in_flight` and `failure` (`code`, `segment`,
-`reason`, `since`, or null).
+`reason`, `since` as an instant or null, or the whole failure null).
 
 ### Archive prepare halvings and the daemon's library warnings (#324)
 
