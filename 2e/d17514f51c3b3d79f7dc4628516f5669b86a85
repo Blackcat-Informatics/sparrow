@@ -1,0 +1,23 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: a0388b37ef6fd4ed06176d5d8e4d8e1e419589de
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 355
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/355
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 9ff21741d889d79d24039657499de13224d4c62a
+GhpRsq-Head-Ref: paudley/349-flaky-test-cancelled-rpc-keeps-worker
+GhpRsq-Head-OID: a0388b37ef6fd4ed06176d5d8e4d8e1e419589de
+GhpRsq-Result-Tree: 840e83ed456f237440f5f4947fb6a6f8079e31e6
+GhpRsq-Result-Commit: 2ed17514f51c3b3d79f7dc4628516f5669b86a85
+GhpRsq-Parent-Hashes: a0388b37ef6fd4ed06176d5d8e4d8e1e419589de
+GhpRsq-Squash-Notes-SHA256: 269720ead49560ea729745639d3d5c14fc3b4d089c1462980aa4f01dc43df246
+GhpRsq-Stage-Tree: 204176f98bf37fd7d6e9bf1402787c2ea8961bbf
+GhpRsq-Stage-Commit: 3e52db3e7bbce44935b0a4002249595697eccec4
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/3e52db3e7bbce44935b0a4002249595697eccec4
+GhpRsq-Stage-Ref: refs/ghprsq/pr/355/stage
+GhpRsq-Stage-Files: 4
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/3e52db3e7bbce44935b0a4002249595697eccec4
