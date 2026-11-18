@@ -171,8 +171,9 @@ therefore rebuilds and adopts its existing segments. A different PurRDF revision
 a different identity for the same range. The file name depends only on the range, so no
 second file is written. A rebuild of the same range under another identity replaces the
 uncommitted intent (section 7), and one against a file already in place that the decoder
-did not refuse fails the byte-equal check in section 8. Every later pass then fails until
-an operator resolves it, and the watermark does not move.
+did not refuse fails the byte-equal check in section 8: that pass fails, and every later pass
+fails the same way, until an operator moves that file aside (the journal line names it); the
+watermark does not move.
 
 ## 4. Content
 
@@ -334,9 +335,13 @@ it exists and differs, the pass fails with a verify error and the watermark does
 Only a verified segment is committed: verification decodes the segment with the same
 decoder as `sparrow-archive verify`, so each record's bytes must hash to the digest its
 link quad names. When the decoder refuses a segment, the worker renames the file to
-`<name>.refused` (kept for inspection, never deleted), the watermark stays and the intent
+`<name>.<segment id hex>.refused` (kept for inspection, never deleted; the identity covers
+the bytes, so refusals of different bytes never collide and the same bytes refused again
+leave one copy), the watermark stays and the intent
 stays. The next pass rebuilds the range; bytes of another identity replace the intent and take
-the freed name, and the same bytes are refused again. A Synology NFS export must use synchronous writes
+the freed name, and the same bytes are refused again. A valid file a crash left under the
+range's name, followed by a rebuild under another identity, fails the byte-equal check; the
+journal line names the file, and the operator moves it aside. A Synology NFS export must use synchronous writes
 (`sync`); with `async` exports fsync proves nothing.
 
 Crash recovery follows from the intent:

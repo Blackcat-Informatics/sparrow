@@ -366,36 +366,49 @@ fn verify_segment(
             fs::read(&path).map_err(io_at("read back", &path))?
         };
         if read != *expected {
-            return Err(ArchiveError::Verify {
-                path,
-                reason: format!(
-                    "{} bytes read, {} written, or contents differ",
-                    read.len(),
-                    expected.len()
-                ),
-            });
+            let reason = format!(
+                "{} bytes read, {} written, or contents differ; if an earlier pass left \
+                 a valid file under another identity, move {} aside",
+                read.len(),
+                expected.len(),
+                path.display()
+            );
+            return Err(ArchiveError::Verify { path, reason });
         }
     }
     decode::verify(&segment.files).map_err(|reason| {
-        // The bytes were written as prepared and the decoder refuses them. Move them aside to
-        // `<name>.refused` (kept for inspection) so a rebuild of the same range under another
-        // identity can take the name; the watermark has not moved and nothing is deleted.
-        for (name, _) in &segment.files {
-            let path = store_dir.join(name);
-            let aside = store_dir.join(format!("{name}.refused"));
-            if let Err(error) = fs::rename(&path, &aside) {
-                return ArchiveError::Io {
-                    step: "set a refused segment aside",
-                    path,
-                    source: error,
-                };
-            }
-        }
+        // The bytes were written as prepared and the decoder refuses them. Move each file
+        // aside to `<name>.<segment id hex>.refused` and keep it for inspection, so a rebuild
+        // of the same range under another identity can take the name. The identity covers the
+        // bytes, so refused files of different bytes never collide; the same bytes refused
+        // again replace one identical copy. The watermark has not moved, nothing is deleted,
+        // and the decoder's reason survives any failure to set the file aside.
+        let reason = match set_aside(flight, store_dir, segment) {
+            Ok(()) => reason,
+            Err(failure) => format!("{reason}; {failure}"),
+        };
         ArchiveError::Verify {
             path: store_dir.to_path_buf(),
             reason,
         }
     })
+}
+
+/// Rename each refused file to `<name>.<segment id hex>.refused`, then sync the directory.
+fn set_aside(flight: &Flight, store_dir: &Path, segment: &PreparedSegment) -> Result<(), String> {
+    for (name, _) in &segment.files {
+        let path = store_dir.join(name);
+        let aside = store_dir.join(format!("{name}.{}.refused", segment.id_hex()));
+        let _step = flight.step("set a refused segment aside", &path);
+        fs::rename(&path, &aside).map_err(|error| {
+            format!(
+                "setting {} aside as {} failed: {error}",
+                path.display(),
+                aside.display()
+            )
+        })?;
+    }
+    sync_dir(flight, store_dir).map_err(|error| error.to_string())
 }
 
 /// Filesystem magic numbers (`statfs` `f_type`) of the network filesystems an archive share is
@@ -974,9 +987,14 @@ mod tests {
         // so the rebuilt segment has another identity over the same range: the store replaces
         // the intent and the worker writes the rebuilt segment and commits it.
         let target = root.join("s").join(&segment.files[0].0);
-        let aside = root
-            .join("s")
-            .join(format!("{}.refused", segment.files[0].0));
+        let aside_of = |segment: &PreparedSegment| {
+            root.join("s").join(format!(
+                "{}.{}.refused",
+                segment.files[0].0,
+                segment.id_hex()
+            ))
+        };
+        let aside = aside_of(&segment);
         assert!(!target.exists(), "the name is free for the rebuild");
         assert_eq!(
             fs::read(&aside).unwrap(),
@@ -990,6 +1008,20 @@ mod tests {
                 .intent
                 .map(|i| i.segment_id),
             Some(segment.segment_id)
+        );
+        // A second refusal with different bytes keeps the first refused file.
+        let mut second = segment.clone();
+        second.segment_id = [6; 32];
+        second.files[0].1 = sparrow_test_support::forged_segment(b"alpha\n", b"charlie\n");
+        archive_segment(&flight(), &store, &root, "s", &second).unwrap_err();
+        assert_eq!(
+            fs::read(&aside).unwrap(),
+            sparrow_test_support::forged_segment(b"alpha\n", b"bravo\n"),
+            "the earlier refused file is kept"
+        );
+        assert_eq!(
+            fs::read(aside_of(&second)).unwrap(),
+            sparrow_test_support::forged_segment(b"alpha\n", b"charlie\n")
         );
         let rebuilt = PreparedSegment {
             segment_id: [7; 32],
