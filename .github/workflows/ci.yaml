@@ -72,6 +72,10 @@ jobs:
         with:
           workspaces: sparrow
 
+      - name: Install the commit hook
+        working-directory: sparrow
+        run: make install-hooks
+
       - name: make check
         working-directory: sparrow
         run: make check

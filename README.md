@@ -146,7 +146,7 @@ git -C ../purrdf checkout "$(sed -n 's/^git_revision = "\(.*\)"/\1/p' registry/c
 
 make check          # fmt, release Clippy (warnings denied), shipped crates without test-support, release tests, census
 make build-runtime  # release server and client binaries
-make install-hooks  # run make check before every commit
+make install-hooks  # run make precommit before every commit
 ```
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for the gate, the PurRDF reuse rules

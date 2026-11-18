@@ -29,7 +29,7 @@ cargo run --locked --release -p sparrow-helper-census -- --dump-ledger
 ```
 
 Hook installation uses Git 2.54's additive `hook.sparrow-verify` configuration in
-the checkout's local Git config. It runs `make check` on commits; it does not
+the checkout's local Git config. It runs `make precommit` on commits; it does not
 replace Stage hooks or change global configuration. Install it in each checkout.
 
 To use another PurRDF checkout, pass `--purrdf-repo /path/to/purrdf` with a cross
