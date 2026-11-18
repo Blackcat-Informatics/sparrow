@@ -322,7 +322,25 @@ struct Status {
   # daemon started. In memory, so it restarts at zero. A reader that does not know this field
   # sees no change.
   archiveHalvings @63 :UInt64;
+  # Additive (#365): the archive worker's phase, durable watermark and last failure, as the
+  # worker last published them. A reader that does not know this field sees no change.
+  archiveWorker @64 :ArchiveWorkerStatus;
 }
+# The archive worker as of the end of its last step. `through` is the durable `archive:through`
+# watermark, empty before the first commit; `intentInFlight` is true while a prepared segment
+# is recorded and not yet committed. `failure` is the last failed pass and is absent once a
+# pass ends without error. `holding` is the phase between a failed pass and the next one.
+enum ArchivePhase { notConfigured @0; idle @1; preparing @2; writing @3; verifying @4; holding @5; }
+struct ArchiveWorkerStatus {
+  phase @0 :ArchivePhase; through @1 :Text; intentInFlight @2 :Bool;
+  failure @3 :OptionalArchiveFailure;
+}
+# `code` is the error class (`ARCHIVE_VERIFY`, `ARCHIVE_IO`, `STORAGE_PRESSURE`, ...); `segment`
+# is the segment's file name, empty when the failure came before a segment was chosen; `reason`
+# is the cause, cut to a bounded length; `since` is the Unix milliseconds the failure began,
+# kept across repeated passes with the same code and segment, 0 when the clock itself failed.
+struct ArchiveFailure { code @0 :Text; segment @1 :Text; reason @2 :Text; since @3 :UInt64; }
+struct OptionalArchiveFailure { union { absent @0 :Void; value @1 :ArchiveFailure; } }
 # RDF staging refusals since the daemon started: `refusals` counts every refused graph, not
 # refused intakes. A projection graph an ingest absorbs into a failed projection counts, and the
 # batch can still fail afterwards on a later graph, which counts again. The `last*` fields name the latest: the limit

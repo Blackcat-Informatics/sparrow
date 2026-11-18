@@ -636,9 +636,10 @@ Schema 63 adds the enum values `PressurePhase.awaitingArchive` and
 `EvictionFrontier.archiveLag`. CLI and MCP status render them as
 `awaiting_archive` and `archive_lag`. `Status.pressureStatus` reports `archiveConfigured` and `archiveHeld`
 (`PressureStatus` ordinals 36 and 37), and `Status` reports `archiveHalvings`
-(ordinal 63). The worker's phase, watermark, backlog age, last
-segment and a listing of held entries are not in the schema through 71; they
-need a later schema. The daemon journals a failed pass and a held entry.
+(ordinal 63). `Status.archiveWorker` (ordinal 64) reports the worker; see
+[Archive worker status](#archive-worker-status-365). Backlog age, the last
+segment and a listing of held entries are not in the schema. The daemon journals a failed
+pass and a held entry.
 
 ### Table rewrite status (schema 64)
 
@@ -809,6 +810,30 @@ Every counted refusal writes its line; none is thinned. The line is written with
 panicking, because it is written while the store's writer lock is held, and a failed
 stderr write is dropped (the counter still holds the fact). Whether to stage an artifact's RDF in pieces or store it with
 its graph deferred is separate work.
+
+### Archive worker status (#365)
+
+`Status.archiveWorker` (field 64, additive; a reader that does not know it sees no change) is
+an `ArchiveWorkerStatus`, a copy the worker publishes as each step ends. `status` reads the
+copy and never waits on the worker or takes the store's writer lock, so a worker stuck on a
+hung mount still reports where it stopped.
+
+| Field | Ordinal | Meaning |
+| --- | --- | --- |
+| `phase` | 0 | `ArchivePhase`: `notConfigured` (no worker runs), `idle`, `preparing`, `writing` (root checks and file writes), `verifying` (read-back, decode and commit) or `holding` (the last pass failed and the worker waits to retry). |
+| `through` | 1 | The durable `archive:through` watermark; empty before the first commit. |
+| `intentInFlight` | 2 | A prepared segment is recorded and not yet committed. |
+| `failure` | 3 | `OptionalArchiveFailure`: absent, or the last failed pass. |
+
+`ArchiveFailure` carries `code` (ordinal 0: `ARCHIVE_VERIFY`, `ARCHIVE_IO`, `ARCHIVE_ROOT`,
+`ARCHIVE_NOT_ON_MOUNT`, `ARCHIVE_OVERRAN`, `INVALID_ARGUMENT`, or the store's own code such as
+`STORAGE_PRESSURE`), `segment` (1: the segment file name, empty when the failure came before a
+segment was chosen), `reason` (2: the cause, cut to 512 characters; the journal line holds it
+whole) and `since` (3: Unix milliseconds the failure began, kept while the same code and
+segment keep failing, 0 when the clock itself failed). A pass that ends without error clears
+the failure and returns the phase to `idle`. CLI and MCP status render the field as
+`archive_worker` with `phase`, `through`, `intent_in_flight` and `failure` (`code`, `segment`,
+`reason`, `since`, or null).
 
 ### Archive prepare halvings and the daemon's library warnings (#324)
 

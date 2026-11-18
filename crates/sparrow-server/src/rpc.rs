@@ -105,6 +105,8 @@ pub struct Rpc {
     admin: Option<String>,
     /// The free-space pause's counters (#257), shared with the daemon's accept loops.
     pause: crate::floor_pause::FloorPause,
+    /// The archive worker's published state (#365); `notConfigured` without a worker.
+    archive: crate::archive::ArchiveStatus,
 }
 
 /// The full typed service and the ingest socket run no CHAP; only anonymous TCP does.
@@ -181,6 +183,7 @@ impl Rpc {
             connection: Default::default(),
             syslog: crate::syslog_listener::SyslogRegistry::default(),
             pause: crate::floor_pause::FloorPause::new(store.space_floor()),
+            archive: crate::archive::ArchiveStatus::new(),
             store,
             admission: crate::admission::Admission::new(requests),
             connections: None,
@@ -203,6 +206,13 @@ impl Rpc {
     #[must_use]
     pub fn floor_pause(&self) -> &crate::floor_pause::FloorPause {
         &self.pause
+    }
+
+    /// Report the archive worker's published state in `status`.
+    #[must_use]
+    pub fn with_archive_status(mut self, archive: crate::archive::ArchiveStatus) -> Self {
+        self.archive = archive;
+        self
     }
 
     /// Use the daemon's one admission, which shutdown closes to interrupt waiting writers.
@@ -3341,6 +3351,7 @@ impl wire::sparrow::Server for Rpc {
                     staging.set_last_bytes(number(&value, "staging_refused_last_bytes")?);
                 }
                 out.set_archive_halvings(number(&value, "archive_halvings")?);
+                self.archive.encode(out.reborrow().init_archive_worker());
                 out.set_pin_read_handles(number(&value, "pin_read_handles")?);
                 out.set_pin_read_bytes(number(&value, "pin_read_bytes")?);
                 out.set_max_pin_read_handles(number(&value, "max_pin_read_handles")?);
