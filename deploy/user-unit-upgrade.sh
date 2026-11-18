@@ -12,7 +12,7 @@
 # fix forward on TO. It serves until Sparrow issue #22 moves the store to the system unit.
 # Ported from the operator's restart-bundle.sh; its predecessor restart-schema68.sh ran clean on
 # the live host on 2026-11-07 (exit 0, 180 s down).
-# Every check that can refuse runs before anything changes. Run it only on coordination's "go".
+# Every check that can refuse runs before anything changes. Run it only when the restart is authorized.
 set -euo pipefail
 umask 077
 

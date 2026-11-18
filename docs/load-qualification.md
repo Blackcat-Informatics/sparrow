@@ -58,8 +58,8 @@ seconds on tmpfs (about 1.8 ms per record) and did not finish within the
 log import on tmpfs found 1,361 `fdatasync` calls, 13,567 `statx` and 2,670
 `getdents64`: preparation committed one synced batch per record and per RPC,
 each with its own footprint measurement. Deep JSON costs more per record (about
-100 ms on tmpfs) but less per byte; that cost is JSON-specific and stays parked
-under the 2026-10-27 ruling.
+100 ms on tmpfs) but less per byte; that cost is JSON-specific and is not
+addressed here.
 
 Preparation now commits up to 256 ordinary records per synced batch, adding
 records after the first only while their source stays within 256 KiB. Measured
@@ -431,8 +431,8 @@ load measurements or a general shutdown latency guarantee.
 ## Source summary migration (issue #14)
 
 Issue #14 set a target of seeding the per-source counters and artifact index in
-under 60 seconds at open. The 2026-11-07 ruling that store format changes
-follow the online migration criterion of #18 replaces that target: the open
+under 60 seconds at open. Store format changes follow the online migration
+criterion of #18 instead of that target: the open
 fences the store and serves at once, and the `source-summary` migration runs in
 the maintenance duty afterwards (see "Per-source counters and artifact index"
 in the [interfaces](interfaces.md)). Its duration on the live store is not recorded here: the
@@ -443,7 +443,7 @@ tool that measured it on a restored backup was removed with the online backup (#
 The live daemon (schema 68 image, two background jobs, two 8 MiB memtables per family)
 spent 35 percent of its life with writes stalled or stopped (issue 160). Its LOG on
 2026-11-09 shows 57 slowdowns and 19 stops from 01:00 to 04:40 (the issue's comment), and
-440 and 141 from 04:40 to 09:00 and 139 and 51 from 09:00 to 14:30 (coordination's count
+440 and 141 from 04:40 to 09:00 and 139 and 51 from 09:00 to 14:30 (counted
 over all rotated logs), with level 0 at 20 to 24 files on the slowdown lines. The live
 stops were "2 immutable memtables (waiting for flush)": both write buffers were full
 while one flushed.

@@ -53,4 +53,4 @@ reason = "Pin group A repin (D69, memetics #202): purrdf, gmeow-ontology, rust-a
 date = "2026-11-11"
 supplier = "purrdf"
 revision = "f48977d3fe6f15be473fd344562ca95f48310923"
-reason = "Repin to the released purrdf =4 (Patrick, 2026-11-09: exactly \"=4\", no patch form; issue 164). Cargo.lock resolves 4.0.2 from crates.io, tag rust-v4.0.2 is this revision, and no git, revision, path or patch source remains. The census reference and the text lexicons (which the registry crates exclude) move to the same revision; the lexicon tree is identical to the one at c6d670c."
+reason = "Repin to the released purrdf =4 (exactly =4, no patch form; issue 164). Cargo.lock resolves 4.0.2 from crates.io, tag rust-v4.0.2 is this revision, and no git, revision, path or patch source remains. The census reference and the text lexicons (which the registry crates exclude) move to the same revision; the lexicon tree is identical to the one at c6d670c."

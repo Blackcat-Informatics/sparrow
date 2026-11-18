@@ -23,11 +23,10 @@ unit. Earlier transient-unit and schema sections retain history.
 
 ## Production sources, memory limits and backups
 
-On 2026-10-27 the unit gained `MemoryHigh=2G` and `MemoryMax=4G` at Patrick's
-direction, installed with a daemon reload; the cgroup reports 2147483648 and
-4294967296 bytes.
+The unit sets `MemoryHigh=2G` and `MemoryMax=4G`, installed with a daemon
+reload; the cgroup reports 2147483648 and 4294967296 bytes.
 
-Patrick approved five lab-local sources, all fed through the
+Five lab-local sources are fed through the
 [shipper](deployment.md#shipping-finished-files-from-producers-that-keep-them)
 into consume roots under `~/.local/state/sparrow/intake/`. Their watches
 (revisions 8 to 12) and sources share these names:
@@ -53,8 +52,7 @@ attempts. Later chunks are 1 MiB. On the live store, records rose from 217 to
 On 2026-10-28 the backlog saturated the host's disk and CPU. The installed
 `43e8f2a` daemon could not finish a 1 MiB deep-JSONL chunk within the 60-second
 connection lease, so every chunk was retried about once a minute, and the store
-grew to 10.1 GB in a day. Patrick stopped it. Mentation has moved to memetics
-and was retired at his direction:
+grew to 10.1 GB in a day. The mentation source was stopped and retired:
 
 - Its source left `ship.toml`, and the shipper's 1,125 queued copies (1.1 GB,
   all single-link files) were deleted. The producer's 130 original segments
@@ -146,7 +144,7 @@ the build. Only the daemon carries `cap_net_bind_service=ep`. The previous
 `bee07bc` images remain for rollback. The configuration was backed up as
 `~/.config/sparrow/server.toml.pre-chap-43e8f2a`. It gained `rpc_tcp_secret_file`
 for a new 32-byte random mode-0600 secret, and `disk_budget` rose from 512 MiB to
-50 GiB (`53687091200`) at Patrick's direction. The store filesystem had 353 GB free.
+50 GiB (`53687091200`). The store filesystem had 353 GB free.
 
 No `sparrowd` process remained before cutover. Startup removed the refused stale
 socket under the store lock and reconciled both watches. Live checks preserve

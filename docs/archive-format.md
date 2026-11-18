@@ -11,7 +11,7 @@ as a NAS. This document defines the archive's on-disk format, the write
 protocol, and the rules that keep deletion behind the archive. Tools written
 later must be able to read the archive without a running Sparrow.
 
-Patrick's rulings bind this design:
+These requirements bind this design:
 
 - Segments are GTS files, written through PurRDF's GTS writer.
 - Sparrow never deletes unarchived evidence, even when the archive is down.
@@ -26,8 +26,7 @@ Patrick's rulings bind this design:
 - An entry that cannot be archived is held, never skipped or deleted: archiving stops
   before it and reports it (section 6).
 - Content projection graphs are archived.
-- Sparrow has no configurable per-artifact byte limit (2026-11-01: "Remove the
-  limit"). Entries are records. New layouts cap a record at 128 MiB, but stores
+- Sparrow has no configurable per-artifact byte limit. Entries are records. New layouts cap a record at 128 MiB, but stores
   laid out earlier may hold larger raw records, and either can exceed the
   closing target, so a segment must be able to hold an entry larger than its
   target.

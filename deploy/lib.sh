@@ -341,7 +341,7 @@ print(v["store_id"], v["schema_version"], v["pressure"]["phase"], len(v["consume
         "$store" "$schema" "$pressure" "$durability" "$watches"
 }
 
-# Copy-on-write is off for the store (Patrick, 2026-10-15: "COW off everywhere"), by Katamari's
+# Copy-on-write is off for the store, by Katamari's
 # mechanism (katamari-io copy_on_write.rs). On btrfs, a file or directory created in a directory
 # that carries the no-copy-on-write attribute (chattr +C) inherits it. So the attribute is set on
 # a directory before anything is written there. A file that already holds data keeps
