@@ -182,14 +182,14 @@ A test in the suite runs for every change, forever; it must earn its keep.
   Clippy with warnings denied, each shipped crate alone without test-support
   (`make check-shipped`), release tests, the census self-tests and the pinned
   cross-workspace gate. The pre-commit hook runs `make precommit` (formatting,
-  release Clippy over all targets, document checks; no tests, no lock). Run
+  release Clippy over all targets; no tests, no lock). Run
   `make check` on a change's head before merge and cite its EXIT line in the PR body.
 - Install the hook with `make install-hooks` in each checkout (Git 2.54 or
   newer) and preserve existing hooks. Commit verification is never bypassed:
   no skip flag, no `-n`, no `SKIP=`, no `HUSKY=0`, no equivalent. Wait for a
   slow hook and fix what it finds; a change that cannot pass is not committed.
-- Run one heavy command at a time across all workers: every cargo command,
-  test suite goes through `flock` on `.stage/cargo.lock` in the main
+- Run one heavy command at a time across all workers: every cargo command
+  and test suite goes through `flock` on `.stage/cargo.lock` in the main
   checkout. Send its output to a log under `.stage/` with the tool's own exit
   status after it, and name the tree it ran in. A status read through a pipe,
   or a result built in the wrong directory, is not evidence.
