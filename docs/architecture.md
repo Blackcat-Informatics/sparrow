@@ -238,8 +238,8 @@ occurrence counts remain separate.
 
 ### 4.3 Budgets and reclamation
 
-The deployment must supply a disk budget and a maintenance reserve. Thirty days
-bounds age; it does not by itself bound bytes. Account for table/blob files,
+The deployment must supply a disk budget and a maintenance reserve. The 30-day
+deadline does not by itself bound bytes. Account for table/blob files,
 journals, incomplete imports, dictionaries, indexes, old snapshot versions, and
 compaction output. Distinguish live logical bytes from measured physical bytes.
 
@@ -285,7 +285,7 @@ filesystem quota's responsibility.
 
 ### 4.4 Archive before delete
 
-Sparrow keeps a 30-day searchable window of disposable logs. It can also
+Sparrow keeps disposable logs searchable until their 30-day deadline. It can also
 archive aged-out evidence to a large, slower store, such as a NAS, before
 deleting it. The archive writes GTS segment files through PurRDF's GTS writer,
 as specified in [the archive format](archive-format.md). Archiving is optional and

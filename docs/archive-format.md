@@ -5,7 +5,7 @@ SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 # Sparrow archive format: `sparrow-archive/1`
 
-Sparrow keeps a searchable 30-day window of disposable logs. Before it deletes
+Sparrow keeps disposable logs searchable until their 30-day deadline. Before it deletes
 aged-out evidence, it can write that evidence to a large, slower archive, such
 as a NAS. This document defines the archive's on-disk format, the write
 protocol, and the rules that keep deletion behind the archive. Tools written

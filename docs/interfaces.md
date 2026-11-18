@@ -63,9 +63,9 @@ source the producer names; the source is the item's lasting address in queries.
 [Large artifacts](#large-artifacts-schema-65)). What bounds an item is:
 
 - the disk budget, the maintenance reserve and the free-space floor
-  (`disk_budget`, `maintenance_reserve`, `min_free_bytes`): at the budget, while
-  nothing can be retired, ingest is refused with `STORAGE_PRESSURE`, which is
-  retryable;
+  (`disk_budget`, `maintenance_reserve`, `min_free_bytes`): while nothing can be retired, ingest is
+  refused with `STORAGE_PRESSURE`, which is retryable, once the store reaches the
+  budget less the reserve or free space is below the floor;
 - the inline ingest bound: one inline `ingest` carries at most 16 MiB
   (`Discovery.maxInlineArtifactBytes`) and a larger one is refused with
   `RESOURCE_LIMIT`. It applies to a single inline `ingest`, not to imports; a
@@ -107,7 +107,7 @@ segment counts only once it is written and verified. Disk pressure can retire
 archived, unpinned items earlier. A pin keeps an item until the pin ends. The
 deletion gate keeps every unarchived item past its deadline, so with no archive
 running (the live daemon today) nothing retires and ingest is refused with
-`STORAGE_PRESSURE` at the budget. Source timestamps do not move the deadline. Whether the
+`STORAGE_PRESSURE` at the budget less the reserve or below the floor. Source timestamps do not move the deadline. Whether the
 archive worker runs on the live daemon is stated in
 [Archive status](archive-format.md#archive-status).
 
@@ -1540,7 +1540,7 @@ they do not specify their generated wire grammar.
 
 | Setting | Initial contract |
 | --- | --- |
-| Retention | Global 30 days after acceptance; earlier unpinned eviction under pressure. |
+| Retention | Global deadline 30 days after acceptance for an unpinned item, retired once archived; earlier eviction of archived, unpinned items under pressure; a pin or an unarchived item keeps it longer. |
 | Buffered durability | Two-second flush interval, configurable; expose lag and bounded-queue pressure. |
 | Watch detection | Linux inotify first, with recursive startup/overflow/periodic reconciliation. |
 | Completed-file readiness | `close_or_idle`: writable-close/publication candidates plus scan-stable pre-existing files, within a finished-file producer contract. |

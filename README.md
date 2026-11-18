@@ -71,10 +71,14 @@ large directories of JSONL and `.log` files. Sustained throughput, import bursts
 and total storage density have finite workload measurements, not a production
 capacity guarantee; see the [acceptance boundary](docs/implementation-plan.md#current-acceptance-boundary).
 
-The default retention window is **up to 30 days from server acceptance**. Source
-timestamps remain queryable but do not determine expiry. A configured disk budget
-can cause earlier eviction of the oldest unpinned data. When protected data or
-unreclaimed storage prevents another write, ingestion applies backpressure.
+An unpinned item is due at `received_at + 30 days` (server acceptance) and is
+retired then once the archive holds it. Source timestamps remain queryable but
+do not determine expiry. Disk pressure can retire archived, unpinned items
+earlier. A pin keeps an item until the pin ends. The deletion gate keeps every
+unarchived item past its deadline, so with no archive running (the live daemon
+today) nothing retires and ingest is refused with `STORAGE_PRESSURE` at the
+budget less the reserve or below the free-space floor. When protected data or unreclaimed storage prevents another write,
+ingestion applies backpressure.
 
 Agents can retain selected evidence in named, expiring collections. For example:
 
