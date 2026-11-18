@@ -11,6 +11,36 @@ before implementation, and any `.baseline`, `.goals` and governing ADRs when
 present. This file is the single home of the working rules; `CLAUDE.md` only
 imports it.
 
+## Purpose
+
+Sparrow is a low-assurance, high-throughput, searchable, centralized log store,
+a radical improvement over scattered log files. It optimizes only for speed and
+storage efficiency, and it owes no more durability, privacy or tamper-evidence
+than the plain log files it replaces.
+
+- **Method.** One RocksDB store holds every artifact and record as exact bytes,
+  behind typed Cap'n Proto interfaces. PurRDF supplies the JSON and Markdown
+  projections, SPARQL and text search over them. Every item stays in the live
+  store for a 30-day window from receipt, then is written to the archive, and
+  nothing is deleted that has not been archived. The archive is implemented and
+  is not yet running on the live daemon; see
+  [Archive status](docs/archive-format.md#archive-status).
+- **Consumers.** Every daemon sends its operational log to Sparrow.
+  `lillith_memetics` sends cruft (see [Cruft](docs/interfaces.md#cruft)).
+  `lillith_decodes` searches what Sparrow holds.
+- **Suppliers.** PurRDF supplies RDF semantics, codecs, projections, SPARQL,
+  text analysis, scoring and query governors. The helper census is repository
+  tooling ported from Katamari; runtime crates do not depend on it.
+- **What Sparrow is not.** It is not a place for anything irreplaceable as its
+  only copy. Assurance, long-term storage, privacy, encryption, validation and
+  resilience work belongs to Katamari. The Katamari/Sparrow razor decides where
+  data lives: whatever needs those goes to Katamari, at a high and justified
+  bar, and everything else goes to Sparrow; it may cut one body of data into
+  sets and subsets, each placed by its own need
+  ([architecture, section 1](docs/architecture.md#1-goals-and-boundaries)).
+
+The [glossary](docs/glossary.md) names each term and the document that governs it.
+
 ## Authority
 
 - A direct word from Patrick in the session decides. Nothing below overrides it.

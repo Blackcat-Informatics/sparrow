@@ -43,6 +43,66 @@ MCP and CLI adapters call the generated Cap'n Proto daemon client. They must not
 implement separate filtering, retention, pin, or query semantics. The daemon
 owns the database; the local CLI and stdio MCP adapter connect to it.
 
+### Cruft
+
+Cruft is what a producer sends Sparrow as material it has set aside: files and
+records the producer no longer wants in its own store but does not want lost
+while it may still be wanted. `lillith_memetics` is the producer. Sparrow gives
+cruft no special path, type or retention: an item of cruft is an ordinary
+artifact or record, and the producer's cruft specification names its own rules
+for what the item means. Sparrow answers only where the item is and how long it
+stays.
+
+**Intake.** `lillith_memetics` sends cruft through the typed ingest and import
+operations, over the ingest-only Unix socket (`ingest_socket_path`, see the
+RPC binding in section 1 and the ingest socket in section 5) or the private
+socket, like any other producer. The ingest socket records the sender's uid,
+gid and pid in the item's provenance (`intake`). Every item is under the
+source the producer names; the source is the item's lasting address in queries.
+
+**Limits.** Sparrow has no per-artifact byte limit (see
+[Large artifacts](#large-artifacts-schema-65)). What bounds an item is:
+
+- the disk budget, the maintenance reserve and the free-space floor
+  (`disk_budget`, `maintenance_reserve`, `min_free_bytes`): at the budget, while
+  nothing can be retired, ingest is refused with `STORAGE_PRESSURE`, which is
+  retryable;
+- `max_records`, the records in one artifact;
+- `MAX_IMPORT_BYTES`, 8515420160 bytes (129935 chunks, about 7.93 GiB), a fixed
+  bound on one `import_begin` until the v2 store format (#5). A larger input is
+  split into parts of at most that many bytes, each imported as its own
+  request, and then the manifest is imported.
+
+**Finding one item's fate.** While the item is live, three reads find it:
+
+- `payloadLookup` (CLI `payload`, MCP `payload_lookup`) takes the item's
+  `blake3:` payload id and returns the artifacts that hold those bytes. The
+  answer is exact once the payload-index migration completes; before that,
+  every listed artifact is held and an unlisted one is unknown (see
+  [Payload id index](#payload-id-index-store-format));
+- `records` over the item's source lists its records;
+- `values_search` over the item's source finds it by content.
+
+Once the item has aged out, the archive holds it, if the archive is running (see
+[Archive status](archive-format.md#archive-status)). `sparrow-archive list DIR`
+prints one JSON line per segment with an `entries` array; each entry gives the
+artifact `id`, `source`, `received_at` and `byte_length`. It does not print
+payload ids. The reader matches the item by source, receipt time and length
+(or by the artifact id noted while the item was live), then runs
+`sparrow-archive extract DIR ARTIFACT_ID`, which writes the artifact's verified
+bytes to stdout. `sparrow-archive verify DIR` checks every segment. All three
+are offline and read-only.
+
+**Retention Sparrow guarantees.** Every item stays in the live store for 30 days
+from receipt (`received_at + 30 days`), then is written to the archive. Archiving
+begins early, by default at 75% of the window (day 22.5), and a segment counts
+only once it is written and verified. Nothing is deleted that has not been
+archived: the deletion gate, the archive watermark and the store fence enforce
+it (see [Archive-before-delete gate](#archive-before-delete-gate-schema-63)). A
+pin only delays deletion. Source timestamps do not move the deadline. Whether
+the archive worker runs on the live daemon is stated in
+[Archive status](archive-format.md#archive-status).
+
 ### Frozen scope receipts (schema 56)
 
 Record, text, artifact-group, key and value captures include a typed
@@ -566,9 +626,10 @@ resume edge.
 
 Schema 63 adds the enum values `PressurePhase.awaitingArchive` and
 `EvictionFrontier.archiveLag`. CLI and MCP status render them as
-`awaiting_archive` and `archive_lag`. Archive worker status, with its phase,
-watermark, backlog age, last segment and quarantine listing, belongs to the
-worker phase and will use a later schema.
+`awaiting_archive` and `archive_lag`. Status reports `archiveConfigured` and `archiveHeld` (ordinals 36 and 37) and
+`archiveHalvings` (ordinal 63). The worker's phase, watermark, backlog age, last
+segment and a listing of held entries are not in the schema through 71; they
+need a later schema. The daemon journals a failed pass and a held entry.
 
 ### Table rewrite status (schema 64)
 
@@ -2584,7 +2645,7 @@ family. Like the archive family, the fence includes the log time law.
 Archive manifests and link quads use the same namespace: `ArchiveStore`,
 `ArchiveSegment`, `ArchiveTable` and `QuarantineEntry` classes, and
 `payloadSha256`, `archiveFormat`, `storeId`, `table` and the other predicates
-listed in [the archive format](archive-format.md#9-manifest). Archive segments
+listed in [the archive format](archive-format.md#9-no-manifest). Archive segments
 hold only these facts and the store's existing graphs.
 
 The API returns occurrence/graph IRIs; clients do not construct them by guessing

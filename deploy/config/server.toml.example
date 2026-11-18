@@ -33,5 +33,5 @@ text_lexicon_dir = "/usr/local/share/sparrow/lexicons-REV/artifacts"
 # Consume watches live in the store's catalog; an entry here only seeds a missing catalog. Add
 # roots with `sparrow /SPARROW/store/rpc.sock watch put ...` (deploy/config/watch.toml.example).
 
-# The archive table is absent: the archive worker is not deployed, and the unit and profile do not
-# grant its path. Sparrow issues #15 to #17 add both.
+# The archive table is absent: the live daemon runs no archive worker, and the unit and profile do
+# not grant its path. See docs/archive-format.md, "Archive status".

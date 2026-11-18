@@ -53,8 +53,8 @@ attempts. Later chunks are 1 MiB. On the live store, records rose from 217 to
 On 2026-10-28 the backlog saturated the host's disk and CPU. The installed
 `43e8f2a` daemon could not finish a 1 MiB deep-JSONL chunk within the 60-second
 connection lease, so every chunk was retried about once a minute, and the store
-grew to 10.1 GB in a day. Patrick stopped it. Mentation has moved to memetics
-and was retired at his direction:
+grew to 10.1 GB in a day. Patrick stopped it. The mentation source was retired
+on 2026-10-28:
 
 - Its source left `ship.toml`, and the shipper's 1,125 queued copies (1.1 GB,
   all single-link files) were deleted. The producer's 130 original segments

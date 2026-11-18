@@ -24,7 +24,18 @@ Sparrow is a high-density, temporal diagnostic log and data server. It turns
 scattered operational artifacts into retained evidence that agents can discover,
 inspect, correlate, and query as a semantic graph.
 
-**Status: implemented and running; measured limits apply.** A RocksDB daemon, Cap'n Proto RPC,
+## Purpose
+
+The charter (what Sparrow is, its method, consumers, suppliers and what it is
+not) is the Purpose section of [AGENTS.md](AGENTS.md#purpose). In short, Sparrow
+is a low-assurance, high-throughput, searchable log store that optimizes only
+for speed and storage efficiency; anything irreplaceable, and all assurance,
+privacy, encryption and validation work, belongs to Katamari. The
+[glossary](docs/glossary.md) names each term and the document that governs it.
+
+## Status
+
+**Implemented and running; measured limits apply.** A RocksDB daemon, Cap'n Proto RPC,
 CLI with resumable typed file imports and bounded oversized-record preparation,
 stdio MCP, JSON field discovery, immutable JSON source-time and diagnostic profiles,
 mapped service/host/severity/trace/span filters,
@@ -39,7 +50,8 @@ WAL flush controls, and helper-census tooling are implemented. Active tailing
 with explicit completed-generation retirement, typed public TCP
 ingestion, and syslog are implemented. Stored-view SELECT, ASK, CONSTRUCT,
 DESCRIBE, measured EXPLAIN and native stored-text rank/span relations are
-implemented and deployed in schema 62. See [Development runtime](docs/development-runtime.md) for
+implemented. The wire schema is version 71. The archive is implemented and not
+yet running on the live daemon ([Archive status](docs/archive-format.md#archive-status)). See [Development runtime](docs/development-runtime.md) for
 present commands, verified behavior and limits.
 
 The production deployment is the system unit in [`deploy/`](deploy/README.md),
