@@ -808,21 +808,30 @@ fn fail_pass(flight: &Flight, code: &'static str, cause: String, at: Option<u64>
     cause
 }
 
+/// `cause`, with the clock's own error appended when the clock failed in the same pass.
+fn with_clock_error(cause: String, clock: &Result<u64, sparrow_core::Error>) -> String {
+    match clock {
+        Ok(_) => cause,
+        Err(clock) => format!("{cause}; clock: {clock}"),
+    }
+}
+
 /// One pass: publish the store's position, read the store id and the clock, and drain. A
 /// failure before `drain` is recorded in status here; `drain` records its own.
 fn pass(flight: &Flight, store: &Store, root: &Path) -> Result<u64, String> {
     let clock = crate::now();
     let at = clock.as_ref().ok().copied();
     if let Err(error) = publish_position(flight.status(), store) {
-        return Err(fail_pass(flight, error.code(), error.to_string(), at));
+        let cause = with_clock_error(error.to_string(), &clock);
+        return Err(fail_pass(flight, error.code(), cause, at));
     }
     let id = match store.store_id() {
         Ok(id) => id,
         Err(error) => {
-            let mut cause = format!("store id: {} {}", error.code, error.message);
-            if let Err(clock) = &clock {
-                cause = format!("{cause}; clock: {clock}");
-            }
+            let cause = with_clock_error(
+                format!("store id: {} {}", error.code, error.message),
+                &clock,
+            );
             return Err(fail_pass(flight, error.code, cause, at));
         }
     };
