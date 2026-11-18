@@ -44,8 +44,8 @@ integrity come after all other concerns and never on the hot path.
 
 Producers send Sparrow what they set aside, including the cruft that
 `lillith_memetics` sends. Sparrow stores it as any other artifact or record and
-keeps it 30 days in the live store, then in the archive; the intake, limits and
-lookup are in the [cruft section of the interfaces](interfaces.md#cruft).
+holds it live for at most 30 days from receipt and never deletes it before it
+is archived; the intake, limits and lookup are in the [cruft section of the interfaces](interfaces.md#cruft).
 
 There is one global 30-day retention policy. Per-class retention, replication,
 distributed queries, embeddings, an embedded language model, and a human
