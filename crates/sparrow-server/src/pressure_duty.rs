@@ -555,7 +555,7 @@ mod tests {
         assert!(later.lines[0].contains("2 failures since the last report"));
     }
 
-    // Value: #218 ruling: a new RocksDB error is surfaced at once, and the forced-failure
+    // Value (#218): a new RocksDB error is surfaced at once, and the forced-failure
     // line names the real reason. Protects: a failed pass that carries a new native error is
     // journaled inside the rate-limit window with its reason, is not journaled twice, and
     // an error already reported falls back to the bounded rate.

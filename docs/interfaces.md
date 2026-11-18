@@ -425,7 +425,7 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
   with the counters, and one when it ends. A pause that begins within a minute of the
   last line is announced only if it lasts a minute, so a volume hovering at the floor
   cannot flood the journal, and no long pause is silent.
-- Spool. A daemon-side file spool is not built; coordination accepted that for UDP. A
+- Spool. A daemon-side file spool is not built for UDP. A
   spool would append to the filesystem the floor protects, so it would need its own
   higher floor or a separate filesystem. What remains: Syslog UDP datagrams are held in the
   daemon up to `hold_bytes` and then in the kernel buffer, and are lost only past the
@@ -727,8 +727,7 @@ counter rows (see `sources_list` below) and remains one immutable capture.
 
 ### Large artifacts (schema 65)
 
-Patrick ruled on 2026-11-01: "Remove the limit". The configurable per-artifact
-limit is gone. The server configuration no longer has `max_artifact_bytes`. A
+Sparrow has no configurable per-artifact limit. The server configuration no longer has `max_artifact_bytes`. A
 configuration that still sets it refuses to start, and the error says to delete
 the key. The disk budget, the maintenance reserve and the free-space floor still
 bound what the store admits, and `max_records` still bounds the records in one
@@ -2942,7 +2941,7 @@ may call `discover`, `ingest`, `eventsIngest`, `flush` and the import operations
 (`importBegin` through `importCancel`). Every other operation, including
 `status`, returns a typed `UNAUTHENTICATED` failure. An operation added to the
 schema without an explicit admission decision returns Cap'n Proto `unimplemented`.
-The Unix socket serves the complete capability unchanged (rulings 2026-10-27).
+The Unix socket serves the complete capability unchanged.
 
 The ingest socket (`ingest_socket_path` and `ingest_socket_gid`, schema 68)
 shares this one producer list: anonymous TCP and the ingest socket forward the
