@@ -52,6 +52,9 @@ a worker runs, a store retires nothing on its own. Expiry waits, and under
 pressure ingest is refused with `STORAGE_PRESSURE`. Other documents link to this
 section for the state of the archive.
 
+A daemon with a worker reports its phase, watermark and last failure in status; see
+[section 8](#8-write-protocol).
+
 ## 1. Layout
 
 ```text
@@ -343,6 +346,15 @@ the freed name, and the same bytes are refused again. A valid file a crash left 
 range's name, followed by a rebuild under another identity, fails the byte-equal check; the
 journal line names the file, and the operator moves it aside. A Synology NFS export must use synchronous writes
 (`sync`); with `async` exports fsync proves nothing.
+
+A held worker is visible in status. After a failed pass `status` reports `archive_worker`
+(`Status.archiveWorker`) with `phase` `holding`, the watermark in `through`, `intent_in_flight`,
+and a `failure` naming the error `code`, the `segment` file, the `reason` and when it
+began (`since`). The worker retries every `check_secs`. To leave the hold, remove the cause the
+failure names: move a conflicting or refused file under `<root>/<store-id>/` aside, mount the
+share, or correct the `STORE_ID`. The next pass that ends without error clears the failure and
+returns the phase to `idle`, and the watermark has advanced if a segment committed. Nothing
+needs a restart.
 
 Crash recovery follows from the intent:
 

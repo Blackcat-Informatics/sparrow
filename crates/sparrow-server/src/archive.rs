@@ -19,6 +19,10 @@
 //! `io_timeout_secs` is not committed (see [`Flight`]).
 
 mod decode;
+mod status;
+
+pub use status::ArchiveStatus;
+use status::Phase;
 
 use sparrow_core::{ArchiveHold, HoldReason, PreparedSegment, Store};
 use std::{
@@ -46,6 +50,8 @@ pub(crate) struct Flight {
     /// device, or on a local filesystem of its type, is not on its mount.
     filesystem_root: PathBuf,
     state: Mutex<FlightState>,
+    /// What `status` reports; the worker publishes it as its steps end.
+    status: ArchiveStatus,
 }
 
 #[derive(Default)]
@@ -77,7 +83,14 @@ impl Flight {
             timeout,
             filesystem_root: PathBuf::from("/"),
             state: Mutex::new(FlightState::default()),
+            status: ArchiveStatus::new(),
         }
+    }
+
+    /// The same flight publishing to `status`, the copy the daemon's `status` call reads.
+    fn publishing_to(mut self, status: ArchiveStatus) -> Self {
+        self.status = status;
+        self
     }
 
     /// The same flight with another directory standing for the root filesystem, so a test
@@ -86,6 +99,10 @@ impl Flight {
     fn rooted_at(mut self, filesystem_root: impl Into<PathBuf>) -> Self {
         self.filesystem_root = filesystem_root.into();
         self
+    }
+
+    fn status(&self) -> &ArchiveStatus {
+        &self.status
     }
 
     fn state(&self) -> MutexGuard<'_, FlightState> {
@@ -246,6 +263,21 @@ pub(crate) enum ArchiveError {
     Overran,
     /// The store refused a step.
     Store(sparrow_core::Error),
+}
+
+impl ArchiveError {
+    /// The error class `status` reports; a store refusal keeps the store's own code.
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Io { .. } => "ARCHIVE_IO",
+            Self::Name(_) => "INVALID_ARGUMENT",
+            Self::Verify { .. } => "ARCHIVE_VERIFY",
+            Self::NotOnMount { .. } => "ARCHIVE_NOT_ON_MOUNT",
+            Self::Root { .. } => "ARCHIVE_ROOT",
+            Self::Overran => "ARCHIVE_OVERRAN",
+            Self::Store(error) => error.code,
+        }
+    }
 }
 
 impl fmt::Display for ArchiveError {
@@ -584,6 +616,7 @@ pub(crate) fn archive_segment(
 ) -> Result<PathBuf, ArchiveError> {
     plain_component(store_id)?;
     flight.start_pass();
+    flight.status().phase(Phase::Writing);
     let root_is_dir = {
         let _step = flight.step("find archive root", root);
         root.is_dir()
@@ -610,6 +643,7 @@ pub(crate) fn archive_segment(
         sync_dir(flight, root)?;
     }
     write_segment(flight, &store_dir, segment)?;
+    flight.status().phase(Phase::Verifying);
     verify_segment(flight, &store_dir, segment)?;
     if flight.overran() {
         return Err(ArchiveError::Overran);
@@ -620,8 +654,28 @@ pub(crate) fn archive_segment(
     Ok(store_dir)
 }
 
+/// Publish the store's watermark and whether an intent is in flight.
+fn publish_position(status: &ArchiveStatus, store: &Store) -> Result<(), ArchiveError> {
+    let state = store.archive_state().map_err(ArchiveError::Store)?;
+    let (through, intent) = state.map_or((None, false), |state| {
+        (state.through, state.intent.is_some())
+    });
+    status.position(through, intent);
+    Ok(())
+}
+
+/// The segment's `.gts` file name, which status and the journal name a failure by.
+fn segment_file_name(segment: &PreparedSegment) -> String {
+    segment
+        .files
+        .first()
+        .map_or_else(|| segment.name(), |(name, _)| name.clone())
+}
+
 /// One archive pass over the backlog: segments until none is due, then a look at whether a
-/// held record stands at the head. Returns how many segments committed.
+/// held record stands at the head. Returns how many segments committed. The pass publishes
+/// its phase and position to status as steps end; a failure becomes the standing failure
+/// until a pass ends without one.
 fn drain(
     flight: &Flight,
     store: &Store,
@@ -629,8 +683,43 @@ fn drain(
     store_id: &str,
     now: u64,
 ) -> Result<u64, ArchiveError> {
+    let mut segment = String::new();
+    let outcome = drain_segments(flight, store, root, store_id, now, &mut segment);
+    match &outcome {
+        Ok(_) => flight.status().pass_succeeded(),
+        Err(error) => {
+            // The pass failure is the one reported; a position that cannot be read keeps the
+            // last published one and is journaled.
+            if let Err(secondary) = publish_position(flight.status(), store) {
+                eprintln!(
+                    "sparrowd: archive status could not read the watermark after a failed pass: {secondary}"
+                );
+                tracing::warn!(%secondary, "archive status could not read the watermark");
+            }
+            flight
+                .status()
+                .pass_failed(error.code(), &segment, &error.to_string(), Some(now));
+        }
+    }
+    outcome
+}
+
+fn drain_segments(
+    flight: &Flight,
+    store: &Store,
+    root: &Path,
+    store_id: &str,
+    now: u64,
+    failed_segment: &mut String,
+) -> Result<u64, ArchiveError> {
     let mut committed = 0;
-    while let Some(segment) = store.archive_prepare(now).map_err(ArchiveError::Store)? {
+    loop {
+        flight.status().phase(Phase::Preparing);
+        let Some(segment) = store.archive_prepare(now).map_err(ArchiveError::Store)? else {
+            break;
+        };
+        *failed_segment = segment_file_name(&segment);
+        publish_position(flight.status(), store)?;
         if let Some(short) = segment.shortened {
             let halvings_total = store.archive_halvings();
             eprintln!(
@@ -646,6 +735,8 @@ fn drain(
             );
         }
         let dir = archive_segment(flight, store, root, store_id, &segment)?;
+        failed_segment.clear();
+        publish_position(flight.status(), store)?;
         committed += 1;
         eprintln!(
             "sparrowd: archive committed segment={} records={} artifacts={} retired_records={} dir={}",
@@ -664,6 +755,7 @@ fn drain(
             "archive segment committed"
         );
     }
+    publish_position(flight.status(), store)?;
     if let Some(held) = store.archive_held().map_err(ArchiveError::Store)? {
         journal_held(&held);
     }
@@ -681,15 +773,19 @@ impl Worker {
     /// Start the thread and its watchdog. `every` is how long it waits after a pass finds
     /// nothing due, or fails, before looking again; the store itself decides what is due at
     /// its 75 per cent start. `stall_warn` and `io_timeout` are the `[archive]` settings of
-    /// that name; see [`Flight`] for what each does.
+    /// that name; see [`Flight`] for what each does. The worker publishes its phase, watermark
+    /// and last failure to `status`, the copy the daemon's `status` call reports.
     pub fn start(
         store: Store,
         root: PathBuf,
         every: Duration,
         stall_warn: Duration,
         io_timeout: Duration,
+        status: ArchiveStatus,
     ) -> Result<Self, io::Error> {
-        let flight = Arc::new(Flight::new(stall_warn, io_timeout));
+        publish_position(&status, &store).map_err(io::Error::other)?;
+        status.phase(Phase::Idle);
+        let flight = Arc::new(Flight::new(stall_warn, io_timeout).publishing_to(status));
         let (stop, stopped) = mpsc::channel::<()>();
         let (watch_stop, watch_stopped) = mpsc::channel::<()>();
         let watched = Arc::clone(&flight);
@@ -706,15 +802,52 @@ impl Worker {
     }
 }
 
+/// Record a failure that came before `drain` and return its cause for the journal.
+fn fail_pass(flight: &Flight, code: &'static str, cause: String, at: Option<u64>) -> String {
+    flight.status().pass_failed(code, "", &cause, at);
+    cause
+}
+
+/// `cause`, with the clock's own error appended when the clock failed in the same pass.
+fn with_clock_error(cause: String, clock: &Result<u64, sparrow_core::Error>) -> String {
+    match clock {
+        Ok(_) => cause,
+        Err(clock) => format!("{cause}; clock: {clock}"),
+    }
+}
+
+/// One pass: publish the store's position, read the store id and the clock, and drain. A
+/// failure before `drain` is recorded in status here; `drain` records its own.
+fn pass(flight: &Flight, store: &Store, root: &Path) -> Result<u64, String> {
+    let clock = crate::now();
+    let at = clock.as_ref().ok().copied();
+    if let Err(error) = publish_position(flight.status(), store) {
+        let cause = with_clock_error(error.to_string(), &clock);
+        return Err(fail_pass(flight, error.code(), cause, at));
+    }
+    let id = match store.store_id() {
+        Ok(id) => id,
+        Err(error) => {
+            let cause = with_clock_error(
+                format!("store id: {} {}", error.code, error.message),
+                &clock,
+            );
+            return Err(fail_pass(flight, error.code, cause, at));
+        }
+    };
+    let now = match clock {
+        Ok(now) => now,
+        Err(error) => {
+            let cause = format!("clock: {error}");
+            return Err(fail_pass(flight, error.code, cause, None));
+        }
+    };
+    drain(flight, store, root, &id, now).map_err(|error| error.to_string())
+}
+
 fn run(flight: &Flight, store: &Store, root: &Path, every: Duration, stopped: &mpsc::Receiver<()>) {
     loop {
-        let outcome = match (store.store_id(), crate::now()) {
-            (Ok(id), Ok(now)) => {
-                drain(flight, store, root, &id, now).map_err(|error| error.to_string())
-            }
-            (Err(error), _) => Err(format!("store id: {} {}", error.code, error.message)),
-            (_, Err(error)) => Err(format!("clock: {error}")),
-        };
+        let outcome = pass(flight, store, root);
         if let Err(cause) = outcome {
             eprintln!("sparrowd: archive pass failed; the watermark did not move: {cause}");
             tracing::error!(%cause, "archive pass failed; the watermark did not move");
@@ -1130,6 +1263,96 @@ mod tests {
                 "{case}: the second pass changes nothing"
             );
         }
+    }
+
+    /// INVARIANT (#365): status shows a held worker and why, and shows it recovered. A forged
+    /// file under the segment's name is refused by the worker's read-back; the published state
+    /// is `holding` with the failure's class, segment file name, reason and start, and the
+    /// watermark behind with the intent in flight. After the operator moves the file aside, the
+    /// next pass commits: the failure is gone, the worker is idle and the watermark advanced.
+    /// Times come from the pass's `now` argument.
+    #[test]
+    fn status_shows_a_refused_segment_as_holding_and_clears_when_a_pass_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, segment) = archiving_store(&dir.path().join("store"));
+        let root = nas(dir.path(), "s");
+        let (name, _) = segment.files[0].clone();
+        let forged = root.join("s").join(&name);
+        fs::create_dir(root.join("s")).unwrap();
+        fs::write(
+            &forged,
+            sparrow_test_support::forged_segment(b"alpha\n", b"bravo\n"),
+        )
+        .unwrap();
+
+        let status = ArchiveStatus::new();
+        assert_eq!(status.snapshot().phase, Phase::NotConfigured);
+        let flight = flight().publishing_to(status.clone());
+        drain(&flight, &store, &root, "s", LATER).unwrap_err();
+        drain(&flight, &store, &root, "s", LATER + 60_000).unwrap_err();
+
+        let held = status.snapshot();
+        assert_eq!(held.phase, Phase::Holding);
+        assert_eq!(held.through, None);
+        assert!(
+            held.intent_in_flight,
+            "the prepared segment is not committed"
+        );
+        let failure = held.failure.expect("the refusal is the standing failure");
+        assert_eq!(failure.code, "ARCHIVE_VERIFY");
+        assert_eq!(failure.segment, name);
+        assert!(
+            failure.reason.contains("contents differ"),
+            "{}",
+            failure.reason
+        );
+        assert_eq!(
+            failure.since,
+            Some(LATER),
+            "a repeated failure keeps its start"
+        );
+
+        fs::rename(&forged, root.join("s").join(format!("{name}.moved"))).unwrap();
+        assert_eq!(
+            drain(&flight, &store, &root, "s", LATER + 120_000).unwrap(),
+            1
+        );
+        let recovered = status.snapshot();
+        assert_eq!(recovered.phase, Phase::Idle);
+        assert_eq!(recovered.failure, None);
+        assert_eq!(recovered.through.as_deref(), Some(segment.through.as_str()));
+        assert!(!recovered.intent_in_flight);
+    }
+
+    /// INVARIANT (#365): status is right after a restart, before any pass reaches `drain`. A
+    /// worker started on a store that already holds a committed watermark and an uncommitted
+    /// intent reports both at once; the archive root is missing, so no pass can get past
+    /// its first step.
+    #[test]
+    fn a_started_worker_reports_the_stores_watermark_and_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, first) = archiving_store(&dir.path().join("store"));
+        let root = nas(dir.path(), "s");
+        archive_segment(&flight(), &store, &root, "s", &first).unwrap();
+        store.ingest("r2", "source", "log", b"c\nd\n", 2).unwrap();
+        store
+            .archive_prepare(LATER)
+            .unwrap()
+            .expect("a second segment");
+
+        let status = ArchiveStatus::new();
+        let _worker = Worker::start(
+            store.clone(),
+            dir.path().join("not-mounted"),
+            Duration::from_secs(3600),
+            Duration::from_secs(120),
+            Duration::from_secs(900),
+            status.clone(),
+        )
+        .unwrap();
+        let started = status.snapshot();
+        assert_eq!(started.through.as_deref(), Some(first.through.as_str()));
+        assert!(started.intent_in_flight);
     }
 
     /// INVARIANT: a segment written, synced, read back and decoded advances the watermark to

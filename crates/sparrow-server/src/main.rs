@@ -295,7 +295,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
+    let archive_status = sparrow_server::archive::ArchiveStatus::new();
     let mut rpc = Rpc::new(store.clone(), operations.clone(), config.max_pin_members)
+        .with_archive_status(archive_status.clone())
         .with_admission(admission.clone())
         .with_connections(connections.clone())
         .with_watches(watches)
@@ -347,6 +349,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::time::Duration::from_secs(archive.check_secs),
                     std::time::Duration::from_secs(archive.stall_warn_secs),
                     std::time::Duration::from_secs(archive.io_timeout_secs),
+                    archive_status.clone(),
                 )?),
                 None => None,
             };

@@ -162,6 +162,10 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         )
         .with("archive_halvings", value.get_archive_halvings().to_string())
         .with(
+            "archive_worker",
+            archive_worker(value.get_archive_worker()?)?,
+        )
+        .with(
             "pressure",
             crate::pressure::decode(value.get_pressure_status()?)?,
         )
@@ -505,6 +509,43 @@ fn floor_pause(status: wire::floor_pause_status::Reader<'_>) -> Value {
             status.get_read_staging_refused().to_string(),
         )
         .into()
+}
+
+/// The archive worker's phase, watermark and last failure (#365); a daemon that predates them
+/// reports `not_configured`, an empty watermark and no failure.
+fn archive_worker(status: wire::archive_worker_status::Reader<'_>) -> Result<Value> {
+    let phase = match status.get_phase()? {
+        wire::ArchivePhase::NotConfigured => "not_configured",
+        wire::ArchivePhase::Idle => "idle",
+        wire::ArchivePhase::Preparing => "preparing",
+        wire::ArchivePhase::Writing => "writing",
+        wire::ArchivePhase::Verifying => "verifying",
+        wire::ArchivePhase::Holding => "holding",
+    };
+    let failure = match status.get_failure()?.which()? {
+        wire::optional_archive_failure::Absent(()) => Value::Null,
+        wire::optional_archive_failure::Value(failure) => {
+            let failure = failure?;
+            Object::new()
+                .with("code", failure.get_code()?.to_str()?)
+                .with("segment", failure.get_segment()?.to_str()?)
+                .with("reason", failure.get_reason()?.to_str()?)
+                .with(
+                    "since",
+                    match failure.get_since()?.which()? {
+                        wire::optional_instant::Absent(()) => Value::Null,
+                        wire::optional_instant::Value(instant) => super::instant(instant?)?.into(),
+                    },
+                )
+                .into()
+        }
+    };
+    Ok(Object::new()
+        .with("phase", phase)
+        .with("through", status.get_through()?.to_str()?)
+        .with("intent_in_flight", status.get_intent_in_flight())
+        .with("failure", failure)
+        .into())
 }
 
 /// RDF staging refusals and the latest one (#340); a daemon that predates them reports zeros.
