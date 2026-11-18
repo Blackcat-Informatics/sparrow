@@ -1,0 +1,22 @@
+{
+  "docs/archive-format.md": [
+    {
+      "mode": "100644",
+      "oid": "b256494100618c663225082a750afae5a0b6f53a",
+      "stage": 1,
+      "content": "inputs/0-1.bin"
+    },
+    {
+      "mode": "100644",
+      "oid": "24bf83930cf900a6aa958292ea7d2ae045d15b01",
+      "stage": 2,
+      "content": "inputs/0-2.bin"
+    },
+    {
+      "mode": "100644",
+      "oid": "32d244f8ff9f317de4841b46ddf7533c1c6c5896",
+      "stage": 3,
+      "content": "inputs/0-3.bin"
+    }
+  ]
+}

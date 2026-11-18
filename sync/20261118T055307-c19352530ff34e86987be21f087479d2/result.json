@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/352-archive-worker-does-not-check-record",
+  "branch": "paudley/352-archive-worker-does-not-check-record",
+  "base_ref": "origin/main",
+  "head": "0550a8b07c01f1e9de68b7c6a4c1718eaadbee9c",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/352-archive-worker-does-not-check-record/.stage/archive-worker-does-not-check-record/sync/20261118T055307-c19352530ff34e86987be21f087479d2",
+  "conflicts": [
+    "docs/archive-format.md"
+  ],
+  "status": "completed",
+  "base": "49aa9a02ec5a6b33aae98353c1d26af35f3d3f7e",
+  "merge_bases": [
+    "ee799319739805f21c129d631d0691e0a66d5a45"
+  ],
+  "merge_index": "c38a0ad967c6524d6572ea8aa208b3d9469f26aef825776a1b89145ef3194576",
+  "reused_paths": [],
+  "rerere_output": "Recorded preimage for 'docs/archive-format.md'\n",
+  "candidate_tree": "e14ae3001767638a2d85089a52e53f75dd3561ba",
+  "candidate_patch": "candidate-8d9da4c7c6fc47dcb4039a1c8943874d.patch",
+  "stdout_log": "commit-8d9da4c7c6fc47dcb4039a1c8943874d.stdout.log",
+  "stderr_log": "commit-8d9da4c7c6fc47dcb4039a1c8943874d.stderr.log",
+  "validation_records": [],
+  "commit_duration_seconds": 1027.9525450059737,
+  "commit": "31538c1ba680b6584418ab5d47f0bde0fa2f422b",
+  "tree": "e14ae3001767638a2d85089a52e53f75dd3561ba",
+  "exit_code": 0
+}

@@ -1,0 +1,1582 @@
+diff --git AGENTS.md AGENTS.md
+index d898d95..7bd8623 100644
+--- AGENTS.md
++++ AGENTS.md
+@@ -11,6 +11,37 @@ before implementation, and any `.baseline`, `.goals` and governing ADRs when
+ present. This file is the single home of the working rules; `CLAUDE.md` only
+ imports it.
+ 
++## Purpose
++
++Sparrow is a low-assurance, high-throughput, searchable, centralized log store,
++a radical improvement over scattered log files. It optimizes only for speed and
++storage efficiency, and it owes no more durability, privacy or tamper-evidence
++than the plain log files it replaces.
++
++- **Method.** One RocksDB store holds every artifact and record as exact bytes,
++  behind typed Cap'n Proto interfaces. PurRDF supplies the JSON and Markdown
++  projections, SPARQL and text search over them. An unpinned item is due at
++  `received_at + 30 days` and is retired then once the archive holds it; a pin
++  keeps an item until the pin ends, and nothing is deleted that has not been
++  archived. The archive is implemented and is not yet running on the live
++  daemon, so nothing retires there today; see
++  [Archive status](docs/archive-format.md#archive-status).
++- **Consumers.** Every daemon sends its operational log to Sparrow.
++  `lillith_memetics` sends cruft (see [Cruft](docs/interfaces.md#cruft)).
++  `lillith_decodes` searches what Sparrow holds.
++- **Suppliers.** PurRDF supplies RDF semantics, codecs, projections, SPARQL,
++  text analysis, scoring and query governors. The helper census is repository
++  tooling ported from Katamari; runtime crates do not depend on it.
++- **What Sparrow is not.** It is not a place for anything irreplaceable as its
++  only copy. Assurance, long-term storage, privacy, encryption, validation and
++  resilience work belongs to Katamari. The Katamari/Sparrow razor decides where
++  data lives: whatever needs those goes to Katamari, at a high and justified
++  bar, and everything else goes to Sparrow; it may cut one body of data into
++  sets and subsets, each placed by its own need
++  ([architecture, section 1](docs/architecture.md#1-goals-and-boundaries)).
++
++The [glossary](docs/glossary.md) names each term and the document that governs it.
++
+ ## Authority
+ 
+ - A direct word from Patrick in the session decides. Nothing below overrides it.
+diff --git README.md README.md
+index 9f27582..9f202f9 100644
+--- README.md
++++ README.md
+@@ -24,7 +24,18 @@ Sparrow is a high-density, temporal diagnostic log and data server. It turns
+ scattered operational artifacts into retained evidence that agents can discover,
+ inspect, correlate, and query as a semantic graph.
+ 
+-**Status: implemented and running; measured limits apply.** A RocksDB daemon, Cap'n Proto RPC,
++## Purpose
++
++The charter (what Sparrow is, its method, consumers, suppliers and what it is
++not) is the Purpose section of [AGENTS.md](AGENTS.md#purpose). In short, Sparrow
++is a low-assurance, high-throughput, searchable log store that optimizes only
++for speed and storage efficiency; anything irreplaceable, and all assurance,
++privacy, encryption and validation work, belongs to Katamari. The
++[glossary](docs/glossary.md) names each term and the document that governs it.
++
++## Status
++
++**Implemented and running; measured limits apply.** A RocksDB daemon, Cap'n Proto RPC,
+ CLI with resumable typed file imports and bounded oversized-record preparation,
+ stdio MCP, JSON field discovery, immutable JSON source-time and diagnostic profiles,
+ mapped service/host/severity/trace/span filters,
+@@ -39,7 +50,8 @@ WAL flush controls, and helper-census tooling are implemented. Active tailing
+ with explicit completed-generation retirement, typed public TCP
+ ingestion, and syslog are implemented. Stored-view SELECT, ASK, CONSTRUCT,
+ DESCRIBE, measured EXPLAIN and native stored-text rank/span relations are
+-implemented and deployed in schema 62. See [Development runtime](docs/development-runtime.md) for
++implemented. The wire schema is version 71. The archive is implemented and not
++yet running on the live daemon ([Archive status](docs/archive-format.md#archive-status)). See [Development runtime](docs/development-runtime.md) for
+ present commands, verified behavior and limits.
+ 
+ The production deployment is the system unit in [`deploy/`](deploy/README.md),
+@@ -59,10 +71,14 @@ large directories of JSONL and `.log` files. Sustained throughput, import bursts
+ and total storage density have finite workload measurements, not a production
+ capacity guarantee; see the [acceptance boundary](docs/implementation-plan.md#current-acceptance-boundary).
+ 
+-The default retention window is **up to 30 days from server acceptance**. Source
+-timestamps remain queryable but do not determine expiry. A configured disk budget
+-can cause earlier eviction of the oldest unpinned data. When protected data or
+-unreclaimed storage prevents another write, ingestion applies backpressure.
++An unpinned item is due at `received_at + 30 days` (server acceptance) and is
++retired then once the archive holds it. Source timestamps remain queryable but
++do not determine expiry. Disk pressure can retire archived, unpinned items
++earlier. A pin keeps an item until the pin ends. The deletion gate keeps every
++unarchived item past its deadline, so with no archive running (the live daemon
++today) nothing retires and ingest is refused with `STORAGE_PRESSURE` at the
++budget less the reserve or below the free-space floor. When protected data or unreclaimed storage prevents another write,
++ingestion applies backpressure.
+ 
+ Agents can retain selected evidence in named, expiring collections. For example:
+ 
+diff --git crates/sparrow-core/src/storage/forced_compaction.rs crates/sparrow-core/src/storage/forced_compaction.rs
+index 44ee8d2..96b6123 100644
+--- crates/sparrow-core/src/storage/forced_compaction.rs
++++ crates/sparrow-core/src/storage/forced_compaction.rs
+@@ -182,6 +182,10 @@ impl Forced {
+                 });
+                 outcome.elapsed_ms =
+                     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
++                // Release the database before publishing the end: whoever sees `Finished` (a
++                // test waiting for native quiet, then closing the store and reopening its
++                // directory) must find no handle of this thread left holding the RocksDB lock.
++                drop(db);
+                 *owner.slot() = Slot::Finished(outcome);
+                 owner.changed.notify_all();
+                 let waker = owner.waker.lock().ok().and_then(|slot| slot.clone());
+@@ -362,6 +366,13 @@ mod tests {
+         let forced = Forced::new(Arc::default());
+         assert!(forced.start(Arc::clone(&db)).unwrap());
+         forced.wait_finished();
++        // Finished means the thread holds no handle of the database (#348): a caller that sees
++        // the end may close the store and reopen its directory at once.
++        assert_eq!(
++            Arc::strong_count(&db),
++            1,
++            "a finished compaction holds the database"
++        );
+         let Slot::Finished(outcome) = forced.poll() else {
+             panic!("the compaction did not finish");
+         };
+@@ -391,6 +402,11 @@ mod tests {
+             forced.arm(fault);
+             assert!(forced.start(Arc::clone(&db)).unwrap());
+             forced.wait_finished();
++            assert_eq!(
++                Arc::strong_count(&db),
++                1,
++                "a failed compaction holds the database"
++            );
+             let Slot::Finished(outcome) = forced.poll() else {
+                 panic!("the compaction did not finish");
+             };
+diff --git crates/sparrow-core/tests/archive_segment.rs crates/sparrow-core/tests/archive_segment.rs
+index acbb5aa..fe6f8d4 100644
+--- crates/sparrow-core/tests/archive_segment.rs
++++ crates/sparrow-core/tests/archive_segment.rs
+@@ -397,6 +397,45 @@ fn a_query_is_served_during_an_archive_read_and_still_excludes_another_query() {
+     archive.join().unwrap();
+ }
+ 
++/// REGRESSION (#324 item 7): an ordinary query holding the query slot never makes an archive
++/// prepare fail or halve. Before the archive had its own slot (#319) the prepare's read was
++/// refused with `RESOURCE_LIMIT` while a query ran and was read as an entry fault, halved, and
++/// ended as "archive cannot encode" for a sound entry. Now the prepare runs inside a live query
++/// over the whole range: unshortened, with no halving counted. Time is the store's `now`.
++#[test]
++fn a_prepare_inside_a_running_query_is_neither_refused_nor_halved() {
++    use sparrow_core::{QueryCancellation, QueryScope, RdfGraphLayers, RdfReadLimits};
++
++    let dir = tempfile::tempdir().unwrap();
++    let store = Store::open(dir.path(), archiving(ArchivePolicy::default())).unwrap();
++    let body: String = (0..10).map(|i| format!("line {i}\n")).collect();
++    store
++        .ingest("seg-query", "source", "log", body.as_bytes(), 1)
++        .unwrap();
++    let now = 1 + 30 * DAY;
++
++    let scope = sparrow_test_support::record_scope!(QueryScope, "source", 1);
++    let prepared = store
++        .with_rdf_scope(
++            &scope,
++            RdfGraphLayers::ALL,
++            2,
++            RdfReadLimits::default(),
++            &QueryCancellation::default(),
++            |_, _| store.archive_prepare(now),
++        )
++        .unwrap()
++        .unwrap()
++        .expect("due");
++
++    assert!(
++        prepared.shortened.is_none(),
++        "the query must not shorten it"
++    );
++    assert_eq!(prepared.records, 10);
++    assert_eq!(store.archive_halvings(), 0);
++}
++
+ /// One jsonl line of `keys` string keys: about 33 quads a key once the stored rows are doubled
+ /// into the default graph (about 3,300 quads for 100 keys).
+ fn json_line(keys: u64) -> String {
+diff --git crates/sparrow-core/tests/storage.rs crates/sparrow-core/tests/storage.rs
+index e1c8a4d..16e3478 100644
+--- crates/sparrow-core/tests/storage.rs
++++ crates/sparrow-core/tests/storage.rs
+@@ -6310,8 +6310,8 @@ fn a_floor_refusal_below_budget_retires_archived_evidence_and_stops_at_the_archi
+     );
+ }
+ 
+-// Value (#267): the floor is no reason to delete what is pinned, and, by the coordination
+-// ruling, no reason to retire anything early on a store with no archive policy, where
++// Value (#267): the floor is no reason to delete what is pinned, and
++// no reason to retire anything early on a store with no archive policy, where
+ // "archived" protects nothing. Protects: (a) a pinned archived entry is skipped and the pass
+ // is Blocked with the floor facts; (b) a store with no archive policy retires nothing at the
+ // floor and says so in plain words, while the budget path stays as it was.
+@@ -6397,7 +6397,7 @@ fn floor_retirement_respects_pins_and_a_store_without_an_archive_policy() {
+     assert_eq!(store.bytes(&old.id, 0, 4, 11).unwrap(), b"old\n");
+ }
+ 
+-// Value (#267, coordination ruling): evidence is retired early for a floor that something
++// Value (#267): evidence is retired early for a floor that something
+ // outside Sparrow crossed only up to the first deficit plus the maintenance reserve. Protects:
+ // once an episode has freed that much, the next pass retires nothing more, is Blocked with
+ // the "held outside Sparrow" reason, says the bound was reached, and unretired archived
+@@ -7391,7 +7391,7 @@ fn an_ended_wait_leaves_no_marker_to_restore_at_open() {
+     );
+ }
+ 
+-// Value: #218 ruling: a store too damaged to take even the small write that ends a wait
++// Value (#218): a store too damaged to take even the small write that ends a wait
+ // must say so plainly, and must keep saying it while it lasts. Protects: the failure names
+ // the cause in plain words, is re-reported on the next pass (the error baseline does not
+ // advance past an unreported error), and once the store takes the write the error fails one
+@@ -25794,7 +25794,7 @@ fn a_claim_publishes_as_one_artifact_or_as_a_set_never_both() {
+     assert_eq!(store.records(1_000).unwrap().len(), 1);
+ 
+     // (b) Part 0 is accepted first: the single publish is refused, the set records, and the
+-    // claim's staging row is released by reclaim as ruling A says.
++    // claim's staging row is released by reclaim as #280 requires.
+     let dir = tempfile::tempdir().unwrap();
+     let store = Store::open(dir.path(), config()).unwrap();
+     let claim = set_claim(&store, b"b", content);
+@@ -25879,7 +25879,7 @@ fn a_pending_claims_single_and_manifest_artifacts_survive_eviction_until_removal
+     }
+ }
+ 
+-/// INVARIANT (#280, ruling A): a claim that began single staging and was then recorded as a
++/// INVARIANT (#280): a claim that began single staging and was then recorded as a
+ /// set and removed has its unpublished staging row, and so its import slot, released by the
+ /// next reclaim pass.
+ #[test]
+@@ -25900,7 +25900,7 @@ fn reclaim_releases_the_staging_row_of_a_claim_recorded_as_a_set() {
+     assert!(!import_row_present(dir.path(), &journal.import_id));
+ }
+ 
+-/// INVARIANT (#280, ruling A): a single-path claim's unpublished staging row is kept by
++/// INVARIANT (#280): a single-path claim's unpublished staging row is kept by
+ /// reclamation as before, whatever the clock says, while the claim may still publish.
+ #[test]
+ fn reclaim_keeps_the_unpublished_staging_row_of_a_single_path_claim() {
+@@ -25914,7 +25914,7 @@ fn reclaim_keeps_the_unpublished_staging_row_of_a_single_path_claim() {
+     assert_eq!(kept.received_bytes, content.len() as u64);
+ }
+ 
+-/// INVARIANT (#280, ruling A; issue 283): a set claim whose manifest receipt is gone is not
++/// INVARIANT (#280, #283): a set claim whose manifest receipt is gone is not
+ /// provably a set, so reclamation keeps its unpublished staging row.
+ #[test]
+ fn reclaim_keeps_the_staging_row_of_a_set_claim_without_its_manifest_receipt() {
+diff --git crates/sparrow-server/src/admission.rs crates/sparrow-server/src/admission.rs
+index 2a92eb7..08036d0 100644
+--- crates/sparrow-server/src/admission.rs
++++ crates/sparrow-server/src/admission.rs
+@@ -223,9 +223,14 @@ const SHUTTING_DOWN: Refusal = Refusal {
+ };
+ 
+ /// Permits held for the duration of one storage operation. Dropping releases both.
++///
++/// Fields drop in declaration order, so the reader slot is declared first and released first:
++/// whoever is handed the operation permit then finds the reader slot already free. The other
++/// order let a caller that waited for the permit and asked again at once be refused as busy by
++/// the slot of the read that had just ended (#349).
+ pub struct Admitted {
+-    _operation: Option<OwnedSemaphorePermit>,
+     _reader: Option<OwnedSemaphorePermit>,
++    _operation: Option<OwnedSemaphorePermit>,
+ }
+ 
+ /// The daemon's operation permit budget and the rules for taking from it.
+@@ -699,6 +704,51 @@ impl Ceiling {
+ mod tests {
+     use super::*;
+ 
++    /// A waker that records how many reader slots were free at the instant it was woken.
++    struct SlotsAtWake {
++        readers: Arc<Semaphore>,
++        free: AtomicU64,
++    }
++
++    impl std::task::Wake for SlotsAtWake {
++        fn wake(self: Arc<Self>) {
++            self.free.store(
++                self.readers.available_permits() as u64 + 1,
++                Ordering::SeqCst,
++            );
++        }
++    }
++
++    /// INVARIANT (#349): a finished read frees its reader slot no later than its operation
++    /// permit, so whoever is handed the operation permit (a queued writer, or a caller that
++    /// waited for it before asking again) never meets a reader slot still held by the read
++    /// that just ended and is refused as busy. Observed deterministically: the operation
++    /// permit's waiter is woken inline while the permit is released, and by then the reader
++    /// slot must already be free.
++    #[test]
++    fn a_finished_read_frees_its_reader_slot_before_its_operation_permit() {
++        let admission = Admission::new(Arc::new(Semaphore::new(1)));
++        let read = admission.reader().expect("a free budget admits a reader");
++        let wake = Arc::new(SlotsAtWake {
++            readers: admission.readers.clone(),
++            free: AtomicU64::new(0),
++        });
++        let waker = std::task::Waker::from(wake.clone());
++        let mut context = std::task::Context::from_waker(&waker);
++        let mut waiting = std::pin::pin!(admission.operations.clone().acquire_owned());
++        assert!(
++            waiting.as_mut().poll(&mut context).is_pending(),
++            "the read holds the only operation permit"
++        );
++        drop(read);
++        // Stored as free + 1 so that "never woken" (0) differs from "woken with no slot free" (1).
++        assert_eq!(
++            wake.free.load(Ordering::SeqCst),
++            2,
++            "the operation permit was handed on while the reader slot was still held"
++        );
++    }
++
+     /// INVARIANT (#246): at the connection ceiling the accept loop's wait is counted, shows
+     /// as a waiter while it lasts with its longest duration, and ends when a connection ends
+     /// and frees its slot; the active gauge follows the connections, not the reserved slot.
+diff --git crates/sparrow-server/src/pressure_duty.rs crates/sparrow-server/src/pressure_duty.rs
+index ecb4bf9..9354e36 100644
+--- crates/sparrow-server/src/pressure_duty.rs
++++ crates/sparrow-server/src/pressure_duty.rs
+@@ -555,7 +555,7 @@ mod tests {
+         assert!(later.lines[0].contains("2 failures since the last report"));
+     }
+ 
+-    // Value: #218 ruling: a new RocksDB error is surfaced at once, and the forced-failure
++    // Value (#218): a new RocksDB error is surfaced at once, and the forced-failure
+     // line names the real reason. Protects: a failed pass that carries a new native error is
+     // journaled inside the rate-limit window with its reason, is not journaled twice, and
+     // an error already reported falls back to the bounded rate.
+diff --git crates/sparrow-server/tests/rpc.rs crates/sparrow-server/tests/rpc.rs
+index 2268904..bdc2c6e 100644
+--- crates/sparrow-server/tests/rpc.rs
++++ crates/sparrow-server/tests/rpc.rs
+@@ -14939,7 +14939,7 @@ impl SetHarness {
+     }
+ }
+ 
+-/// INVARIANT (#285, ruling condition 1): the source of a set claim stays held, and its bytes
++/// INVARIANT (#285, condition 1): the source of a set claim stays held, and its bytes
+ /// are unchanged, for as long as the claim is pending: before the manifest and while it is
+ /// accepted and not yet recorded. With no archive configured, eviction holds at `ArchiveLag`
+ /// and retires no part, so the claim's parts stay stored and `publish` completes the set. Once
+@@ -15007,7 +15007,7 @@ async fn a_set_claims_source_stays_held_while_the_claim_is_pending() {
+         .await;
+ }
+ 
+-/// INVARIANT (#285, ruling condition 2, review-pr286 B1): with no archive configured, eviction
++/// INVARIANT (#285, condition 2, review-pr286 B1): with no archive configured, eviction
+ /// holds at `ArchiveLag` and retires no record of a set part, so a part is never answered as
+ /// evicted and never sent again. Every part keeps its original artifact, the claim publishes
+ /// from the stored parts, and each source line is read exactly once.
+diff --git deploy/README.md deploy/README.md
+index 1279ac3..3048354 100644
+--- deploy/README.md
++++ deploy/README.md
+@@ -35,15 +35,12 @@ lives.
+ The units are the source of truth. The scripts are thin wrappers over them
+ and over the kept images in `./bin`.
+ 
+-## Rulings
++## Deployment requirements
+ 
+-Patrick's decisions for this deployment, 2026-11-01:
+-
+-- Unit scope: "System unit, own user (Recommended)". `sparrow.service` is a
+-  system unit in the fleet's production slice, running as the `sparrow` user
+-  and group.
+-- Store location, verbatim: "sparrow's final store location is /SPARROW". The
+-  store is `/SPARROW/store` and its socket `/SPARROW/store/rpc.sock`.
++- `sparrow.service` is a system unit in the fleet's production slice, running
++  as the `sparrow` user and group.
++- The store location is `/SPARROW`: the store is `/SPARROW/store` and its
++  socket `/SPARROW/store/rpc.sock`.
+ - Sparrow is not real time. It joins the production slice so that development
+   yields to it: nice -20, best-effort IO priority 0, OOM score adjustment -900,
+   real-time scheduling refused.
+@@ -56,9 +53,10 @@ Patrick's decisions for this deployment, 2026-11-01:
+   directory does not implement it.
+ - Sparrow backs up nothing except the age-out to GTS files on the NAS: the archive worker
+   writes aged-out segments under `[archive] dir` (`/net/synology/archives/sparrow-archive`) and
+-  never to a local disk (Patrick, 2026-11-08: "Sparrow and katamaria are FORBIDDEN from backing
+-  up to local disks"). The online store backup (#156) was removed in #330. The daemon's archive
+-  worker is not deployed by these files (Sparrow issues #15 to #17); it refuses a directory that
++  never to a local disk; no Sparrow backup is ever written to a local disk. The online store backup (#156) was removed in #330. The archive
++  worker is implemented, and these files do not enable it: the shipped configuration has no
++  `[archive]` table, so the live daemon runs no worker (see
++  [Archive status](../docs/archive-format.md#archive-status)). Once enabled, it refuses a directory that
+   is on the root filesystem's device, or on a local filesystem of the root's type (an unmounted
+   share), and one whose `STORE_ID` names another store or which holds content but no `STORE_ID`.
+   It writes `STORE_ID` itself into an empty directory on its first pass. A file naming another
+@@ -69,7 +67,7 @@ Patrick's decisions for this deployment, 2026-11-01:
+ 
+ ## Layout
+ 
+-Copy-on-write is off for the store (Patrick, 2026-10-15: "COW off everywhere"). `install.sh`
++Copy-on-write is off for the store. `install.sh`
+ sets the btrfs no-copy-on-write attribute on `/SPARROW/store` while it is empty, so every file
+ created in it inherits it. `restart.sh` rewrites a closed store that
+ still has copy-on-write files, using `deploy/copy-on-write.sh convert`, and keeps the original
+diff --git deploy/RECOVERY.md deploy/RECOVERY.md
+index 574092d..39246c6 100644
+--- deploy/RECOVERY.md
++++ deploy/RECOVERY.md
+@@ -217,7 +217,7 @@ every watch in `consume_watches` names a root that exists.
+ - Diagnose: `findmnt -T /net/synology/archives/sparrow-archive` must show `nfs4` from
+   `192.168.1.1:/volume1/archives`.
+ - Recover: restore the mount; the next pass retries by itself. The unit and the profile
+-  grant no archive path yet. Sparrow issues #15 to #17 add the archive worker's deployment.
++  grant no archive path yet. The archive worker is implemented; it runs on the live daemon only once it is enabled (see `docs/archive-format.md`, "Archive status").
+ 
+ ## Revert the cutover to the user unit
+ 
+@@ -287,13 +287,13 @@ Each remaining item and why it stays:
+ | all | `PrivateUsers=` | The daemon's port 518 needs the bind capability in the host's user namespace, and every unit reads or writes files whose real owners must stay mapped (the store, the roots, the producers' files). |
+ | all | `DeviceAllow=char-rtc:r` | Added by `ProtectClock=yes` itself; read-only clock access. |
+ | `sparrow` | `PrivateNetwork=`, `RestrictAddressFamilies=~AF_(INET\|INET6)`, `IPAddressDeny=` | The public Cap'n Proto listener on 0.0.0.0:518 serves remote agents on any trusted network; CHAP guards it. |
+-| `sparrow` | `AmbientCapabilities=`, `CAP_NET_BIND_SERVICE` | Binding port 518, Patrick's ruling of 2026-11-01; the bounding set holds nothing else. |
++| `sparrow` | `AmbientCapabilities=`, `CAP_NET_BIND_SERVICE` | Binding port 518; the bounding set holds nothing else. |
+ | `sparrow` | `RestrictSUIDSGID=` | systemd implements it with a seccomp rule that cannot inspect `openat2`'s mode, so it refuses `openat2` outright, and the daemon needs `openat2` to open files beneath a consume root without following symlinks (measured, [evidence/lifecycle.md](evidence/lifecycle.md)). `NoNewPrivileges=yes` makes a setuid file inert, and the daemon creates every file with a fixed mode. |
+ | `ship` | `ProtectHome=read-only` | It reads the producers' directories under `/home/paudley`. |
+ 
+ Hardening settings the specification lists that the units do not use, and why:
+ `StateDirectory=`, `RuntimeDirectory=`, `CacheDirectory=` and `LogsDirectory=`
+-on `sparrow.service`, because the store is `/SPARROW/store` by ruling, the
++on `sparrow.service`, because the store is `/SPARROW/store`, the
+ daemon keeps no runtime or cache files and it logs to the journal; `WatchdogSec=`, because the
+ daemon does not implement the systemd notification protocol (`Type=exec`).
+ 
+diff --git deploy/config/server.toml.example deploy/config/server.toml.example
+index e16211b..3ebb7d7 100644
+--- deploy/config/server.toml.example
++++ deploy/config/server.toml.example
+@@ -33,5 +33,5 @@ text_lexicon_dir = "/usr/local/share/sparrow/lexicons-REV/artifacts"
+ # Consume watches live in the store's catalog; an entry here only seeds a missing catalog. Add
+ # roots with `sparrow /SPARROW/store/rpc.sock watch put ...` (deploy/config/watch.toml.example).
+ 
+-# The archive table is absent: the archive worker is not deployed, and the unit and profile do not
+-# grant its path. Sparrow issues #15 to #17 add both.
++# The archive table is absent: the live daemon runs no archive worker, and the unit and profile do
++# not grant its path. See docs/archive-format.md, "Archive status".
+diff --git deploy/evidence/rehearsal.md deploy/evidence/rehearsal.md
+index e19a969..7c5edb8 100644
+--- deploy/evidence/rehearsal.md
++++ deploy/evidence/rehearsal.md
+@@ -147,7 +147,7 @@ One constraint on this run: my shell permission scope allowed the `deploy/*.sh`
+ 
+ #### G12. Unexplained references
+ 
+-- **Document**: README.md "Rulings", "Permissions", "Moving a running service"; MANUAL.md; evidence files.
++- **Document**: README.md "Deployment requirements", "Permissions", "Moving a running service"; MANUAL.md; evidence files.
+ - **Happened**: "issue #10", "the tracking issue's acceptance steps", "PRODUCTION-LAUNCH section B" (in the unit comments) and "Katamari" appear with no link, number or path. The `REV` suffix for lexicons is a 40-character PurRDF hash while image `REV` is a 7-character Sparrow commit; the Layout table uses `REV` for both. `make install-hooks` needs Git 2.54 or newer (AGENTS.md) but step 1 lists `git` with no version.
+ - **Should say**: link the issues, name the Katamari path, distinguish `PURRDF_REV` from `REV` as docs/deployment.md already does, and add the Git version.
+ 
+diff --git deploy/lib.sh deploy/lib.sh
+index 1d3c98a..c9b6d98 100644
+--- deploy/lib.sh
++++ deploy/lib.sh
+@@ -341,7 +341,7 @@ print(v["store_id"], v["schema_version"], v["pressure"]["phase"], len(v["consume
+         "$store" "$schema" "$pressure" "$durability" "$watches"
+ }
+ 
+-# Copy-on-write is off for the store (Patrick, 2026-10-15: "COW off everywhere"), by Katamari's
++# Copy-on-write is off for the store, by Katamari's
+ # mechanism (katamari-io copy_on_write.rs). On btrfs, a file or directory created in a directory
+ # that carries the no-copy-on-write attribute (chattr +C) inherits it. So the attribute is set on
+ # a directory before anything is written there. A file that already holds data keeps
+diff --git deploy/user-unit-upgrade.sh deploy/user-unit-upgrade.sh
+index 5b4f346..59eb4f2 100755
+--- deploy/user-unit-upgrade.sh
++++ deploy/user-unit-upgrade.sh
+@@ -12,7 +12,7 @@
+ # fix forward on TO. It serves until Sparrow issue #22 moves the store to the system unit.
+ # Ported from the operator's restart-bundle.sh; its predecessor restart-schema68.sh ran clean on
+ # the live host on 2026-11-07 (exit 0, 180 s down).
+-# Every check that can refuse runs before anything changes. Run it only on coordination's "go".
++# Every check that can refuse runs before anything changes. Run it only when the restart is authorized.
+ set -euo pipefail
+ umask 077
+ 
+diff --git docs/BRAND.md docs/BRAND.md
+index 9ec108d..0fa4e9e 100644
+--- docs/BRAND.md
++++ docs/BRAND.md
+@@ -37,7 +37,7 @@ MCP and a CLI.
+ 
+ - Plain, exact and calm. State what is implemented, what was measured, and
+   what is still unverified.
+-- Prefer concrete limits ("up to 30 days from acceptance") to adjectives
++- Prefer concrete limits ("retired at 30 days from acceptance once archived") to adjectives
+   ("long retention").
+ - No hype words, no exclamation marks and no promised performance without a
+   cited measurement.
+diff --git docs/architecture.md docs/architecture.md
+index 41032d2..46beacc 100644
+--- docs/architecture.md
++++ docs/architecture.md
+@@ -13,6 +13,7 @@ Production capacity claims remain limited to the measured envelopes in the
+ [acceptance boundary](implementation-plan.md#current-acceptance-boundary).
+ 
+ The external contracts and examples are defined in [Interfaces](interfaces.md).
++The [glossary](glossary.md) names each term and the document that governs it.
+ 
+ ## 1. Goals and boundaries
+ 
+@@ -41,6 +42,11 @@ anonymous intake is allowed because it is the fastest path; deduplication and
+ compression matter because efficient storage is a primary goal; signatures and
+ integrity come after all other concerns and never on the hot path.
+ 
++Producers send Sparrow what they set aside, including the cruft that
++`lillith_memetics` sends. Sparrow stores it as any other artifact or record and
++retires it, once the archive holds it, at `received_at + 30 days` unless a pin
++keeps it, and never deletes it before it is archived; the intake, limits and lookup are in the [cruft section of the interfaces](interfaces.md#cruft).
++
+ There is one global 30-day retention policy. Per-class retention, replication,
+ distributed queries, embeddings, an embedded language model, and a human
+ dashboard are outside the first version. Agents perform reasoning using evidence
+@@ -232,8 +238,8 @@ occurrence counts remain separate.
+ 
+ ### 4.3 Budgets and reclamation
+ 
+-The deployment must supply a disk budget and a maintenance reserve. Thirty days
+-bounds age; it does not by itself bound bytes. Account for table/blob files,
++The deployment must supply a disk budget and a maintenance reserve. The 30-day
++deadline does not by itself bound bytes. Account for table/blob files,
+ journals, incomplete imports, dictionaries, indexes, old snapshot versions, and
+ compaction output. Distinguish live logical bytes from measured physical bytes.
+ 
+@@ -279,11 +285,12 @@ filesystem quota's responsibility.
+ 
+ ### 4.4 Archive before delete
+ 
+-Sparrow keeps a 30-day searchable window of disposable logs. It can also
++Sparrow keeps disposable logs searchable until their 30-day deadline. It can also
+ archive aged-out evidence to a large, slower store, such as a NAS, before
+ deleting it. The archive writes GTS segment files through PurRDF's GTS writer,
+ as specified in [the archive format](archive-format.md). Archiving is optional and
+-configured by an `[archive]` table. Once a store has been fenced for archiving,
++configured by an `[archive]` table. Whether the archive is built and running is
++stated in [Archive status](archive-format.md#archive-status). Once a store has been fenced for archiving,
+ it never deletes unarchived evidence. That holds when the archive is down, while
+ it lags, and for the backlog present when archiving was enabled.
+ 
+@@ -544,7 +551,7 @@ event with identical bytes receives a new occurrence. Backpressure is explicit,
+ with retryability and delivery state distinguishable from parser diagnostics.
+ 
+ The daemon transport is Cap'n Proto RPC over a private Unix-domain socket and
+-a public TCP socket, as directed on 2026-10-08. The selected public binding is
++a public TCP socket. The selected public binding is
+ `0.0.0.0:518`; ingestion does not require authentication, while reads, queries
+ and administration over TCP require a shared-secret CHAP session. CLI, Rust clients and the stdio MCP adapter use the same
+ generated schema. Requests, binary payloads, instants, integer counts, receipts
+diff --git docs/archive-format.md docs/archive-format.md
+index 24bf839..14a599c 100644
+--- docs/archive-format.md
++++ docs/archive-format.md
+@@ -5,13 +5,13 @@ SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+ 
+ # Sparrow archive format: `sparrow-archive/1`
+ 
+-Sparrow keeps a searchable 30-day window of disposable logs. Before it deletes
++Sparrow keeps disposable logs searchable until their 30-day deadline. Before it deletes
+ aged-out evidence, it can write that evidence to a large, slower archive, such
+ as a NAS. This document defines the archive's on-disk format, the write
+ protocol, and the rules that keep deletion behind the archive. Tools written
+ later must be able to read the archive without a running Sparrow.
+ 
+-Patrick's rulings bind this design:
++These requirements bind this design:
+ 
+ - Segments are GTS files, written through PurRDF's GTS writer.
+ - Sparrow never deletes unarchived evidence, even when the archive is down.
+@@ -23,59 +23,66 @@ Patrick's rulings bind this design:
+ - An unreachable archive at startup starts the daemon degraded; it does not refuse to start.
+ - When archiving is enabled on an existing store, the whole retained backlog is
+   archived before anything is deleted.
+-- An entry that cannot be encoded is quarantined, and archiving continues.
++- An entry that cannot be archived is held, never skipped or deleted: archiving stops
++  before it and reports it (section 6).
+ - Content projection graphs are archived.
+-- Sparrow has no configurable per-artifact byte limit (2026-11-01: "Remove the
+-  limit"). Entries are records. New layouts cap a record at 128 MiB, but stores
++- Sparrow has no configurable per-artifact byte limit. Entries are records. New layouts cap a record at 128 MiB, but stores
+   laid out earlier may hold larger raw records, and either can exceed the
+   closing target, so a segment must be able to hold an entry larger than its
+   target.
+ 
+-Phase status: the specification and the deletion gate with its store fence
+-(phases P0 and P1) are implemented. So are segment encoding (P2,
+-`Store::archive_prepare`), the archive worker and NAS thread (P3,
+-`sparrow_server::archive::Worker`, started by `sparrowd` when `[archive]` is
+-configured and the daemon is not query-only) and the offline reader (P4, the
+-`sparrow-archive` crate with its `list`, `verify` and `extract` commands). Implemented does not mean running: the worker is not installed or
+-running on the live daemon, so the live store retires nothing through it. Until
+-a worker runs, an archiving store retires nothing on its own. Expiry waits, and
+-under pressure ingest is refused with `STORAGE_PRESSURE`.
++## Archive status
++
++The archive is implemented on `main` and is not running on the live daemon.
++
++- Implemented: the specification and the deletion gate with its store fence
++  (phases P0 and P1), segment encoding (P2, `Store::archive_prepare`), the
++  archive worker and NAS thread (P3, `sparrow_server::archive::Worker`, started
++  by `sparrowd` when `[archive]` is configured and the daemon is not
++  query-only) and the offline reader (P4, the `sparrow-archive` crate with its
++  `list`, `verify` and `extract` commands).
++- Not running: the live daemon has no `[archive]` table, so it runs no archive
++  worker and its store carries no archive policy.
++
++The live store deletes nothing today, because the live daemon runs no archive worker and so nothing is retired. Running the worker on the live daemon is a separate condition, behind issue 352 and an authorized image switch.
++
++Implemented does not mean running: whether a daemon runs the worker is
++operational state, set by its `[archive]` table and shown in its journal. Until
++a worker runs, a store retires nothing on its own. Expiry waits, and under
++pressure ingest is refused with `STORAGE_PRESSURE`. Other documents link to this
++section for the state of the archive.
+ 
+ ## 1. Layout
+ 
+ ```text
+-<root>/<store-hex>/STORE.nq
+-<root>/<store-hex>/segments/YYYY/MM/DD/<segment-id>/<segment files, GTS>
+-<root>/<store-hex>/segments/YYYY/MM/DD/<segment-id>/manifest.nq
+-<root>/<store-hex>/quarantine/YYYY/MM/DD/<segment-id>/<n>.bin
+-<root>/<store-hex>/.staging/<staging-id>/
++<root>/STORE_ID
++<root>/<store-id>/<first-position>-<last-position>.gts
+ ```
+ 
+-- `<store-hex>` is the hexadecimal part of the store identity `store:<hex>`.
+-  One root can hold several stores.
+-- `YYYY/MM/DD` is the UTC receipt date of the segment's first entry.
+-- `<segment-id>` is the lowercase hexadecimal segment identity (section 3).
+-- The segment files are written by PurRDF's GTS writer. The encoder is the one
+-  module that knows their names and layout; nothing else in Sparrow assumes it.
+-- `quarantine/` holds raw bytes of quarantined entries (section 6), grouped by
+-  the segment that covers them. `<n>` is the entry's decimal index in that
+-  segment's manifest.
+-- `.staging/` holds partial writes. Readers ignore it, and the writer removes
+-  stale staging directories before it starts a new write.
++- `<root>` is the `[archive] dir`. It must already exist, be on its own mount and be empty
++  (apart from a leftover `STORE_ID.partial`) before the first segment, or already hold this
++  store's `STORE_ID`. The worker creates nothing else in `<root>`.
++- `STORE_ID` holds the store identity, `store:<hex>`, and a newline. The worker writes it
++  once, on the first pass into an empty root, through a `STORE_ID.partial` that is synced
++  and renamed. It is never overwritten: a root whose `STORE_ID` names another store, or
++  that holds other entries but no `STORE_ID`, is refused and not adopted. One root holds one
++  store.
++- `<store-id>` is the whole store identity including its `store:` prefix, so the directory
++  is named `store:<hex>`. The worker creates it on the first segment.
++- A segment is one file, `<first-position>-<last-position>.gts`, directly in the store
++  directory. The positions are the eviction positions of the segment's first and last
++  entries (section 2), `{received_at:020}:{id}` or `{received_at:020}:artifact:<hex>`, so
++  the files sort in eviction order. There are no date directories, no subdirectories and no
++  separate manifest.
++- A segment file is written by PurRDF's GTS writer (profile `sparrow-archive`). The encoder
++  is the one module that knows its layout; the offline reader has one decoder module.
++- A file being written has the suffix `.partial` until it is synced and renamed into
++  place. A stale `.partial` from a crashed pass is truncated by the next write of the same
++  name. Readers ignore it, because they read only `*.gts`.
+ 
+-Segments are immutable. Nothing in a committed segment directory is rewritten,
+-appended to or deleted by Sparrow.
+-
+-`STORE.nq` binds the directory to one store and is written once, when the
+-archive is first used:
+-
+-```text
+-<urn:sparrow:archive:store:HEX> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:sparrow:vocab:ArchiveStore> .
+-<urn:sparrow:archive:store:HEX> <urn:sparrow:vocab:storeId> "store:HEX" .
+-<urn:sparrow:archive:store:HEX> <urn:sparrow:vocab:archiveFormat> "sparrow-archive/1" .
+-```
+-
+-Startup compares it with the opened store and refuses a mismatch.
++Segments are immutable. Sparrow never rewrites, appends to or deletes a committed segment
++file. A file already at its name when a pass writes it is a retry of an earlier pass: it is
++kept and checked, not overwritten (section 8).
+ 
+ ## 2. Segment boundaries
+ 
+@@ -130,11 +137,13 @@ A record whose content projection failed at ingest is held the same way, because
+ its evidence cannot be read whole. `Store::archive_held` reports the held record
+ and the reason when it is the first unarchived entry. A segment that fails to
+ encode is halved until the failing entry stands alone, which is then named in
+-the error and in a warning. The segment's read renews its lease while it makes
++the error; the worker journals that failed pass and the watermark does not move. The segment's read renews its lease while it makes
+ progress, so a long segment is not a failure; only a read that stalls for the
+-lease's 60 seconds ends with `RESULT_EXPIRED` and is halved. Every record and artifact a segment covers has its
+-graph in the file (a record's parent artifact graph included); an artifact with
+-no graph, retired before the fence, is counted in `retired_artifacts`. The count of held records and the bytes waiting behind the first are not
++lease's 60 seconds ends with `RESULT_EXPIRED` and is halved. Every live record a segment covers has its graph in the file (its parent
++artifact graph included), and every artifact the segment covers has its graph unless it was retired
++before the fence, in which case it is counted in `retired_artifacts`. A record that was
++evicted or retired before the fence is counted in `retired_records` and is absent from the file:
++no graph, blob or link quad. The count of held records and the bytes waiting behind the first are not
+ scanned, because that would read every record row on each pass.
+ 
+ The 256 MiB ceiling and the hold bound are memory limits of the GTS writer. They
+@@ -148,20 +157,22 @@ figure is an estimate to measure.
+ segment-id = BLAKE3( frame("sparrow-archive/1")
+                    ‖ frame(store-id)
+                    ‖ frame(first-position) ‖ frame(last-position)
+-                   ‖ for each segment file in write order:
+-                     frame(file-name) ‖ frame(BLAKE3(file))
+-                   ‖ frame(u64_le(quarantine-count))
+-                   ‖ frame(BLAKE3(0.bin)) ‖ … )
++                   ‖ frame(file-name) ‖ frame(BLAKE3(file))
++                   ‖ frame(u64_le(0)) )
+ ```
+ 
+ `frame` is PurRDF's `purrdf_hash::frame::frame_le`: an eight-byte little-endian
+-length followed by the bytes. Digests are the raw 32 bytes. Quarantine files
+-appear in ascending entry index. The PurRDF codec is
++length followed by the bytes. Digests are the raw 32 bytes. A segment has one file. The
++final term is the quarantine count, which is always zero: nothing is quarantined (section 6).
++The identity is not stored in the archive; it is the name a commit uses (section 7). The PurRDF codec is
+ byte-deterministic, so the same range of the same store, encoded by the same
+ PurRDF revision, always gives the same identity. A copy of a store
+-therefore rebuilds and adopts its existing segments. A different PurRDF revision
+-can give a different identity for the same range. Readers then see duplicates
+-and remove them by record IRI (section 8).
++therefore rebuilds and adopts its existing segments. A different PurRDF revision can give
++a different identity for the same range. The file name depends only on the range, so no
++second file is written: a rebuild against an intent already in flight is refused with
++`CONFLICT`, and one against a file already in place fails the byte-equal check in
++section 8. Either way every later pass fails until an operator resolves it, and the
++watermark does not move.
+ 
+ ## 4. Content
+ 
+@@ -175,30 +186,35 @@ in its range, with its dependencies:
+ 
+ | Content | Where |
+ | --- | --- |
+-| Record bytes `[byte_start, byte_end)` | One blob per record in the segment's GTS files, keyed by lowercase hexadecimal SHA-256. A record's chunks are joined in order. |
++| Record bytes `[byte_start, byte_end)` | One blob per record in the segment's GTS file, keyed by its BLAKE3 digest string `blake3:<hex>`, compressed with zstd (independent 64 KiB zstd frames from 8 MiB up). A record's chunks are joined in order. |
+ | Record metadata graph `urn:sparrow:graph:record:<hex>` | the segment's GTS files, including its provenance and tracing facts. |
+ | Diagnostic graph | the segment's GTS files, under its recorded graph IRI. |
+ | Artifact graph `urn:sparrow:graph:artifact:<hex>` | the segment's GTS files of the segment whose covered range contains the artifact's position. When artifacts share a millisecond, that can be an earlier segment that holds none of the artifact's records. The gate treats the artifact as archived once that segment commits. |
+ | Content projection graphs | the segment's GTS files, under each projection's graph IRI. A projection shared by records in several segments appears in each of them. |
+-| Link quads | One per record with bytes, in the graph `urn:sparrow:graph:archive-links`. |
++| Link quads | Two per encoded record, zero-length ones included (below), in the graph `urn:sparrow:graph:archive-links`. |
+ | Reifiers and annotations of these graphs | the segment's GTS files. |
+ 
+-A link quad ties a record to its blob by the SHA-256 of the record's bytes:
++Two link quads tie a record to its blob, one carrying the SHA-256 of the record's bytes
++(64 hexadecimal digits) and one the BLAKE3 digest string that keys the blob:
+ 
+ ```text
+ <urn:sparrow:record:HEX> <urn:sparrow:vocab:payloadSha256> "64 hex digits" <urn:sparrow:graph:archive-links> .
++<urn:sparrow:record:HEX> <urn:sparrow:vocab:payloadBlake3> "blake3:64 hex digits" <urn:sparrow:graph:archive-links> .
+ ```
+ 
+ Artifact bytes are not copied separately. Every byte of an artifact with records
+ belongs to one of its records, and a recordless artifact has no bytes. A reader
+ rebuilds an artifact by joining its records' blobs in source order. `sparrow-archive`
+-hashes each record's bytes against the digest its link quad names, checks that the
++hashes each record's bytes against the `payloadBlake3` digest its link quad names, checks that the
+ records are contiguous in byte order from zero, and checks that their total equals the
+ artifact's `byteLength`. It does not compare the whole artifact with its BLAKE3 `payload`.
+ 
+ An entry already retired before the store was fenced still has its catalog row
+-until ordinary cleanup removes it. Its metadata is archived. Its missing bytes
+-or projection go through the quarantine path, with the reason `retired`.
++until ordinary cleanup removes it. A record evicted or retired before the fence has no
++metadata or bytes to read: selection counts it in the prepared segment's `retired_records`
++and writes nothing for it, and an artifact with no graph is counted in `retired_artifacts`.
++Only a live record with zero bytes gets an empty blob and its two link quads, so a reader
++finds every encoded record the same way.
+ 
+ The archive leaves out text postings, term dictionaries, tail ranges, pins,
+ request and retry rows, journals, import staging and catalog JSON. These are
+@@ -209,39 +225,37 @@ derived or operational state. Readers rebuild indexes from the archived graphs.
+ - **By age**: an entry is due once `now ≥ received_at + start_fraction ·
+   (expires_at − received_at)`. With the defaults, that is day 22.5 of 30.
+ - **By size**: everything is due, oldest first, once
+-  `linked_physical_bytes ≥ start_fraction · (disk_budget − maintenance_reserve)`,
+-  or whenever pressure maintenance has been requested.
++  `linked_physical_bytes ≥ start_fraction · (disk_budget − maintenance_reserve)`.
+ - **Backlog**: an existing store that turns archiving on is fenced with nothing
+   archived. Its whole retained backlog is archived, oldest first, before any of
+   it is deleted.
+-- **Horizon**: no segment extends past the earliest of
+-  `now − max(10 minutes, buffered_flush_interval)`, the receipt time of the
+-  oldest open import preparation, and the oldest unsynchronized buffered entry.
+-  A publication behind the horizon is refused as a clock regression
+-  (section 7), so the horizon must trail every publication still in flight.
++- **Horizon**: no new segment extends past `now − max(10 minutes, buffered_flush_interval)`.
++  Nothing else moves it: an open import preparation or an unsynchronized buffered entry
++  does not hold it back. A publication at or behind the watermark or the in-flight segment's end is
++  refused with `ARCHIVE_WATERMARK` (section 7), so an import that outlives the horizon is
++  refused, not waited for. A rebuild of an in-flight segment follows the intent's range and
++  applies no horizon, size or day limit.
+ 
+ Pins do not affect archiving. A pinned entry is archived in order like any
+ other entry; its pin only delays deletion.
+ 
+-## 6. Quarantine
++## 6. Held entries
+ 
+-An entry the encoder cannot represent is quarantined, so it does not block
+-retention. This covers metadata the codec rejects, a projection that failed
+-during ingestion, and bytes retired before the fence. The rest of the segment
+-is encoded normally:
++Nothing is quarantined: the format has no quarantine files and no quarantine records.
++An entry that cannot be archived is held, so it does not leave the store unarchived and
++unreported:
+ 
+-- The entry's available raw bytes go to `quarantine/…/<segment-id>/<n>.bin`
+-  without any graph.
+-- The segment manifest records a `QuarantineEntry` with the evidence IRI, the
+-  reason, the file's BLAKE3 and SHA-256 digests and its length.
+-- The segment still covers the entry's position, so the watermark stays
+-  contiguous.
+-- The store keeps a bounded quarantine listing, which status and an operator
+-  listing operation report (P3). Quarantine is visible, never silent.
+-
+-Reasons are `encode` (the codec refused the entry), `projection` (a recorded
+-projection failure left part of its content unrepresented) and `retired` (its
+-bytes or projection were retired before the store was fenced).
++- A record whose bytes exceed 128 MiB (`TooLarge`), or whose content projection failed at
++  ingest (`ProjectionFailed`), is held at selection. Selection stops before it, so the
++  watermark never passes it and nothing after it is archived or deleted until it is
++  resolved. `Store::archive_held` reports the held record and the reason when it is the
++  first unarchived entry, and the worker journals it.
++- An entry the encoder refuses is found by halving the segment until it stands alone (a
++  rebuild of an in-flight segment, and an `UNSUPPORTED` error, are not halved: the error
++  then names the range's first entry). The prepare fails with the error naming that entry and its code, the worker journals
++  the failed pass, and the watermark does not move. The entry is retried on the next pass.
++- In every case the entry stays in the store, unarchived and undeleted, until it is
++  archived by a later pass.
+ 
+ ## 7. Deletion gate and store fence
+ 
+@@ -275,11 +289,13 @@ the intent in one synchronized batch. The commit resets the pressure cursor, so
+ the next pressure pass starts again from the beginning of the eviction order.
+ 
+ A publication batch whose earliest position is at or before the watermark or the
+-in-flight intent's end is refused with `STORAGE_FAILURE`. The message names
+-both positions and says to correct the clock. Without this guard, a backwards
++in-flight intent's end is refused with `ARCHIVE_WATERMARK`, a code typed apart from
++`STORAGE_FAILURE` so a caller that stamped the batch early can offer it again with a later
++instant. The message names the position and the watermark and says that the clock moved
++backwards or an import outlived the archive horizon. Without this guard, a backwards
+ clock step could publish evidence the archive would never cover.
+ 
+-Archiving fences the store format with the `sparrow.store/99` to `/109` family, or `/121` to `/131` once the store is also fenced for intake provenance. A store fenced for receipt-time event fallback RDF (schema 69) uses `/154` to `/164` and `/176` to `/186` respectively. A store that also carries the owner-to-graph index uses `/209` to `/219` and `/231` to `/241` respectively.
++Archiving fences the store format with the `sparrow.store/99` to `/109` family, or `/121` to `/131` once the store is also fenced for intake provenance. A store fenced for receipt-time event fallback RDF (schema 69) uses `/154` to `/164` and `/176` to `/186` respectively. A store that also carries the owner-to-graph index uses `/209` to `/219` and `/231` to `/241` respectively; the source summary adds `/264` to `/274` and `/286` to `/296`; the store counters add `/319` to `/329` and `/341` to `/351`; and the payload index adds `/374` to `/384` and `/396` to `/406` (the first range of each pair without intake provenance, the second with it). A store opened by the current binary is lifted into the payload-index families.
+ It sits above every earlier authority family and keeps the underlying authority
+ through later transitions. It includes the log time law, so stores in this
+ family always carry that law marker. Binaries without the gate do not know these
+@@ -290,78 +306,66 @@ from a store is not supported in this version.
+ 
+ ## 8. Write protocol
+ 
+-The worker runs every archive operation on one dedicated thread,
+-`sparrow-archive-nas`, with at most one operation in flight:
++The worker runs every archive operation on one dedicated thread, `sparrow-archive`, with at
++most one operation in flight, and a second thread watches the step in flight. For each
++prepared segment it:
+ 
+-1. Write each staged table into a fresh
+-   `.staging/<staging-id>/` directory and fsync it.
+-2. Write `manifest.nq` last and fsync it.
+-3. Fsync the staging directory.
+-4. Create the missing parent directories, fsyncing each one and its parent.
+-5. Rename the staging directory to its final path. An existing non-empty target
+-   refuses the rename. NFS has no `RENAME_NOREPLACE`, so the check and the
+-   rename are separate steps under the single-writer rule.
+-6. Fsync the parent directory.
+-7. Read every file back past the client cache and check its BLAKE3.
++1. Checks that `<root>` is a directory on its own mount (a different device from `/`, and a
++   network filesystem type or a type different from `/`'s), and that it holds this store's
++   `STORE_ID`, writing it on the first pass into an empty root (section 1).
++2. Creates `<root>/<store-id>` if it is missing and syncs `<root>`.
++3. Writes each segment file as `<name>.partial`, syncs it and renames it to `<name>`. A file
++   already at `<name>` is kept as is. Then it syncs the store directory.
++4. Reads every file back and requires it byte-equal to what it prepared, then decodes the
++   set with the decoder `sparrow-archive verify` and `extract` run (`sparrow_archive::verify`,
++   called from `sparrow-server/src/archive/decode.rs`): the set is exactly one `.gts` file,
++   PurRDF's GTS reader reports no diagnostic (which covers the frame hash chain), the record
++   and artifact metadata is well formed, and each record's bytes hash to the digest its link
++   quad names. A blob corrupted before the write is refused here, before the commit.
++5. Refuses to commit if any step ran at least `io_timeout_secs`: the files stay, and the
++   next pass verifies and commits them.
++6. Commits: `archive_commit` names the segment identity and advances the watermark
++   (section 7).
+ 
+-If the target already exists and verifies, the write counts as done. If it
+-exists and does not verify, the write fails hard and the watermark does not
+-move. Only a verified segment is committed: verification decodes the segment with the
+-same decoder as `sparrow-archive verify`, so each record's bytes must hash to the digest its
+-link quad names. A refused file stays in place and the operator clears it before the worker
+-writes the segment again. A Synology NFS export must use
+-synchronous writes (`sync`); with `async` exports fsync proves nothing.
++If the target already exists and equals the prepared bytes, the write counts as done. If
++it exists and differs, the pass fails with a verify error and the watermark does not move.
++Only a verified segment is committed: verification decodes the segment with the same
++decoder as `sparrow-archive verify`, so each record's bytes must hash to the digest its
++link quad names. A refused file stays in place and the operator clears it before the
++worker writes the segment again. A Synology NFS export must use synchronous writes
++(`sync`); with `async` exports fsync proves nothing.
+ 
+ Crash recovery follows from the intent:
+ 
+ | Crash point | Recovery |
+ | --- | --- |
+ | Before the intent | Nothing to recover. |
+-| After the intent | Rebuild the identical segment from the intent's range in a new staging directory. |
+-| After the rename | Verify and adopt the existing segment, then commit. |
+-| Range content differs from the intent | `STORAGE_FAILURE`; nothing is deleted. |
++| After the intent | The next prepare rebuilds the segment from the intent's range, and the worker's next write truncates a stale `.partial`. |
++| After the rename, before the commit | The next pass finds the file, checks it against the rebuilt bytes and commits. |
++| Range content differs from the intent | A rebuild whose identity or counts differ is refused by `archive_intend` with `CONFLICT`; an intent that now covers a held record fails with `STORAGE_FAILURE`. Nothing is deleted either way. |
+ 
+-## 9. Manifest
++## 9. No manifest
+ 
+-`manifest.nq` is N-Quads written by PurRDF's N-Quads serializer, in the default
+-graph. It holds no wall-clock time, so identical inputs give identical bytes.
+-The segment subject is `urn:sparrow:archive:segment:<segment-id>`. Terms use
+-the `urn:sparrow:vocab:` namespace, written `sp:` below.
+-
+-| Subject | Predicate | Object |
+-| --- | --- | --- |
+-| Segment | `rdf:type` | `sp:ArchiveSegment` |
+-| Segment | `sp:archiveFormat` | `"sparrow-archive/1"` |
+-| Segment | `sp:compression` | `"zstd"` |
+-| Segment | `sp:storeId` | `"store:<hex>"` |
+-| Segment | `sp:rdfProfile` | The store's recorded RDF profile identity. |
+-| Segment | `sp:purrdfRevision` | The full PurRDF commit that encoded the tables. |
+-| Segment | `sp:firstPosition`, `sp:lastPosition` | Eviction positions, as strings. |
+-| Segment | `sp:receivedFrom`, `sp:receivedThrough` | `xsd:dateTime` receipt instants of the first and last entries. |
+-| Segment | `sp:recordCount`, `sp:artifactCount`, `sp:blobCount`, `sp:quarantineCount` | `xsd:nonNegativeInteger` counts. |
+-| Segment | `sp:table` | One file IRI, `<segment>#<file name>`, per segment file. |
+-| Table | `rdf:type` | `sp:ArchiveTable` |
+-| Table | `sp:fileName` | The segment file's name. |
+-| Table | `sp:blake3` | Lowercase hexadecimal BLAKE3 of the file. |
+-| Table | `sp:byteLength` | `xsd:nonNegativeInteger`. |
+-| Segment | `sp:quarantined` | One entry IRI, `<segment>#quarantine-<n>`, per entry. |
+-| Entry | `rdf:type` | `sp:QuarantineEntry` |
+-| Entry | `sp:evidence` | The record or artifact IRI. |
+-| Entry | `sp:quarantineReason` | `"encode"`, `"projection"` or `"retired"`. |
+-| Entry | `sp:fileName`, `sp:blake3`, `sp:payloadSha256`, `sp:byteLength` | The quarantine file and its digests. |
++The archive writes no manifest. A segment's contents are its GTS file: the graphs of its
++records and artifacts, the link quads and the record blobs. The per-segment facts that
++other tools need are in that file or are derived from it: `sparrow-archive list` prints each
++segment's record, artifact and blob counts and its artifacts' `id`, `source`, `received_at`
++and `byte_length`. The store's own progress is in its catalog, not in the archive
++(section 7).
+ 
+ ## 10. Readers
+ 
+-PurRDF's GTS reader reads a segment directly and returns the validated dataset
+-and its content; every blob is checked against its SHA-256 digest. Readers
+-verify each file's BLAKE3 against the manifest first. Every record's link
+-digest names a blob. To find a record's bytes, follow the link quad
+-(predicate IRI `urn:sparrow:vocab:payloadSha256`) to the blob with that digest.
++PurRDF's GTS reader reads a segment directly and checks its frame hash chain; it does not
++hash a blob's decompressed bytes, so the decoder hashes each record's bytes and compares
++them with the digest its link quad names. To find a record's bytes, follow the link quad
++(predicate IRI `urn:sparrow:vocab:payloadBlake3`) to the blob with that digest. A file the
++reader refuses, or with no segment head, is a refusal and never a partial read.
+ 
+-Duplicates can appear after a PurRDF revision change (section 3). Readers keep
+-one copy per record IRI and report duplicates rather than merging conflicting
+-content. The offline `sparrow-archive list|verify DIR` tool (crate `sparrow-archive`)
+-walks `DIR` for segment files, decodes each in memory through one decoder module, and
++No reader detects duplicate segments: `list` and `verify` treat each file alone, and
++`extract` drops a repeated record id silently after sorting an artifact's records by byte
++position. The offline `sparrow-archive list|verify DIR` tool (crate `sparrow-archive`)
++walks `DIR` for `*.gts` files (it also skips a directory named `.staging`, which this
++format does not write), decodes each in memory through one decoder module, and
+ prints one JSON line per segment with its record, artifact and blob counts. `verify`
+ also fails any segment the decoder refuses, with `"ok":false` and exit 1. The tool never
+ opens a live store and writes nothing.
+diff --git docs/deployment.md docs/deployment.md
+index 182ef92..c741fd5 100644
+--- docs/deployment.md
++++ docs/deployment.md
+@@ -495,8 +495,9 @@ cursor was saved. It touches nothing but the scratch directory and its own unit.
+ ## Archive and backups
+ 
+ Sparrow backs up nothing except the age-out to GTS files on the NAS: the archive worker
+-(docs/interfaces.md, "Archive") writes each aged-out segment under `[archive] dir`, here
+-`/net/synology/archives/sparrow-archive`, before the store retires it. The online store backup
++(docs/interfaces.md, "Archive-before-delete gate") writes each aged-out segment under `[archive] dir`, here
++`/net/synology/archives/sparrow-archive`, before the store retires it. The worker is implemented
++and is not running on the live daemon; see [Archive status](archive-format.md#archive-status). The online store backup
+ (#156) was removed in #330, with `sparrow-backup`, its restore, `deploy/verify-backup.sh`,
+ `deploy/pre-upgrade-backup.sh` and the nightly timer. The configuration keys `backup_root` and
+ `backup_keep` were removed too. The server file refuses unknown keys, so a `server.toml` that still
+diff --git docs/development-runtime.md docs/development-runtime.md
+index 0776fb7..c07a36b 100644
+--- docs/development-runtime.md
++++ docs/development-runtime.md
+@@ -23,11 +23,10 @@ unit. Earlier transient-unit and schema sections retain history.
+ 
+ ## Production sources, memory limits and backups
+ 
+-On 2026-10-27 the unit gained `MemoryHigh=2G` and `MemoryMax=4G` at Patrick's
+-direction, installed with a daemon reload; the cgroup reports 2147483648 and
+-4294967296 bytes.
++The unit sets `MemoryHigh=2G` and `MemoryMax=4G`, installed with a daemon
++reload; the cgroup reports 2147483648 and 4294967296 bytes.
+ 
+-Patrick approved five lab-local sources, all fed through the
++Five lab-local sources are fed through the
+ [shipper](deployment.md#shipping-finished-files-from-producers-that-keep-them)
+ into consume roots under `~/.local/state/sparrow/intake/`. Their watches
+ (revisions 8 to 12) and sources share these names:
+@@ -53,8 +52,7 @@ attempts. Later chunks are 1 MiB. On the live store, records rose from 217 to
+ On 2026-10-28 the backlog saturated the host's disk and CPU. The installed
+ `43e8f2a` daemon could not finish a 1 MiB deep-JSONL chunk within the 60-second
+ connection lease, so every chunk was retried about once a minute, and the store
+-grew to 10.1 GB in a day. Patrick stopped it. Mentation has moved to memetics
+-and was retired at his direction:
++grew to 10.1 GB in a day. The mentation source was stopped and retired:
+ 
+ - Its source left `ship.toml`, and the shipper's 1,125 queued copies (1.1 GB,
+   all single-link files) were deleted. The producer's 130 original segments
+@@ -63,7 +61,7 @@ and was retired at his direction:
+   in the intake root.
+ - Watch removal then ran with zero pending claims and recorded revision 13.
+ - Its watch definition file was deleted. Mentation artifacts already stored
+-  remain until retention expires.
++  remain, because nothing retires while no archive worker runs.
+ 
+ The unit gained `CPUQuota=100%`, `IOWeight=20` and `Nice=10`. Under those
+ limits the drain held the daemon near 40 percent of one core, with host I/O
+@@ -146,7 +144,7 @@ the build. Only the daemon carries `cap_net_bind_service=ep`. The previous
+ `bee07bc` images remain for rollback. The configuration was backed up as
+ `~/.config/sparrow/server.toml.pre-chap-43e8f2a`. It gained `rpc_tcp_secret_file`
+ for a new 32-byte random mode-0600 secret, and `disk_budget` rose from 512 MiB to
+-50 GiB (`53687091200`) at Patrick's direction. The store filesystem had 353 GB free.
++50 GiB (`53687091200`). The store filesystem had 353 GB free.
+ 
+ No `sparrowd` process remained before cutover. Startup removed the refused stale
+ socket under the store lock and reconciled both watches. Live checks preserve
+diff --git docs/glossary.md docs/glossary.md
+new file mode 100644
+index 0000000..5a7c72a
+--- /dev/null
++++ docs/glossary.md
+@@ -0,0 +1,36 @@
++<!--
++SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++-->
++
++# Sparrow glossary
++
++Each entry gives the term's meaning in Sparrow and the document that governs it.
++The governing document wins over this page. The charter is
++the [Purpose section of AGENTS.md](../AGENTS.md#purpose).
++
++| Term | Meaning | Governing document |
++| --- | --- | --- |
++| Archive | The large, slower store (a NAS) to which aged-out evidence is written as GTS segment files before it is deleted. It is implemented and is not running on the live daemon. | [Archive format](archive-format.md#archive-status) |
++| Artifact | One accepted complete file, dump, document or upload, with an occurrence ID, receipt time, media type, provenance and an exact-byte payload or manifest. | [Architecture, section 3](architecture.md#3-logical-model-and-identity) |
++| Cruft | What `lillith_memetics` sends Sparrow as material it has set aside. Sparrow stores it as an ordinary artifact or record, with no special path. | [Interfaces, Cruft](interfaces.md#cruft) |
++| Deletion gate | The single check that every expiry and eviction passes: nothing is retired unless the archive watermark covers it. | [Archive format, section 7](archive-format.md#7-deletion-gate-and-store-fence) |
++| Disk budget | The store's configured byte allowance, with the maintenance reserve and the free-space floor. Ingest above it is refused with `STORAGE_PRESSURE`. | [Architecture, section 4.3](architecture.md#43-budgets-and-reclamation) |
++| Event time basis | Whether a record's event time is a source instant (`source`) or its receipt time derived when read (`receipt`). Expiry never uses event time. | [Architecture, section 3](architecture.md#3-logical-model-and-identity); [Interfaces, receipt-time event fallback](interfaces.md#receipt-time-event-fallback-schema-69) |
++| Fate | Where one item of cruft is and how long it stays. While the item is live, Sparrow finds it by source, by an exact JSON field value, or, for a whole artifact, by its BLAKE3 payload id; once archived, `sparrow-archive` lists and extracts it. | [Interfaces, Cruft](interfaces.md#cruft) |
++| Fence | The store format change at first open with an archive policy that makes older binaries refuse the store, so no writer can bypass the gate. | [Archive format, section 7](archive-format.md#7-deletion-gate-and-store-fence) |
++| Ingest socket | The optional group-accessible Unix socket that admits producer operations only and records each caller's uid, gid and pid in provenance. | [Interfaces, section 5](interfaces.md#5-capn-proto-ingestion-queries-and-administration) |
++| Payload | An exact byte sequence identified by its full BLAKE3 digest, stored once however many records share it. | [Architecture, section 3](architecture.md#3-logical-model-and-identity) |
++| Payload id | `blake3:` and the 64 lower-case hex digits of the BLAKE3 hash of an artifact's bytes. `payloadLookup` returns the artifacts that hold it. | [Interfaces, payload id index](interfaces.md#payload-id-index-store-format) |
++| Pin | A named, expiring collection of artifact and record IDs that delays their deletion. Reads do not extend it. | [Architecture, section 5](architecture.md#5-retention-and-named-pins); [Interfaces, section 4](interfaces.md#4-named-pin-example-and-rules) |
++| Projection | Derived RDF or text facts for a record, identified by content, codec and interpretation context, produced by PurRDF. | [Architecture, section 3](architecture.md#3-logical-model-and-identity) |
++| Query-only daemon | A daemon started with `--query-only`: it opens a store to serve reads only and starts no consume or tail worker, syslog listener, TCP listener or maintenance worker. | [Interfaces, query-only daemon](interfaces.md#query-only-daemon-schema-67) |
++| Razor | The Katamari/Sparrow rule for where data lives: whatever needs long-term storage, privacy, encryption, validation or resilience goes to Katamari, and everything else goes to Sparrow. | [Architecture, section 1](architecture.md#1-goals-and-boundaries) |
++| Receipt time | The server instant at which Sparrow accepted an artifact or record. Retention and expiry use it alone. | [Architecture, section 5](architecture.md#5-retention-and-named-pins) |
++| Record | One addressable log event or JSONL entry, with its own occurrence ID, source byte range and payload references. | [Architecture, section 3](architecture.md#3-logical-model-and-identity) |
++| Retention window | An unpinned item is due at `received_at + 30 days` and is retired then once the archive holds it. Disk pressure can retire archived, unpinned items earlier; a pin keeps an item until the pin ends; the deletion gate keeps every unarchived item past its deadline, which on the live daemon today is every item. There is one global policy. | [Architecture, section 5](architecture.md#5-retention-and-named-pins) |
++| Segment | One immutable GTS file of the archive, named by the first and last eviction positions it holds. | [Archive format, section 1](archive-format.md#1-layout) |
++| Source | A logical intake origin, such as a configured watch, syslog listener or client, that groups artifacts and stream generations. | [Architecture, section 3](architecture.md#3-logical-model-and-identity) |
++| Store id | The persistent identity of one store, `store:<hex>`, that scopes every artifact, record, source, stream and pin ID. The archive holds one store per root. | [Architecture, section 3](architecture.md#3-logical-model-and-identity); [Archive format, section 1](archive-format.md#1-layout) |
++| Stream | An ongoing source such as an active file or syslog stream. It describes provenance and ordering and does not retain unlimited history. | [Architecture, section 3](architecture.md#3-logical-model-and-identity) |
++| Watermark | The durable `archive:through` position: the last eviction position written to the archive and verified. Nothing after it is deleted. | [Archive format, section 7](archive-format.md#7-deletion-gate-and-store-fence) |
+diff --git docs/interfaces.md docs/interfaces.md
+index 8fb2ef0..fa51924 100644
+--- docs/interfaces.md
++++ docs/interfaces.md
+@@ -43,6 +43,74 @@ MCP and CLI adapters call the generated Cap'n Proto daemon client. They must not
+ implement separate filtering, retention, pin, or query semantics. The daemon
+ owns the database; the local CLI and stdio MCP adapter connect to it.
+ 
++### Cruft
++
++Cruft is what a producer sends Sparrow as material it has set aside: files and
++records the producer no longer wants in its own store but does not want lost
++while it may still be wanted. `lillith_memetics` is the producer, and its cruft
++specification owns what an item means. Sparrow gives cruft no special path,
++type or retention: an item of cruft is an ordinary artifact or record. Sparrow answers only where the item is and how long it
++stays.
++
++**Intake.** `lillith_memetics` sends cruft through the typed ingest and import
++operations. Sparrow accepts them on the ingest-only Unix socket
++(`ingest_socket_path`, see the RPC binding in section 1 and the ingest socket in
++section 5) and on the private socket, like any other producer. The ingest socket records the sender's uid,
++gid and pid in the item's provenance (`intake`). Every item is under the
++source the producer names; the source is the item's lasting address in queries.
++
++**Limits.** Sparrow has no per-artifact byte limit (see
++[Large artifacts](#large-artifacts-schema-65)). What bounds an item is:
++
++- the disk budget, the maintenance reserve and the free-space floor
++  (`disk_budget`, `maintenance_reserve`, `min_free_bytes`): while nothing can be retired, ingest is
++  refused with `STORAGE_PRESSURE`, which is retryable, once the store reaches the
++  budget less the reserve or free space is below the floor;
++- the inline ingest bound: one inline `ingest` carries at most 16 MiB
++  (`Discovery.maxInlineArtifactBytes`) and a larger one is refused with
++  `RESOURCE_LIMIT`. It applies to a single inline `ingest`, not to imports; a
++  larger input goes through the staged import;
++- `max_records`, the records in one artifact;
++- `MAX_IMPORT_BYTES`, 8515420160 bytes (129935 chunks, about 7.93 GiB), a fixed
++  bound on one `import_begin` until the v2 store format (#5). A larger input is
++  split into parts of at most that many bytes, each imported as its own
++  request, and then the manifest is imported.
++
++**Finding one item's fate.** While the item is live, three reads find it:
++
++- `payloadLookup` (CLI `payload`, MCP `payload_lookup`) takes an artifact
++  item's payload id, the BLAKE3 hash of its bytes as `blake3:` and 64 hex
++  digits (not another hash such as a SHA-256), and returns the artifacts that
++  hold those bytes. It covers whole artifacts only. The
++  answer is exact once the payload-index migration completes; before that,
++  every listed artifact is held and an unlisted one is unknown (see
++  [Payload id index](#payload-id-index-store-format));
++- `records` over the item's source lists its records;
++- `values_search` over the item's source finds a record by an exact JSON field
++  value.
++
++Once the item has aged out, the archive holds it, if the archive is running (see
++[Archive status](archive-format.md#archive-status)). `sparrow-archive list DIR`
++prints one JSON line per segment with an `entries` array; each entry gives the
++artifact `id`, `source`, `received_at` and `byte_length`. It does not print
++payload ids. The reader matches the item by source, receipt time and length
++(or by the artifact id noted while the item was live), then runs
++`sparrow-archive extract DIR ARTIFACT_ID`, which writes the artifact's verified
++bytes to stdout. `sparrow-archive verify DIR` checks every segment. All three
++are offline and read-only.
++
++**Retention Sparrow guarantees.** Nothing is deleted that has not been archived:
++the deletion gate, the archive watermark and the store fence enforce it (see
++[Archive-before-delete gate](#archive-before-delete-gate-schema-63)). An unpinned item is due at `received_at + 30 days` and is retired then once the
++archive holds it. Archiving starts early, by default at 75% of the window, and a
++segment counts only once it is written and verified. Disk pressure can retire
++archived, unpinned items earlier. A pin keeps an item until the pin ends. The
++deletion gate keeps every unarchived item past its deadline, so with no archive
++running (the live daemon today) nothing retires and ingest is refused with
++`STORAGE_PRESSURE` at the budget less the reserve or below the floor. Source timestamps do not move the deadline. Whether the
++archive worker runs on the live daemon is stated in
++[Archive status](archive-format.md#archive-status).
++
+ ### Frozen scope receipts (schema 56)
+ 
+ Record, text, artifact-group, key and value captures include a typed
+@@ -365,7 +433,7 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
+   with the counters, and one when it ends. A pause that begins within a minute of the
+   last line is announced only if it lasts a minute, so a volume hovering at the floor
+   cannot flood the journal, and no long pause is silent.
+-- Spool. A daemon-side file spool is not built; coordination accepted that for UDP. A
++- Spool. A daemon-side file spool is not built for UDP. A
+   spool would append to the filesystem the floor protects, so it would need its own
+   higher floor or a separate filesystem. What remains: Syslog UDP datagrams are held in the
+   daemon up to `hold_bytes` and then in the kernel buffer, and are lost only past the
+@@ -566,9 +634,11 @@ resume edge.
+ 
+ Schema 63 adds the enum values `PressurePhase.awaitingArchive` and
+ `EvictionFrontier.archiveLag`. CLI and MCP status render them as
+-`awaiting_archive` and `archive_lag`. Archive worker status, with its phase,
+-watermark, backlog age, last segment and quarantine listing, belongs to the
+-worker phase and will use a later schema.
++`awaiting_archive` and `archive_lag`. `Status.pressureStatus` reports `archiveConfigured` and `archiveHeld`
++(`PressureStatus` ordinals 36 and 37), and `Status` reports `archiveHalvings`
++(ordinal 63). The worker's phase, watermark, backlog age, last
++segment and a listing of held entries are not in the schema through 71; they
++need a later schema. The daemon journals a failed pass and a held entry.
+ 
+ ### Table rewrite status (schema 64)
+ 
+@@ -666,8 +736,7 @@ counter rows (see `sources_list` below) and remains one immutable capture.
+ 
+ ### Large artifacts (schema 65)
+ 
+-Patrick ruled on 2026-11-01: "Remove the limit". The configurable per-artifact
+-limit is gone. The server configuration no longer has `max_artifact_bytes`. A
++Sparrow has no configurable per-artifact limit. The server configuration no longer has `max_artifact_bytes`. A
+ configuration that still sets it refuses to start, and the error says to delete
+ the key. The disk budget, the maintenance reserve and the free-space floor still
+ bound what the store admits, and `max_records` still bounds the records in one
+@@ -1471,7 +1540,7 @@ they do not specify their generated wire grammar.
+ 
+ | Setting | Initial contract |
+ | --- | --- |
+-| Retention | Global 30 days after acceptance; earlier unpinned eviction under pressure. |
++| Retention | Global deadline 30 days after acceptance for an unpinned item, retired once archived; earlier eviction of archived, unpinned items under pressure; a pin or an unarchived item keeps it longer. |
+ | Buffered durability | Two-second flush interval, configurable; expose lag and bounded-queue pressure. |
+ | Watch detection | Linux inotify first, with recursive startup/overflow/periodic reconciliation. |
+ | Completed-file readiness | `close_or_idle`: writable-close/publication candidates plus scan-stable pre-existing files, within a finished-file producer contract. |
+@@ -2584,7 +2653,7 @@ family. Like the archive family, the fence includes the log time law.
+ Archive manifests and link quads use the same namespace: `ArchiveStore`,
+ `ArchiveSegment`, `ArchiveTable` and `QuarantineEntry` classes, and
+ `payloadSha256`, `archiveFormat`, `storeId`, `table` and the other predicates
+-listed in [the archive format](archive-format.md#9-manifest). Archive segments
++listed in [the archive format](archive-format.md#9-no-manifest). Archive segments
+ hold only these facts and the store's existing graphs.
+ 
+ The API returns occurrence/graph IRIs; clients do not construct them by guessing
+@@ -2881,7 +2950,7 @@ may call `discover`, `ingest`, `eventsIngest`, `flush` and the import operations
+ (`importBegin` through `importCancel`). Every other operation, including
+ `status`, returns a typed `UNAUTHENTICATED` failure. An operation added to the
+ schema without an explicit admission decision returns Cap'n Proto `unimplemented`.
+-The Unix socket serves the complete capability unchanged (rulings 2026-10-27).
++The Unix socket serves the complete capability unchanged.
+ 
+ The ingest socket (`ingest_socket_path` and `ingest_socket_gid`, schema 68)
+ shares this one producer list: anonymous TCP and the ingest socket forward the
+diff --git docs/load-qualification.md docs/load-qualification.md
+index 5fc1cf0..02b7824 100644
+--- docs/load-qualification.md
++++ docs/load-qualification.md
+@@ -58,8 +58,8 @@ seconds on tmpfs (about 1.8 ms per record) and did not finish within the
+ log import on tmpfs found 1,361 `fdatasync` calls, 13,567 `statx` and 2,670
+ `getdents64`: preparation committed one synced batch per record and per RPC,
+ each with its own footprint measurement. Deep JSON costs more per record (about
+-100 ms on tmpfs) but less per byte; that cost is JSON-specific and stays parked
+-under the 2026-10-27 ruling.
++100 ms on tmpfs) but less per byte; that cost is JSON-specific and is not
++addressed here.
+ 
+ Preparation now commits up to 256 ordinary records per synced batch, adding
+ records after the first only while their source stays within 256 KiB. Measured
+@@ -431,8 +431,8 @@ load measurements or a general shutdown latency guarantee.
+ ## Source summary migration (issue #14)
+ 
+ Issue #14 set a target of seeding the per-source counters and artifact index in
+-under 60 seconds at open. The 2026-11-07 ruling that store format changes
+-follow the online migration criterion of #18 replaces that target: the open
++under 60 seconds at open. Store format changes follow the online migration
++criterion of #18 instead of that target: the open
+ fences the store and serves at once, and the `source-summary` migration runs in
+ the maintenance duty afterwards (see "Per-source counters and artifact index"
+ in the [interfaces](interfaces.md)). Its duration on the live store is not recorded here: the
+@@ -443,7 +443,7 @@ tool that measured it on a restored backup was removed with the online backup (#
+ The live daemon (schema 68 image, two background jobs, two 8 MiB memtables per family)
+ spent 35 percent of its life with writes stalled or stopped (issue 160). Its LOG on
+ 2026-11-09 shows 57 slowdowns and 19 stops from 01:00 to 04:40 (the issue's comment), and
+-440 and 141 from 04:40 to 09:00 and 139 and 51 from 09:00 to 14:30 (coordination's count
++440 and 141 from 04:40 to 09:00 and 139 and 51 from 09:00 to 14:30 (counted
+ over all rotated logs), with level 0 at 20 to 24 files on the slowdown lines. The live
+ stops were "2 immutable memtables (waiting for flush)": both write buffers were full
+ while one flushed.
+diff --git docs/open-items.md docs/open-items.md
+deleted file mode 100644
+index a63ae89..0000000
+--- docs/open-items.md
++++ /dev/null
+@@ -1,213 +0,0 @@
+-# Open items inventory
+-
+-Date: 2026-11-07. Main at eedb484.
+-
+-This document lists every item in Sparrow's issues and delivery notes that was marked optional, later, follow-up, deferred, waiting, out of scope, excluded, not done, not run, unverified, accepted risk or known flake. Each row gives the item's real state at main and the issue or commit that lands it.
+-
+-Patrick's ruling, relayed 2026-11-07 by lillith_coordination: "nothing is optional, deferred or a follow-up on your own authority; requests to cut count as failure and evasion; every claim of done carries the number that proves it."
+-
+-## Sources
+-
+-- Forgejo issues and pull requests 1 to 36 in fleet/sparrow, with comments, fetched 2026-11-07. Cited as `#N body` or `#N comment <id>`.
+-- Archived stage notes stored by ghprsq. Cited as `pr/N:<file>:<line>`, which is `refs/ghprsq/pr/N/stage:<file>` in this repository.
+-- Delivery notes. Cited as `SD/<file>:<line>`, where SD is `~/.local/state/sparrow-deliver/`. Squash notes are in `~/.claude/squashes/sparrow-*.txt`.
+-- The uncommitted #36 step 2 notes. Cited as `W36/<file>:<line>`, where W36 is `.worktrees/36-bound-the-schema-69-first-open/.stage/bound-the-schema-69-first-open/`. They were read at about 12:10 CST, and another agent is still editing that worktree.
+-- The #1 stage notes. Cited as `S1/<file>:<line>`, where S1 is `.stage/authenticate-the-public-tcp-listener/` in the main checkout.
+-- Repository text at eedb484: `docs/`, `crates/`, `deploy/` and `helpers-ledger.toml`.
+-
+-Real state was checked read-only by reading code, docs and git history at eedb484. No build, test or live-service command was run for this document. "Unverified" means the claim was not checked.
+-
+-## Who marked an item
+-
+-- **Ruling:** Patrick or lillith_coordination made the deferral or acceptance. Each such row quotes the ruling verbatim, with the source of the quote.
+-- **Agent:** an implementer, a reviewer or the delivery session made the call on its own authority. The 2026-11-07 ruling targets these rows.
+-
+-Under "Lands in", a number marks the issue that lands the item. Rows that read "needs issue" in the first version now carry the issue filed for them.
+-
+-Issue numbers were added on 2026-11-07 under the coordination ruling: "every one of the 82 agent-marked rows with no covering issue gets an issue (REQUIRED, with a falsifiable done-when), and the doc gains the issue number per row". Under the same ruling, C-23, D-2 and D-4 became builds with issues, and A-11, A-16, A-22, A-24, C-22 and F-10 were corrected to the exact words of their rulings.
+-
+-## (A) Open issues and their unmet acceptance
+-
+-| Id | Item | Source | Marked by | Real state | Lands in |
+-| --- | --- | --- | --- | --- | --- |
+-| A-1 | #5 v2 disk format: all work and UAT unmet. The JSON costs (catalog codec, deep-JSON projection, expansion) are "parked". | #5 body; comments 3562, 3936, 4006 | Agent. The comments cite a 2026-10-27 ruling, but its verbatim text is not in the issue (unverified). | Not started. It depends on #13 and ships with #18. | #5 |
+-| A-2 | #6 producer-window registry: all work and UAT unmet | #6 body; SD/STATE.md:93 | Agent: "Not started" | Not started | #6 |
+-| A-3 | #7 lossless-confirmed spool: all work and UAT unmet | #7 body; SD/STATE.md:93 | Agent: "Not started" | Not started | #7 |
+-| A-4 | #8 lossy-aspirational mode: all work and UAT unmet | #8 body; SD/STATE.md:93 | Agent: "Not started" | Not started | #8 |
+-| A-5 | #9 producer profile contract: all work and UAT unmet | #9 body; SD/STATE.md:93 | Agent: "Not started" | Not started. No `producerProfiles` or `sparrow-producer/1` exists in crates or docs. | #9 |
+-| A-6 | #11 journal forwarding: all work and UAT unmet | #11 body; SD/STATE.md:93 | Agent: "Not started" | Not started. It depends on #7. | #11 |
+-| A-7 | #12 `./bin` and seeded builds: UAT steps 1 to 4 not recorded | #12 body, which has no comments | Agent: issue left open with no UAT comment | The code is on main (ba6ebe7: `make install-bin`, `.config/wt.toml`, `seed-excludes-check`), but no UAT run is posted. | #12 |
+-| A-8 | #13 scoped SPARQL: UAT steps 0 to 4 not run | #13 body; PR #35 body; pr/35:validation.md:12 | Agent: "The issue stays open for UAT after the bundled deploy" | Merged in 9e71b63 (main 758b41a). The UAT needs the schema 69 switch, which is gated on #36. | #13, after #36 |
+-| A-9 | #13 UAT step 2 amended: `?r a sp:Record` replaces the `sp:byteLength` query, and the artifact byte-length check is called "optional" | #13 comment 7283; pr/35:reviews/review-1.md:107-113 | Agent: the review finding and the amendment, both posted by agents. "Optional" is an agent call. | Still true: records carry no `sp:byteLength`, and `docs/interfaces.md:1571-1572` writes it for artifacts only. The amended step has not run. | #13 |
+-| A-10 | #13 UAT addition: the `sp:peerUid` SPARQL check moved from #10 | #13 comment 7161; #10 comments 7159, 7163 | Ruling, coordination 2026-11-06 19:45 CST: "(a): close #10 now ... add the sp:peerUid SPARQL check to #13's UAT" (SD/STATE.md:128) | Not run. Same deploy gate as A-8. | #13 |
+-| A-11 | #14 `sources` and `artifacts` at any size: all work and UAT unmet | #14 body; SD/STATE.md:131 | Ruling, coordination 2026-11-07 06:3x CST: "#14 waits." This is sequencing, not a hold: #14 is a build after #36. The agent's own 11:15 CST report says: "Its only blocker is my sequencing, behind #36." | Not started | #14 |
+-| A-12 | #14 body cites line numbers that went stale after #24 merged | SD/STATE.md:89 | Agent: "Line references to refresh after #24 merges" | Still stale: `artifact_read.rs:397` and `storage.rs:997-1031` no longer hold the cited scans. | #14 |
+-| A-13 | #15 archive segment encoder: all work and UAT unmet | #15 body | Agent: "Not started" | Not started. No `archive_prepare` exists in crates. | #15 |
+-| A-14 | #16 NAS archive worker: all work and UAT unmet | #16 body | Agent: "Not started" | Not started. It depends on #15. | #16 |
+-| A-15 | #17 offline archive readers: all work and UAT unmet | #17 body | Agent: "Not started" | Not started. No `sparrow-archive` tool exists. It depends on #16. | #17 |
+-| A-16 | #18 online v2 migration: all work and UAT unmet | #18 body; comment 7426 | Ruling, Patrick 2026-11-07 06:0x CST via coordination: "the #20 metadata-graph rewrite plus the #13 index build belong under it" (SD/STATE.md:134). This is a direction to build: #18's remaining work is a build. | Not started. #36 was filed as part of it. | #18 |
+-| A-17 | #20 receipt-time fallback: UAT not run | #20 comment 7241; pr/34:validation.md:10 | Agent: "Open for the live acceptance run" | Merged in 8e7a191. Live is schema 68, so the UAT waits for the schema 69 switch. | #20, after #36 |
+-| A-18 | #22 system unit: the root steps, the cutover and the UAT are unmet | #22 body; SD/STATE.md:88 | Agent: "wait for Patrick's window". The trigger is named, but no date is set. | The deploy code is merged at 0221e87. Production still runs the user unit. | #22 |
+-| A-19 | #22: AppArmor profile `deploy/apparmor/sparrow` was parsed but never loaded or run in enforce mode | deploy/evidence/apparmor.md:95-112 | Agent: "not yet loaded", "Load and live checks, not run" | Still true | #22 (steps 6, 8 and 12) |
+-| A-20 | #22: `uninstall.sh` and the cutover revert never ran on a host | #22 body; deploy/RECOVERY.md:565-569 | Agent: "Unverified" | Still unverified. `uninstall.sh` has run in staged mode only. | #22 |
+-| A-21 | #22 rehearsal G8: the README step 7 commands and intake consumption were not verified against the system unit | deploy/evidence/rehearsal.md:118-123 | Agent: "unverified by me" | Unverified | #22 |
+-| A-22 | #23 collision-free test ports: all work unmet | #23 body | Ruling, coordination 2026-11-06 19:45 CST: "Your order becomes #20, #13, #14; #23 after." (SD/STATE.md:129). This is sequencing, not a hold: #23 is a build. | Not started. `NEXT_PORT` still starts at 10240 (`crates/sparrow-server/tests/rpc.rs:465`). | #23 |
+-| A-23 | #25 query-only and verify-backup: UAT steps 0 to 3 not posted on #25. Steps 0 to 2 were moved to the #22 cutover. | #25 body; SD/STATE.md:26 | Agent: "Coordination was told". No verbatim ruling is recorded. | Merged in 6737fac. #31 comment 7364 shows a nightly passing verify-backup with exit 0, and #19 comment 6286 used `--image --time-records`. Neither is posted on #25. #31 made the repository helper run under the user unit, so the reason for the move may no longer hold (unverified). | #25 |
+-| A-24 | #36 acceptance: under CPUQuota=100%, IOWeight=20 and MemoryHigh=2G, `status` answers within 10 minutes and the backfill finishes, with both times recorded | #36 body; W36/plan.md:14-15; W36/reviews/review-2.md:35; W36/implementation.md:215-219 | Ruling, coordination 2026-11-07 06:3x CST, sets the bar: "if over, build the online duty as you designed". The step 2 implementer listed the run "Not done" and called it "Patrick's or the coordinator's to schedule", which was an agent hand-off. The delivery session runs it, gated only on root free space of 50 GB (the 11:5x ruling). | Not run. Step 1 (9c91a97) measured 34 min, 07:49:12 to 08:23:37 CST (pr/37:validation.md:9-14). The verify-backup writable mode required by the 11:5x ruling is not written yet. | #36 |
+-| A-25 | #36 step 2 online migration: uncommitted, and review 2 is BLOCKED | W36/reviews/review-2.md:33-57; W36/implementation.md:229-257 | Agent: "Nothing is committed" | 23 tracked files changed, plus an untracked `migration.rs`. The implementer reports R2 to R4 fixed, and the full sparrow-server tests passed (EXIT=0) at 12:08 CST. No review 3 exists, the hook has not run and there is no PR. | #36 |
+-| A-26 | #36: attribute the remaining 30 minutes of the 34-minute open by profiling a nightly copy under unit limits | W36/plan.md (Behavior); W36/implementation.md:190-219 | Agent: "the 30-minute attribution remains an inference" | Not measured. The only evidence is a warm, unlimited synthetic probe of 50,000 records. | #36 |
+-
+-## (B) Review OPTIONAL findings not taken
+-
+-Every row in this group is agent-marked: a reviewer labelled the finding OPTIONAL, and the implementer or the delivery session did not act on it.
+-
+-| Id | Item | Source | Marked by | Real state | Lands in |
+-| --- | --- | --- | --- | --- | --- |
+-| B-1 | #13: the parity test never checks a strict subset scope | pr/35:reviews/review-1.md:114-120 | Agent: review OPTIONAL | Still true. `scoped_sparql_answers_match_the_store_wide_plan` (`crates/sparrow-core/tests/storage.rs:18808`) compares only scopes equal to the whole fixture. | #39 |
+-| B-2 | #13: the malformed-key test fires on the first row, so page atomicity is untested | pr/35:reviews/review-1.md:121-124 | Agent: review OPTIONAL | Still true. `graph_key(0, 5)` sorts first (`rdf_index.rs:1322`). | #49 |
+-| B-3 | #13: a crash followed by a downgrade can leave stale `rdf:o:` rows, and an empty graph is listed | pr/35:reviews/review-1.md:125-131 | Agent: review OPTIONAL | Still true. The docs carry no note and the job has no subset check. Whether #36 changes the job order is unverified. | #51 |
+-| B-4 | #20 O1: the fallback-placement test checks the basis through `placement()`, not through a read row | pr/34:reviews/review-1.md:157-161; pr/34:implementation.md:210-219 | Agent: "O1: not taken" | Unchanged | #53 |
+-| B-5 | #20 O2: `interpretations.event_time.fallback` always equals `unknown` | pr/34:reviews/review-1.md:162-166 | Agent: no disposition recorded | Still true (`sparql.rs:760`) | #54 |
+-| B-6 | #20 O3: the event-clock selector and the Source selector share `?selected_source` | pr/34:reviews/review-1.md:168-172 | Agent: no disposition recorded | Still true (`correlation.rs:225`, `:290`) | #58 |
+-| B-7 | #20 O7: no test covers the "already current" or "facts disagree" branches | pr/34:reviews/review-2.md:156-159; pr/34:validation.md:13 | Agent: "not taken" | Moot: the event fallback backfill was removed (#193)| #59 |
+-| B-8 | #20 O8: a malformed stored `receivedAt` fails INVALID_ARGUMENT without job context | pr/34:reviews/review-3.md:96-102; pr/34:validation.md:13 | Agent: "not taken" | Moot: the event fallback backfill was removed (#193)| #60 |
+-| B-9 | #36 step 1 O2: no test covers the 16 MiB `PAGE_BATCH` bound | pr/37:reviews/review-1.md:136-140 | Agent: "the contract does not need it" | Moot: the event fallback backfill was removed (#193)| #62; not in #36 acceptance |
+-| B-10 | #36 step 1 O4: each rebuilt graph parses its manifest three times | pr/37:reviews/review-1.md:148-152 | Agent: "only if the measurement shows decoding dominates" | Moot: the event fallback backfill was removed (#193)| #63; not in #36 acceptance |
+-| B-11 | #36 step 1 O5: graphs that already carry `eventTime` skip the ownership, closure and term checks, so the open no longer refuses such a malformed graph | pr/37:reviews/review-1.md:154-159 | Agent: "no change is needed" | Moot: the event fallback backfill was removed (#193)| #66 |
+-| B-12 | #36 step 2 O5: test names overstate what the tests drive | W36/reviews/review-2.md:53; W36/implementation.md:269-273 | Agent: "Not done ... Neither was renamed or extended" | Still true in the uncommitted worktree | #36 PR; not in its acceptance |
+-| B-13 | #36 step 2 O6: a large metadata scope can refuse RESOURCE_LIMIT while the backfill is pending | W36/reviews/review-2.md:54 | Agent: no done or not-done mark | The worktree's reader table has no such sentence. | #36 |
+-| B-14 | #36 step 2 O1 to O4: stale text, swapped doc comments, duplicate slot mapping, journal read off the blocking pool | W36/reviews/review-2.md:49-52; W36/implementation.md:259-264 | Agent: "Done" | Reported done, uncommitted and not re-reviewed (unverified) | #36 |
+-| B-15 | #24 O3: the listing's integrity refusals are untested | pr/26:review-r2.md:185-187 | Agent: "partly done" | Unverified: grep found no named test. | #40 |
+-| B-16 | #24 O9: a source listing charges every source's recordless artifacts | PR #26 body; pr/26:review-r2.md:204-208 | Agent: "O9 (optional, out of scope) is recorded" | Still true. `docs/interfaces.md:304-308` says nothing about recordless artifacts, and #14 does not name this. | #41 |
+-| B-17 | #24 O10: on listings, the cache-failure message says "before requesting context" | pr/26:review-r2.md:210-212 | Agent: review OPTIONAL | Still true (`source_context.rs:145`) | #42 |
+-| B-18 | #24 O11: an artifact inside a partly walked millisecond can be partly counted | pr/26:review-r2.md:214-218 | Agent: review OPTIONAL | Not documented (`docs/interfaces.md:332-333`) | #43 |
+-| B-19 | #24 O12: a millisecond with thousands of artifacts makes the listing refuse | pr/26:review-r2.md:220-223 | Agent: review OPTIONAL | Unverified | #44 |
+-| B-20 | #24 round-1 O4 was not done | pr/26:review-r2.md:76 | Agent: "not done; both were optional" | Unverified: the round 1 text is not archived. | #45 |
+-| B-21 | #25 O1: the docs say "exited 0" where the check is `Result=success` | pr/27:review-r4.md:63-73; pr/27:validation.md:17 | Agent: "optional" | Still true (`deploy/RECOVERY.md:261`, `docs/deployment.md:366`, `docs/interfaces.md:493`, `sparrow-backup:23`, `:328`) | #46 |
+-| B-22 | #25 O2: rehearse the system-scope `journalctl` read at the cutover | pr/27:review-r4.md:75-77; pr/27:validation.md:19 | Agent: "at the #22 cutover" | Not run. Whether #22's UAT names this is unverified. | #22 |
+-| B-23 | No-COW B3: no atomic exchange between the two renames | pr/29:review.md:121-125; pr/29:validation.md:15 | Agent: "Optional and not done" | Still true (`deploy/lib.sh:486-487`, two `mv -T` calls) | #47 |
+-| B-24 | No-COW B4: the converter's refusals fire after `drain_stop` | pr/29:review.md:126-129; pr/29:validation.md:15 | Agent: "Optional and not done" | Still true (`restart.sh:67-69`, `lib.sh:459-465`). The live store is already converted, so the path does nothing today. | #48 |
+-| B-25 | No-COW: pre-copy the store to cut downtime; handle file names that contain newlines | pr/29:review.md:232-241; pr/29:validation.md:15 | Agent: "Optional and not done" | Still true. File names with newlines fail safe. | #50 |
+-| B-26 | #10 O1: no runtime assertion of the intake fence or of import provenance | pr/33:reviews/review-1.md:143-151 | Agent: review-debt "not required" | Still true (rpc.rs tests, checked by grep) | #52 |
+-| B-27 | #10 O2: the shipped system unit cannot bind the ingest socket | pr/33:reviews/review-1.md:152-158 | Agent: "or a follow-up issue" | Still true. `deploy/systemd/sparrow.service:101` does not allow the ingest socket path, deploy/apparmor has no rule for it, and #22 lists the ingest socket as out of scope. | #55 |
+-| B-28 | #10 O3: `importCancel` is not bound to the caller of `importBegin` | pr/33:reviews/review-1.md:159-163 | Agent: review OPTIONAL | Unverified: grep found no cancel check. | #56 |
+-| B-29 | #10 O4: `server.toml.example` lacks the three ingest keys, and `ArtifactReceipt` omits intake | pr/33:reviews/review-1.md:164-168; pr/33:implementation.md:216-219 | Agent: "Not done" | Still true (`deploy/config/server.toml.example`; `receipt.rs:129`) | #57 |
+-| B-30 | #10 O5: `admit_import` is `pub` with no outside caller; `bind_ingest` drops the check error; paired `_with_intake` entry points | pr/33:reviews/review-1.md:169-175 | Agent: review OPTIONAL | Still true (`lib.rs:62`, `local_endpoint.rs:50`) | #61 |
+-| B-31 | #1 O2: a failure of the OS random source for the CHAP nonce is reported as STORAGE_FAILURE | S1/reviews/delivery-review.md:184-188 | Agent: "deferred by the coordinator". No verbatim coordinator quote is recorded. | Still true (`crates/sparrow-server/src/tcp_gate.rs:52-53`) | #64 |
+-| B-32 | #1 O3: a bad secret file is reported as `local I/O: <os error>` without the path | S1/reviews/delivery-review.md:184-188 | Agent: as B-31 | Still true (`transport.rs:41`, `error.rs:68`) | #65 |
+-| B-33 | #1 O4: an `expect` relies on a TCP and secret pairing that `config.rs` enforces elsewhere | S1/reviews/delivery-review.md:184-188 | Agent: as B-31 | Still true (`crates/sparrow-server/src/main.rs:246`) | #67 |
+-| B-34 | #1 O6: two rules find the canonical root, and the test-support one has a silent fallback | S1/reviews/delivery-review.md:184-188 | Agent: as B-31 | Still true (`sparrow-test-support/src/lib.rs:17-33` and `sparrow-helper-census/src/cross.rs:260`) | #68 |
+-| B-35 | #1 recheck: the list of operations allowed on anonymous TCP omits `flush` | S1/reviews/delivery-review.md:190-191 | Agent: "New OPTIONAL nit" | Partly done: `docs/interfaces.md:2543` names `flush`, but `:586` still does not. | #69 |
+-| B-36 | Archive P1 O4: behavior when the quarantine listing overflows | SD/archive-p1-review.md:100, :179 | Agent: "stay open as recorded" | Specified in #16, not built | #16 |
+-| B-37 | Archive P1 O5: whether a projection quarantine keeps the metadata graph | SD/archive-p1-review.md:101, :179 | Agent: "stay open as recorded" | #15 and `docs/archive-format.md` section 6 still disagree. | #15 |
+-| B-38 | Issue review: the archive-p3 design compares `statfs` IDs, which differ per btrfs subvolume | SD/issues-v2/REVIEW.md:84-85 | Agent: "OPTIONAL (not changed)" | #16 still specifies the statfs ID. Not built. | #16 |
+-| B-39 | Issue review: the tmpfiles entry hard-codes the owner `paudley` | SD/issues-v2/REVIEW.md:86 | Agent: "OPTIONAL (not changed)" | Still true (`packaging/tmpfiles/sparrow-ingest.conf`; `docs/deployment.md:166`). Whether #22 names it is unverified. | #22 |
+-| B-40 | Census O4: no automated test that `load()` removes the tree after a walk | SD/census-review-r2.md:36-39 | Agent: "not done, and the coordinator recorded why". No verbatim quote. | Unverified | #70 |
+-| B-41 | #5 doc O1: the load range "25 to 46" should read "25 to 45" | SD/issue5-review-r2.md:58-60 | Agent: review OPTIONAL | Still true (`docs/load-qualification.md:106-107`) | #71 |
+-| B-42 | rdf_reverse O3: the column family is created before validation, so a refused open locks out older images | SD/revcf-review.md:61; SD/revcf-review-r2.md:49-51 | Agent: "the coordinator chose not to address". No verbatim quote. | Still true (`table_options.rs:44`) | #72 |
+-| B-43 | rdf_reverse O6: the migration leaves tombstones, and there is no `compact_range` | SD/revcf-review.md:64 | Agent: as B-42 | Unverified: the live tombstone count was not measured. | #73 |
+-| B-44 | rdf_reverse O7: `upgrade_reverse` takes no disk budget | SD/revcf-review.md:65 | Agent: as B-42 | Still true (`rdf_index.rs:258`) | #74 |
+-| B-45 | rdf_reverse O8: the WAL cap may grow with a third column family | SD/revcf-review.md:66 | Agent: as B-42 | Unverified: an inference, not measured | #75 |
+-| B-46 | rdf_reverse O9: the fixture never opens a store that lacks the column family | SD/revcf-review.md:67 | Agent: as B-42 | Unverified | #76 |
+-| B-47 | rdf_reverse r2 O1: `development-runtime.md` says "both existing column families" | SD/revcf-review-r2.md:47 | Agent: "leave it as history" | Still present (`docs/development-runtime.md:331`) | #77 |
+-| B-48 | Space floor: `Tail::reconcile_missing` writes while ingest is paused | SD/space-floor-review.md:231-232 | Agent: "carried over" | Still true (`watches.rs:1054-1056`, `tailing.rs:378`) | #78 |
+-| B-49 | Space floor: the syslog gate hard-codes 1 s instead of using `SPACE_CHECK_INTERVAL` | SD/space-floor-review.md:233-234 | Agent: review OPTIONAL | Still true (`syslog_listener.rs:415`) | #79 |
+-| B-50 | Space floor: the `store-free-space-floor` ledger row enforces nothing | SD/space-floor-review.md:224-231 | Agent: review OPTIONAL | Still true (`helpers-ledger.toml:4582`) | #80 |
+-| B-51 | Space floor: no runtime test of pause and resume | SD/space-floor-review.md:122-123 | Agent: review OPTIONAL | Unverified | #81 |
+-| B-52 | Artifact limit O2: `retention_metrics` can refuse on stores near the ceiling | SD/reviews/artifact-limit-review.md:157-161 | Agent: "belongs with #5" | Still bounded at a 32 MiB catalog (`retention_metrics.rs:169-178`). #5 does not name it. | #82 |
+-| B-53 | Artifact limit O3: draining an artifact with many records rereads the parent row | SD/reviews/artifact-limit-review.md:162-164 | Agent: "belongs with #5" | Named in #5 | #5 |
+-| B-54 | Artifact limit O4 and the #21 exclusion: no test splits a single line longer than the raw-record ceiling | SD/reviews/artifact-limit-review.md:165-166; #21 body, Out of scope | Agent: "carried" | Unverified | #83 |
+-| B-55 | Compression O6: no test turns the rewrite window off once it is on | SD/reviews/compression-review.md:171 | Agent: review OPTIONAL | Still true (`storage.rs:18676-18682` ends at `Running`) | #84 |
+-| B-56 | Deploy O1: no `sync` between the revert marker and `mv -T` | SD/reviews/deploy-review.md:75 | Agent: review OPTIONAL | Still true (`deploy/RECOVERY.md:446-447`) | #22 |
+-| B-57 | Deploy O2: `restart.sh` lacks `require_settled` | SD/reviews/deploy-review.md:76 | Agent: review OPTIONAL | Still true: only `start.sh:64` calls it. | #85 |
+-| B-58 | #31 O4: no automated test of the backup guard's truth table | pr/32:reviews/review-1.md:44; pr/32:validation.md:14 | Agent: "accepted" | Still true | #86 |
+-
+-## (C) Plan exclusions and implementer "not done"
+-
+-| Id | Item | Source | Marked by | Real state | Lands in |
+-| --- | --- | --- | --- | --- | --- |
+-| C-1 | #1: no TLS, so an on-path attacker can observe or hijack an authenticated TCP session | S1/plan.md:29-31 | Agent: plan Exclusion. It follows the 2026-10-27 ruling "(2) shared secret, using CHAP", which did not exclude TLS. | Still true. Documented at `docs/interfaces.md:1948`. | #104 |
+-| C-2 | #1: syslog listeners are not behind CHAP | S1/plan.md:32 | Agent: plan Exclusion | Unchanged. Whether a syslog listener is enabled live is unverified. | #105 |
+-| C-3 | #3: raising the import lease or slot count | #3 body, Out of scope | Agent: issue draft | No open issue names it. | #106 |
+-| C-4 | #5: JSON value facts for `keys` and `values`; the Markdown projection | #5 body, Out of scope | Agent: issue draft | No open issue names them. | #107, #108 |
+-| C-5 | #5: 3.4 GB of RPC reads per 30 s are unattributed, and 6.8 million deletion markers are left to compaction | #5 comments 3924, 4006 | Agent: "Remaining cost, not fixed here" | Current state unverified | #5 |
+-| C-6 | #6: receiver-window bounds for syslog listeners | #6 body, Out of scope | Agent: issue draft | No open issue names it. | #109 |
+-| C-7 | #7: a spool for lossy mode; spool replication or backup; automatic discard of held batches | #7 body, Out of scope | Agent: issue draft | No open issue names them. | #110, #111, #112 |
+-| C-8 | #8 and #9: a producer connection pool; publishing `sparrow-client`; relaxing the exact schema for CLI and MCP | #8 and #9 bodies, Out of scope | Agent: issue draft | No open issue names them. | #91, #92, #93 |
+-| C-9 | #10: peer credentials on the private socket; binding sources to uids; remote producers | #10 body, Out of scope | Agent: issue draft | No open issue names them. | #113, #114, #115 |
+-| C-10 | #10 step 3: no schema 67 run proves the SPARQL refusal predates #10 | #10 comment 7159 | Agent: "I have no run of the schema 67 image" | Unverified. Settled when A-10 passes. | #13 |
+-| C-11 | #11: other hosts' journals, journal history import, redaction, and a native journal reader, which is "not yet designed" | #11 body, Out of scope; docs/implementation-plan.md:189-192 | Agent: issue draft and plan text | Not designed and not built | #116, #117, #118, #119 |
+-| C-12 | #13: raising host ceilings; planning specific to correlation | #13 body, Out of scope; pr/35:plan.md:13-15 | Agent: issue draft and plan Exclusion | Not done | #120, #121 |
+-| C-13 | #13: large filtered live scopes fail RESOURCE_LIMIT on per-graph cursors | pr/35:implementation.md:181-184 | Agent: "Not done / for the caller" | Unverified on live | #122 |
+-| C-14 | #14 exclusion: the record search scan budget for wide time windows. Effect on 2026-11-07 at 11:15 CST: the ingest rate over the last hour cannot be answered, because a one-hour `records` window fails RESOURCE_LIMIT "record capture exhausted candidate scan_budget". | #14 body, Out of scope; delivery session report to coordination, 2026-11-07, round 60 reply (two sends timed out; the third was delivered) | Agent: issue draft exclusion; the report said "I cannot give it" | Still true by code: `crates/sparrow-core/src/storage/text_index.rs:539-545` refuses once `scan_budget` (at most 100,000, `query.rs:158`) candidates are visited. | #123 |
+-| C-15 | #14: per-source byte totals | #14 body, Out of scope | Agent: issue draft | No open issue names it. | #124 |
+-| C-16 | #15 to #17: raising segment caps once the large-payload format is decided; re-import of archived evidence (archive Decision 6, "deferred"); NAS pruning; an archive query service; segment repair | #15, #16 and #17 bodies, Out of scope; docs/archive-format.md:353; SD/archive-design.md:146, :164 | Agent: issue draft and design note | None built. The segment cap tracks the large-payload format decision (D-4). | #125, #126, #127, #128, #129 |
+-| C-17 | #18: removing v1 decoders after the migration | #18 body, Out of scope | Agent: issue draft | No open issue names it. | #130 |
+-| C-18 | #19: ZSTD above the bottommost level and level 9; blob level; filesystem compression; raw-hash keys in `rdf_reverse` | #19 body, Out of scope | Agent: issue draft | No open issue names them. | #131, #132, #133, #134 |
+-| C-19 | #20: inferring event time from message text | #20 body, Out of scope | Agent: issue draft | No open issue names it. | #135 |
+-| C-20 | #21: a tailed line longer than the 1 MiB capture window still fails | #21 body, Out of scope | Agent: issue draft | Unverified in code | #136 |
+-| C-21 | #21: raw records over 128 MiB published earlier keep their size | #21 body, Out of scope | Agent: issue draft | Unverified. #18 re-derives derived rows, not raw records. | #137 |
+-| C-22 | #21: the 7.93 GiB import bound, the eviction row copy, and resumable seal, layout and publish | #21 body, Out of scope; SD/STATE.md:95 | Ruling, Patrick direct in the #21 session (SD/STATE.md:95): "ON the limit, concur.  For now anyways." A concurrence "for now", not a standing hold: lifting the bound is a build under #5. | Still in force. #5 owns lifting the bound. | #5 |
+-| C-23 | Pin caps of 606 pins and 36,594 members kept as merged | SD/STATE.md:95; SD/reviews/artifact-limit-review.md:148-156 | Agent. Only a paraphrase exists: "kept the pin caps ... as merged". No verbatim words exist, so this is not a hold; it is a build. | Still in force (`eviction.rs:230` `MAX_PINS`) | #87 |
+-| C-24 | #22: AppArmor profiles for the two timer helpers, `sparrow-backup` and `sparrow-ship` | #22 body, Out of scope; deploy/RECOVERY.md:599-601; deploy/systemd/sparrow-backup.service:51-52; deploy/systemd/sparrow-ship.service:45-46 | Agent: "follow-up work" | Not written. `deploy/apparmor` holds only `sparrow`. | #88 |
+-| C-25 | #36 step 2 is not #18's full re-derivation | W36/plan.md:11-12 | Agent: plan Exclusion. Its placement follows the 06:3x ruling "file it under #18". | #18 open, not started | #18 |
+-| C-26 | #36 plan excludes changes to the #13 owner-index job | pr/37:plan.md:9-10 | Agent: "unless measurement shows it matters" | The step 2 design covers both jobs, as A-16's ruling requires. | #36 |
+-| C-27 | #36 step 2: `with_rdf_records` refused while graphs were pending | W36/implementation.md:225-227 | Agent: "Not done / open" | Resolved by #158: the view serves the facts the event fallback backfill owes, so pending graphs no longer refuse. | #36 |
+-| C-28 | Broad query acceptance is unfinished, and other captured query families keep their old implementation | docs/query-streaming.md:159-163 | Agent: doc text | Still stated at HEAD. Current behavior unverified. | #14 for `sources` and `artifacts`; #89 for the rest |
+-| C-29 | Social-preview card not drawn | docs/BRAND.md:111-112 | Agent: "not yet drawn" | Still true | #90 |
+-| C-30 | Decodes draft (C17): a direct sparrow-client producer in lossless-confirmed mode comes "later", once the registry, spool and profile land | .stage/tmp-rescue-20261103/sparrow-issue.md:38 | Agent draft with a named trigger. The parent ruling, Patrick 2026-11-01: "both must be supported in the capnproto shim" (:9) | Sparrow's prerequisites are not started. | #6, #7, #9 |
+-| C-31 | Producer contract G7: producer sessions inside `max_rpc_connections` | SD/coord/decodes-producer-contract.md:43 | Agent: "FEATURE", owner Patrick | No producer pool exists. | #91 |
+-| C-32 | Producer contract G9: a unit restart policy that recovers without a human | SD/coord/decodes-producer-contract.md:45 | Agent: "FEATURE S", owner Patrick | Unchanged: `StartLimitBurst=5`, `Restart=on-failure` (`deploy/systemd/sparrow.service:24-25`, `:50-51`) | #94 |
+-| C-33 | Producer contract G11: per-source ingest binding and retention priority | SD/coord/decodes-producer-contract.md:47 | Agent: "FEATURE M/L", owner Patrick | Absent | #95, #96 |
+-| C-34 | Producer contract G13: PurRDF and sparrow-client from a registry | SD/coord/decodes-producer-contract.md:48 | Agent: "FEATURE, plus a ruling" | #9 lists registry publishing as out of scope. | #92 |
+-| C-35 | GitHub readiness: six questions for Patrick (purrdf public, lexicons, author identity, canonical or mirror, which docs, the Katamari name) | SD/github-readiness.md:222-245 | Agent: "needs network or Patrick's decision" | No decision is recorded. | #97 |
+-
+-## (D) Accepted risks and known flakes
+-
+-| Id | Item | Source | Marked by | Real state | Lands in |
+-| --- | --- | --- | --- | --- | --- |
+-| D-1 | Anonymous TCP gets ingest and all import operations, with no namespace isolation or quota | #1 body, "Rulings (2026-10-27)"; S1/plan.md:53 | Ruling, Patrick 2026-10-27: "No quote, no security, just take it." The #1 body records: "Anonymous TCP gets ingest only; `status` requires CHAP. Anonymous imports get no isolation or quota." | Still true (`docs/interfaces.md:586`, `:1951`) | accepted by ruling |
+-| D-2 | No new TCP connection ceiling, so the starvation risk on the shared ceiling stays | S1/plan.md:55 | Ruling, Patrick direct 2026-10-27: "No limits". His words mean: add no new ceiling. "The starvation risk stays, documented" was the agent's reading; the risk is a build. | Unchanged. Where it is documented is unverified. | #98 |
+-| D-3 | Pipelined calls on returned session capabilities are not gated, "by design" | S1/plan.md:44 | Agent: plan Risk | Unverified | #99 |
+-| D-4 | The archive segment ceiling of 256 MiB stays until the format for large payloads is decided | docs/archive-format.md section 2 | Ruling, Patrick direct 2026-11-01 (SD/archive-design.md:158): the segment size problem goes away on a future PurRDF upgrade. The operator has since moved the segment format to GTS. This is a prediction, not a hold: a build that tracks the format decision. | The ceiling is unchanged. The trigger is the operator's decision on the large-payload format. | #125 (tracks the format decision) |
+-| D-5 | Known flake: `consume_coverage_limit_and_root_replacement_fail_without_source_retirement` misses its 10 s deadline under hook load | SD/STATE.md:121; PR #32 body | Agent: "Known flake ... the retry passed" | Still present (`crates/sparrow-server/tests/rpc.rs:5180`). Which 10 s deadline fires is unverified. #23 covers ports only. | #100 |
+-| D-6 | TCP tests fail with AddrInUse when checkouts run concurrently | #23 body | Agent: issue filed 2026-11-02 | Unfixed: fixed start port 10240 (`rpc.rs:465`) | #23 |
+-| D-7 | R40: the image copy in a pre-upgrade backup loses `cap_net_bind_service`, so a rollback from that copy needs setcap again | SD/STATE.md:27, :124; #10 comment 7159; #28 comment 6289 | Ruling, coordination 2026-11-05: "do not setcap yourself; when the new image is built, send me its exact path and I run the setcap and confirm with getcap before your switch. #22 retires the step." | Still true for user-unit backups, including `pre-upgrade-sparrowd-schema67-13af50d`. `restart-bundle.sh` copies images with `cp -a` and no setcap. The system unit grants the capability as ambient (`deploy/systemd/sparrow.service:93`). | #22 |
+-| D-8 | The 2026-11-02 nightly backup failed with exit 1, and the cause is unknown because the journal rotated | SD/STATE.md:49 | Agent: recorded, not investigated | The nightlies of 20261105, 20261106 and 20261107 exist. The cause is still unknown. | #101 |
+-| D-9 | `restart-h.sh` still copies the no-COW store into the COW backups directory, which fails | SD/STATE.md:115 | Agent: "fix it before reuse" | `SD/restart-h.sh:37` is unchanged. `restart-schema68.sh:52-53` and `restart-bundle.sh:54-55` carry the fix. The script lives outside the repository. | #102 (fix or delete the script) |
+-| D-10 | `rdf_reverse` rollback is one-way, and the backup before deploy was "left to Patrick" | SD/revcf-review-r2.md:50 | Agent: coordinator choice, no verbatim quote | Historical (schema 62). Pre-upgrade backups now precede every restart. | none (historical) |
+-| D-11 | `WORKTREE_REVIEW.md` says archive-gate has landed and lists no entries | .worktrees/WORKTREE_REVIEW.md:16-17 | Ruling, Patrick 2026-11-06 13:20 CST: "Have all agents ... run /sweep-branches" | True for merged work: 1ccdb43 is an ancestor of main. It does not record the two current worktrees, 36-bound-the-schema-69-first-open and open-items-inventory. | needs a sweep entry for the two worktrees |
+-
+-## (E) Code and doc TODOs
+-
+-The repository has no `TODO` or `FIXME` comments in `crates/`, `deploy/` or `docs/` at eedb484. The only `todo!` matches are census rule fixtures (`crates/sparrow-helper-census/src/rules.rs:828`, `:849`). `helpers-ledger.toml` has 316 rows with `enforced = true` and none with `enforced = false`.
+-
+-| Id | Item | Source | Marked by | Real state | Lands in |
+-| --- | --- | --- | --- | --- | --- |
+-| E-1 | The persistent client spool is called "a later extension" | docs/interfaces.md:2674 | Agent: doc text | Present | #7 |
+-| E-2 | Archive worker status "will use a later schema"; do not enable `[archive]` before the worker ships | docs/interfaces.md:226, :277 | Agent: doc text | Present | #16 |
+-| E-3 | Stale sentence: record-backed membership "does not yet add independent metadata graphs for recordless artifacts or expose the RPC/CLI/MCP query operations" | docs/purrdf-integration-gaps.md:325-326 | Agent: historical doc text | Superseded by the same file's current-state section (:13-19) | #103 (doc correction) |
+-| E-4 | Dated "not yet" entries in the runtime log: watch coordinator, cursor pagination, captured result leases, field-posting indexes | docs/development-runtime.md:2938, :5541, :5654, :6027, :6327 | Agent: dated log entries | The current state of each is unverified. | unverified |
+-| E-5 | `restart-bundle.sh` says the first-open cost is "not measured yet ... put the number here" | SD/restart-bundle.sh:6-10 | Agent: script comment | Stale: 76 min (758b41a) and 34 min (9c91a97) were measured. The script lives outside the repository. | #36 |
+-| E-6 | `development-runtime.md` still records the installed schema 62 runtime | SD/archive-p1-validation.md:44 | Agent: "Open" | Unverified | #103 |
+-
+-## Items found done, with evidence
+-
+-| Id | Item | Source | Marked by | Evidence | Landed in |
+-| --- | --- | --- | --- | --- | --- |
+-| F-1 | #13 review evidence: `make check` not run at review; first-open cost unmeasured | pr/35:reviews/review-1.md:133 | Agent: review OPTIONAL | The commit hook passed with EXIT=0, and the first open was measured at about 76 min (#36 body). | 9e71b63; #36 |
+-| F-2 | #24 O7 test and O8 wording | PR #26 body; #24 comment 6092 | Agent: review OPTIONAL, taken | Added before merge. The hook passed with 427 tests (SD/STATE.md:9). | e16a81d |
+-| F-3 | #28 O1: pin the stored identity values | pr/30:review.md:104-109 | Agent: review OPTIONAL, taken | `persisted_identities_are_pinned_and_the_markdown_contract_move_migrates` (`storage.rs:11852`) | 71d2199 |
+-| F-4 | #28 d74 O3: `previous_profile_advances` comment wording | pr/30:review-d74.md:186-192 | Agent: review OPTIONAL | The old phrase no longer appears in crates. The fixing commit is unverified. | before eedb484 |
+-| F-5 | #31 O1 and O2 | PR #32 body | Agent: review optional, taken | Commit c8bdca3 is titled "(#31 review O1, O2)". | 712ee8d, c8bdca3 |
+-| F-6 | #36 step 1 O3: doc and comment wording | pr/37:reviews/review-1.md:142-146 | Agent: review OPTIONAL | `docs/interfaces.md:534` reads "examines up to 4,096 graphs". | 9c91a97 |
+-| F-7 | #36 step 1: copy measurement under unit limits | pr/37:implementation.md:158-162 | Agent: "Not done" at implementation | 2,065 s on image 9c91a97, 07:49:12 to 08:23:37 CST (pr/37:validation.md:11). This misses the 10-minute bar, which A-24 owns. | 9c91a97 (measurement only) |
+-| F-8 | #1 O1, O5, O7 | S1/reviews/delivery-review.md:178-182 | Agent: reviewer confirmed done | Confirmed at the recheck | 829b429 |
+-| F-9 | #1: live deployment with the secret file and the 50 GiB budget | S1/validation.md:35-36 | Agent: "Not run (Patrick-gated)" | `~/.config/sparrow/server.toml:8` sets `rpc_tcp_secret_file`, and `:10` sets `disk_budget = 53687091200`. | live since 829b429 |
+-| F-10 | #1: production inputs deferred | S1/plan.md:50 | Ruling, Patrick direct 2026-10-27: "Defer for now". Superseded: the watches are live. | STATE.md records 6 of 6 watches live. This is to be rechecked and recorded; it was not rechecked here. | superseded |
+-| F-11 | No-COW B2: sync before the swap | pr/29:review.md:114-120 | Agent: review OPTIONAL | `deploy/lib.sh:485` runs `sync -f -- "$partial"`. | f18bc12 |
+-| F-12 | Compression O5 and O7: the re-marking comment and the `Running` doc | SD/reviews/compression-review.md:166-172 | Agent: review OPTIONAL | `docs/architecture.md:194`; `recompression.rs:41-45` | 004cab8 |
+-| F-13 | Remove `/SPARROW/store.cow-20261105T032247Z` after a verified nightly | SD/STATE.md:107 | Agent: "Pending" | The path no longer exists. The removal date is unverified. | done outside the repository |
+-| F-14 | The 20261104 nightly's SOURCE lacks `store_id` and `image` | SD/STATE.md:15 | Agent: recorded | Moot: that nightly is gone, and #31 closed on the 20261107 nightly passing verify-backup. | #31 |
+-| F-15 | #19 step 0 baseline never recorded; step 4 compared on query-only copies instead | #19 comments 5900, 6286 | Agent: a substitute measurement, then the issue was closed | 0.018 s against 0.204 s cold on like-for-like copies. The original pre-deploy comparison does not exist, so this is a substitution, not the step as written. | closed (substitute) |
+-| F-16 | #21 step 3 not passed as written; amended to use `records` | #21 comments 5899, 5920 | Agent: amended, then the issue was closed | #24 fixed the listing refusal. The original `artifacts` step was never re-run live, so this is a substitution. | ada4a21 (substitute) |
+diff --git docs/status-2026-11-10.md docs/status-2026-11-10.md
+deleted file mode 100644
+index 8de3c20..0000000
+--- docs/status-2026-11-10.md
++++ /dev/null
+@@ -1,81 +0,0 @@
+-# Sparrow status, 2026-11-10
+-
+-A new session can pick up from this file alone. Times are CST unless marked Z. Every fact names the file or number that proves it. Anything not proven here is marked **unknown**.
+-
+-## 1. Merged and proven
+-
+-| Item | Proof |
+-| --- | --- |
+-| PR #194 (issue #193, "Refs", open): event-fallback-rdf backfill removed; fallback facts derived at read time; mandate, razor and worked examples in `docs/architecture.md` section 1. Merge commit `a77756a`. | Opus review PASS at head `0d0dd74` (`.stage/193-review2.md`). Hook log `.stage/193-commit7.log`, `EXIT=0`. |
+-| PR #196 (issue #195, "Refs", open): `user-unit-upgrade.sh` exports `SPARROW_PREFIX` and passes the installed unit's backup arguments; `verify-backup.sh` removes the chunk file before each read. Merge commit `e1fea40`. | Opus review PASS at `983cfb8` (`.stage/195-review3.md`). Hook log `.stage/195-commit-3.log`, `EXIT=0`. Shell harness `.stage/195-shell-check-2.log`, `EXIT=0`. |
+-| Live daemon on `sparrowd-schema71-a77756a`, pid 6118, since 13:08:55 (downtime 125.8 s). | `.stage/image/switch2c.log`, `EXIT=0`. |
+-| All four migrations complete, no failure: store-counters 17,408,074/17,408,074; owner-graph-index 5,805,107/5,805,107; source-summary 2,931,993/2,931,993; source-context 2,896,488/2,896,488. | `.stage/image/status-8.json` (read 16:11). Journal `sparrowd: migration ... complete` lines, source-summary 14:41:19, source-context 15:38:38. |
+-| Restore point `sets/6` on the NAS: complete, 780 files read back from the NAS. | `.stage/image/backup-set-2.log` (`EXIT=0`, backup 6). |
+-| `verify-backup.sh` on `sets/6` passes all checks, including the artifact check that failed before the fix (5,323,644 bytes read back). | `.stage/image/verify-6b.log`, `EXIT=0`, eight PASS lines, ended 17:22:13. |
+-| Migration rate after the switch: about 2.5 hours for all four migrations. | `.stage/image/status-8.json` and the journal lines above. Against about 44 hours projected on the old image. |
+-| Backup timer `sparrow-backup.timer` active since 16:13. Next run 2026-11-11 04:04. | `systemctl --user list-timers sparrow-backup.timer`. |
+-| Unscoped `records` query fails. A one-hour window answers in 24.24 s with 1,803 items. | `.stage/image/first-row.txt`, `first-row-page.json`, `first-row-window.json`. Commented on #183 (comment 11997). |
+-| Store LOG read: compaction CPU about 0.88 of the one-core quota in the slow window; zero write-stall events. | `/SPARROW/store/LOG`, compaction_finished events for 09:00-09:49 and 10:00-10:49 local. The cause is inferred from these events. |
+-
+-Earlier merges in the same work: #181 (tail watch loop), #185, #186, #189, #190 (source-summary run order), #192 (client retry wake). Their evidence is in `.stage/STATUS.md`.
+-
+-## 2. Open PRs, branches and worktrees
+-
+-- **Open PRs:** none (`tea api /repos/fleet/sparrow/pulls?state=open` returns `[]`).
+-- **Worktrees:** only the main checkout. `.worktrees/WORKTREE_REVIEW.md` is stale and lists items that no longer exist; it needs a sweep.
+-- **Local branch** `paudley/195-user-unit-upgrade-sh-pre-upgrade-backup`: its worktree was removed, the remote branch was deleted by `ghprsq`, but the local branch remains. `stagectl cleanup` refused to delete it without `--force`. It is not force-deleted. Its commits are all in `main`.
+-- **This document's branch** `paudley/status-2026-11-10`: created with worktree `.worktrees/status-2026-11-10`. See section 7 for its state.
+-
+-## 3. In progress
+-
+-- **Nothing coding.** The next lane item, a 50 ms page cap with unsynced pages and a concurrent-writer test, has **no issue and no branch**. It has not started.
+-- **#193 read-time cost** is not measured against the live store as a full query set. Only the windowed and unscoped `records` probes above were run. The issue says the facts stay if a normal query exceeds 30 s. The windowed probe is 24.24 s, which is under 30 s but close.
+-
+-## 4. Running, timers and how to read them
+-
+-- **Daemon:** `sparrowd` pid 6118, user unit `sparrow.service`. Read: `timeout 120 sparrow /SPARROW/store/rpc.sock status > FILE 2>&1; echo "EXIT=$?"`.
+-- **Backup timer:** `sparrow-backup.timer` active. Read the last run: `journalctl --user -u sparrow-backup.service`. Each set is verified by the engine and by `deploy/verify-backup.sh SET`.
+-- **Ship timer:** `ship` active (`sparrow-ship`, copies finished producer files into intake roots).
+-- **Katamari spool processes** (`katamari-journal-spool`, `katamari-manager-spool`, pids 53535 and 1382728 at 16:1x): part of the katamari-stored spool, not started by this session. Their state is **unknown** beyond running.
+-- **No sub-agents are running.** The implementers and reviewers for #193 and #195 have all reported.
+-- **Build:** no cargo job is running. `.stage/cargo.lock` is the flock for cargo.
+-
+-## 5. What I owe, and to whom
+-
+-- **Coordinator (`lillith_coordination`):**
+-  - the read-time cost number for #193, after a live measurement (owed);
+-  - the live proof for #195: a run of `user-unit-upgrade.sh` without `--no-backup` (owed, and the issue stays open until it is shown);
+-  - notice before any further switch;
+-  - retirement of the development watches `development-completed` and `development-tail-8a45378` if they have no live producer. **Not done.** I have not verified the producers. `docs/development-runtime.md` describes them as synthetic development watches.
+-- **Forge:** issues #193 and #195 stay open until their live items above are shown. Other open issues are listed in section 6.
+-- **Local cleanup:** the stale local branch in section 2.
+-- **`WORKTREE_REVIEW.md`:** sweep it.
+-
+-## 6. What I wait on
+-
+-- **Patrick:** nothing currently pending from Patrick. The #196 PR body is stale, and comments #12008 and #12010 are the accepted record. `.stage/STATUS.md` is gitignored and is not part of the record.
+-- **Coordinator:** a window for any further switch, and a ruling on whether the #193 facts stay if the live measurement is near 30 s.
+-- **Open issues, with state as I know it:**
+-  - #145, #156, #158, #160: live acceptance owed (#158 needs intake rate, latency and drops measured before, during and after; #160 needs 24 hours).
+-  - #163, #164 (purrdf `=4` repin, waits on memetics #319), #165, #166, #167 (CPUQuota and IOWeight sizing), #172, #174, #176, #178, #183 (tail latency; first-row numbers above), #191.
+-  - #144, #150 (POSIX ACLs, after the switches), #159, #97, #96, #95, #94, #92.
+-  - The forge has about 100 more open issues, most of them older Sparrow backlog (IDs 109 to 137 and others). **Unknown:** their current state. Read them with `tea api '/repos/fleet/sparrow/issues?state=open&type=issues&limit=60'`.
+-
+-## 7. Known faults and unknowns
+-
+-- **Fault, reported late:** `verify-backup.sh` failed on `sets/6` at its artifact check. I reported it late. It is fixed in #196 and the corrected run passes (section 1).
+-- **Fault, script:** `user-unit-upgrade.sh` without `--no-backup` was never run to completion against the live daemon, so its backup path is **unproven**. The two earlier attempts failed inside its backup step and stopped nothing. The fix is #196, not yet shown live.
+-- **Unknown:** the read-time cost of the derived facts at live scale, beyond the two probes above.
+-- **Unknown:** whether `sets/` on the NAS holds older sets. An `ls` at 13:06 showed only `6/`, which conflicts with the three-set retention. The retention behaviour is not verified.
+-- **Unknown:** Katamari's node state. It was OOM-killed on 2026-11-09 at 18:37:07 and I have not read its status since.
+-- **Unknown:** the migration rate under real intake. Intake was about zero during the window, so the post-switch rate is not evidence of behaviour under load.
+-- **Unknown:** whether `development-completed` and `development-tail-8a45378` have live producers.
+-- **Unknown:** the store LOG interpretation (compaction CPU as the cause) is inferred from events, not from a controlled experiment.
+-- **Tool note:** the `tea` PR query returned `[]`, and the issue query printed the list above, so both results are from the forge, not from memory.
+-
+-## 8. Razor and mandate (recorded)
+-
+-- Sparrow is a low-assurance, high-throughput, searchable, centralized log store. It optimizes only for speed and storage efficiency.
+-- Razor: long-term storage, privacy, encryption, validation or resilience goes to Katamari at a high, justified bar; everything else goes to Sparrow. Nothing irreplaceable may have its only copy in Sparrow.
+-- Radical improvement: Sparrow beats scattered log files that may be altered, reaped, accidentally deleted or pruned. Being in one place, searchable, compact and fast is already the win.
+-- Consume watches: sparrow-ship reads originals and copies them; soul originals remain in place. The katamari journal lines are log data and stay in Sparrow, per the coordinator.
+diff --git registry/compatibility.toml registry/compatibility.toml
+index a479e08..985c265 100644
+--- registry/compatibility.toml
++++ registry/compatibility.toml
+@@ -53,4 +53,4 @@ reason = "Pin group A repin (D69, memetics #202): purrdf, gmeow-ontology, rust-a
+ date = "2026-11-11"
+ supplier = "purrdf"
+ revision = "f48977d3fe6f15be473fd344562ca95f48310923"
+-reason = "Repin to the released purrdf =4 (Patrick, 2026-11-09: exactly \"=4\", no patch form; issue 164). Cargo.lock resolves 4.0.2 from crates.io, tag rust-v4.0.2 is this revision, and no git, revision, path or patch source remains. The census reference and the text lexicons (which the registry crates exclude) move to the same revision; the lexicon tree is identical to the one at c6d670c."
++reason = "Repin to the released purrdf =4 (exactly =4, no patch form; issue 164). Cargo.lock resolves 4.0.2 from crates.io, tag rust-v4.0.2 is this revision, and no git, revision, path or patch source remains. The census reference and the text lexicons (which the registry crates exclude) move to the same revision; the lexicon tree is identical to the one at c6d670c."
