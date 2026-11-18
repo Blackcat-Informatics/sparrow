@@ -376,9 +376,25 @@ fn verify_segment(
             });
         }
     }
-    decode::verify(&segment.files).map_err(|reason| ArchiveError::Verify {
-        path: store_dir.to_path_buf(),
-        reason,
+    decode::verify(&segment.files).map_err(|reason| {
+        // The bytes were written as prepared and the decoder refuses them. Move them aside to
+        // `<name>.refused` (kept for inspection) so a rebuild of the same range under another
+        // identity can take the name; the watermark has not moved and nothing is deleted.
+        for (name, _) in &segment.files {
+            let path = store_dir.join(name);
+            let aside = store_dir.join(format!("{name}.refused"));
+            if let Err(error) = fs::rename(&path, &aside) {
+                return ArchiveError::Io {
+                    step: "set a refused segment aside",
+                    path,
+                    source: error,
+                };
+            }
+        }
+        ArchiveError::Verify {
+            path: store_dir.to_path_buf(),
+            reason,
+        }
     })
 }
 
@@ -931,7 +947,9 @@ mod tests {
     /// INVARIANT (#352): a segment whose record bytes do not hash to the digest their link
     /// names is refused before the commit, so the watermark stays and the originals stay
     /// unretired. The container is internally consistent (only the per-record check can
-    /// tell), and the same segment with matching bytes decodes.
+    /// tell). The refused file is set aside, and a rebuild of the same range under another
+    /// identity replaces the intent and commits. The fixture's mismatch surfaces as a record
+    /// with no blob under its link's digest, not as a hash comparison.
     #[test]
     fn a_record_whose_bytes_differ_from_its_link_digest_is_refused_before_the_commit() {
         let dir = tempfile::tempdir().unwrap();
@@ -951,16 +969,46 @@ mod tests {
         );
         assert_eq!(through(&store), None);
 
-        // Recovery: the refused file stays on disk for inspection (nothing is deleted), the
-        // original is unretired, and once the operator clears the refused file the worker
-        // writes the genuine segment and commits it.
-        let refused = root.join("s").join(&segment.files[0].0);
-        assert!(refused.exists(), "the refused file is kept");
-        fs::remove_file(&refused).unwrap();
-        segment.files[0].1 = genuine.clone();
-        archive_segment(&flight(), &store, &root, "s", &segment).unwrap();
+        // Recovery: the refused bytes are set aside for inspection (nothing is deleted), the
+        // intent stays, and the originals stay unretired. The encoder then yields good bytes,
+        // so the rebuilt segment has another identity over the same range: the store replaces
+        // the intent and the worker writes the rebuilt segment and commits it.
+        let target = root.join("s").join(&segment.files[0].0);
+        let aside = root
+            .join("s")
+            .join(format!("{}.refused", segment.files[0].0));
+        assert!(!target.exists(), "the name is free for the rebuild");
+        assert_eq!(
+            fs::read(&aside).unwrap(),
+            sparrow_test_support::forged_segment(b"alpha\n", b"bravo\n")
+        );
+        assert_eq!(
+            store
+                .archive_state()
+                .unwrap()
+                .unwrap()
+                .intent
+                .map(|i| i.segment_id),
+            Some(segment.segment_id)
+        );
+        let rebuilt = PreparedSegment {
+            segment_id: [7; 32],
+            files: vec![(segment.files[0].0.clone(), genuine.clone())],
+            ..segment.clone()
+        };
+        store
+            .archive_intend(&sparrow_core::ArchiveIntent {
+                segment_id: rebuilt.segment_id,
+                first: rebuilt.from.clone(),
+                last: rebuilt.through.clone(),
+                records: rebuilt.records,
+                artifacts: rebuilt.artifacts,
+            })
+            .unwrap();
+        assert_eq!(through(&store), None, "replacing the intent moves nothing");
+        archive_segment(&flight(), &store, &root, "s", &rebuilt).unwrap();
         assert_eq!(through(&store).as_deref(), Some(segment.through.as_str()));
-        assert_eq!(fs::read(&refused).unwrap(), genuine);
+        assert_eq!(fs::read(&target).unwrap(), genuine);
     }
 
     /// INVARIANT (operators depend on it): a pass that finds files an earlier pass left, whether
