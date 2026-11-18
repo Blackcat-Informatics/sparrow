@@ -223,9 +223,14 @@ const SHUTTING_DOWN: Refusal = Refusal {
 };
 
 /// Permits held for the duration of one storage operation. Dropping releases both.
+///
+/// Fields drop in declaration order, so the reader slot is declared first and released first:
+/// whoever is handed the operation permit then finds the reader slot already free. The other
+/// order let a caller that waited for the permit and asked again at once be refused as busy by
+/// the slot of the read that had just ended (#349).
 pub struct Admitted {
-    _operation: Option<OwnedSemaphorePermit>,
     _reader: Option<OwnedSemaphorePermit>,
+    _operation: Option<OwnedSemaphorePermit>,
 }
 
 /// The daemon's operation permit budget and the rules for taking from it.
@@ -698,6 +703,51 @@ impl Ceiling {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A waker that records how many reader slots were free at the instant it was woken.
+    struct SlotsAtWake {
+        readers: Arc<Semaphore>,
+        free: AtomicU64,
+    }
+
+    impl std::task::Wake for SlotsAtWake {
+        fn wake(self: Arc<Self>) {
+            self.free.store(
+                self.readers.available_permits() as u64 + 1,
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    /// INVARIANT (#349): a finished read frees its reader slot no later than its operation
+    /// permit, so whoever is handed the operation permit (a queued writer, or a caller that
+    /// waited for it before asking again) never meets a reader slot still held by the read
+    /// that just ended and is refused as busy. Observed deterministically: the operation
+    /// permit's waiter is woken inline while the permit is released, and by then the reader
+    /// slot must already be free.
+    #[test]
+    fn a_finished_read_frees_its_reader_slot_before_its_operation_permit() {
+        let admission = Admission::new(Arc::new(Semaphore::new(1)));
+        let read = admission.reader().expect("a free budget admits a reader");
+        let wake = Arc::new(SlotsAtWake {
+            readers: admission.readers.clone(),
+            free: AtomicU64::new(0),
+        });
+        let waker = std::task::Waker::from(wake.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut waiting = std::pin::pin!(admission.operations.clone().acquire_owned());
+        assert!(
+            waiting.as_mut().poll(&mut context).is_pending(),
+            "the read holds the only operation permit"
+        );
+        drop(read);
+        // Stored as free + 1 so that "never woken" (0) differs from "woken with no slot free" (1).
+        assert_eq!(
+            wake.free.load(Ordering::SeqCst),
+            2,
+            "the operation permit was handed on while the reader slot was still held"
+        );
+    }
 
     /// INVARIANT (#246): at the connection ceiling the accept loop's wait is counted, shows
     /// as a waiter while it lasts with its longest duration, and ends when a connection ends

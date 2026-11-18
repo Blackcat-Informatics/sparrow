@@ -37,7 +37,7 @@ MCP and a CLI.
 
 - Plain, exact and calm. State what is implemented, what was measured, and
   what is still unverified.
-- Prefer concrete limits ("up to 30 days from acceptance") to adjectives
+- Prefer concrete limits ("retired at 30 days from acceptance once archived") to adjectives
   ("long retention").
 - No hype words, no exclamation marks and no promised performance without a
   cited measurement.

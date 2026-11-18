@@ -397,6 +397,45 @@ fn a_query_is_served_during_an_archive_read_and_still_excludes_another_query() {
     archive.join().unwrap();
 }
 
+/// REGRESSION (#324 item 7): an ordinary query holding the query slot never makes an archive
+/// prepare fail or halve. Before the archive had its own slot (#319) the prepare's read was
+/// refused with `RESOURCE_LIMIT` while a query ran and was read as an entry fault, halved, and
+/// ended as "archive cannot encode" for a sound entry. Now the prepare runs inside a live query
+/// over the whole range: unshortened, with no halving counted. Time is the store's `now`.
+#[test]
+fn a_prepare_inside_a_running_query_is_neither_refused_nor_halved() {
+    use sparrow_core::{QueryCancellation, QueryScope, RdfGraphLayers, RdfReadLimits};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), archiving(ArchivePolicy::default())).unwrap();
+    let body: String = (0..10).map(|i| format!("line {i}\n")).collect();
+    store
+        .ingest("seg-query", "source", "log", body.as_bytes(), 1)
+        .unwrap();
+    let now = 1 + 30 * DAY;
+
+    let scope = sparrow_test_support::record_scope!(QueryScope, "source", 1);
+    let prepared = store
+        .with_rdf_scope(
+            &scope,
+            RdfGraphLayers::ALL,
+            2,
+            RdfReadLimits::default(),
+            &QueryCancellation::default(),
+            |_, _| store.archive_prepare(now),
+        )
+        .unwrap()
+        .unwrap()
+        .expect("due");
+
+    assert!(
+        prepared.shortened.is_none(),
+        "the query must not shorten it"
+    );
+    assert_eq!(prepared.records, 10);
+    assert_eq!(store.archive_halvings(), 0);
+}
+
 /// One jsonl line of `keys` string keys: about 33 quads a key once the stored rows are doubled
 /// into the default graph (about 3,300 quads for 100 keys).
 fn json_line(keys: u64) -> String {

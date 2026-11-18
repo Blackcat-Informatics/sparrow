@@ -217,7 +217,7 @@ every watch in `consume_watches` names a root that exists.
 - Diagnose: `findmnt -T /net/synology/archives/sparrow-archive` must show `nfs4` from
   `192.168.1.1:/volume1/archives`.
 - Recover: restore the mount; the next pass retries by itself. The unit and the profile
-  grant no archive path yet. Sparrow issues #15 to #17 add the archive worker's deployment.
+  grant no archive path yet. The archive worker is implemented; it runs on the live daemon only once it is enabled (see `docs/archive-format.md`, "Archive status").
 
 ## Revert the cutover to the user unit
 
@@ -287,13 +287,13 @@ Each remaining item and why it stays:
 | all | `PrivateUsers=` | The daemon's port 518 needs the bind capability in the host's user namespace, and every unit reads or writes files whose real owners must stay mapped (the store, the roots, the producers' files). |
 | all | `DeviceAllow=char-rtc:r` | Added by `ProtectClock=yes` itself; read-only clock access. |
 | `sparrow` | `PrivateNetwork=`, `RestrictAddressFamilies=~AF_(INET\|INET6)`, `IPAddressDeny=` | The public Cap'n Proto listener on 0.0.0.0:518 serves remote agents on any trusted network; CHAP guards it. |
-| `sparrow` | `AmbientCapabilities=`, `CAP_NET_BIND_SERVICE` | Binding port 518, Patrick's ruling of 2026-11-01; the bounding set holds nothing else. |
+| `sparrow` | `AmbientCapabilities=`, `CAP_NET_BIND_SERVICE` | Binding port 518; the bounding set holds nothing else. |
 | `sparrow` | `RestrictSUIDSGID=` | systemd implements it with a seccomp rule that cannot inspect `openat2`'s mode, so it refuses `openat2` outright, and the daemon needs `openat2` to open files beneath a consume root without following symlinks (measured, [evidence/lifecycle.md](evidence/lifecycle.md)). `NoNewPrivileges=yes` makes a setuid file inert, and the daemon creates every file with a fixed mode. |
 | `ship` | `ProtectHome=read-only` | It reads the producers' directories under `/home/paudley`. |
 
 Hardening settings the specification lists that the units do not use, and why:
 `StateDirectory=`, `RuntimeDirectory=`, `CacheDirectory=` and `LogsDirectory=`
-on `sparrow.service`, because the store is `/SPARROW/store` by ruling, the
+on `sparrow.service`, because the store is `/SPARROW/store`, the
 daemon keeps no runtime or cache files and it logs to the journal; `WatchdogSec=`, because the
 daemon does not implement the systemd notification protocol (`Type=exec`).
 

@@ -13,6 +13,7 @@ Production capacity claims remain limited to the measured envelopes in the
 [acceptance boundary](implementation-plan.md#current-acceptance-boundary).
 
 The external contracts and examples are defined in [Interfaces](interfaces.md).
+The [glossary](glossary.md) names each term and the document that governs it.
 
 ## 1. Goals and boundaries
 
@@ -40,6 +41,11 @@ need. Nothing irreplaceable may have its only copy in Sparrow. Worked examples:
 anonymous intake is allowed because it is the fastest path; deduplication and
 compression matter because efficient storage is a primary goal; signatures and
 integrity come after all other concerns and never on the hot path.
+
+Producers send Sparrow what they set aside, including the cruft that
+`lillith_memetics` sends. Sparrow stores it as any other artifact or record and
+retires it, once the archive holds it, at `received_at + 30 days` unless a pin
+keeps it, and never deletes it before it is archived; the intake, limits and lookup are in the [cruft section of the interfaces](interfaces.md#cruft).
 
 There is one global 30-day retention policy. Per-class retention, replication,
 distributed queries, embeddings, an embedded language model, and a human
@@ -232,8 +238,8 @@ occurrence counts remain separate.
 
 ### 4.3 Budgets and reclamation
 
-The deployment must supply a disk budget and a maintenance reserve. Thirty days
-bounds age; it does not by itself bound bytes. Account for table/blob files,
+The deployment must supply a disk budget and a maintenance reserve. The 30-day
+deadline does not by itself bound bytes. Account for table/blob files,
 journals, incomplete imports, dictionaries, indexes, old snapshot versions, and
 compaction output. Distinguish live logical bytes from measured physical bytes.
 
@@ -279,11 +285,12 @@ filesystem quota's responsibility.
 
 ### 4.4 Archive before delete
 
-Sparrow keeps a 30-day searchable window of disposable logs. It can also
+Sparrow keeps disposable logs searchable until their 30-day deadline. It can also
 archive aged-out evidence to a large, slower store, such as a NAS, before
 deleting it. The archive writes GTS segment files through PurRDF's GTS writer,
 as specified in [the archive format](archive-format.md). Archiving is optional and
-configured by an `[archive]` table. Once a store has been fenced for archiving,
+configured by an `[archive]` table. Whether the archive is built and running is
+stated in [Archive status](archive-format.md#archive-status). Once a store has been fenced for archiving,
 it never deletes unarchived evidence. That holds when the archive is down, while
 it lags, and for the backlog present when archiving was enabled.
 
@@ -544,7 +551,7 @@ event with identical bytes receives a new occurrence. Backpressure is explicit,
 with retryability and delivery state distinguishable from parser diagnostics.
 
 The daemon transport is Cap'n Proto RPC over a private Unix-domain socket and
-a public TCP socket, as directed on 2026-10-08. The selected public binding is
+a public TCP socket. The selected public binding is
 `0.0.0.0:518`; ingestion does not require authentication, while reads, queries
 and administration over TCP require a shared-secret CHAP session. CLI, Rust clients and the stdio MCP adapter use the same
 generated schema. Requests, binary payloads, instants, integer counts, receipts

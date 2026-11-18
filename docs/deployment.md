@@ -495,8 +495,9 @@ cursor was saved. It touches nothing but the scratch directory and its own unit.
 ## Archive and backups
 
 Sparrow backs up nothing except the age-out to GTS files on the NAS: the archive worker
-(docs/interfaces.md, "Archive") writes each aged-out segment under `[archive] dir`, here
-`/net/synology/archives/sparrow-archive`, before the store retires it. The online store backup
+(docs/interfaces.md, "Archive-before-delete gate") writes each aged-out segment under `[archive] dir`, here
+`/net/synology/archives/sparrow-archive`, before the store retires it. The worker is implemented
+and is not running on the live daemon; see [Archive status](archive-format.md#archive-status). The online store backup
 (#156) was removed in #330, with `sparrow-backup`, its restore, `deploy/verify-backup.sh`,
 `deploy/pre-upgrade-backup.sh` and the nightly timer. The configuration keys `backup_root` and
 `backup_keep` were removed too. The server file refuses unknown keys, so a `server.toml` that still
