@@ -6857,9 +6857,6 @@ fn expiry_below_the_floor_hands_its_retirement_to_the_pressure_wait() {
         state.waiting_on
     );
     assert_eq!(state.wait_age_ms(), 0);
-    // The last pass may have forced a compaction whose thread still holds the database: the
-    // marker read below reopens the directory, so wait for native work to end first (#348).
-    store.await_native_quiet().unwrap();
     drop(store);
     assert!(marker(dir.path()).is_none());
 

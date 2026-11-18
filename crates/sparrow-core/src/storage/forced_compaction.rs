@@ -366,6 +366,13 @@ mod tests {
         let forced = Forced::new(Arc::default());
         assert!(forced.start(Arc::clone(&db)).unwrap());
         forced.wait_finished();
+        // Finished means the thread holds no handle of the database (#348): a caller that sees
+        // the end may close the store and reopen its directory at once.
+        assert_eq!(
+            Arc::strong_count(&db),
+            1,
+            "a finished compaction holds the database"
+        );
         let Slot::Finished(outcome) = forced.poll() else {
             panic!("the compaction did not finish");
         };
@@ -395,6 +402,11 @@ mod tests {
             forced.arm(fault);
             assert!(forced.start(Arc::clone(&db)).unwrap());
             forced.wait_finished();
+            assert_eq!(
+                Arc::strong_count(&db),
+                1,
+                "a failed compaction holds the database"
+            );
             let Slot::Finished(outcome) = forced.poll() else {
                 panic!("the compaction did not finish");
             };
