@@ -2,10 +2,21 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 .DEFAULT_GOAL := check
-.PHONY: all check tools-check fmt fmt-check lint test check-shipped census census-cross census-check install-hooks build-runtime install-bin seed-excludes-check
+.PHONY: all check precommit hook-check tools-check fmt fmt-check lint test check-shipped census census-cross census-check install-hooks build-runtime install-bin seed-excludes-check
 
 all: check
-check: tools-check fmt-check lint check-shipped test census-check
+
+# Two gates. `precommit` is what the pre-commit hook runs: tool presence,
+# formatting and the release clippy over all targets; no tests and no cargo
+# lock. `check` is the full gate (hook-check first, so a checkout without the
+# hook cannot pass silently); it must pass on a change's head before merge.
+precommit: tools-check fmt-check lint
+check: hook-check tools-check fmt-check lint check-shipped test census-check
+
+hook-check:
+	@cmd="$$(git config --local --get hook.sparrow-verify.command)"; \
+	test "$$cmd" = 'make precommit' || { echo "error: the pre-commit hook command is '$${cmd:-unset}', expected 'make precommit'; run 'make install-hooks'"; exit 1; }
+	@git hook list pre-commit | grep -qx sparrow-verify || { echo "error: the sparrow-verify pre-commit hook is not enabled in this checkout; run 'make install-hooks'"; exit 1; }
 
 # Select both executable artifacts explicitly after verification hooks. Some
 # managed Cargo targets may republish unselected artifacts from another lease.
@@ -70,5 +81,6 @@ census-check: tools-check
 # Git 2.54's additive hooks preserve existing Stage and repository hooks.
 install-hooks:
 	git config --local hook.sparrow-verify.event pre-commit
-	git config --local hook.sparrow-verify.command 'make check'
+	git config --local hook.sparrow-verify.command 'make precommit'
 	git config --local hook.sparrow-verify.parallel false
+	git config --local hook.sparrow-verify.enabled true
