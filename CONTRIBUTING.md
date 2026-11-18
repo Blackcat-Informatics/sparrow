@@ -69,7 +69,7 @@ The main commands:
 
 ```bash
 make check          # the gate: tools, fmt, release Clippy, release tests, census
-make install-hooks  # run make check as an additive pre-commit hook
+make install-hooks  # run make precommit as an additive pre-commit hook
 make fmt            # apply rustfmt
 make census         # local duplicate baseline
 make census-cross   # overlap report against the pinned PurRDF revision
@@ -85,7 +85,7 @@ time; later runs reuse the target directory.
 ### Commit hooks
 
 Run `make install-hooks` once in each checkout. It uses Git 2.54's additive
-`hook.<name>` configuration to run `make check` before every commit, and it
+`hook.<name>` configuration to run `make precommit` (formatting and release Clippy) before every commit, and it
 preserves any hooks you already have.
 
 **Never bypass commit verification.** Do not use the commit command's

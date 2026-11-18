@@ -14,7 +14,9 @@ precommit: tools-check fmt-check lint
 check: hook-check tools-check fmt-check lint check-shipped test census-check
 
 hook-check:
-	@test "$$(git config --local --get hook.sparrow-verify.command)" = 'make precommit' || { echo "error: the pre-commit hook is not installed for this checkout; run 'make install-hooks'"; exit 1; }
+	@cmd="$$(git config --local --get hook.sparrow-verify.command)"; \
+	test "$$cmd" = 'make precommit' || { echo "error: the pre-commit hook command is '$${cmd:-unset}', expected 'make precommit'; run 'make install-hooks'"; exit 1; }
+	@git hook list pre-commit | grep -qx sparrow-verify || { echo "error: the sparrow-verify pre-commit hook is not enabled in this checkout; run 'make install-hooks'"; exit 1; }
 
 # Select both executable artifacts explicitly after verification hooks. Some
 # managed Cargo targets may republish unselected artifacts from another lease.
@@ -81,3 +83,4 @@ install-hooks:
 	git config --local hook.sparrow-verify.event pre-commit
 	git config --local hook.sparrow-verify.command 'make precommit'
 	git config --local hook.sparrow-verify.parallel false
+	git config --local hook.sparrow-verify.enabled true
