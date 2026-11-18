@@ -1,0 +1,123 @@
+diff --git .github/workflows/ci.yaml .github/workflows/ci.yaml
+index cfa76c5..ede1eab 100644
+--- .github/workflows/ci.yaml
++++ .github/workflows/ci.yaml
+@@ -72,6 +72,10 @@ jobs:
+         with:
+           workspaces: sparrow
+ 
++      - name: Install the commit hook
++        working-directory: sparrow
++        run: make install-hooks
++
+       - name: make check
+         working-directory: sparrow
+         run: make check
+diff --git AGENTS.md AGENTS.md
+index 7bd8623..23df607 100644
+--- AGENTS.md
++++ AGENTS.md
+@@ -181,14 +181,15 @@ A test in the suite runs for every change, forever; it must earn its keep.
+   `make check` (also `make all`) is the gate: formatting, release-profile
+   Clippy with warnings denied, each shipped crate alone without test-support
+   (`make check-shipped`), release tests, the census self-tests and the pinned
+-  cross-workspace gate. The pre-commit hook runs it in full, so do not run it
+-  by hand before a commit that will run it anyway.
++  cross-workspace gate. The pre-commit hook runs `make precommit` (formatting,
++  release Clippy over all targets; no tests, no lock). Run
++  `make check` on a change's head before merge and cite its EXIT line in the PR body.
+ - Install the hook with `make install-hooks` in each checkout (Git 2.54 or
+   newer) and preserve existing hooks. Commit verification is never bypassed:
+   no skip flag, no `-n`, no `SKIP=`, no `HUSKY=0`, no equivalent. Wait for a
+   slow hook and fix what it finds; a change that cannot pass is not committed.
+-- Run one heavy command at a time across all workers: every cargo command,
+-  test suite and commit goes through `flock` on `.stage/cargo.lock` in the main
++- Run one heavy command at a time across all workers: every cargo command
++  and test suite goes through `flock` on `.stage/cargo.lock` in the main
+   checkout. Send its output to a log under `.stage/` with the tool's own exit
+   status after it, and name the tree it ran in. A status read through a pipe,
+   or a result built in the wrong directory, is not evidence.
+diff --git CONTRIBUTING.md CONTRIBUTING.md
+index 6200472..a7cfb1f 100644
+--- CONTRIBUTING.md
++++ CONTRIBUTING.md
+@@ -69,7 +69,7 @@ The main commands:
+ 
+ ```bash
+ make check          # the gate: tools, fmt, release Clippy, release tests, census
+-make install-hooks  # run make check as an additive pre-commit hook
++make install-hooks  # run make precommit as an additive pre-commit hook
+ make fmt            # apply rustfmt
+ make census         # local duplicate baseline
+ make census-cross   # overlap report against the pinned PurRDF revision
+@@ -85,7 +85,7 @@ time; later runs reuse the target directory.
+ ### Commit hooks
+ 
+ Run `make install-hooks` once in each checkout. It uses Git 2.54's additive
+-`hook.<name>` configuration to run `make check` before every commit, and it
++`hook.<name>` configuration to run `make precommit` (formatting and release Clippy) before every commit, and it
+ preserves any hooks you already have.
+ 
+ **Never bypass commit verification.** Do not use the commit command's
+diff --git Makefile Makefile
+index 44cfeee..3b782b9 100644
+--- Makefile
++++ Makefile
+@@ -2,10 +2,21 @@
+ # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+ 
+ .DEFAULT_GOAL := check
+-.PHONY: all check tools-check fmt fmt-check lint test check-shipped census census-cross census-check install-hooks build-runtime install-bin seed-excludes-check
++.PHONY: all check precommit hook-check tools-check fmt fmt-check lint test check-shipped census census-cross census-check install-hooks build-runtime install-bin seed-excludes-check
+ 
+ all: check
+-check: tools-check fmt-check lint check-shipped test census-check
++
++# Two gates. `precommit` is what the pre-commit hook runs: tool presence,
++# formatting and the release clippy over all targets; no tests and no cargo
++# lock. `check` is the full gate (hook-check first, so a checkout without the
++# hook cannot pass silently); it must pass on a change's head before merge.
++precommit: tools-check fmt-check lint
++check: hook-check tools-check fmt-check lint check-shipped test census-check
++
++hook-check:
++	@cmd="$$(git config --local --get hook.sparrow-verify.command)"; \
++	test "$$cmd" = 'make precommit' || { echo "error: the pre-commit hook command is '$${cmd:-unset}', expected 'make precommit'; run 'make install-hooks'"; exit 1; }
++	@git hook list pre-commit | grep -qx sparrow-verify || { echo "error: the sparrow-verify pre-commit hook is not enabled in this checkout; run 'make install-hooks'"; exit 1; }
+ 
+ # Select both executable artifacts explicitly after verification hooks. Some
+ # managed Cargo targets may republish unselected artifacts from another lease.
+@@ -70,5 +81,6 @@ census-check: tools-check
+ # Git 2.54's additive hooks preserve existing Stage and repository hooks.
+ install-hooks:
+ 	git config --local hook.sparrow-verify.event pre-commit
+-	git config --local hook.sparrow-verify.command 'make check'
++	git config --local hook.sparrow-verify.command 'make precommit'
+ 	git config --local hook.sparrow-verify.parallel false
++	git config --local hook.sparrow-verify.enabled true
+diff --git README.md README.md
+index 9f202f9..59d1e59 100644
+--- README.md
++++ README.md
+@@ -146,7 +146,7 @@ git -C ../purrdf checkout "$(sed -n 's/^git_revision = "\(.*\)"/\1/p' registry/c
+ 
+ make check          # fmt, release Clippy (warnings denied), shipped crates without test-support, release tests, census
+ make build-runtime  # release server and client binaries
+-make install-hooks  # run make check before every commit
++make install-hooks  # run make precommit before every commit
+ ```
+ 
+ See [CONTRIBUTING.md](./CONTRIBUTING.md) for the gate, the PurRDF reuse rules
+diff --git docs/helper-census.md docs/helper-census.md
+index 8c142f0..08d3772 100644
+--- docs/helper-census.md
++++ docs/helper-census.md
+@@ -29,7 +29,7 @@ cargo run --locked --release -p sparrow-helper-census -- --dump-ledger
+ ```
+ 
+ Hook installation uses Git 2.54's additive `hook.sparrow-verify` configuration in
+-the checkout's local Git config. It runs `make check` on commits; it does not
++the checkout's local Git config. It runs `make precommit` on commits; it does not
+ replace Stage hooks or change global configuration. Install it in each checkout.
+ 
+ To use another PurRDF checkout, pass `--purrdf-repo /path/to/purrdf` with a cross

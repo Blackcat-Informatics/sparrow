@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/365-show-the-archive-worker-s-phase",
+  "branch": "paudley/365-show-the-archive-worker-s-phase",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "2b42a8e24c32bfd30485b6e02f0d7de16412a751",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/365-show-the-archive-worker-s-phase/.stage/show-the-archive-worker-s-phase/sync/20261118T205730-2663c80e39b24947a0cb2ddb9ba28375",
+  "conflicts": [],
+  "status": "completed",
+  "base": "87dfe48adfccdcd5c4433f54c34fe1bf8c5196f3",
+  "merge_bases": [
+    "b2ba7151833e9f9018c8701a70e6b5138b4836b7"
+  ],
+  "merge_index": "b548abf0c0952df75e2dffe698711df805d35a30e3f0813bbf88a37b3dfacc59",
+  "candidate_tree": "b7775d31c6a34c8dff4a4249977f705784d5de01",
+  "candidate_patch": "candidate-314113111467446eb4d598f570ec30ee.patch",
+  "stdout_log": "commit-314113111467446eb4d598f570ec30ee.stdout.log",
+  "stderr_log": "commit-314113111467446eb4d598f570ec30ee.stderr.log",
+  "validation_records": [],
+  "commit_duration_seconds": 36.03519036399666,
+  "commit": "be1972fa01a84f76ee416053fbf4b78d0f53646e",
+  "tree": "b7775d31c6a34c8dff4a4249977f705784d5de01",
+  "exit_code": 0
+}
