@@ -14939,7 +14939,7 @@ impl SetHarness {
     }
 }
 
-/// INVARIANT (#285, ruling condition 1): the source of a set claim stays held, and its bytes
+/// INVARIANT (#285, condition 1): the source of a set claim stays held, and its bytes
 /// are unchanged, for as long as the claim is pending: before the manifest and while it is
 /// accepted and not yet recorded. With no archive configured, eviction holds at `ArchiveLag`
 /// and retires no part, so the claim's parts stay stored and `publish` completes the set. Once
@@ -15007,7 +15007,7 @@ async fn a_set_claims_source_stays_held_while_the_claim_is_pending() {
         .await;
 }
 
-/// INVARIANT (#285, ruling condition 2, review-pr286 B1): with no archive configured, eviction
+/// INVARIANT (#285, condition 2, review-pr286 B1): with no archive configured, eviction
 /// holds at `ArchiveLag` and retires no record of a set part, so a part is never answered as
 /// evicted and never sent again. Every part keeps its original artifact, the claim publishes
 /// from the stored parts, and each source line is read exactly once.

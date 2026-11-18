@@ -35,15 +35,12 @@ lives.
 The units are the source of truth. The scripts are thin wrappers over them
 and over the kept images in `./bin`.
 
-## Rulings
+## Deployment requirements
 
-Patrick's decisions for this deployment, 2026-11-01:
-
-- Unit scope: "System unit, own user (Recommended)". `sparrow.service` is a
-  system unit in the fleet's production slice, running as the `sparrow` user
-  and group.
-- Store location, verbatim: "sparrow's final store location is /SPARROW". The
-  store is `/SPARROW/store` and its socket `/SPARROW/store/rpc.sock`.
+- `sparrow.service` is a system unit in the fleet's production slice, running
+  as the `sparrow` user and group.
+- The store location is `/SPARROW`: the store is `/SPARROW/store` and its
+  socket `/SPARROW/store/rpc.sock`.
 - Sparrow is not real time. It joins the production slice so that development
   yields to it: nice -20, best-effort IO priority 0, OOM score adjustment -900,
   real-time scheduling refused.
@@ -56,8 +53,7 @@ Patrick's decisions for this deployment, 2026-11-01:
   directory does not implement it.
 - Sparrow backs up nothing except the age-out to GTS files on the NAS: the archive worker
   writes aged-out segments under `[archive] dir` (`/net/synology/archives/sparrow-archive`) and
-  never to a local disk (Patrick, 2026-11-08: "Sparrow and katamaria are FORBIDDEN from backing
-  up to local disks"). The online store backup (#156) was removed in #330. The daemon's archive
+  never to a local disk; no Sparrow backup is ever written to a local disk. The online store backup (#156) was removed in #330. The daemon's archive
   worker is not deployed by these files (Sparrow issues #15 to #17); it refuses a directory that
   is on the root filesystem's device, or on a local filesystem of the root's type (an unmounted
   share), and one whose `STORE_ID` names another store or which holds content but no `STORE_ID`.
@@ -69,7 +65,7 @@ Patrick's decisions for this deployment, 2026-11-01:
 
 ## Layout
 
-Copy-on-write is off for the store (Patrick, 2026-10-15: "COW off everywhere"). `install.sh`
+Copy-on-write is off for the store. `install.sh`
 sets the btrfs no-copy-on-write attribute on `/SPARROW/store` while it is empty, so every file
 created in it inherits it. `restart.sh` rewrites a closed store that
 still has copy-on-write files, using `deploy/copy-on-write.sh convert`, and keeps the original

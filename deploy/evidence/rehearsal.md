@@ -147,7 +147,7 @@ One constraint on this run: my shell permission scope allowed the `deploy/*.sh` 
 
 #### G12. Unexplained references
 
-- **Document**: README.md "Rulings", "Permissions", "Moving a running service"; MANUAL.md; evidence files.
+- **Document**: README.md "Deployment requirements", "Permissions", "Moving a running service"; MANUAL.md; evidence files.
 - **Happened**: "issue #10", "the tracking issue's acceptance steps", "PRODUCTION-LAUNCH section B" (in the unit comments) and "Katamari" appear with no link, number or path. The `REV` suffix for lexicons is a 40-character PurRDF hash while image `REV` is a 7-character Sparrow commit; the Layout table uses `REV` for both. `make install-hooks` needs Git 2.54 or newer (AGENTS.md) but step 1 lists `git` with no version.
 - **Should say**: link the issues, name the Katamari path, distinguish `PURRDF_REV` from `REV` as docs/deployment.md already does, and add the Git version.
 

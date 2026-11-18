@@ -6310,8 +6310,8 @@ fn a_floor_refusal_below_budget_retires_archived_evidence_and_stops_at_the_archi
     );
 }
 
-// Value (#267): the floor is no reason to delete what is pinned, and, by the coordination
-// ruling, no reason to retire anything early on a store with no archive policy, where
+// Value (#267): the floor is no reason to delete what is pinned, and
+// no reason to retire anything early on a store with no archive policy, where
 // "archived" protects nothing. Protects: (a) a pinned archived entry is skipped and the pass
 // is Blocked with the floor facts; (b) a store with no archive policy retires nothing at the
 // floor and says so in plain words, while the budget path stays as it was.
@@ -6397,7 +6397,7 @@ fn floor_retirement_respects_pins_and_a_store_without_an_archive_policy() {
     assert_eq!(store.bytes(&old.id, 0, 4, 11).unwrap(), b"old\n");
 }
 
-// Value (#267, coordination ruling): evidence is retired early for a floor that something
+// Value (#267): evidence is retired early for a floor that something
 // outside Sparrow crossed only up to the first deficit plus the maintenance reserve. Protects:
 // once an episode has freed that much, the next pass retires nothing more, is Blocked with
 // the "held outside Sparrow" reason, says the bound was reached, and unretired archived
@@ -7391,7 +7391,7 @@ fn an_ended_wait_leaves_no_marker_to_restore_at_open() {
     );
 }
 
-// Value: #218 ruling: a store too damaged to take even the small write that ends a wait
+// Value (#218): a store too damaged to take even the small write that ends a wait
 // must say so plainly, and must keep saying it while it lasts. Protects: the failure names
 // the cause in plain words, is re-reported on the next pass (the error baseline does not
 // advance past an unreported error), and once the store takes the write the error fails one
@@ -25794,7 +25794,7 @@ fn a_claim_publishes_as_one_artifact_or_as_a_set_never_both() {
     assert_eq!(store.records(1_000).unwrap().len(), 1);
 
     // (b) Part 0 is accepted first: the single publish is refused, the set records, and the
-    // claim's staging row is released by reclaim as ruling A says.
+    // claim's staging row is released by reclaim as #280 requires.
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
     let claim = set_claim(&store, b"b", content);
@@ -25879,7 +25879,7 @@ fn a_pending_claims_single_and_manifest_artifacts_survive_eviction_until_removal
     }
 }
 
-/// INVARIANT (#280, ruling A): a claim that began single staging and was then recorded as a
+/// INVARIANT (#280): a claim that began single staging and was then recorded as a
 /// set and removed has its unpublished staging row, and so its import slot, released by the
 /// next reclaim pass.
 #[test]
@@ -25900,7 +25900,7 @@ fn reclaim_releases_the_staging_row_of_a_claim_recorded_as_a_set() {
     assert!(!import_row_present(dir.path(), &journal.import_id));
 }
 
-/// INVARIANT (#280, ruling A): a single-path claim's unpublished staging row is kept by
+/// INVARIANT (#280): a single-path claim's unpublished staging row is kept by
 /// reclamation as before, whatever the clock says, while the claim may still publish.
 #[test]
 fn reclaim_keeps_the_unpublished_staging_row_of_a_single_path_claim() {
@@ -25914,7 +25914,7 @@ fn reclaim_keeps_the_unpublished_staging_row_of_a_single_path_claim() {
     assert_eq!(kept.received_bytes, content.len() as u64);
 }
 
-/// INVARIANT (#280, ruling A; issue 283): a set claim whose manifest receipt is gone is not
+/// INVARIANT (#280, #283): a set claim whose manifest receipt is gone is not
 /// provably a set, so reclamation keeps its unpublished staging row.
 #[test]
 fn reclaim_keeps_the_staging_row_of_a_set_claim_without_its_manifest_receipt() {
