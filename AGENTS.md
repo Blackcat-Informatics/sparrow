@@ -20,10 +20,11 @@ than the plain log files it replaces.
 
 - **Method.** One RocksDB store holds every artifact and record as exact bytes,
   behind typed Cap'n Proto interfaces. PurRDF supplies the JSON and Markdown
-  projections, SPARQL and text search over them. An item is held live for at
-  most 30 days from receipt, and nothing is deleted that has not been archived.
-  The archive is implemented and is not yet running on the live daemon, so
-  nothing retires there today; see
+  projections, SPARQL and text search over them. An unpinned item is due at
+  `received_at + 30 days` and is retired then once the archive holds it; a pin
+  keeps an item until the pin ends, and nothing is deleted that has not been
+  archived. The archive is implemented and is not yet running on the live
+  daemon, so nothing retires there today; see
   [Archive status](docs/archive-format.md#archive-status).
 - **Consumers.** Every daemon sends its operational log to Sparrow.
   `lillith_memetics` sends cruft (see [Cruft](docs/interfaces.md#cruft)).

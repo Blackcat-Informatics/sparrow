@@ -44,7 +44,7 @@ The archive is implemented on `main` and is not running on the live daemon.
 - Not running: the live daemon has no `[archive]` table, so it runs no archive
   worker and its store carries no archive policy.
 
-Nothing is deleted from the live store today, because nothing is retired: the live daemon runs no archive worker. The archive worker running on the live daemon is a condition, behind issue 352 and an authorized image switch.
+The live store deletes nothing today, because the live daemon runs no archive worker and so nothing is retired. Running the worker on the live daemon is a separate condition, behind issue 352 and an authorized image switch.
 
 Implemented does not mean running: whether a daemon runs the worker is
 operational state, set by its `[archive]` table and shown in its journal. Until

@@ -101,15 +101,13 @@ are offline and read-only.
 
 **Retention Sparrow guarantees.** Nothing is deleted that has not been archived:
 the deletion gate, the archive watermark and the store fence enforce it (see
-[Archive-before-delete gate](#archive-before-delete-gate-schema-63)). An item is
-held live for at most 30 days from receipt (`received_at + 30 days`), then
-written to the archive and retired. Archiving begins early, by default at 75% of
-the window (day 22.5), and a segment counts only once it is written and
-verified. Under disk pressure, once an archive runs, the oldest unpinned
-archived items may leave the live store before day 30. With no archive running,
-which is the live daemon today, nothing retires: items stay past day 30 and
-ingest is refused with `STORAGE_PRESSURE` once the budget is reached. A pin only
-delays deletion. Source timestamps do not move the deadline. Whether the
+[Archive-before-delete gate](#archive-before-delete-gate-schema-63)). An unpinned item is due at `received_at + 30 days` and is retired then once the
+archive holds it. Archiving starts early, by default at 75% of the window, and a
+segment counts only once it is written and verified. Disk pressure can retire
+archived, unpinned items earlier. A pin keeps an item until the pin ends. The
+deletion gate keeps every unarchived item past its deadline, so with no archive
+running (the live daemon today) nothing retires and ingest is refused with
+`STORAGE_PRESSURE` at the budget. Source timestamps do not move the deadline. Whether the
 archive worker runs on the live daemon is stated in
 [Archive status](archive-format.md#archive-status).
 
