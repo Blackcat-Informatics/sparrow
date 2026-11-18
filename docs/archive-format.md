@@ -306,7 +306,10 @@ The worker runs every archive operation on one dedicated thread,
 
 If the target already exists and verifies, the write counts as done. If it
 exists and does not verify, the write fails hard and the watermark does not
-move. Only a verified segment is committed. A Synology NFS export must use
+move. Only a verified segment is committed: verification decodes the segment with the
+same decoder as `sparrow-archive verify`, so each record's bytes must hash to the digest its
+link quad names. A refused file stays in place and the operator clears it before the worker
+writes the segment again. A Synology NFS export must use
 synchronous writes (`sync`); with `async` exports fsync proves nothing.
 
 Crash recovery follows from the intent:

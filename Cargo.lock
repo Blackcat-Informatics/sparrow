@@ -1429,6 +1429,7 @@ dependencies = [
  "purrdf-lex",
  "rustix",
  "serde",
+ "sparrow-archive",
  "sparrow-client",
  "sparrow-core",
  "sparrow-test-support",
@@ -1445,6 +1446,7 @@ name = "sparrow-test-support"
 version = "0.1.0"
 dependencies = [
  "capnp",
+ "purrdf",
  "purrdf-lex",
  "rocksdb",
  "rustix",

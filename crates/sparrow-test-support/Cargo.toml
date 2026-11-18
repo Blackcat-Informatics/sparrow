@@ -13,6 +13,7 @@ license.workspace = true
 sparrow-core = { path = "../sparrow-core", features = ["test-support"] }
 rocksdb.workspace = true
 purrdf-lex.workspace = true
+purrdf.workspace = true
 sparrow-client = { path = "../sparrow-client" }
 capnp.workspace = true
 
