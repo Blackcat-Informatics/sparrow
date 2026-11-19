@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
-use crate::{ArtifactReceipt, Client, Endpoint, Error, sparrow_capnp as wire};
+use crate::{ArtifactReceipt, Client, Endpoint, Error, Expect, expect, sparrow_capnp as wire};
 use std::{
     fs::File,
     os::unix::fs::{FileExt, MetadataExt},
@@ -16,8 +16,39 @@ use std::{
 /// same request resumes from its durable checkpoint while each attempt advances it.
 /// A terminal failure cancels the staging journal, so an abandoned import never
 /// holds one of the daemon's import slots for the retry window.
+///
+/// No instance role or store id is required of the daemon; see [`import_file_expecting`].
 pub async fn import_file(
     endpoint: &Endpoint,
+    request_id: &str,
+    source: &str,
+    format: wire::Format,
+    path: &Path,
+) -> Result<ArtifactReceipt, Error> {
+    import_checked(endpoint, None, request_id, source, format, path).await
+}
+
+/// Stream a completed regular file as [`import_file`] does, requiring `expect` of every
+/// connection the crate makes: the first, each replacement and the cancel's. A connection
+/// whose discovery reports another instance role or store id fails with the non-retryable
+/// `INSTANCE_MISMATCH` before any import call is made over it, so no further byte reaches
+/// that daemon. A journal staged on a daemon that later fails the check is left in place:
+/// the cancel would have to reach the refused daemon, and a cancel refused for the same
+/// reason ends as `IMPORT_ABANDONED` naming the import.
+pub async fn import_file_expecting(
+    endpoint: &Endpoint,
+    expect: &Expect,
+    request_id: &str,
+    source: &str,
+    format: wire::Format,
+    path: &Path,
+) -> Result<ArtifactReceipt, Error> {
+    import_checked(endpoint, Some(expect), request_id, source, format, path).await
+}
+
+async fn import_checked(
+    endpoint: &Endpoint,
+    expect: Option<&Expect>,
     request_id: &str,
     source: &str,
     format: wire::Format,
@@ -26,7 +57,7 @@ pub async fn import_file(
     let mut file = open_completed_file(path)?;
     let mut checkpoint = Checkpoint::default();
     let attempt = async |file: &mut File, checkpoint: &mut Checkpoint| {
-        let client = reconnect(endpoint).await?;
+        let client = reconnect(endpoint, expect).await?;
         upload(
             client.capability(),
             client.discovery(),
@@ -46,11 +77,15 @@ pub async fn import_file(
             Err(error) => break error,
         }
     };
+    // A refused daemon is not asked to cancel: the refusal is the result.
+    if expect::is_mismatch(&error) {
+        return Err(error);
+    }
     settle(
         error,
         checkpoint.import.clone(),
         Session::Replaceable,
-        async |store: &str, id: &str| cancel(endpoint, store, id).await,
+        async |store: &str, id: &str| cancel(endpoint, expect, store, id).await,
         async || attempt(&mut file, &mut checkpoint).await,
     )
     .await
@@ -104,7 +139,7 @@ async fn settle(
             Err(Error::Domain {
                 code: "IMPORT_RESUMABLE".into(),
                 message: format!(
-                    "{error}; canceling import {id} did not complete ({cancel}); retrying under the same request ID resumes its journal if it is still staged, or starts a fresh import if the cancel committed"
+                    "{error}; canceling import {id} did not complete ({cancel}); a retry under the same request ID resumes its journal if it is still staged; if the cancel committed and its reply was lost, that ID answers IMPORT_EXPIRED until reclamation has removed the journal, then begins afresh"
                 ),
                 retryable: true,
                 class,
@@ -233,10 +268,14 @@ impl Checkpoint {
 }
 
 /// Connect, waiting a bounded time while a restarting daemon is not yet accepting.
-async fn reconnect(endpoint: &Endpoint) -> Result<Client, Error> {
+async fn reconnect(endpoint: &Endpoint, expect: Option<&Expect>) -> Result<Client, Error> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        match Client::connect_endpoint(endpoint).await {
+        let connected = match expect {
+            Some(expect) => Client::connect_endpoint_expecting(endpoint, expect).await,
+            None => Client::connect_endpoint(endpoint).await,
+        };
+        match connected {
             Err(error)
                 if crate::delivery::retryable(&error) && tokio::time::Instant::now() < deadline =>
             {
@@ -247,8 +286,13 @@ async fn reconnect(endpoint: &Endpoint) -> Result<Client, Error> {
     }
 }
 
-pub(crate) async fn cancel(endpoint: &Endpoint, store: &str, id: &str) -> Result<(), Error> {
-    let client = reconnect(endpoint).await?;
+pub(crate) async fn cancel(
+    endpoint: &Endpoint,
+    expect: Option<&Expect>,
+    store: &str,
+    id: &str,
+) -> Result<(), Error> {
+    let client = reconnect(endpoint, expect).await?;
     cancel_on(client.capability(), store, id).await
 }
 

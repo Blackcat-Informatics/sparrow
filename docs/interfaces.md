@@ -4312,6 +4312,36 @@ fails for good, for example `PERMISSION_DENIED`, the caller receives
 `IMPORT_ABANDONED` naming the import, and its slot stays occupied until the retry
 window ends.
 
+A producer states what it requires of the daemon with an `Expect`: a `RequiredRole`
+(`Production` or `Scratch`; `unspecified` cannot be required) and optionally a store id.
+The crate checks it against `Discovery.instance_role` and `Discovery.store_id` on every
+connection it makes, before any import call: `Client::connect_endpoint_expecting`, each
+replacement connection and the cancellation connection of `import_file_expecting(endpoint,
+&Expect, ...)`, and the cancellation connection of a part set uploaded over such a client.
+A daemon that reports another role, including a store with no role row (`unspecified`), or
+another store id fails closed with the non-retryable `INSTANCE_MISMATCH`, which names the
+required and the reported role and store id. The free `import_file(endpoint, ...)` and the
+CLI require nothing. A journal staged before a daemon fails the check stays staged: the
+cancellation would have to reach the refused daemon, and a cancellation refused for the same
+reason ends as `IMPORT_ABANDONED`. `Expect::require(&Discovery)` serves a caller that holds a
+bare `Connection`, which fetches no discovery itself.
+
+A request ID names one item for its whole life. The crate retries a retryable error itself
+while an attempt advances the checkpoint. After a terminal failure it cancels, and the same
+ID answers `IMPORT_EXPIRED` until reclamation has removed the journal; the caller then
+begins again under the same ID, with bounded backoff. An input-bound refusal is not resent:
+`RESOURCE_LIMIT` for more than 32,768 records in one publication or for RDF write staging
+over 64 MiB fails the same way on the same bytes, so the caller cuts the input.
+
+`sparrow_client` is the producer interface. It depends on no `sparrow-core`, and a crate
+outside this workspace depends on it by git revision (`publish = false`). It builds with
+the `capnp` compiler on the host and Rust 1.98, and the Cap'n Proto schema travels in the
+crate. The ingest socket carries `discover`, `ingest`, `import` (begin, append, seal,
+layout, prepare, publish, get and cancel), `eventsIngest` and `flush`
+(`crates/sparrow-server/src/ingest_gate.rs`). A producer that writes its own client speaks
+the same schema and owns every rule the crate holds: resuming from the durable checkpoint,
+canceling on terminal failure and checking receipts.
+
 The binaries are `sparrowd` for the daemon and `sparrow` for its client.
 Every client invocation takes an optional `--secret-file PATH` and then an
 endpoint: a Unix socket path or `tcp://IP:PORT`. Operations other than discovery,

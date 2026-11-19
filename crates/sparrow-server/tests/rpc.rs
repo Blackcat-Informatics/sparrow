@@ -7309,6 +7309,8 @@ struct EventRelayState {
     /// Daemon-style refusals `(code, retryable)` answered, in order, to the next event batches
     /// instead of forwarding them.
     refusals: std::cell::RefCell<std::collections::VecDeque<(&'static str, bool)>>,
+    /// Replace the backend with this daemon when `importPublish` is next refused.
+    swap_backend_after_refused_publish: std::cell::RefCell<Option<wire::sparrow::Client>>,
     /// Connections accepted by the relay.
     connections: std::cell::Cell<u32>,
     mutate_file: std::cell::RefCell<Option<std::path::PathBuf>>,
@@ -7490,6 +7492,9 @@ impl wire::sparrow::Server for EventRelay {
             failure.set_code(code);
             failure.set_message("injected refusal");
             failure.set_retryable(retryable);
+            if let Some(next) = self.0.swap_backend_after_refused_publish.take() {
+                *self.0.backend.borrow_mut() = next;
+            }
             return Ok(());
         }
         let mut request = self.0.backend.borrow().import_publish_request();
@@ -7842,6 +7847,7 @@ fn relay(
         refuse_publish: std::cell::Cell::new(None),
         refuse_cancel: std::cell::Cell::new(None),
         refusals: std::cell::RefCell::new(std::collections::VecDeque::new()),
+        swap_backend_after_refused_publish: std::cell::RefCell::new(None),
         connections: std::cell::Cell::new(0),
         mutate_file: std::cell::RefCell::new(None),
         mutate_published_file: std::cell::RefCell::new(None),
@@ -14857,6 +14863,149 @@ async fn the_ingest_socket_discover_reports_the_instance_role_and_store() {
                 assert_eq!(discovered["instance_role"].as_str(), Some(expected));
                 assert_eq!(discovered["store_id"], store);
             }
+        })
+        .await;
+}
+
+/// Start a daemon with the given `instance_role` (none for a store without a role) and return
+/// it with its socket; the temporary directory lives as long as the returned guard.
+async fn daemon_with_role(role: Option<&str>) -> (tempfile::TempDir, std::path::PathBuf, Daemon) {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("store");
+    let socket = data.join("rpc.sock");
+    let config = write_server_config(dir.path(), &data, &socket);
+    if let Some(role) = role {
+        let base = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("instance_role = \"{role}\"\n{base}")).unwrap();
+    }
+    let daemon = start(&config, &socket).await;
+    (dir, socket, daemon)
+}
+
+/// Whether the daemon holds any record of the import `request_id`: none means no import call
+/// ever reached it.
+async fn import_reached(client: &sparrow_client::Client, request_id: &str) -> bool {
+    let status = sparrow_client::get_ingest_status(
+        client.capability(),
+        &client.discovery().store_id,
+        &sparrow_client::IngestSelector::Request(request_id.into()),
+        Default::default(),
+    )
+    .await;
+    !matches!(&status, Err(sparrow_client::Error::Domain { code, .. }) if code == "NOT_FOUND")
+}
+
+/// INVARIANT (#399): a caller that requires `scratch` (and a store id) is refused by a daemon
+/// that reports `unspecified`, `production` or another store, before any import call reaches
+/// it, and a matching scratch store passes. The check is the non-retryable `INSTANCE_MISMATCH`
+/// naming what was required and what was reported, on both the free import and the client.
+#[tokio::test(flavor = "current_thread")]
+async fn a_required_instance_role_and_store_refuse_a_mismatched_daemon_before_any_import_call() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let scratch = sparrow_client::Expect::new(sparrow_client::RequiredRole::Scratch);
+            let dir = tempfile::tempdir().unwrap();
+            let input = dir.path().join("input.log");
+            std::fs::write(&input, b"one line\n").unwrap();
+            for (role, wrong_store) in [
+                (None, false),
+                (Some("production"), false),
+                (Some("scratch"), true),
+            ] {
+                let (_keep, socket, _daemon) = daemon_with_role(role).await;
+                let endpoint = sparrow_client::Endpoint::Unix(socket.clone());
+                let genuine = sparrow_client::Client::connect(&socket).await.unwrap();
+                let expect = if wrong_store {
+                    scratch.clone().with_store_id("store:another")
+                } else {
+                    scratch.clone()
+                };
+                let error = sparrow_client::import_file_expecting(
+                    &endpoint, &expect, "refused", "src", wire::Format::Log, &input,
+                )
+                .await
+                .unwrap_err();
+                let reported = role.unwrap_or("unspecified");
+                assert!(
+                    matches!(&error, sparrow_client::Error::Domain { code, message, retryable: false, .. }
+                        if code == "INSTANCE_MISMATCH"
+                            && message.contains("required instance_role scratch")
+                            && message.contains(&format!("reports instance_role {reported}"))
+                            && message.contains(&genuine.discovery().store_id)),
+                    "{error}"
+                );
+                let connect =
+                    sparrow_client::Client::connect_endpoint_expecting(&endpoint, &expect).await;
+                assert!(
+                    matches!(&connect, Err(sparrow_client::Error::Domain { code, .. }) if code == "INSTANCE_MISMATCH"),
+                    "client connected despite the mismatch"
+                );
+                assert!(
+                    !import_reached(&genuine, "refused").await,
+                    "an import call reached a refused daemon"
+                );
+            }
+            let (_keep, socket, _daemon) = daemon_with_role(Some("scratch")).await;
+            let endpoint = sparrow_client::Endpoint::Unix(socket.clone());
+            let genuine = sparrow_client::Client::connect(&socket).await.unwrap();
+            let expect = scratch.with_store_id(genuine.discovery().store_id.clone());
+            sparrow_client::import_file_expecting(
+                &endpoint, &expect, "accepted", "src", wire::Format::Log, &input,
+            )
+            .await
+            .unwrap();
+            sparrow_client::Client::connect_endpoint_expecting(&endpoint, &expect)
+                .await
+                .unwrap();
+        })
+        .await;
+}
+
+/// INVARIANT (#399): a reconnect inside the free import re-checks the expectation. A daemon
+/// replaced by a production store after the first attempt's retryable refusal is refused with
+/// `INSTANCE_MISMATCH`, no import call reaches it, and the first store's journal is left staged
+/// rather than canceled through the refused connection.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reconnect_inside_the_import_refuses_a_daemon_swapped_to_another_role() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (dir, socket, _scratch) = daemon_with_role(Some("scratch")).await;
+            let (_other_dir, other_socket, _production) =
+                daemon_with_role(Some("production")).await;
+            let first = sparrow_client::Client::connect(&socket).await.unwrap();
+            let other = sparrow_client::Client::connect(&other_socket)
+                .await
+                .unwrap();
+            let proxy_socket = dir.path().join("proxy.sock");
+            let (state, proxy) = relay(&proxy_socket, first.capability().clone());
+            state.refuse_publish.set(Some(("RESOURCE_LIMIT", true)));
+            *state.swap_backend_after_refused_publish.borrow_mut() =
+                Some(other.capability().clone());
+            let input = dir.path().join("input.log");
+            std::fs::write(&input, b"one line\n").unwrap();
+            let expect = sparrow_client::Expect::new(sparrow_client::RequiredRole::Scratch)
+                .with_store_id(first.discovery().store_id.clone());
+            let error = sparrow_client::import_file_expecting(
+                &sparrow_client::Endpoint::Unix(proxy_socket),
+                &expect,
+                "swapped",
+                "src",
+                wire::Format::Log,
+                &input,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(&error, sparrow_client::Error::Domain { code, retryable: false, .. }
+                    if code == "INSTANCE_MISMATCH"),
+                "{error}"
+            );
+            assert!(import_reached(&first, "swapped").await);
+            assert!(
+                !import_reached(&other, "swapped").await,
+                "an import call reached the swapped daemon"
+            );
+            proxy.abort();
         })
         .await;
 }
