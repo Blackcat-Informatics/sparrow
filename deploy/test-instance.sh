@@ -31,7 +31,8 @@ Usage: deploy/test-instance.sh setup [SCRATCH]
        deploy/test-instance.sh purge [SCRATCH]
 
 setup stages a test instance in SCRATCH (default: .stage/test-instance in the repository) and
-prints the environment that points the lifecycle scripts at it; env prints it again; teardown
+prints the environment that points the lifecycle scripts at it, with SPARROW_TEST_INGEST_SOCKET
+naming the ingest socket a sender uses; env prints it again; teardown
 stops the test unit and removes it (the scratch directory, with its store, is kept); purge
 removes the scratch store, intake, ingest socket directory and staged files, and only when the
 unit is stopped and SCRATCH holds a configuration written by this script. SPARROW_TEST_INGEST_GROUP,
@@ -62,6 +63,7 @@ environment() {
     printf 'export SPARROW_SCOPE=user SPARROW_UNIT=%s\n' "$UNIT"
     printf 'export SPARROW_PREFIX=%q SPARROW_CONFIG=%q\n' "$ROOT/usr/local" "$ROOT/etc/sparrow/server.toml"
     printf 'export SPARROW_BIN=%q\n' "${SPARROW_BIN:-$REPO_DIR/bin}"
+    printf 'export SPARROW_TEST_INGEST_SOCKET=%q\n' "$INGEST/ingest.sock"
 }
 
 case $ACTION in

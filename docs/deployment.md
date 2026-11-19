@@ -88,7 +88,8 @@ for a store that has no role row.
 
 `deploy/test-instance.sh` writes `instance_role = "scratch"` into the scratch
 configuration it generates, together with an ingest socket for senders, a disk
-budget and a free-space floor sized for a test load, and no `archive` table.
+budget and a free-space floor sized for a test load, and an `archive` table only
+when `SPARROW_TEST_ARCHIVE_DIR` names a directory.
 A scratch store created before roles existed has no role row, so the daemon
 refuses to start on it; `test-instance.sh setup` detects it and asks for
 `test-instance.sh purge` followed by a fresh `setup`. `deploy/README.md`,

@@ -441,9 +441,23 @@ never shares a path, socket or store with `/SPARROW`.
 | Free-space floor | 4 GiB (`SPARROW_TEST_MIN_FREE`, bytes) on the filesystem holding the store |
 | Archive | off unless `SPARROW_TEST_ARCHIVE_DIR` names a directory (see below); without it the configuration has no `archive` table, the daemon runs no worker and nothing retires |
 
+The ingest socket is a stable interface. A scratch instance set up from the
+main checkout with the default `SCRATCH` has it at
+`<main checkout>/.stage/test-instance/ingest/ingest.sock`, on this host
+`/home/paudley/Active/sparrow/.stage/test-instance/ingest/ingest.sock`. The
+location does not move without an issue in the consuming repository's forge
+first. A sender finds it by that path, or by `deploy/test-instance.sh env`,
+which prints `export SPARROW_TEST_INGEST_SOCKET=<path>`. A setup run from a
+linked worktree defaults `SCRATCH` to a path inside that worktree, which is
+refused when the socket path exceeds the 107-byte limit, so the stated
+location requires running `setup` from the main checkout (or passing `SCRATCH`).
+
 A sender configures the ingest socket path and nothing else; it ingests with
 the repository's CLI or client, for example `sparrow
-SCRATCH/ingest/ingest.sock ingest REQUEST_ID SOURCE FORMAT FILE`. The ingest
+SCRATCH/ingest/ingest.sock ingest REQUEST_ID SOURCE FORMAT FILE`. Before it
+sends anything it asks the same socket `sparrow SCRATCH/ingest/ingest.sock
+discover`, which prints `store_id` and `instance_role`; a sender refuses
+`production` and `unspecified` and sends only to `scratch`. The ingest
 socket refuses every other operation. A census reads each file's fate from the
 census socket with the same CLI, for example `sparrow SCRATCH/data/store/rpc.sock
 values --source SOURCE`, or `records`, `text` and `sparql`. Size the budget and

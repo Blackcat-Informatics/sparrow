@@ -47,7 +47,7 @@ pub(crate) mod tool;
 
 pub(super) const USAGE: &str = concat!(
     "sparrow SOCKET_PATH sparql REQUEST.json | sparql-explain REQUEST.json | correlate REQUEST.json; ",
-    "usage: sparrow SOCKET_PATH capabilities | status | rdf STORE_ID RECORD_ID | ingest REQUEST_ID SOURCE FORMAT FILE | ingest-get STORE_ID IMPORT_ID | flush STORE_ID SESSION_ID SEQUENCE",
+    "usage: sparrow SOCKET_PATH capabilities | discover | status | rdf STORE_ID RECORD_ID | ingest REQUEST_ID SOURCE FORMAT FILE | ingest-get STORE_ID IMPORT_ID | flush STORE_ID SESSION_ID SEQUENCE",
     " | retention-metrics STORE_ID [--max-visits N] [--catalog-bytes N] [--payload-bytes N]",
     " | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION]",
     " | pins STORE_ID [--cursor CURSOR] [--page-size N] [--scan-budget N]",
@@ -72,6 +72,7 @@ pub async fn run_cli(connection: &sparrow_client::Client, args: &[String]) -> Re
 
 pub(super) enum Command {
     Capabilities,
+    Discover,
     Flush(sparrow_client::DurabilityWatermark),
     Status,
     Sparql(Box<sparql::Input>),
@@ -203,6 +204,9 @@ impl Command {
     pub(super) fn parse(args: &[String]) -> Result<Self> {
         if args == ["capabilities"] {
             return Ok(Self::Capabilities);
+        }
+        if args == ["discover"] {
+            return Ok(Self::Discover);
         }
         if args.first().is_some_and(|arg| arg == "correlate") {
             if args.len() != 2 {
@@ -561,6 +565,9 @@ impl Command {
         let client = connection.capability();
         if let Self::Capabilities = self {
             return Ok(Some(capabilities::execute(client).await?));
+        }
+        if let Self::Discover = self {
+            return Ok(Some(status::discovery(connection.discovery())));
         }
         if let Self::Sparql(input) = self {
             return Ok(Some(input.execute(client).await?));
