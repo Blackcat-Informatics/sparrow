@@ -697,11 +697,13 @@ switch 1, so no archive worker runs, and the switch crosses only the payload ind
 - At the first open, before the daemon serves, one synced batch lifts the store format from `/340`
   to `/395` (the payload index family, #323), deletes any stale `payload-id:` keys and seeds the
   `payload-index-upgrade` checkpoint and two zero counter rows. The batch is atomic: a kill leaves
-  `/340` untouched or the whole of `/395`. It is the point of no return:
-  `sparrowd-schema71-fda2812` refuses `/395` with `UNSUPPORTED: unsupported store format;
-  migration required`. The downgrade check in `deploy/lib.sh` compares schema numbers only, so it
-  cannot see this fence (Sparrow issue 385); the rules below, not the script, keep the old image
-  off the store.
+  `/340` untouched or the whole of `/395`. It is the point of no return: `sparrowd-schema71-fda2812`
+  refuses a lifted store at its open and exits with status 1. The refusal observed on a lifted
+  store is `Error: Error { code: "STORAGE_FAILURE", message: "log time interpretation law and writer
+  fence disagree" }` (below, "What the measurement covers"). The code is `STORAGE_FAILURE`, not
+  `UNSUPPORTED`. The downgrade check in `deploy/lib.sh` compares schema numbers only, so it cannot
+  see this fence (Sparrow issue 385); the rules below, not the script, keep the old image off the
+  store.
 - The online `payload-index` migration then runs in the maintenance worker, with the daemon
   serving throughout. Pages of 1,024 artifacts or 64 MiB each commit atomically with their
   checkpoint, the migration resumes after a kill or power loss without redoing or skipping a
@@ -730,6 +732,8 @@ STORE=$(sed -n 's/^data_dir *= *"\([^"]*\)".*/\1/p' "$CONF")      # /SPARROW/sto
 COPY=/SPARROW/store.before-b420503     # a new sibling of $STORE (check: "$STORE" is /SPARROW/store)
 BIN=…/bin       # the directory holding the b420503 pair; the script reads it as SPARROW_BIN
 RECORD=…/.stage/image/switch-1   # under the main checkout's .stage/, never /tmp
+REH=/SPARROW/store.rehearsal-b420503   # the rehearsal copy, a new sibling of $STORE
+REH_CONF=$RECORD/rehearsal.toml        # its configuration; its socket is $REH/rpc.sock
 ```
 
 #### Before the window
@@ -788,6 +792,18 @@ the copy, and the ingest figures `flush_lag_ms`, `oldest_pending_ms` and `pendin
 stand for ingest latency and which the new image's figures are compared with. The CLI link
 today names an older CLI than the daemon (Sparrow issue 387), so the live `sparrow` may lack
 commands the image has; the script switches the link to the new CLI.
+Record a payload sample for the rehearsal: at least 50 artifacts whose exact bytes the operator
+still holds (a file the shipper sent and that is still on disk, or a file kept beside an ingest
+receipt), each as one artifact. The payload id of an artifact is `blake3:` and the BLAKE3 hash of
+its bytes:
+
+```bash
+for f in SAMPLE_FILE...; do printf 'blake3:%s\n' "$(b3sum --no-names -- "$f")"; done > "$RECORD/payload-sample.txt"
+```
+
+The sample size is a choice; the scratch measurement checked every artifact of its store (8,160),
+and nothing measured fixes a live size.
+
 Check what the window needs.
 - `status` shows `pressure.failure` and `durability.failure` null, every migration with `done`
   equal to `total` and `failure` null, and `counts` exact.
@@ -812,6 +828,80 @@ Check what the window needs.
 
 Give the notice (below) and wait for the go.
 
+#### Before the stop: the stop timeout and the quiesce
+
+Two acts precede the script, in this order. Neither stops the daemon or touches the store.
+
+1. Raise the unit's stop timeout for the window. The live user unit sets `TimeoutStopSec=120` and
+   `KillSignal=SIGINT`; a stop that outlasts it ends in SIGKILL. A stop of the new image after
+   ingest outlasted 120 s at scratch scale ("What the measurement covers", below). The proposed value for the
+   live store of about 39 GB is `TimeoutStopSec=2400`. Its basis, all arithmetic: the longest
+   per-byte stop measured is 234.4 s on a store of 4.33 GB on disk before the ingest (log
+   `35-stop-new.log`; `31-lift-measure.log` for the size), which is 54.1 s per GB; times 39 GB is
+   2,111 s; 2,400 s adds about 14 percent. The shortest per-byte stop measured, 18.5 s on a store of
+   1.57 GB (`143-C-bigOld-stop-timed.log`, `113-C-copies.log`), gives 461 s at 39 GB by the same
+   arithmetic. The assumption that the stop grows in proportion to the store is not measured; the
+   measurements also fit a stop driven by the ingest backlog rather than the store's size. A longer
+   timeout costs nothing when the stop is quick, because the unit is stopped when the daemon exits;
+   a shorter one risks SIGKILL. The user unit is not in the repository (Sparrow issue 386), and the
+   script refuses any drop-in under `~/.config/systemd/user/sparrow.service.d` but its own
+   `limits.conf`, so the value goes in a runtime drop-in, outside that directory, which a logout
+   or reboot removes:
+
+   ```bash
+   RT=${XDG_RUNTIME_DIR:?}/systemd/user/sparrow.service.d
+   mkdir -p -- "$RT"
+   printf '[Service]\nTimeoutStopSec=2400\n' > "$RT/timeout.conf"
+   systemctl --user daemon-reload
+   systemctl --user show -p TimeoutStopUSec --value sparrow.service     # 40min
+   ```
+
+   The daemon keeps running through the reload. If the last command prints `2min`, another
+   setting overrides the drop-in: do not start the window. This route has not been run. A stop
+   that has to end early is ended on purpose with `systemctl --user kill -s SIGKILL
+   sparrow.service`, with the consequences under "A stop that ends in SIGKILL". The drop-in stays
+   until the unit file carries the value (#386), and then its one path is removed.
+2. Quiesce. Read `status` until `pressure.pending_flushes` and `pressure.pending_compactions` are
+   both 0 and `durability.pending_writes` is 0 on three consecutive reads, ten seconds apart,
+   within a bound of 10 minutes:
+
+   ```bash
+   ~/.local/bin/sparrow "$SOCK" status | python3 -I -c 'import json,sys
+   v=json.load(sys.stdin)
+   print(v["pressure"]["pending_flushes"], v["pressure"]["pending_compactions"], v["durability"]["pending_writes"])'
+   ```
+
+   The bound is a proposal: 10 minutes is 300 flush intervals of the 2,000 ms
+   `buffered_flush_interval_ms` (arithmetic), long enough for the daemon's own buffered work and
+   short enough to hold a window. At scratch scale every read after an ingest was already 0
+   (`33-post-ingest-status.log`, `102-C-new-pre-stop-status.log`, `122-C-bigNew-status.log`,
+   `152-C-kill-pre-status.log`); no wait was needed. The counters read above 0 under a pressure
+   phase of `requested` (`pend_comp=3`, logs `52-A-ingest.log` to `59-A-ingest3.log`), so a nonzero
+   reading is real.
+
+   What the quiesce does not do. The same counters read 0 before the 234.4 s stop
+   (`33-post-ingest-status.log`, read 25 s before the stop began) and before the 61.4 s stop
+   (`122-C-bigNew-status.log`), so a zero reading did not predict a short stop, and no measurement
+   shows that the quiesce shortens one. The `TimeoutStopSec` above is the protection against
+   SIGKILL, not the quiesce. If the bound passes with a counter above 0, do not stop the daemon
+   under that load. Wait, read `pressure.phase` and the journal, and report the figures to the
+   coordination session. Stopping anyway, which accepts the longer stop and the SIGKILL risk
+   below, is the coordination session's decision.
+
+A stop that ends in SIGKILL. The daemon's own shutdown steps (worker joins, admission drain and
+the final flush) finished in 0.2 to 1 s after SIGINT in every measured stop, including the longest,
+and the rest was process exit and store teardown, during which the storage engine's low-priority
+compaction threads ran (`133-C-bigNew-d-stop-timed.log`). After a SIGKILL of the new image, three
+acknowledged ingests (15,000 records) on a store of 1.57 GB at `/387`, the next open took 2,058 ms
+in the storage engine, against 14 to 36 ms for the clean opens of the stores of that series
+(`154-C-kill-daemon2.log`; clean opens in logs `100`, `120`, `125` and `128`), and read 165,000 live records, the 150,000 of the base
+and all 15,000 acknowledged (`155-C-kill-post-status.log`). Not measured: a SIGKILL during an
+in-flight ingest, a SIGKILL of the old image, and a kept copy taken from a store left by SIGKILL.
+The script goes on after a stop that ended in SIGKILL (it checks only that the unit has settled and
+no `sparrowd` remains; this is read from the script, not run). The script's log stamps the lines
+`stop sparrow.service` and `daemon stopped`; a gap equal to `TimeoutStopSec` means SIGKILL ended
+the stop.
+
 #### The window
 
 ```bash
@@ -826,7 +916,7 @@ daemon has `cap_net_bind_service`, `server.toml` carries the ingest keys and no 
 keys, the store is no-COW, the drop-in directory holds only the repository's `limits.conf` (the
 live host already has an identical one), the running daemon reports the `--from` schema and the
 copy's name and room are sound. Then it stops `sparrow-ship.timer` and waits for the shipper,
-stops the unit through the SIGINT drain (up to 120 s), **copies the closed store to `COPY`**, links
+stops the unit through the SIGINT drain (up to `TimeoutStopSec`), **copies the closed store to `COPY`**, links
 the new pair, starts the unit and waits up to 600 s for the first status answer. It checks the
 store id and the schema, prints the migrations and the ingest socket, starts the timer and exits 0.
 The online backfill continues in the running daemon.
@@ -854,6 +944,116 @@ for `data_dir` and `socket_path`, and remove that one probe path afterwards. Nei
 nor `sparrow-recovery-schema71-b420503` may open `COPY` or `COPY.probe`: either lifts the format and
 spoils the copy as a way back.
 
+#### The rehearsal on a copy
+
+The rehearsal opens a second copy of the closed store with the new image and proceeds to the live
+open only if the copy passes. It runs after `COPY` exists and before the new image opens the live
+store. The first copy, `COPY`, stays untouched as the way back; the rehearsal copy is taken from it.
+`deploy/user-unit-upgrade.sh` runs from the stop to the start with no pause, so it cannot hold the
+start for this step. The step needs a pause after the copy that the script does not have, and until
+the script has one the rehearsal cannot gate the live open.
+
+1. Copy. Take a reflink copy of `COPY` with the repository's own script, which refuses an open
+   store, compares the file lists and gives `REH` its name only when they agree:
+
+   ```bash
+   deploy/copy-on-write.sh copy "$COPY" "$REH"
+   ```
+
+2. Configure. The copy's stored watch catalog names the live consume roots, which delete each file
+   after publication, so the rehearsal daemon runs with `--no-intake`: it opens the store writable
+   with its maintenance worker, starts no consume worker, no ingest socket and no public listener,
+   and opens no root. The configuration may not set `consume`, `syslog`, `rpc_tcp_address`,
+   `ingest_socket_path` or `archive`; the daemon refuses the open and names the key. Keep the keys
+   that shape the open and name the copy:
+
+   ```bash
+   { grep -E '^(disk_budget|maintenance_reserve|min_free_bytes|max_records|max_pin_members|max_concurrent_requests|max_rpc_connections|buffered_flush_interval_ms|text_lexicon_dir) *=' "$CONF"
+     printf 'socket_path = "%s/rpc.sock"\ndata_dir = "%s"\n' "$REH" "$REH"; } > "$REH_CONF"
+   ```
+
+   `text_lexicon_dir` must equal the live one, so the analyzer is the live analyzer. The
+   `--no-intake` mode is not what the scratch measurement ran (it ran the full configuration with
+   an ingest socket on a store with no watches); it is read from `docs/interfaces.md` and the
+   daemon's option check, and has not been run by this procedure.
+
+3. Open. Start the new image on the copy in a scratch scope with the live unit's limits, never the
+   live unit and never the live socket. The descriptor limit is raised in the scope's shell, as the
+   unit's `limits.conf` does for the live daemon (the store refuses to open below 2048):
+
+   ```bash
+   systemd-run --user --scope --quiet --unit=sparrow-rehearsal \
+       -p MemoryHigh=2G -p MemoryMax=4G -p CPUQuota=100% -p IOWeight=20 -- \
+       bash -c 'ulimit -n 65536; exec nice -n 10 "$0" --config "$1" --no-intake' \
+       "$LIB/$NEW" "$REH_CONF" > "$RECORD/rehearsal-daemon.log" 2>&1 &
+   ```
+
+   Run it in the background and read `$RECORD/rehearsal-daemon.log`, which gains the `store_open_ms`
+   line (with `migration_fence=`), the `migration payload-index start` line and the
+   `migration payload-index complete pages=P done=N elapsed_seconds=S` line. `N` is the live
+   artifact count and `P` its page count, `ceil(N / 1024)` or more when 64 MiB cuts a page.
+
+4. Check. Proceed to the live open only if all of these hold.
+   - The copy lifts to the new format: `sparrow-schema71-b420503 "$REH/rpc.sock" status` shows
+     `store_format` `sparrow.store/395` and the recorded `store_id`.
+   - The payload-index migration completes, or is seen advancing page by page: successive `status`
+     reads show `migrations[]` `payload-index` `done` rising toward `total` with `failure` null, and
+     the completion line appears.
+   - A sample of payload lookups is exact. After the completion line, for each line of
+     `$RECORD/payload-sample.txt`, run
+     `sparrow-schema71-b420503 "$REH/rpc.sock" payload STORE_ID PAYLOAD_ID`: each answers
+     `answer_certainty` `exact` and lists the artifact that holds those bytes. A lookup that lists
+     none, or answers `pending` after the completion line, fails the rehearsal.
+   - A stop of the scratch daemon is clean: SIGINT to the one process in the scope, then the journal
+     line `sparrowd: closed store=` and an exit.
+
+     ```bash
+     kill -INT "$(cat /sys/fs/cgroup"$(systemctl --user show sparrow-rehearsal.scope -p ControlGroup --value)"/cgroup.procs)"
+     ```
+
+5. Record the old image's refusal. Open `REH` once with the old image in the same form and write
+   the line it prints to `$RECORD/rehearsal-old-refusal.log`. The measured refusal on a store lifted
+   from `/332` is quoted above; this open observes the refusal on the live store's own lift. A
+   refusal changes nothing in the copy.
+
+   ```bash
+   systemd-run --user --scope --quiet --unit=sparrow-rehearsal-old -- \
+       bash -c 'ulimit -n 65536; exec "$0" --config "$1" --no-intake' "$LIB/$OLD" "$REH_CONF" \
+       > "$RECORD/rehearsal-old-refusal.log" 2>&1
+   ```
+
+6. Remove the rehearsal copy after listing it, as one command on one exact path:
+
+   ```bash
+   ls -ld /SPARROW/store.rehearsal-b420503
+   ```
+
+   ```bash
+   rm -r -- /SPARROW/store.rehearsal-b420503
+   ```
+
+If any check fails, the new image does not open the live store. The live store is untouched, so the
+"Not opened" way back applies: point both links at the old pair and start the unit.
+
+What the rehearsal adds to the downtime, all arithmetic. The copy of `COPY` costs the copy time
+below. The migration costs `P` pages times the per-page time, 0.108 s median at 1,024 artifacts of
+3 records, 0.159 s at most there, and 0.263 to 0.602 s for the single page of 101 larger artifacts
+(figures and logs under "What the measurement covers"). An illustration with an assumed count, not
+the live one: 1,000,000 artifacts is 977 pages, 106 s at 0.108 s per page and 588 s at 0.602 s. Add
+the open and the scratch stop (0.015 to 0.025 s idle at a store of 164 MB, 1.85 to 3.47 s at
+4.3 GB; logs `76`, `85`, `92`, `38`, `47`), and the lookups. The rehearsal reads `N` itself, so
+the figure is computed at the window, not here.
+
+The disk the rehearsal needs. The reflink copy writes almost nothing when it is made. `check_store_copy`
+asks for the store's size plus 10 GiB free for each copy, which the unchanged free space satisfies
+again after a reflink. The lifted copy then diverges from `COPY` by what the lift and the migration
+write. Measured: 68.2 MB in the cgroup and 106 MB in the process at a store of 8,160 artifacts and 164 MB
+(`73-B-lift-cgroup.log`), and 1.19 MB in the cgroup and 9.76 MB in the process at a store of
+4.32 GB and 101 artifacts (`31-lift-measure.log`). The write follows the artifact count, not the
+store's size: about 8.4 kB and 11.8 kB per artifact (arithmetic, 68.2 MB over 8,160 and 1.19 MB
+over 101, two points that differ in artifact size). The live figure is not measured; it is the
+live `N` times about 8 to 12 kB, and the lifted copy's compaction may rewrite more.
+
 #### After the window
 
 Record `status > "$RECORD/after.json"` and compare with `before.json`:
@@ -875,13 +1075,127 @@ Record `status > "$RECORD/after.json"` and compare with `before.json`:
   `instance_role` as `unspecified`.
 - `readlink "$LIB/sparrowd" ~/.local/bin/sparrow` names the new pair.
 
-The measured window. Downtime, from the unit stop to the first status answer: [to be measured]
-seconds, with the copy's share [to be measured]. The `payload-index` migration: the artifact count is
-the migration's `total` (the status does not carry it before the open), at 1,024 artifacts a page,
-so `ceil(total / 1024)` pages. The rehearsal on a scratch store without resource limits
-(`.stage/rehearsal-323-migration/REPORT.md`) ran 13,100 artifacts in 11 pages and 1.846 s after
-2 pages were already done. The live figure under the unit's `CPUQuota=100%`, `IOWeight=20` and
-live intake: [to be measured] pages in [to be measured] seconds.
+#### What the measurement covers
+
+Every figure below was measured on a scratch store under a user scope with the live unit's
+limits (`MemoryHigh=2G`, `MemoryMax=4G`, `CPUQuota=100%`, `IOWeight=20`, `nice 10`, read back from
+the cgroup) with the image `sparrowd-schema71-b420503`, unless a line
+says otherwise. Logs are under `.stage/372-measure/logs/` in the main checkout. Nothing was
+measured at live size: the live store is about 39 GB and holds an unknown number of artifacts, and
+the pages of the migration number `ceil(artifacts / 1024)`, or more where 64 MiB cuts a page. The
+live artifact count is read at the rehearsal. The host load was not logged, so no figure carries
+one.
+
+The lift was measured from `sparrow.store/332` to `/387`, not from `/340`. A store at `/340`
+cannot be made with `sparrowd-schema71-fda2812`: `/340` is the tenth format of the intake family
+`/330` to `/340`, and its only writer is the `artifact-retirement:` key, which the old image writes
+only during expiry or eviction; with no `[archive]` it never retires (`retire_without_archive` is
+false in `sparrow-server/src/config.rs`), and with `[archive]` the format is the `/341` to `/351`
+family. An image from before that gate with a tiny budget reached `phase=requested` with no pass
+and no eviction (logs `50` to `59`), and then wedged ingest. The lift keeps the family index (read
+from the code, not run from `/340`), so `/340` lifts to `/395`. No test of the `/340` identity is
+on `main` at this revision; the gap is covered only by the rehearsal on the live store's own copy,
+and the refusal text on a lifted `/340` store is not yet observed.
+
+Lift at a store of 4.32 GB on disk, 101 artifacts, 392,095 live records, `/332` to `/387`
+(`21-pre-lift-old-status.log`, `31-lift-measure.log`):
+
+- Open-time fence 61 ms; the whole store open 230 ms (`30-lift-daemon.log`).
+- The first status answered 2.51 s after the launch; the open line came at 2.48 s, so about 2.2 s
+  is the scope and process start (arithmetic from the 230 ms open).
+- The `payload-index` migration took 1 page and 0.263 s, and completed 2.78 s after the launch.
+  Repeats on copies: 0.546 s (`40-interrupt-run1-daemon.log`) and 0.602 s
+  (`45-interrupt2-run2-daemon.log`).
+- Peak memory 164 MB; disk written 1.19 MB in the cgroup and 9.76 MB in the process.
+- Format after: `/387`.
+
+Lift at a store of 8,160 artifacts of 3 records (24,480 records; status `physical_bytes`
+262.7 MB before and 164.7 MB after, `65-B-pre-status.log`, `74-B-lift-status.log`), `/332` to
+`/387` (`70-B-lift-daemon.log`, `73-B-lift-cgroup.log`, `91-B-per-page.log`):
+
+- Open-time fence 6 ms; the whole store open 99 ms.
+- 8 pages (1,024 artifacts each, the last 992), 0.870 s in all (the journal's `elapsed_seconds`).
+- Per page, from the first sighting of each `done` count by a `status` sampler, 8 intervals:
+  minimum 0.089 s, median 0.108 s, maximum 0.159 s. The resolution is one `status` call, 7 to 9 ms.
+  The journal prints only the start and the completion, and the pages are about 100 ms apart, the
+  daemon's writer-yield window (inferred).
+- Peak memory 407 MB; disk written 68.2 MB in the cgroup and 106 MB in the process.
+- Payload lookups after the lift: 8,160 of 8,160 answered with exactly one artifact
+  (`75-B-lift-payload-verify.log`).
+
+SIGKILL between pages, on the 8,160-artifact store, twice. Killed at `done=1024` of 8,160, the next
+open's start line read `done=2048`, the migration completed with 7 more pages, and 8,160 of 8,160
+lookups were exact (logs `80` to `84`). Killed at `done=5120`, the next open's start line read
+`done=6144`, the migration completed in 0.191 s, and the lookups were exact (logs `86` to `90`). No
+page was redone or skipped in either. A SIGKILL before the first page, on the 101-artifact store,
+left the next open already at `/387` with fence 0 ms and the migration complete 101 of 101
+(`43` to `46`).
+
+The kept copy and the way back, on the 4.32 GB store (`23-keepcopy.log`, `24-interruptcopy.log`,
+`42-interrupt2-copy.log`, `36-wayback-old-daemon.log`, `37-wayback-measure.log`):
+
+- `deploy/copy-on-write.sh copy` made a reflink copy of 92 files and 4,317,743,679 bytes in 6.6 s,
+  and further copies in 2.7 s and 1.5 s. At live size, not measured; arithmetic, 39 GB over 4.32 GB is 9.03 times
+  the bytes: 24 s at 2.7 s and 60 s at 6.6 s, if the time follows the bytes.
+- After the lift and 30,000 further records on the new image, the kept copy opened under the old
+  image in 193 ms and read `sparrow.store/332` with 392,095 live records. The 30,000 records of
+  the new image are absent, as the way back says.
+- The old image refuses the lifted store. Command, as run: the old daemon in a systemd scope with
+  `ulimit -n 65536` and `nice 0`, `sparrowd-schema71-fda2812 --config CONFIG`, on the lifted store.
+  It printed `Error: Error { code: "STORAGE_FAILURE", message: "log time interpretation law and
+  writer fence disagree" }` and exited with status 1, on the 4.32 GB store lifted to `/387`
+  (`39-old-on-lifted-refusal.log`) and on the 8,160-artifact store lifted to `/387`
+  (`170-A-old-refuses-lifted.log`). The rehearsal's step 5 runs the old image with `--no-intake`,
+  which was not measured.
+
+Stop time, SIGINT with a SIGKILL at 120 s as the live unit does (never reached), on small stores
+after the same ingest, 6 artifacts of 5,000 records:
+
+- New image under the limits, 1.57 GB `/332` base (150,000 records): 61.4 s and 25.0 s
+  (`124-C-bigNew-stop-timed.log`, `133-C-bigNew-d-stop-timed.log`).
+- Old image under the limits: 18.5 s (`143-C-bigOld-stop-timed.log`). New image without limits:
+  18.6 s (`163-C-unlimited-new-stop.log`).
+- New image under the limits on the 4.32 GB store after 30,000 records: 234.4 s
+  (`35-stop-new.log`), which the live unit's 120 s would have ended in SIGKILL. On the 8,160-artifact
+  store: 1.99 s (`104-C-new-stop-timed.log`).
+- No new ingest: 0.015 to 0.025 s on the 8,160-artifact store (`76`, `85`, `92`), 1.85 s and 3.47 s
+  on the 4.32 GB store (`38`, `47`).
+
+The slow stop is not particular to the new image: the old image took 18.5 s after the same ingest.
+The pending counters read 0 before the slow stops that had a status read (see "Before the stop"). During a 25 s stop the
+storage engine's low-priority compaction threads ran and the process wrote about 351 MB in 18 s
+(`133-C-bigNew-d-stop-timed.log`, `write_bytes` 7,523,508,224 at 2 s and 7,874,908,160 at 20 s).
+That the teardown waits on compaction is an inference: no stacks were taken.
+
+Pending-compaction observation. `pressure.pending_flushes` and `pressure.pending_compactions` read 0
+before the stops that had a status read (`33-post-ingest-status.log`, `102-C-new-pre-stop-status.log`,
+`122-C-bigNew-status.log`, `152-C-kill-pre-status.log`), and read `pend_comp=3` under pressure phase
+`requested` on a store with a tiny budget (`52-A-ingest.log` to `59-A-ingest3.log`).
+
+Ingest under the limits, a throttling observation. On the 4.32 GB store after the lift, six
+artifacts of 5,000 records took 55 to 176 s each (`32-post-lift-ingest.log`); the scope hit
+`memory.high` 9,988 times, peaked at 2.15 GB, was CPU-throttled in 4,912 of 6,553 periods, and
+wrote 12.3 GB for the 30,000 records (`34-lift-scope-after-ingest.log`). On the 1.57 GB store the
+same six artifacts took 410 s and 577 s in the two runs under the limits on the new image
+(`121-C-bigNew-ingest.log`, `132-C-bigNew-d-ingest.log`), 422 s on the old image (`141-C-bigOld-ingest.log`)
+and 365 s on the new image without limits (`161-C-unlimited-new-ingest.log`); peak memory was
+2.15 GB under the limits and 3.61 GB without (`123`, `142`, `162`; the figure includes page
+cache). The lift's migration took 0.5 to 0.9 s under the limits and 0.867 s without (`120`,
+`70`, `160`). No difference in what the new image needs from the limits was visible at these
+sizes. Ingest under the limits is heavily throttled (Sparrow issue 396).
+
+SIGKILL's cost, on the 1.57 GB store at `/387` after three acknowledged ingests: the next open
+took 2,058 ms in the storage engine and read 165,000 live records (`154-C-kill-daemon2.log`,
+`155-C-kill-post-status.log`). Not measured: a SIGKILL during an in-flight ingest, and a
+SIGKILL of the old image.
+
+Downtime at live size is not measured. Its parts are the drain (up to `TimeoutStopSec`), the copy
+(24 to 60 s, arithmetic above), the rehearsal and the first open and status, which at 4.32 GB
+and 164 MB took 0.23 and 0.10 s to open and 2.5 s to the first answer including scope start.
+The `payload-index` migration at live size, under the unit's `CPUQuota=100%`, `IOWeight=20` and
+live intake, is not measured: pages `ceil(N / 1024)`, `N` read at the rehearsal. The rehearsal
+without resource limits on a scratch store (`.stage/rehearsal-323-migration/REPORT.md`) ran 13,100
+artifacts in 11 pages and 1.846 s after 2 pages were already done.
 
 #### The way back
 
@@ -914,7 +1228,7 @@ where the format fence commits.
   was when the daemon stopped:
 
   ```bash
-  systemctl --user stop sparrow-ship.timer sparrow.service     # SIGINT drain, up to 120 s
+  systemctl --user stop sparrow-ship.timer sparrow.service     # SIGINT drain, up to TimeoutStopSec
   systemctl --user show -p ActiveState --value sparrow.service  # inactive
   ps -C sparrowd                                                # prints no process
   mv -T -- /SPARROW/store /SPARROW/store.opened-by-b420503 \
@@ -967,8 +1281,8 @@ on the coordination session's word, is the new store the new image opened:
 
 #### While the daemon is down
 
-The window runs from the unit stop to the first status answer: the drain (up to 120 s), the copy,
-the first open and its migrations' first page. The first status answer of the new image is not the
+The window runs from the unit stop to the first status answer: the drain (up to `TimeoutStopSec`), the copy,
+the rehearsal, the first open and its migrations' first page. The first status answer of the new image is not the
 end of the work; the index fills afterwards with the daemon serving.
 
 - Ingest socket (`ingest_socket_path`, the `sparrow-ingest` group) and the public TCP listener on port
@@ -987,7 +1301,7 @@ end of the work; the index fills afterwards with the daemon serving.
 - No syslog listener is configured at the last recorded status, so no datagram is exposed; check
   `syslog_listeners` in `before.json`.
 
-Notice. Before: the window's start and its expected length (the downtime figure above), that the
+Notice. Before: the window's start and its expected length (the parts listed under "What the measurement covers"; the live total is not measured), that the
 live daemon stops, that senders without a queue lose their output, that the switch is one-way once
 the store opens, and that a copy of the store is taken and kept. After: the first status answer's
 time, the image, `store_id`, that `payload` lookups read `pending` until the index migration
