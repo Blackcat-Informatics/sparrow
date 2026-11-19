@@ -396,7 +396,11 @@ and remains reserved through the final store flush and endpoint cleanup.
 After the final flush succeeds, teardown asks RocksDB to cancel its background flushes
 and compactions (`Store::cancel_background_work`) before the store drops. The flush has
 made every acknowledged write durable, and a cancelled compaction leaves its input files
-live, so cancellation loses no evidence. A store is not used after the call.
+live, so cancellation loses no evidence. Teardown reads the store after the call for the
+closing count and uses it for nothing else. The archive worker is not joined, so a pass
+already running can still write after the call: RocksDB accepts the write into the
+write-ahead log, or refuses it with a shutdown error when writes are stalled, and the pass
+journals a failed pass and runs again at the next start.
 Closed storage admission returns retryable `SHUTTING_DOWN`; preserve the same
 immutable intent when reconnecting. When the reservation begins, every waiting
 writer and every later one is answered `SHUTTING_DOWN` at once. A failed admission drain is reported
