@@ -315,7 +315,9 @@ impl Client {
 
     /// Upload a completed regular file once over this connection. Unlike the free
     /// `import_file(endpoint, ...)` used by the CLI, it never reconnects or resumes: any
-    /// error ends the attempt. A failed attempt cancels its staging journal over this
+    /// error ends the attempt. A hold (`STORAGE_PRESSURE`, `SHUTTING_DOWN`) or a lost
+    /// connection is returned unchanged and cancels nothing: the journal stays staged and a
+    /// retry under the same request ID resumes it. Any other failed attempt cancels its staging journal over this
     /// connection, releasing its import slot; a retry under the same request ID then fails
     /// with `IMPORT_EXPIRED` until reclamation. A cancel answered `CONFLICT` means the
     /// publication committed although its reply was lost, or the daemon's file watcher owns

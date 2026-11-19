@@ -130,10 +130,23 @@ fn resumable(cancel: &Error) -> bool {
     }
 }
 
+/// Whether an upload error asks the caller to hold and retry: the free-space floor or a
+/// restart refusal, or a lost connection. `RESOURCE_LIMIT` is no hold: it is also how the
+/// daemon refuses an input bound.
+fn is_hold(error: &Error) -> bool {
+    match error {
+        Error::Domain { code, .. } => matches!(code.as_str(), "STORAGE_PRESSURE" | "SHUTTING_DOWN"),
+        Error::Transport(lost) => lost.kind == capnp::ErrorKind::Disconnected,
+        _ => false,
+    }
+}
+
 /// Upload over one held connection and cancel the staging journal when the attempt fails.
 ///
-/// A held connection cannot be replaced, so any error ends the attempt. The cancel uses the
-/// same connection; when that is lost too, the journal stays resumable and the result is the
+/// A held connection cannot be replaced, so any error ends the attempt. A hold
+/// (`STORAGE_PRESSURE`, `SHUTTING_DOWN`) or a lost connection is returned unchanged without a
+/// cancel: the journal and checkpoint stay intact and a retry under the same request ID resumes.
+/// Any other error cancels the journal. The cancel uses the same connection; when that is lost too, the journal stays resumable and the result is the
 /// retryable `IMPORT_RESUMABLE`.
 pub(crate) async fn upload_or_cancel(
     client: &wire::sparrow::Client,
@@ -152,6 +165,11 @@ pub(crate) async fn upload_or_cancel(
         Ok(receipt) => return Ok(receipt),
         Err(error) => error,
     };
+    // A hold or a lost connection keeps the journal: the caller retries the same request ID and
+    // resumes the staged bytes, where a cancel would discard them.
+    if is_hold(&error) {
+        return Err(error);
+    }
     let import = checkpoint.import.clone();
     settle(
         error,

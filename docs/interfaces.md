@@ -4294,8 +4294,10 @@ this implementation.
 The SDK upload paths over a held connection (`Client::ingest` and
 `ingest_with_durability` above the inline bound, `Client::import_file`,
 `Client::import_open_file` and the free `import_open_file`) share the cancellation
-rule but never reconnect or resume: any error ends the attempt. An attempt that
-fails after its journal began cancels the journal over the same connection, so a
+rule but never reconnect or resume: any error ends the attempt. A hold
+(`STORAGE_PRESSURE`, `SHUTTING_DOWN`) or a lost connection is returned unchanged and
+cancels nothing: the journal stays staged and a retry under the same request ID
+resumes it. Any other attempt that fails after its journal began cancels the journal over the same connection, so a
 refused import does not hold an import slot for the retry window. A cancellation
 answered `CONFLICT` retries the upload once: the publication committed, or the
 daemon's file watcher owns the staging and its journal stays intact. When the
