@@ -1,0 +1,18 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 19613f178eafb4c85743bfec50a9b18b93ae40f7
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 373
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/373
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: c2baf1476d680dc84b9ae7865b28089c217294eb
+GhpRsq-Head-Ref: paudley/371-record-the-instance-role-in-the-store
+GhpRsq-Head-OID: 19613f178eafb4c85743bfec50a9b18b93ae40f7
+GhpRsq-Result-Tree: 1ce134e90e2b650e7c10233c46289596843d48a2
+GhpRsq-Result-Commit: 38ab411d5248e3ffa25b2948dd12dfdacc43a852
+GhpRsq-Parent-Hashes: 19613f178eafb4c85743bfec50a9b18b93ae40f7
+GhpRsq-Squash-Notes-SHA256: cc229f496da92c3fe3cfdbdcc4533c6030e1295113fec54cad05375bc1ff4e48
+GhpRsq-Stage-Evidence: none
