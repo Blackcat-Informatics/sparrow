@@ -4189,6 +4189,42 @@ count of retired claims is the length of `retired_claims` in `status` and
 `watch list`. Folding the oldest rows into a summary, which would remove the
 refusal, needs a stored-format change and is not part of this bound.
 
+### Quarantining a permanently refused source
+
+The consume worker retries every failed publication with backoff except one: the
+daemon's refusal of the input itself, a non-retryable `INVALID_ARGUMENT` or
+`RESOURCE_LIMIT` (a bound on the input, such as more records than one
+publication holds). Retrying identical bytes cannot change that answer, so the
+worker stops uploading the claim. Occupancy, the free-space floor, transport
+failures, deadline expiry and a non-retryable `STORAGE_FAILURE` keep retrying.
+Only a claim with no recorded publication is quarantined.
+
+The worker renames the claim's private source into `ROOT.sparrow-quarantine/`,
+a directory of mode 0700 beside the watch root, created on first use, as
+`CLAIM_ID`, with `CLAIM_ID.refusal` holding the code, the message and the
+original relative path. It then retires the claim with caller
+`sparrowd consume worker` and the reason `non-retryable CODE: MESSAGE; source
+kept as ROOT.sparrow-quarantine/CLAIM_ID`, cut to the 512-byte reason bound. The
+claim leaves `pending_claims` and its journal slot is freed; `status`, `watch
+list` and `watch claims` show it under `retired_claims`. The daemon logs one
+line, `sparrowd: watch=W claim=ID quarantined caller=… reason=… path=…`. The
+move is a rename on one filesystem, so the source has one name at every instant
+and is never copied or deleted. Consume roots never overlap, so no root contains
+a quarantine directory and the daemon never reads it as input. A stop between the
+move and the retirement is finished from the refusal file on the next failed
+attempt of that claim.
+
+When the quarantine cannot be written (a read-only or unwritable parent, no
+space, a root that is a mount point) or the retired record is full, the source
+stays in `.sparrow-inflight/`, the claim stays pending, and the watch `failure`
+reads `claim ID: non-retryable CODE: MESSAGE; quarantine failed: CAUSE`. The
+worker repeats only the move on the ordinary backoff and uploads nothing.
+
+To recover a quarantined source, read the refusal in `retired_claims` or the
+refusal file, fix the cause (for example split the file below the record
+bound), and move the fixed file into the watch root, where it is consumed as a
+new file. Sparrow never removes anything from the quarantine directory.
+
 The default scan budget is 10,000 (maximum 100,000) records and pin collections;
 aggregate native catalog construction defaults to and is capped at 32 MiB.
 MCP accepts integer `scan_budget` / `catalog_bytes`; CLI accepts `--scan-budget` /

@@ -4,7 +4,7 @@
 //! Anchored completed-file claims. Readiness and discovery belong to the watcher.
 
 use crate::source_file::{BENEATH, open};
-use rustix::fs::{self, AtFlags, FlockOperation, Mode, OFlags, RenameFlags};
+use rustix::fs::{self, AtFlags, FlockOperation, Mode, OFlags, RenameFlags, ResolveFlags};
 use sparrow_client::parts::{
     ClaimParts, Frontier, MissingLimits, PartLimits, PartsProgress, Resume,
 };
@@ -89,6 +89,87 @@ impl From<rustix::io::Errno> for Error {
 }
 
 const INFLIGHT: &str = ".sparrow-inflight";
+/// Appended to a root's final component to name its quarantine directory, a sibling of the root.
+const QUARANTINE_SUFFIX: &str = ".sparrow-quarantine";
+/// Appended to a claim's ID to name the file holding its refusal in the quarantine directory.
+const REFUSAL_SUFFIX: &str = ".refusal";
+/// The caller a retirement records when the worker quarantines a refused source itself.
+const RETIRE_CALLER: &str = "sparrowd consume worker";
+/// Longest retirement reason the store keeps.
+const REASON_BYTES: usize = 512;
+
+/// A permanent refusal of a claim's input by the daemon: a code and message that retrying the
+/// same bytes can never change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    code: String,
+    message: String,
+}
+
+impl Refusal {
+    /// The refusal an error carries, if it is the daemon's permanent refusal of the input: a
+    /// non-retryable `INVALID_ARGUMENT` or `RESOURCE_LIMIT`. Every other failure keeps retrying:
+    /// a retryable refusal (occupancy, the free-space floor), a transport or local failure, and
+    /// a non-retryable code such as `STORAGE_FAILURE` that a daemon fault can raise for a good file.
+    #[must_use]
+    pub(crate) fn of(error: &Error) -> Option<Self> {
+        match error {
+            Error::Upload(sparrow_client::Error::Domain {
+                code,
+                message,
+                retryable: false,
+                ..
+            }) if matches!(code.as_str(), "INVALID_ARGUMENT" | "RESOURCE_LIMIT") => Some(Self {
+                code: code.clone(),
+                message: message.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The one-line retirement reason, at most [`REASON_BYTES`] bytes.
+    fn reason(&self, directory: &str, id: &str) -> String {
+        let tail = format!("; source kept as {directory}/{id}");
+        let head = format!(
+            "non-retryable {}: {}",
+            self.code,
+            self.message.replace('\n', " ")
+        );
+        let mut end = head.len().min(REASON_BYTES.saturating_sub(tail.len()));
+        while !head.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}{tail}", &head[..end])
+    }
+
+    /// The refusal file kept beside the quarantined source.
+    fn sidecar(&self, journal: &ConsumptionJournal) -> String {
+        format!(
+            "code={}\nmessage={}\npath={}\n",
+            self.code,
+            self.message.replace('\n', " "),
+            String::from_utf8_lossy(&journal.relative_path).replace('\n', " ")
+        )
+    }
+
+    fn from_sidecar(text: &str) -> Option<Self> {
+        let mut lines = text.lines();
+        let code = lines.next()?.strip_prefix("code=")?;
+        let message = lines.next()?.strip_prefix("message=")?;
+        Some(Self {
+            code: code.to_owned(),
+            message: message.to_owned(),
+        })
+    }
+
+    /// The failure text status shows while the move or the retirement cannot finish.
+    pub(crate) fn failure(&self, because: &str) -> String {
+        format!(
+            "non-retryable {}: {}; quarantine failed: {because}",
+            self.code, self.message
+        )
+    }
+}
 
 /// What one claim's attempts share across retries (#280): its progress, which survives an
 /// attempt dropped at the deadline, and its planned parts, digests and receipts.
@@ -165,6 +246,8 @@ pub enum RootBinding {
 
 #[cfg(test)]
 mod crash_tests;
+#[cfg(test)]
+mod quarantine_tests;
 
 /// Whether a stored directory inode names the directory held now. The device number is never
 /// compared: it changes across a reboot on btrfs subvolumes, network, overlay and re-enumerated
@@ -683,6 +766,151 @@ impl ClaimRoot {
         Ok(self
             .store
             .consumption_retire(id, &self.watch, caller, reason, now)?)
+    }
+
+    /// The quarantine directory of the root at `root_path`: a sibling of the root, so no
+    /// consume root contains it (roots never overlap) and the scanner never reads it. It is
+    /// created on first use. The root's own identity is checked first, so a replaced root is
+    /// never given a directory.
+    fn quarantine_dir(
+        &self,
+        root_path: &Path,
+        create: bool,
+    ) -> Result<(File, std::ffi::OsString), Error> {
+        let (Some(parent), Some(name)) = (root_path.parent(), root_path.file_name()) else {
+            return Err(Error::State("consume root has no parent directory"));
+        };
+        let parent = open(
+            fs::CWD,
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            ResolveFlags::NO_SYMLINKS,
+        )?;
+        let named = open(
+            &parent,
+            Path::new(name),
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            BENEATH,
+        )?
+        .metadata()?;
+        let held = self.root.metadata()?;
+        if named.dev() != held.dev() || named.ino() != held.ino() {
+            return Err(Error::State(
+                "configured consume root changed; no quarantine directory is created for it",
+            ));
+        }
+        let mut dirname = name.to_owned();
+        dirname.push(QUARANTINE_SUFFIX);
+        if create {
+            match fs::mkdirat(&parent, dirname.as_os_str(), Mode::from_raw_mode(0o700)) {
+                Ok(()) => parent.sync_all()?,
+                Err(error) if error == rustix::io::Errno::EXIST => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let directory = open(
+            &parent,
+            Path::new(&dirname),
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            BENEATH,
+        )?;
+        let metadata = directory.metadata()?;
+        if metadata.uid() != rustix::process::geteuid().as_raw() {
+            return Err(Error::State(
+                "quarantine directory must be owned by the daemon",
+            ));
+        }
+        Ok((directory, dirname))
+    }
+
+    /// Move the private source of claim `id`, which the daemon refused permanently, into the
+    /// quarantine directory beside the root, record the refusal beside it, and retire the claim
+    /// with the refusal as its reason. Nothing is deleted or copied: the source is renamed, so it
+    /// has one name at every instant, and every step is idempotent. A claim whose source already
+    /// sits in quarantine (an earlier run stopped before retiring it) skips the move. A claim
+    /// with a recorded publication is refused here: its source is removed by recovery.
+    pub(crate) fn quarantine(
+        &self,
+        root_path: &Path,
+        id: &str,
+        refusal: &Refusal,
+        now: u64,
+    ) -> Result<RetiredConsumption, Error> {
+        let journal = self.store.consumption_get(id)?;
+        self.scope(&journal)?;
+        self.private_namespace()?;
+        if journal.published_id().is_some()
+            || !matches!(
+                self.store.consumption_set_manifest(id)?,
+                SetManifest::Absent
+            )
+        {
+            return Err(Error::State(
+                "the claim's publication is recorded; recovery removes its source, never quarantine it",
+            ));
+        }
+        if self.store.consumption_retired()?.len() >= sparrow_core::MAX_RETIRED_CONSUMPTION_CLAIMS {
+            return Err(Error::State(
+                "the retired claim record is full; the refused source stays in its private claim directory",
+            ));
+        }
+        let (directory, dirname) = self.quarantine_dir(root_path, true)?;
+        let moved = match open(&directory, Path::new(id), OFlags::RDONLY, BENEATH) {
+            Ok(_) => true,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+        if !moved {
+            let sidecar = format!("{id}{REFUSAL_SUFFIX}");
+            let mut note = open(
+                &directory,
+                Path::new(&sidecar),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
+                BENEATH,
+            )?;
+            std::io::Write::write_all(&mut note, refusal.sidecar(&journal).as_bytes())?;
+            note.sync_all()?;
+            fs::renameat_with(&self.inflight, id, &directory, id, RenameFlags::NOREPLACE)?;
+            directory.sync_all()?;
+            self.inflight.sync_all()?;
+        }
+        let reason = refusal.reason(&dirname.to_string_lossy(), id);
+        Ok(self
+            .store
+            .consumption_retire(id, &self.watch, RETIRE_CALLER, &reason, now)?)
+    }
+
+    /// The refusal of claim `id` when an earlier run moved its source into quarantine and
+    /// stopped before retiring the claim: the private source is gone and the quarantine holds
+    /// it with its refusal. None when the private source exists or nothing was quarantined.
+    pub(crate) fn interrupted_quarantine(
+        &self,
+        root_path: &Path,
+        id: &str,
+    ) -> Result<Option<Refusal>, Error> {
+        match open(&self.inflight, Path::new(id), OFlags::RDONLY, BENEATH) {
+            Ok(_) => return Ok(None),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let (directory, _) = match self.quarantine_dir(root_path, false) {
+            Ok(found) => found,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let sidecar = format!("{id}{REFUSAL_SUFFIX}");
+        let mut note = match open(&directory, Path::new(&sidecar), OFlags::RDONLY, BENEATH) {
+            Ok(note) => note,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut note, &mut text)?;
+        Ok(Refusal::from_sidecar(&text))
     }
 
     /// Publish a claimed file and return the artifact id that proves it: the import's

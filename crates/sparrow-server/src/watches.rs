@@ -6,7 +6,7 @@
 
 use crate::{
     ConsumeWatch,
-    consumption::{ClaimRoot, Error, Recovery, RootBinding},
+    consumption::{ClaimRoot, Error, Recovery, Refusal, RootBinding},
     watch_admin::{self, Action, Catalog, ManagedWatch},
 };
 use rustix::fs::{
@@ -1925,6 +1925,28 @@ async fn run(
                     .attempt,
             );
             attempt.progress.restart();
+            if !is_tail && retry.get(&id).is_some_and(|entry| entry.refusal.is_some()) {
+                let detector = detectors
+                    .iter_mut()
+                    .find(|detector| detector.config.id == watch)
+                    .ok_or(Error::State(
+                        "pending consumption journal has no configured watch owner",
+                    ))?;
+                let refusal = retry
+                    .get(&id)
+                    .and_then(|entry| entry.refusal.clone())
+                    .ok_or(Error::State("refused claim lost its refusal"))?;
+                if quarantine_claim(detector, &id, &refusal)? {
+                    retry.remove(&id);
+                } else {
+                    retry
+                        .entry(id)
+                        .or_insert_with(ClaimRetry::due)
+                        .failed(ProgressMark::default(), false);
+                }
+                tokio::task::yield_now().await;
+                continue;
+            }
             if !is_tail {
                 // A permit the last wait acquired for a tail drain is not held through an
                 // ordinary connection or publication.
@@ -2037,8 +2059,35 @@ async fn run(
                 }
                 let floor =
                     floor_class(&error) && store.space_floor().observe(crate::now()?)?.is_some();
+                let refusal = if is_tail {
+                    None
+                } else {
+                    match Refusal::of(&error) {
+                        Some(refusal) => Some(refusal),
+                        // An earlier run may have moved the source and stopped before it
+                        // retired the claim; its refusal is on file beside the source.
+                        None => match detector
+                            .owner
+                            .claim()?
+                            .interrupted_quarantine(&detector.config.root, &id)
+                        {
+                            Ok(found) => found,
+                            Err(error) => {
+                                eprintln!(
+                                    "sparrowd: watch={watch} claim={id} quarantine record unreadable: {error}"
+                                );
+                                None
+                            }
+                        },
+                    }
+                };
                 let entry = retry.entry(id).or_insert_with(ClaimRetry::due);
                 entry.failed(attempt.progress.mark(), floor);
+                if refusal.is_some() {
+                    // Settle it on the next pass: no further upload of this claim.
+                    entry.at = Instant::now();
+                    entry.refusal = refusal;
+                }
                 if !is_tail {
                     client = None;
                 }
@@ -2068,6 +2117,44 @@ async fn run(
     Ok(())
 }
 
+/// Move the refused source of claim `id` into quarantine and retire the claim. True when the
+/// claim is retired. A failure that is not fatal to the store stays on the claim and the watch's
+/// status, is logged once per change of its text, and leaves the source where it is.
+fn quarantine_claim(detector: &mut Detector, id: &str, refusal: &Refusal) -> Result<bool, Error> {
+    let now = crate::now()?;
+    let outcome = detector
+        .owner
+        .claim()
+        .and_then(|claim| claim.quarantine(&detector.config.root, id, refusal, now));
+    match outcome {
+        Ok(retired) => {
+            detector.held_move_failures.remove(id);
+            detector.clear_failure_of(id);
+            eprintln!(
+                "sparrowd: watch={} claim={id} quarantined caller={:?} reason={:?} path={:?}",
+                detector.config.id,
+                retired.retirement.caller,
+                retired.retirement.reason,
+                String::from_utf8_lossy(&retired.journal.relative_path),
+            );
+            Ok(true)
+        }
+        Err(Error::Storage(error)) if fatal_storage(error.code) => Err(Error::Storage(error)),
+        Err(error) => {
+            let text = refusal.failure(&error.to_string());
+            detector.fail_claim(id, format!("claim {id}: {text}"));
+            if detector.held_move_failures.get(id) != Some(&text) {
+                eprintln!(
+                    "sparrowd: watch={} claim={id} pending: {text}",
+                    detector.config.id
+                );
+                detector.held_move_failures.insert(id.to_owned(), text);
+            }
+            Ok(false)
+        }
+    }
+}
+
 /// Wake for the retries still to come while the due claim waits.
 fn blocked(retry: &BTreeMap<String, ClaimRetry>, wake: &mut Wake) {
     let now = Instant::now();
@@ -2088,6 +2175,9 @@ struct ClaimRetry {
     best: ProgressMark,
     /// Progress and planned parts shared with each attempt.
     attempt: Arc<crate::consumption::ClaimAttempt>,
+    /// The daemon's permanent refusal of this claim's input. Set, the claim is never published
+    /// again: each due time moves its source into quarantine and retires it instead.
+    refusal: Option<Refusal>,
 }
 
 impl ClaimRetry {
@@ -2098,6 +2188,7 @@ impl ClaimRetry {
             failures: 0,
             best: ProgressMark::default(),
             attempt: Arc::default(),
+            refusal: None,
         }
     }
 
