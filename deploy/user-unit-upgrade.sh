@@ -45,10 +45,14 @@ unit while the daemon is down. The script prints the kept copy, the seconds sinc
 stopped and the instructions, then waits, with no timeout (the daemon is down for the whole
 hold; each prompt repeats the elapsed time). Answer "proceed" to switch the links and start TO as
 usual, or "abort" to start the FROM image again on the unchanged store, start sparrow-ship.timer
-if it was active, and exit non-zero. End of input on the terminal, Ctrl-C, SIGTERM and SIGHUP
-abort the same way. The answer is read from the terminal; without one (stdin is not a terminal)
---hold-answer FIFO names an existing named pipe the answer is written to, for example
-"echo proceed > FIFO". The script refuses the option, before anything changes, without
+if it was active, and exit non-zero. End of input, Ctrl-C, SIGTERM and SIGHUP abort the same way,
+and so does an answer pipe that is closed empty or removed. The restore does not depend on any
+output: it comes first, and the outcome is written to DIR.abort.log beside the kept copy, to the
+journal through logger when it exists, and to the terminal. The answer is read from the terminal,
+and the prompt goes to /dev/tty even when stdout is redirected. --hold-answer FIFO names an
+existing named pipe the answer is written to, for example "echo proceed > FIFO"; whenever it is
+given the answer is read from it and not from the terminal, and no terminal is needed. A last
+line without a newline counts. The script refuses the option, before anything changes, without
 --keep-copy, and without a terminal or a FIFO.
 
 Before anything changes it refuses unless: the daemon link names --from; all four images are
@@ -235,16 +239,58 @@ wait_first_status() {
     done
 }
 elapsed_since_stop() { awk -v a="$EPOCHREALTIME" -v b="$T0" 'BEGIN{printf "%.1f", a-b}'; }
+# Say LINE during the hold. Every write here is non-fatal: a dead terminal must never stop the
+# restore. In terminal mode the line also goes to /dev/tty when stdout is redirected (a log
+# file), so an operator at the terminal sees the prompt.
+hold_say() {
+    printf '%s\n' "$1" || true
+    if [[ -z $HOLD_ANSWER && ! -t 1 ]]; then
+        { printf '%s\n' "$1" >/dev/tty; } 2>/dev/null || true
+    fi
+}
+# The abort's durable record: KEEP_COPY.abort.log beside the kept copy, the journal through
+# logger when it exists, then the terminal. None of the writes can fail the abort.
+abort_note() {
+    local line
+    line="$(stamp) $*"
+    { printf '%s\n' "$line" >>"$KEEP_COPY.abort.log"; } 2>/dev/null || true
+    if command -v logger >/dev/null; then logger -t user-unit-upgrade -- "$line" || true; fi
+    hold_say "$line"
+}
 # The hold's abort: nothing has changed since the copy (links name FROM, the store is untouched),
-# so the old image starts again, the timer comes back and the script exits non-zero.
+# so the old image starts again, the timer comes back and the script exits non-zero. The restore
+# comes first and does not depend on any output succeeding (the terminal may be gone: SIGHUP).
 abort_hold() {
+    local started=1 answered=1 down
     trap - INT TERM HUP
-    log "hold aborted ($1) after $(elapsed_since_stop) s down: starting $FROM again on the unchanged store"
-    "${USER_SYSTEMCTL[@]}" start sparrow.service
-    wait_first_status
-    restore_ship_timer
-    log "the daemon runs $FROM again; the links name $FROM and the store is unchanged; the kept copy $KEEP_COPY remains"
-    die "switch aborted at the hold; nothing was switched"
+    trap '' PIPE
+    set +e
+    down=$(elapsed_since_stop)
+    "${USER_SYSTEMCTL[@]}" start sparrow.service || started=0
+    if ((started)); then
+        (wait_first_status) >/dev/null 2>&1 || answered=0
+    fi
+    if ((started && answered)); then
+        restore_ship_timer
+        abort_note "hold aborted ($1) after $down s down: $FROM runs again on the unchanged store, the links name $FROM, sparrow-ship.timer is restored if it was active; the kept copy $KEEP_COPY remains"
+    else
+        abort_note "hold aborted ($1) after $down s down: starting $FROM again FAILED or it does not answer status (sparrow.service: $("${USER_SYSTEMCTL[@]}" is-active sparrow.service)); the links name $FROM, the store is unchanged, sparrow-ship.timer is NOT restarted; read journalctl --user -u sparrow.service and deploy/user-unit-upgrade.sh --help"
+    fi
+    exit 1
+}
+# Read one answer line into the variable named by $1: from the answer pipe, opened afresh for each
+# answer (the read blocks until a writer appears; nothing polls), or from the terminal. A last
+# line without a newline counts. Returns non-zero when nothing could be read: the pipe is gone
+# or closed empty, or the terminal ended.
+read_answer() {
+    local -n into=$1
+    into=''
+    if [[ -n $HOLD_ANSWER ]]; then
+        read -r into <"$HOLD_ANSWER" || [[ -n $into ]]
+    else
+        { printf 'proceed or abort> ' >/dev/tty; } 2>/dev/null || printf 'proceed or abort> '
+        read -r into || [[ -n $into ]]
+    fi
 }
 # Wait for proceed or abort, with no timeout: the daemon is down for the whole hold.
 hold_after_copy() {
@@ -252,23 +298,18 @@ hold_after_copy() {
     trap 'abort_hold SIGINT' INT
     trap 'abort_hold SIGTERM' TERM
     trap 'abort_hold SIGHUP' HUP
+    trap '' PIPE # a dead output must not kill the script while the daemon is down
     while :; do
-        printf '%s HOLD: sparrow.service has been down %s s. The closed store is kept at %s.\n' \
-            "$(stamp)" "$(elapsed_since_stop)" "$KEEP_COPY"
-        printf 'Rehearse the lift on a second copy now, then answer: "proceed" switches the links and starts %s; "abort" starts %s again on the unchanged store.\n' "$TO" "$FROM"
-        if [[ -n $HOLD_ANSWER ]]; then
-            read -r answer <"$HOLD_ANSWER" || answer=''
-            [[ -n $answer ]] || continue
-        else
-            read -r -p 'proceed or abort> ' answer || { printf '\n'; abort_hold "end of input"; }
-        fi
+        hold_say "$(stamp) HOLD: sparrow.service has been down $(elapsed_since_stop) s. The closed store is kept at $KEEP_COPY."
+        hold_say "Rehearse the lift on a second copy now, then answer: \"proceed\" switches the links and starts $TO; \"abort\" starts $FROM again on the unchanged store."
+        read_answer answer || { hold_say ''; abort_hold "no answer: input ended or the answer pipe is gone"; }
         case $answer in
             proceed) break ;;
             abort) abort_hold "operator" ;;
-            *) printf 'not an answer: %s\n' "$answer" ;;
+            *) hold_say "not an answer: $answer" ;;
         esac
     done
-    trap - INT TERM HUP
+    trap - INT TERM HUP PIPE
     log "hold released after $(elapsed_since_stop) s down: proceeding"
 }
 # After the preconditions, a failure says what state it left (the recovery note is in --help).

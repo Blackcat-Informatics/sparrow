@@ -626,9 +626,12 @@ out is forward on `--to`.
 the links change or `--to` starts, so a rehearsal can run on a second copy while the daemon is
 down. The script prints the kept copy and the seconds down, and waits with no timeout for
 `proceed` (switch and start as usual) or `abort` (start `--from` again on the unchanged store,
-restore the timer, exit non-zero). It reads the answer from the terminal, or from a named pipe
-given with `--hold-answer FIFO`; Ctrl-C, SIGTERM and end of input abort. It refuses the option
-without `--keep-copy` and without a terminal or pipe.
+restore the timer, exit non-zero). It reads the answer from the terminal, or, whenever
+`--hold-answer FIFO` is given, from that named pipe; the prompt goes to `/dev/tty` even when the
+output is redirected to a log. Ctrl-C, SIGTERM, a hangup, end of input and a removed or empty
+pipe abort; the abort starts the old image before it writes anything and records its outcome in
+`COPY.abort.log` beside the kept copy and in the journal. It refuses the option without
+`--keep-copy` and without a terminal or pipe.
 
 Before anything changes it refuses unless all of these hold:
 

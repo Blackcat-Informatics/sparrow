@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 #
-# Recorded check for deploy/user-unit-upgrade.sh (issue #175): a successful switch starts
-# sparrow-ship.timer again, and on its early-abort path the script starts again only the timer
-# that was active before it stopped it, changing nothing else.
+# Recorded check for deploy/user-unit-upgrade.sh: a successful switch starts sparrow-ship.timer
+# again (issue #175), and on its early-abort path the script starts again only the timer that was
+# active before it stopped it, changing nothing else; --keep-copy copies the closed store between
+# the stop and the link switch; --hold-after-copy (issue #403) pauses there, and proceed switches,
+# abort or a hangup with dead output restarts the old image and restores the timer, and the option
+# is refused without --keep-copy.
 #
 # It runs the real script end to end in a scratch world: a fake HOME with kept images, links,
-# configuration and a status-answering CLI, and stub systemctl, getcap, lsattr, ps and sleep first
+# configuration and a status-answering CLI, and stub systemctl, getcap, lsattr, logger, ps and sleep first
 # on PATH. The stub systemctl keeps timer state in files and logs every call, so the assertions read
 # what the script asked of the user manager. Nothing here reaches a real unit, timer, store or
 # daemon. It stays out of `make check` (it needs python3 and runs the whole script several times); run
@@ -60,6 +63,8 @@ STUB
 for a; do :; done
 echo "---------------C------ $a"
 STUB
+    # shellcheck disable=SC2016 # the stub expands its own variables
+    printf '#!/bin/sh\necho "$*" >>"$STATE/logger"\n' >"$w/stubs/logger"
     printf '#!/bin/sh\nexit 0\n' >"$w/stubs/ps"
     printf '#!/bin/sh\nexit 0\n' >"$w/stubs/sleep"
     cat >"$w/stubs/systemctl" <<'SYSTEMCTL'
@@ -225,5 +230,47 @@ grep -q 'needs --keep-copy' <<<"$out" || fail "hold refusal did not name --keep-
 [[ ! -e $w/state/calls ]] || fail "hold-no-copy path called systemctl"
 extra=()
 echo "ok   hold without keep-copy: refused before any change"
+
+# 10. The terminal hangs up during the hold (SSH drop) and every write fails (the output pipe's reader has gone): the abort
+#     still starts the old image first and restores the timer, swaps nothing, and leaves its
+#     message in DIR.abort.log and the journal (logger) for the operator to find.
+w=$(world hold-hangup)
+chattr +C -- "$w/store"
+mkfifo -- "$w/answer" "$w/output"
+touch "$w/state/sparrow-ship.timer.active"
+set +e
+# The reader leaves once the hold has begun, so the script's later writes hit a closed pipe.
+{ while IFS= read -r line; do [[ $line == *HOLD:* ]] && break; done; } <"$w/output" &
+env -i PATH="$w/stubs:/usr/bin:/bin" HOME="$w/home" STATE="$w/state" SPARROW_BIN="$w/kept" \
+    "$script" --from sparrowd-schema68-aaa --to sparrowd-schema71-bbb \
+    --keep-copy "$w/store.before" --hold-after-copy --hold-answer "$w/answer" >"$w/output" 2>&1 &
+pid=$!
+# Opening the pipe for writing returns only when the script is reading it, that is, in the hold.
+exec 4>"$w/answer"
+kill -HUP "$pid"
+wait "$pid"
+rc=$?
+exec 4>&-
+set -e
+((rc != 0)) || fail "hold-hangup path exited 0"
+[[ -e $w/state/sparrow.service.active ]] || fail "hold-hangup path left sparrow.service stopped"
+[[ -e $w/state/sparrow-ship.timer.active ]] || fail "hold-hangup path did not restore the timer"
+[[ $(readlink "$w/home/.local/libexec/sparrow/sparrowd") == sparrowd-schema68-aaa ]] || fail "hold-hangup path moved the daemon link"
+grep -q 'hold aborted (SIGHUP)' "$w/store.before.abort.log" || fail "hold-hangup path wrote no durable abort message"
+grep -q 'hold aborted (SIGHUP)' "$w/state/logger" || fail "hold-hangup path wrote no journal message"
+echo "ok   hold + hangup with dead output: old image restarted, message in ${w##*/}/store.before.abort.log"
+
+# 11. An answer without a trailing newline is accepted.
+w=$(world hold-nonewline)
+chattr +C -- "$w/store"
+mkfifo -- "$w/answer"
+extra=(--keep-copy "$w/store.before" --hold-after-copy --hold-answer "$w/answer")
+printf proceed >"$w/answer" &
+writer=$!
+run "$w"
+kill "$writer" 2>/dev/null || true
+extra=()
+((rc == 0)) || { echo "$out" >&2; fail "hold answer without newline exited $rc"; }
+echo "ok   hold answer without a trailing newline: accepted"
 
 echo PASS
