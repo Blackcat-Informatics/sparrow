@@ -18,7 +18,8 @@
 # senders, readable by one group (SPARROW_TEST_INGEST_GROUP, default the invoking user's primary
 # group), and a disk budget (SPARROW_TEST_DISK_BUDGET) and free-space floor
 # (SPARROW_TEST_MIN_FREE) sized for a load. It is a separate store with its own store_id and
-# instance_role = "scratch", never the live store.
+# instance_role = "scratch", never the live store. SPARROW_TEST_ARCHIVE_DIR turns the archive worker
+# on, writing to a directory that must be on its own mount (a tmpfs such as /dev/shm).
 set -euo pipefail
 umask 077
 
@@ -35,7 +36,11 @@ stops the test unit and removes it (the scratch directory, with its store, is ke
 removes the scratch store, intake, ingest socket directory and staged files, and only when the
 unit is stopped and SCRATCH holds a configuration written by this script. SPARROW_TEST_INGEST_GROUP,
 SPARROW_TEST_DISK_BUDGET (bytes, default 16 GiB) and SPARROW_TEST_MIN_FREE (bytes, default
-4 GiB) shape setup.
+4 GiB) shape setup. SPARROW_TEST_ARCHIVE_DIR, an existing directory the invoking user can write
+and on a different device than SCRATCH (a tmpfs such as /dev/shm/NAME), adds the [archive] table
+and its ReadWritePaths entry; unset, the instance has no archive. setup records the directory in
+SCRATCH/archive-dir, and purge then removes that directory's STORE_ID file and <store_id>/
+subtree, never the directory itself or anything else in it.
 USAGE
 }
 (($# >= 1)) || { usage >&2; exit 2; }
@@ -49,6 +54,8 @@ UNIT_DIR=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required}/systemd/user
 ROOT=$SCRATCH/root
 DATA=$SCRATCH/data
 INGEST=$SCRATCH/ingest
+# The archive directory setup was given, recorded so that purge removes only what the daemon wrote there.
+ARCHIVE_RECORD=$SCRATCH/archive-dir
 CONFIG=$ROOT/etc/sparrow/server.toml
 
 environment() {
@@ -72,6 +79,25 @@ case $ACTION in
         [[ -n $gid ]] || die "no group named $group for SPARROW_TEST_INGEST_GROUP"
         disk_budget=${SPARROW_TEST_DISK_BUDGET:-17179869184}
         min_free=${SPARROW_TEST_MIN_FREE:-4294967296}
+        archive_dir=${SPARROW_TEST_ARCHIVE_DIR:-}
+        if [[ -n $archive_dir ]]; then
+            [[ $archive_dir == /* && $archive_dir != *[[:space:]\"\\]* ]] \
+                || die "SPARROW_TEST_ARCHIVE_DIR must be an absolute path without spaces, quotes or backslashes: $archive_dir"
+            [[ /$archive_dir/ != */../* ]] || die "SPARROW_TEST_ARCHIVE_DIR must not contain '..': $archive_dir"
+            [[ -d $archive_dir ]] \
+                || die "the archive directory $archive_dir does not exist; the daemon never creates it, so create it on its own mount first (for example mkdir -m 0700 /dev/shm/NAME)"
+            [[ -w $archive_dir && -x $archive_dir ]] || die "the archive directory $archive_dir is not writable by $(id -un), the daemon's user"
+            archive_dir=$(cd -- "$archive_dir" && pwd -P)
+            # SCRATCH may not exist yet; its nearest existing parent is on the device it will be on.
+            probe=$SCRATCH
+            while [[ ! -e $probe ]]; do probe=$(dirname -- "$probe"); done
+            if [[ $(stat -c %d -- "$archive_dir") == "$(stat -c %d -- "$probe")" ]]; then
+                die "the archive directory $archive_dir is on the same device as the scratch tree ($SCRATCH): the daemon refuses an archive that is not on its own mount, and an archive beside the store is no separate copy. Use a directory on its own mount, such as one under /dev/shm"
+            fi
+            case $archive_dir/ in
+                "$SCRATCH"/*) die "the archive directory $archive_dir lies inside the scratch tree $SCRATCH" ;;
+            esac
+        fi
         install -d -m 0700 -- "$SCRATCH" "$DATA" "$DATA/intake" "$DATA/intake/deploytest"
         # The daemon requires this directory to be a real directory owned by its account, with the
         # sender group and mode exactly 2750 (docs/deployment.md, "Ingest-only group socket").
@@ -113,6 +139,12 @@ quiet_ms = 1000
 max_directories = 1
 max_candidates = 64
 CONFIG
+        read_write_paths="$DATA $INGEST"
+        if [[ -n $archive_dir ]]; then
+            printf '\n[archive]\ndir = "%s"\n' "$archive_dir" >>"$CONFIG"
+            printf '%s\n' "$archive_dir" >"$ARCHIVE_RECORD"
+            read_write_paths="$read_write_paths $archive_dir"
+        fi
         SPARROW_DESTDIR=$ROOT "$DEPLOY_DIR/install.sh" --no-enable
         chmod 0700 -- "$ROOT"
         install -d -m 0700 -- "$UNIT_DIR"
@@ -120,7 +152,7 @@ CONFIG
             -e '/^(User|Group|LoadCredential|AppArmorProfile|AmbientCapabilities|CapabilityBoundingSet|Slice|Nice|OOMScoreAdjust|ManagedOOMPreference|RequiresMountsFor)=/d' \
             -e "s|^ExecStart=.*|ExecStart=$ROOT/usr/local/libexec/sparrow/sparrowd --config $ROOT/etc/sparrow/server.toml|" \
             -e "s|^WorkingDirectory=.*|WorkingDirectory=$DATA|" \
-            -e "s|^ReadWritePaths=.*|ReadWritePaths=$DATA $INGEST|" \
+            -e "s|^ReadWritePaths=.*|ReadWritePaths=$read_write_paths|" \
             -e 's|^ProtectHome=.*|ProtectHome=read-only|' \
             -e 's|^Description=.*|Description=Sparrow deploy test instance (deploy/test-instance.sh)|' \
             -e '/^\[Install\]/,$d' \
@@ -144,7 +176,26 @@ CONFIG
             || die "$SCRATCH holds no configuration written by test-instance.sh ($CONFIG); nothing is removed"
         ! systemctl --user is-active --quiet "$UNIT" || die "$UNIT is active; run teardown first"
         [[ ! -e $UNIT_DIR/$UNIT ]] || die "$UNIT_DIR/$UNIT still exists; run teardown first"
+        # Only the directory setup recorded, and in it only what the daemon writes: STORE_ID and the
+        # <store_id>/ subtree it names. The directory and anything else in it stay.
+        if [[ -f $ARCHIVE_RECORD ]]; then
+            archive_dir=$(<"$ARCHIVE_RECORD")
+            [[ $archive_dir == /* && $archive_dir != *..* ]] || die "$ARCHIVE_RECORD names no absolute archive directory ($archive_dir); nothing is removed"
+            if [[ -f $archive_dir/STORE_ID ]]; then
+                archive_store=$(<"$archive_dir/STORE_ID")
+                [[ $archive_store =~ ^store:[0-9a-f]{32}$ ]] \
+                    || die "$archive_dir/STORE_ID holds '$archive_store', not a store id; nothing is removed"
+                [[ ! -e $archive_dir/$archive_store || ( -d $archive_dir/$archive_store && ! -L $archive_dir/$archive_store ) ]] \
+                    || die "$archive_dir/$archive_store is not a directory; nothing is removed"
+                rm -rf -- "${archive_dir:?}/${archive_store:?}"
+                rm -f -- "$archive_dir/STORE_ID"
+                echo "test-instance.sh: archive subtree $archive_dir/$archive_store and $archive_dir/STORE_ID removed; $archive_dir kept"
+            else
+                echo "test-instance.sh: $archive_dir holds no STORE_ID, so the archive worker wrote nothing there; $archive_dir kept"
+            fi
+        fi
         rm -rf -- "$DATA" "$INGEST" "$ROOT"
+        rm -f -- "$ARCHIVE_RECORD"
         echo "test-instance.sh: scratch store, intake, ingest directory and staged files in $SCRATCH removed"
         ;;
     *)
