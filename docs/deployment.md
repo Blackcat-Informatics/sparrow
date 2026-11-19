@@ -716,8 +716,8 @@ switch 1, so no archive worker runs, and the switch crosses only the payload ind
   `/340` untouched or the whole of `/395`. It is the point of no return: `sparrowd-schema71-fda2812`
   refuses a lifted store at its open and exits with status 1. The refusal observed on stores
   lifted from `/332` to `/387` is `Error: Error { code: "STORAGE_FAILURE", message: "log time
-  interpretation law and writer fence disagree" }` (below, "What the measurement covers"); it is not
-  observed on a store lifted from `/340`. The code is `STORAGE_FAILURE`, not
+  interpretation law and writer fence disagree" }` (below, "What the measurement covers"); it has not
+  been observed on a store lifted from `/340`. The code is `STORAGE_FAILURE`, not
   `UNSUPPORTED`. The downgrade check in `deploy/lib.sh` compares schema numbers only, so it cannot
   see this fence (Sparrow issue 385); the rules below, not the script, keep the old image off the
   store.
@@ -1188,14 +1188,24 @@ if total != sum(held.values()):
     fail(f"migration total {total} != sources complete_artifacts + fragment_parents {sum(held.values())}")
 
 # One full walk of the artifact listing: no call sorts by size or filters by it. A page holds at most 31
-# rows and fewer when its charged catalog bytes run out first, so a page can hold none; every page that
-# ends before the last has consumed at least one catalog entry (an artifact or one of its records), and
-# the store-counters migration `total` counts every such entry, so it bounds the calls.
+# rows and fewer when its charged catalog bytes run out first, so a page can hold none. A page that ends
+# having consumed nothing happens only for a resumed artifact whose next record cannot fit a fresh page
+# (a record entry over 512 KiB, or pins that use up the page's admission) and at the edge of the
+# source-summary window (only while that migration runs). The live store has neither: the source-summary
+# migration is complete, and the records are under that size. Without them every page consumes at least one
+# catalog entry. A run of pages without a new row then folds one artifact, which has at most
+# max_records_per_artifact records, so more than that many plus 1 consecutive pages without a new row is a
+# stalled walk. The store-counters total counts every catalog entry and is the last backstop on the calls.
+# Cursors carry a new snapshot id on every page, so a repeated cursor is not a stall signal and is not checked.
 counters = [m for m in status["migrations"] if m["name"] == "store-counters"]
 if len(counters) != 1 or counters[0]["watermark"] is not None or counters[0]["done"] != counters[0]["total"]:
     fail(f"status has no complete store-counters migration row: {counters}")
+sources_done = [m for m in status["migrations"] if m["name"] == "source-summary"]
+if len(sources_done) != 1 or sources_done[0]["watermark"] is not None or sources_done[0]["done"] != sources_done[0]["total"]:
+    fail(f"status has no complete source-summary migration row: {sources_done}")
 call_limit = int(counters[0]["total"]) + 1
-walk_calls, listed, last, cursors, started = 0, {}, None, set(), time.monotonic()
+stall_limit = int(status["max_records_per_artifact"]) + 1
+walk_calls, listed, last, stalled, started = 0, {}, None, 0, time.monotonic()
 cursor = []
 while True:
     if walk_calls >= call_limit:
@@ -1207,13 +1217,14 @@ while True:
         if r["artifact_id"] in listed:
             fail(f"the listing returned {r['artifact_id']} twice")
         listed[r["artifact_id"]] = r
+    stalled = 0 if page["rows"] else stalled + 1
+    if stalled > stall_limit:
+        fail(f"the listing walk made {stalled} consecutive calls without a new row after {len(listed)} artifacts; "
+             f"one artifact needs at most {stall_limit} (max_records_per_artifact plus 1)")
     if walk_calls % REPORT_EVERY == 0:
         print(f"listing walk: {walk_calls} calls, {len(listed)} artifacts, {time.monotonic() - started:.0f} s", flush=True)
     if page.get("next_cursor") is None:
         break
-    if page["next_cursor"] in cursors:
-        fail(f"the listing repeated the cursor {page['next_cursor']}")
-    cursors.add(page["next_cursor"])
     cursor = ["--cursor", page["next_cursor"]]
 walk_seconds = time.monotonic() - started
 if last is None or last["answer_certainty"] != "exact" or int(last["matching_artifacts"]) != len(listed):
@@ -1388,21 +1399,35 @@ CHECK
      page ends when that is spent, in the middle of an artifact when need be (`artifact_index_page`).
      The CLI's `--scan-budget` (at most 100,000 entries, default 10,000) does not lower the call
      count: 32 MiB divided by 64 is 524,288 bytes of record entries, so a record entry of 53 bytes or
-     more exhausts the bytes before 10,000 entries, and the check leaves the default. Every page
-     that ends before the last consumes at least one catalog entry, an artifact or one of its
-     records, or the call fails with `RESOURCE_LIMIT`. The walk therefore ends within the
+     more exhausts the bytes before 10,000 entries, and the check leaves the default. A page that
+     ends before the last normally consumes at least one catalog entry, an artifact or one of its
+     records, or the call fails with `RESOURCE_LIMIT`. Two pages can end having consumed nothing: a
+     resumed artifact whose next record cannot fit a fresh page (`artifact_read.rs`, the
+     `RESOURCE_LIMIT` arm of `artifact_index_page`), which needs a record entry over `ENTRY_BYTES`
+     (512 KiB) or pins that use up the page's admission, and the edge of the source-summary window
+     (`Listed::Window`), which exists only while the `source-summary` migration runs. The check
+     requires that migration complete, and the live store at its last reading has it complete and no
+     active pins (`.stage/image/switch-1/before.json`); a record entry over 512 KiB is not seen
+     (inference: the dry run read 409,300 records without refusal). Under those conditions a run of
+     pages without a new row folds one artifact, which has at most `max_records_per_artifact`
+     records (100,000 in that `before.json`), so the check fails a walk with more than that count
+     plus 1 consecutive pages without a new row. Every page carries a new random snapshot id in its
+     cursor, so a repeated cursor does not signal a stall and is not checked. At 27.9 calls per
+     second that bound is 100,001 calls, about 3,584 s (arithmetic). The walk also ends within the
      `store-counters` migration `total` plus 1 calls, which counts every catalog entry; the check
-     takes that as its call limit and fails when the walk passes it. It also fails when a cursor
-     repeats, when the listing returns an artifact twice, when the walk ends without an exact final
+     takes that as its last backstop on the call count: the live `total` of 17,764,214
+     (`.stage/image/switch-1/before.json`, not the window's own `before.json`) is 17,764,215 calls,
+     about 636,710 s or 7.4 days at 27.9 calls per second (arithmetic). The check also fails when the
+     listing returns an artifact twice, when the walk ends without an exact final
      page, or when its rows differ from the listing's own `matching_artifacts` count or from the
      migration `total`. The call limit is a bound, not an expectation. The dry run's scratch store,
      308 artifacts of about 1,330 records (409,300 records, arithmetic), took 694 calls: 424 pages
      held no row, 232 one and 38 two, at 27.9 calls per second (`.stage/372-dryrun/logs/12-walk-rate.log`),
      about 590 records per call (arithmetic). Scaling the calls by records to the live
-     2,981,454 `live_records` (`before.json`) gives about 5,055 calls and, at 27.9 calls per second,
-     about 181 s (arithmetic; the rate came from a scratch store while other builds ran on the
-     host, the load was not logged, and live record entries may differ in size, which moves the call
-     count). The check prints a progress line every 1,000 calls and the walk's calls and seconds
+     2,981,454 `live_records` (`.stage/image/switch-1/before.json`) gives about 5,055 calls and, at
+     27.9 calls per second, about 181 s (arithmetic; the rate came from one scratch store under
+     concurrent build load, the load was not logged, and live record entries may differ in size, which
+     moves the call count). The check prints a progress line every 1,000 calls and the walk's calls and seconds
      at the end. It also
      fails when a source that `sources` reports as holding `complete_artifacts` plus
      `fragment_parents` artifacts returns fewer rows than that. The 5 largest artifacts by
@@ -1437,7 +1462,7 @@ CHECK
      read rate of the live copy has been measured, so no duration is stated for it; at an assumed
      100 MiB/s, which is an assumption and not a measurement, 4 GiB is about 41 s of reading
      (arithmetic) before hashing, the lookups and the listing walk. The dry run's whole check took
-     90.5 s on the scratch store, with 879 CLI calls and 108,120,791 bytes read in 133 `bytes` calls
+     90.5 s on the scratch store, with at least 879 CLI calls and 108,120,791 bytes read in 133 `bytes` calls
      (`.stage/372-dryrun/logs/11-rehearsal-4b-checker.log`, `13-checker-call-count.log`). The check prints the artifact count, how many sources hold
      artifacts, how many hold readable ones and how many were sampled, how many of the 6 age windows
      the sample covers, the smallest and the largest artifact in bytes, the total bytes read and the
@@ -1551,8 +1576,9 @@ What the rehearsal adds to the downtime, all arithmetic. The copy of `COPY` cost
 below. The migration costs `P` pages times the per-page time, 0.108 s median at 1,024 artifacts of
 3 records, 0.159 s at most there, and 0.263 to 0.602 s for the single page of 101 larger artifacts
 (figures and logs under "What the measurement covers"); the dry run's single page of 308 artifacts of
-about 1,330 records took 1.636 s, so the per-page time follows the size of the entries, and its open
-(`total=417` ms in `store_open_ms`) and scratch stop (0.236 s) on a 4.24 GB copy are in
+about 1,330 records took 1.636 s, so the per-page time probably follows the size of the entries (inference), and its open
+(`total=417` ms in `store_open_ms`) and scratch stop (0.236 s) on a 4.24 GB copy (4,239,423,985 bytes,
+`07-copy-COPY.log`; `physical_bytes` 4,239,153,288, `10-rehearsal-4a-status.log`) are in
 `.stage/372-dryrun/logs/14-rehearsal-4d-stop.log`. An illustration with an assumed count, not
 the live one: 1,000,000 artifacts is 977 pages, 106 s at 0.108 s per page and 588 s at 0.602 s. Add
 the open and the scratch stop (0.015 to 0.025 s idle at a store of 164 MB, 1.85 to 3.47 s at
