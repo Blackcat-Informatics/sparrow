@@ -439,7 +439,7 @@ never shares a path, socket or store with `/SPARROW`.
 | Ingest group | `SPARROW_TEST_INGEST_GROUP` at `setup`, default the invoking user's primary group; `setup` gives `SCRATCH` that group with mode `0710` and the socket directory `2750`, so members can reach the socket but cannot list the scratch tree or read the store; a sender must belong to the group and be able to search every parent of `SCRATCH` |
 | Disk budget | 16 GiB (`SPARROW_TEST_DISK_BUDGET`, bytes); one roll measured 7.66 GB of cruft |
 | Free-space floor | 4 GiB (`SPARROW_TEST_MIN_FREE`, bytes) on the filesystem holding the store |
-| Archive | none: the configuration has no `archive` table, so nothing retires |
+| Archive | off unless `SPARROW_TEST_ARCHIVE_DIR` names a directory (see below); without it the configuration has no `archive` table, the daemon runs no worker and nothing retires |
 
 A sender configures the ingest socket path and nothing else; it ingests with
 the repository's CLI or client, for example `sparrow
@@ -451,12 +451,48 @@ floor for the load before `setup`: a load that exceeds the budget is refused
 with `STORAGE_PRESSURE`, and free space below the floor pauses writes.
 Free space on the filesystem must cover the budget plus the floor.
 
+#### Archive on the scratch instance
+
+`SPARROW_TEST_ARCHIVE_DIR=DIR deploy/test-instance.sh setup` turns the archive
+worker on. It appends `[archive]` with `dir = "DIR"` and every other key at its
+default to the configuration, adds `DIR` to the unit's `ReadWritePaths`, and
+records `DIR` in `SCRATCH/archive-dir`. It refuses a `DIR` that is absent (the
+daemon never creates the directory), that the invoking user cannot write, or that
+is on the same device as the scratch tree, and says which. `DIR` must also be on
+its own mount: the daemon refuses a directory on the root filesystem's device or
+of the root filesystem's type
+([Archive-before-delete gate](../docs/interfaces.md#archive-before-delete-gate-schema-63)),
+and the scratch tree lives on the root btrfs. A tmpfs such as `/dev/shm` satisfies
+the rule on this host, so create `mkdir -m 0700 /dev/shm/NAME` first and pass it.
+The daemon writes `DIR/STORE_ID` and `DIR/<store_id>/` on its first pass, and only
+into an empty directory.
+
+There is no retention knob: the window is the constant 30 days. A test ages
+items early by size. Set `SPARROW_TEST_DISK_BUDGET` small and load past
+`start_fraction * (disk_budget - maintenance_reserve)`, where `start_fraction` is
+0.75 and the script's `maintenance_reserve` is 64 MiB; the budget must exceed the
+reserve. Everything is then due, oldest first, but a segment never extends past
+`now - max(10 minutes, buffered_flush_interval)`, so the worker archives an
+item only once it is that old. `status` reports the worker under
+`archive_worker` (`phase`, the watermark `through` and the last failure), and
+the size trigger's input as `pressure.linked_bytes`, which counts the whole
+store (the text index and projections too, many times an artifact's own bytes),
+so read it from `status` rather than from file sizes. A refused ingest still
+adds to it. Once the archive
+holds an item, `sparrow-archive list|extract|verify DIR` reads it offline; match
+the payload id that `payload STORE_ID PAYLOAD_ID` finds live
+([Finding a sent item](../docs/interfaces.md)). The item stays live until
+disk pressure retires it. A tmpfs holds the archive in memory, so size the
+load for it.
+
 `teardown` stops and removes the unit and keeps the store. Only the explicit
 step `deploy/test-instance.sh purge` removes the store, the intake and ingest
-directories and the staged files; it refuses while the unit exists or runs, and
+directories and the staged files, and the recorded archive directory's
+`STORE_ID` file and `<store_id>/` subtree (never the directory or anything else
+in it); it refuses while the unit exists or runs, and
 when `SCRATCH` holds no configuration written by this script (it checks the script's header line, which every version wrote). A scratch store created
 before instance roles existed has no role row, so the daemon refuses to start
 on it once the configuration sets `instance_role`; `setup` detects it from its
 older configuration and refuses with this remedy: run `purge`, then `setup` for
 a fresh store. [evidence/test-load.md](evidence/test-load.md) records a run: setup, one
-artifact ingested over the ingest socket, found by `values_search`, teardown and purge.
+artifact ingested over the ingest socket, found by `values_search`, teardown and purge. The same file records a run with the archive on tmpfs: the worker advances, the item is found live by `payload` and in `sparrow-archive list`, and `extract` returns its bytes.

@@ -89,3 +89,118 @@ stop.sh: sparrow-deploytest.service stopped through its drain (pid 2498234); soc
 `coredumpctl` lists no `sparrowd` core from the run. Not run: a production-unit rehearsal with
 the live filter on the live store (the live user unit has no filter), and an explicit `flush`
 request (the script's call lacked its arguments; the daemon's own buffered flush ran).
+
+# The archive worker on the scratch instance (issue 377)
+
+Run 2026-11-19 (UTC) from commit `235e1e4`, images from `make install-bin` and
+`sparrow-archive` from `cargo build --release -p sparrow-archive`, both at that commit. `SCRATCH` is
+`.stage/test-instance` in the canonical checkout; only the user unit `sparrow-deploytest.service`
+ran. The archive directory is `/dev/shm/sparrow-377-archive`, created first with
+`mkdir -m 0700`; `/dev/shm` is a tmpfs on device 29 while the scratch tree is on device 38 and `/`
+on device 41. Raw output is kept in the canonical checkout's `.stage/377-agent/`. Output is
+condensed.
+
+Refusals, before anything is written:
+
+```text
+$ SPARROW_TEST_ARCHIVE_DIR=/dev/shm/nonexistent-377 deploy/test-instance.sh setup SCRATCH
+test-instance.sh: the archive directory /dev/shm/nonexistent-377 does not exist; the daemon never creates it, so create it on its own mount first (for example mkdir -m 0700 /dev/shm/NAME)
+[exit 1]
+
+$ SPARROW_TEST_ARCHIVE_DIR=.stage/377-agent deploy/test-instance.sh setup SCRATCH   # absolute path
+test-instance.sh: the archive directory .../.stage/377-agent is on the same device as the scratch tree (.../.stage/test-instance): the daemon refuses an archive that is not on its own mount, and an archive beside the store is no separate copy. Use a directory on its own mount, such as one under /dev/shm
+[exit 1]
+```
+
+Stand-up with a small budget. `SPARROW_TEST_DISK_BUDGET=268435456` (256 MiB) and the script's
+64 MiB reserve make the size line `0.75 * (268435456 - 67108864) = 150994944` bytes:
+
+```text
+$ SPARROW_TEST_ARCHIVE_DIR=/dev/shm/sparrow-377-archive SPARROW_TEST_DISK_BUDGET=268435456 deploy/test-instance.sh setup SCRATCH
+$ tail -2 SCRATCH/root/etc/sparrow/server.toml
+[archive]
+dir = "/dev/shm/sparrow-377-archive"
+$ grep ReadWritePaths /run/user/1000/systemd/user/sparrow-deploytest.service
+ReadWritePaths=SCRATCH/data SCRATCH/ingest /dev/shm/sparrow-377-archive
+$ deploy/start.sh
+receipt: unit=sparrow-deploytest.service state=active pid=... NRestarts=0
+receipt: store_id=store:a1ef1ca6b5ccc2a84447f88b4baa2902 schema=71 pressure=ready ...
+$ CLI SCRATCH/data/store/rpc.sock status
+"archive_worker":{"phase":"idle","through":"","intent_in_flight":false,"failure":null}
+"pressure":{... "linked_bytes":"85980", ... "archive_configured":true, ...}
+```
+
+The unit's mount namespace shows `/dev/shm` as the host's tmpfs (device `0:29`) with
+`/dev/shm/sparrow-377-archive` bound read-write; `PrivateDevices=yes` and `ProtectSystem=strict`
+do not hide it, and the daemon's own-mount check accepted the directory.
+
+Load and the size trigger. One 2692449-byte JSONL artifact went in over the ingest socket and
+`linked_bytes` rose to 115934189; a second, 1.4 MB file was refused with `STORAGE_PRESSURE` and
+`linked_bytes` read 165898649, past the 150994944 line. The status read `idle` with `through` empty
+until the item was ten minutes old, because a segment never extends past
+`now - max(10 minutes, buffered_flush_interval)`:
+
+```text
+$ CLI SCRATCH/ingest/ingest.sock ingest req-377-1 deploytest-load jsonl load-1.jsonl
+{"store_id":"store:a1ef...","artifact_id":"artifact:207989c5038395bf1c8e2858b22ef774",
+ "received_at":"2026-11-19T06:17:46.964Z","byte_length":"2692449",
+ "payload_id":"blake3:0c69beb90b0d8c2597f5cae5fe802a0668113135111e7fb7fa48a732516571c5", ...}
+
+$ b3sum load-1.jsonl
+0c69beb90b0d8c2597f5cae5fe802a0668113135111e7fb7fa48a732516571c5  load-1.jsonl
+
+$ CLI SCRATCH/data/store/rpc.sock payload store:a1ef... blake3:0c69...71c5      # live, 06:18
+{"answer_certainty":"exact","artifact_ids":["artifact:207989c5038395bf1c8e2858b22ef774"], ...}
+
+$ ls /dev/shm/sparrow-377-archive                                                # 06:28:46
+STORE_ID
+store:a1ef1ca6b5ccc2a84447f88b4baa2902/
+
+$ CLI SCRATCH/data/store/rpc.sock status                                         # 06:29
+"archive_worker":{"phase":"idle","through":"00000001795069066964:record:ffb5f49e239c5a2a0321e26bd5977d15",
+                  "intent_in_flight":false,"failure":null}
+```
+
+`through` was empty before and names the segment's last record afterward, so the worker advanced
+`archive:through`. The same payload id is found in the archive offline, and the extracted bytes
+match:
+
+```text
+$ sparrow-archive list /dev/shm/sparrow-377-archive
+{"path":".../store:a1ef.../...gts","records":889,"artifacts":1,"blobs":889,"entries":[
+ {"id":"artifact:207989c5038395bf1c8e2858b22ef774","source":"deploytest-load",
+  "received_at":1795069066964,"byte_length":2692449,
+  "payload_id":"blake3:0c69beb90b0d8c2597f5cae5fe802a0668113135111e7fb7fa48a732516571c5"}]}
+[exit 0]
+$ sparrow-archive verify /dev/shm/sparrow-377-archive
+{"segments":1,"ok":1,"corrupt":0}
+$ sparrow-archive extract /dev/shm/sparrow-377-archive artifact:207989c5038395bf1c8e2858b22ef774 > extracted.jsonl
+$ b3sum extracted.jsonl
+0c69beb90b0d8c2597f5cae5fe802a0668113135111e7fb7fa48a732516571c5  extracted.jsonl
+$ cmp extracted.jsonl load-1.jsonl
+[exit 0]
+```
+
+The payload lookup still found the artifact live after the archive held it. Teardown and purge, with
+a file `keep.txt` placed in the archive directory first:
+
+```text
+$ deploy/stop.sh
+stop.sh: sparrow-deploytest.service stopped through its drain (pid ...); socket removed
+$ deploy/test-instance.sh teardown SCRATCH
+$ deploy/test-instance.sh purge SCRATCH
+test-instance.sh: archive subtree /dev/shm/sparrow-377-archive/store:a1ef... and /dev/shm/sparrow-377-archive/STORE_ID removed; /dev/shm/sparrow-377-archive kept
+test-instance.sh: scratch store, intake, ingest directory and staged files in SCRATCH removed
+$ ls -A /dev/shm/sparrow-377-archive
+keep.txt
+```
+
+Observed along the way. An earlier stand-up with a 128 MiB budget and three 8 MB files refused every
+ingest with `STORAGE_PRESSURE` ("write would cross the maintenance reserve"): the usable room is
+`disk_budget - maintenance_reserve`, and an 8 MB artifact of random base64 text needed 35 MB of
+linked bytes. The refusals left `linked_bytes` at 65513925 with no artifact stored and the worker
+`idle`, so there was nothing to archive; the run above used a larger budget. `linked_bytes` counts the
+whole store (the 2.7 MB artifact raised it by about 116 MB), so a test sizes its budget by reading
+`status`. A setup without `SPARROW_TEST_ARCHIVE_DIR` produced a configuration with no `archive` text,
+no `archive-dir` record and `ReadWritePaths=SCRATCH/data SCRATCH/ingest`, as before. Not run: a
+retirement of the archived item by disk pressure, and a segment cut into several files.
