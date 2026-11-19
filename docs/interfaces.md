@@ -68,8 +68,8 @@ source the producer names; the source is the item's lasting address in queries.
   budget less the reserve or free space is below the floor;
 - the inline ingest bound: one inline `ingest` carries at most 16 MiB
   (`Discovery.maxInlineArtifactBytes`) and a larger one is refused with
-  `INVALID_ARGUMENT`, which is not retryable. It applies to a single inline `ingest`, not to imports; a
-  larger input goes through the staged import;
+  `INVALID_ARGUMENT`, which is not retryable. It applies to a single inline
+  `ingest`, not to imports; a larger input goes through the staged import;
 - `max_records`, the records in one artifact;
 - `MAX_IMPORT_BYTES`, 8515420160 bytes (129935 chunks, about 7.93 GiB), a fixed
   bound on one `import_begin` until the v2 store format (#5). A larger input is
@@ -105,49 +105,57 @@ Right after an ingest the figure is higher because of the WAL: 2.7 MB of random
 case for `jsonl`. Every measured ingest used the CLI `ingest`, which always goes
 through the staged import; the inline path under 16 MiB is not measured.
 
-**Refused ingests.** Two `jsonl` ingests ended `RESOURCE_LIMIT`. A single
-100 MB random-text file (33,015 lines) ended after 935 s with "atomic source
-context update exceeds metadata admission". A 10 MB file of 58,945 log-like
-records ended after 635 s with "RDF write staging exceeds 64 MiB"; the store
-went from 138 MB to 817 MB, so the refusal added about 679 MB. Sent as
+**Refused ingests.** Two ingests of the sizing series ended `RESOURCE_LIMIT`. A
+single 100 MB random-text file (33,015 lines) ended after 935 s with "atomic
+source context update exceeds metadata admission". A 10 MB file of 58,945
+log-like records ended after 635 s with "RDF write staging exceeds 64 MiB"; the
+store went from 138 MB to 817 MB, so the refusal added about 679 MB. Sent as
 `opaque`, 100 MB of random bytes ingested in 9 s; no log sends the refused files
-as `opaque`. The smallest triggers measured are 32,769 records of `{"a":N}`
-(382 KB), refused after 125 s with the source-context message, and 60,000 such
+as `opaque`. The smallest triggers measured are 32,769 records of `{"a":N}` (382
+KB), refused after 125 s with the source-context message, and 60,000 such
 records (840 KB), refused after 204 s for RDF write staging.
 
 A refused file ingest leaves its prepared records. Preparation commits in
 checkpoints of at most 256 records or 256 KiB of source, each a synced write, so
-the 100 MB file with lines of about 3 KB commits about 85 records at a time. Both
-refusals come after every record is prepared, so all of the residue is
-preparation state. The client cancels on the failure, and reclaim then removes
-one prepared record per pass, at between 50 and 147 records per second in the
-logged idle windows. Reclaim is starved while an ingest runs: one 935 s refusal
+the 100 MB file with lines of about 3 KB commits about 85 records at a time.
+Both refusals come after every record is prepared, so all of the residue is
+preparation state. The CLI `ingest` cancels on the failure, and every measured
+ingest used it. A refused SDK `ingest` or `ingest_with_durability` above 16 MiB
+does not cancel: it keeps its prepared records and its journal slot until the
+2-day retry window ends. Reclaim removes one prepared record per pass, at
+between about 14 and 147 records per second in the logged idle windows, most of
+them 40 to 72. Reclaim is starved while an ingest runs: one 935 s refusal
 drained about 2,000 records. Space returns only after tombstone compaction.
 
 Repeated refusals can drive `physical_bytes` to `STORAGE_PRESSURE`. Five
-back-to-back refusals of 32,769 records took it to 152, 324, 535, 436 and
-642 MB. Refusals of two different 100 MB files took it from 713 MB to 2.54 GB, and
+back-to-back refusals of 32,769 records took it to 152, 324, 535, 436 and 642
+MB. Refusals of two different 100 MB files took it from 713 MB to 2.54 GB, and
 the next ingest answered `STORAGE_PRESSURE` at 3.13 GB against a 3.22 GB budget.
 The lockout is temporary. A one-record ingest succeeded at 3.15 GB, 13 s after
 the last sample that read pressure phase `requested`; a sample in the same
-second read `ready`. A 2.7 MB file was then refused `STORAGE_PRESSURE`, and native
-compaction later brought physical bytes from 3.45 GB to 2.55 GB. Not measured:
-the 16-journal limit (`MAX_IMPORTS`), where an unreclaimed refusal holds its slot
-(no log counts the journals held), the exact staging threshold, and reclaim to
-zero after the 60,000-record refusal. At about 0.9 GB per 100 MB refusal, the
-live status of 2026-11-17 (38.94 GB used of a 53.69 GB budget, about 14.7 GB of
-headroom) would reach the ceiling after about 15 refusals; that is an estimate,
-not a measurement. Issue #389 tracks the fault.
+second read `ready`. A 2.7 MB file was then refused `STORAGE_PRESSURE`, and
+native compaction later brought physical bytes from 3.45 GB to 2.55 GB. Not
+measured: the 16-journal limit (`MAX_IMPORTS`), where an unreclaimed refusal
+holds its slot (no log counts the journals held), the exact staging threshold,
+and reclaim to zero after the 60,000-record refusal. At about 0.9 GB per 100 MB
+refusal, the live status of 2026-11-17 (38.94 GB used of a 53.69 GB budget,
+about 14.7 GB of headroom) would reach the ceiling after about 16 refusals (14.7
+GB divided by 0.9 GB, before the reserve and the batch estimate); that is an
+estimate, not a measurement. Issue #389 tracks the fault.
 
-**Choosing the form.** An item sent `opaque` costs about its size and is found
-by payload id only (`payloadLookup`); there is no search by value. An item sent
-as `jsonl` is searchable by value (`values_search`, `records`) and costs about
-10 to 51 times its size. The measurements support this guidance and no more:
+**Choosing the form.** An item sent `opaque` costs at most about its size (0.21x
+for log text, 1.08x for random bytes) and is found by payload id only
+(`payloadLookup`); there is no search by value. An item sent as `jsonl` is
+searchable by value (`values_search`, `records`) and costs about 10 to 51 times
+its size. The measurements support this guidance and no more:
 
-- Send `jsonl` in bounded chunks of whole lines. Ten files of 10 MB with lines
-  of about 3 KB (100 MB; 112.7 MB with the two earlier files) ingested. A single 100 MB file and a 10 MB file
-  of tiny records did not. No safe chunk size is measured for small records, and
-  100 MB of log-like `jsonl` was not run.
+- Send `jsonl` in bounded chunks of whole lines, each of at most 32,768 records:
+  one publication holds at most that many distinct records, and a larger
+  artifact is refused with `RESOURCE_LIMIT` (the RDF staging message may come
+  first, as at 60,000 records). Ten files of 10 MB with lines of about 3 KB (100
+  MB; 112.7 MB with the two earlier files) ingested. A single 100 MB file and a
+  10 MB file of tiny records did not. No safe chunk size is measured for small
+  records, and 100 MB of log-like `jsonl` was not run.
 - Send large files, and any file whose records need no search by value, as
   `opaque`. A file between 16 MiB and the import bound goes through the staged
   import as one artifact with one payload id; a larger one is cut into parts.
