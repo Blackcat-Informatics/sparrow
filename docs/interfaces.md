@@ -68,7 +68,7 @@ source the producer names; the source is the item's lasting address in queries.
   budget less the reserve or free space is below the floor;
 - the inline ingest bound: one inline `ingest` carries at most 16 MiB
   (`Discovery.maxInlineArtifactBytes`) and a larger one is refused with
-  `RESOURCE_LIMIT`. It applies to a single inline `ingest`, not to imports; a
+  `INVALID_ARGUMENT`, which is not retryable. It applies to a single inline `ingest`, not to imports; a
   larger input goes through the staged import;
 - `max_records`, the records in one artifact;
 - `MAX_IMPORT_BYTES`, 8515420160 bytes (129935 chunks, about 7.93 GiB), a fixed
@@ -106,13 +106,34 @@ Right after an ingest the figure is higher because of the WAL: 2.7 MB of random
 case for `jsonl`.
 
 **Refused ingests.** Two `jsonl` ingests ended `RESOURCE_LIMIT`. A single
-100 MB random-text file ended after 452 s with "atomic source context update
-exceeds metadata admission". A 10 MB file of 58,945 log-like records ended after
-635 s with "RDF write staging exceeds 64 MiB" and left about 817 MB on disk. The
-same bytes sent as `opaque` ingested 100 MB in 9 s. A refused ingest can leave
-bytes counted against the budget, so one refusal can raise the pressure that
-refuses the next. How long that residue stays and whether a flush and compaction
-reclaim it are not measured; issue #389 is open on it.
+100 MB random-text file (33,015 lines) ended after 935 s with "atomic source
+context update exceeds metadata admission". A 10 MB file of 58,945 log-like
+records ended after 635 s with "RDF write staging exceeds 64 MiB" and left about
+817 MB on disk. The same bytes sent as `opaque` ingested 100 MB in 9 s. The
+smallest triggers measured are 32,769 records of `{"a":N}` (382 KB), refused
+after 125 s with the source-context message, and 60,000 such records (840 KB),
+refused after 204 s for RDF write staging.
+
+A refused file ingest leaves its prepared records. Preparation commits in
+batches of 256 records, each a synced write, and both refusals come after every
+record is prepared, so all of the residue is preparation state. The client
+cancels on the failure, and reclaim then removes one prepared record per pass at
+about 60 to 70 records per second when the store is idle. Reclaim is starved
+while an ingest runs: one 935 s refusal drained about 2,000 records. Space
+returns only after tombstone compaction.
+
+Repeated refusals can drive `physical_bytes` to `STORAGE_PRESSURE`. Five
+back-to-back refusals of 32,769 records took it to 152, 324, 535, 436 and
+642 MB. Three refusals of the 100 MB file took it from 713 MB to 2.54 GB, and the
+next ingest answered `STORAGE_PRESSURE` at 3.13 GB against a
+3.22 GB budget. The lockout is temporary: native compaction cut physical bytes
+from 3.45 GB to 2.55 GB in about 20 s, and a one-record ingest succeeded while
+the pressure phase was still `requested`, though a 2.7 MB file was refused
+`STORAGE_PRESSURE`. Not measured: the 16-journal limit (`MAX_IMPORTS`), where an
+unreclaimed refusal holds its slot (about 10 were reached), the exact staging
+threshold, and reclaim to zero after the 60,000-record refusal. On the live
+store, about 15 refusals of 100 MB would reach the ceiling; that is an estimate
+from the 14.7 GB headroom, not a measurement. Issue #389 tracks the fault.
 
 **Choosing the form.** An item sent `opaque` costs about its size and is found
 by payload id only (`payloadLookup`); there is no search by value. An item sent
