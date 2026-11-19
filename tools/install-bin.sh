@@ -10,6 +10,7 @@
 #   bin/sparrowd-schemaN-REV          the daemon
 #   bin/sparrow-schemaN-REV           the CLI
 #   bin/sparrow-recovery-schemaN-REV  the restored-store probe (deploy/RECOVERY.md)
+#   bin/sparrow-stamp-schemaN-REV     the offline instance-role stamp (docs/deployment.md)
 #   bin/lexicons-PURRDF_REV/          the five native CBOR lexicons, with provenance and licenses
 #
 # N is sparrow_client::SCHEMA_VERSION and REV the short commit. The tree must be clean, since
@@ -41,6 +42,7 @@ install -d -m 0755 bin
 keep target/release/sparrowd "bin/sparrowd-schema$schema-$rev"
 keep target/release/sparrow "bin/sparrow-schema$schema-$rev"
 keep target/release/examples/recovery "bin/sparrow-recovery-schema$schema-$rev"
+keep target/release/examples/stamp "bin/sparrow-stamp-schema$schema-$rev"
 
 # The registry crates exclude the lexicons, so tools/purrdf-lexicons.sh archives them from the PurRDF
 # repository at the revision that published the locked release (refusing when the registry, the lock

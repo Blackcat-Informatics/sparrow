@@ -1,8 +1,9 @@
 //! The instance role: one metadata row that fixes, at store creation, whether the store is the
 //! live one or a scratch one. A store with no row has no role and behaves as it always has.
 
-use super::Error;
-use rocksdb::DB;
+use super::{Error, open_files, table_options, writer_format};
+use rocksdb::{DB, WriteOptions};
+use std::path::Path;
 
 /// Metadata key holding the role as its configuration word.
 pub(crate) const KEY: &str = "instance_role";
@@ -84,4 +85,78 @@ pub(crate) fn resolve(
         )),
         (stored, _) => Ok(stored),
     }
+}
+
+/// Stamp a stopped store that has no role row with `role` and return its store id. The store is
+/// opened exclusively without `Store::open`, which would run format upgrades, fences and
+/// migrations, create a missing store; this opens the existing families only and
+/// writes the one row with a synced write. A running daemon holds the lock and refuses the open
+/// (`CONFLICT`); a store that has a role row (`CONFLICT`, naming it), a format this build does
+/// not know (`UNSUPPORTED`) and a directory that is not a Sparrow store (`INVALID_ARGUMENT`)
+/// are refused unchanged.
+pub fn stamp(data_dir: impl AsRef<Path>, role: InstanceRole) -> Result<String, Error> {
+    let path = data_dir.as_ref();
+    if !path.join("CURRENT").is_file() {
+        return Err(not_a_store(path, "it holds no RocksDB database"));
+    }
+    let open_files = open_files::OpenFiles::from_process()?;
+    let mut options = table_options::database(open_files.max_open_files)?;
+    options.create_if_missing(false);
+    options.create_missing_column_families(false);
+    let db = DB::open_cf_descriptors(&options, path, table_options::descriptors()).map_err(
+        |error| {
+            let cause = error.to_string();
+            if cause.contains("lock file") || cause.contains("lock hold") {
+                Error::new(
+                    "CONFLICT",
+                    format!(
+                        "{} is open in another process, probably the running daemon; stop it before stamping ({cause})",
+                        path.display()
+                    ),
+                )
+            } else {
+                Error::new(
+                    "STORAGE_FAILURE",
+                    format!("cannot open {} to stamp it: {cause}", path.display()),
+                )
+            }
+        },
+    )?;
+    let Some(format) = writer_format::read(&db)? else {
+        return Err(not_a_store(path, "it has no store format row"));
+    };
+    if !super::is_known_format(&format) {
+        return Err(Error::new(
+            "UNSUPPORTED",
+            format!(
+                "{} is at store format {:?}, which this build does not know; stamp it with the build that opens it",
+                path.display(),
+                String::from_utf8_lossy(&format)
+            ),
+        ));
+    }
+    let id = db
+        .get("store_id")?
+        .ok_or_else(|| not_a_store(path, "it has no store identity"))?;
+    let id = String::from_utf8(id).map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
+    if let Some(have) = stored(&db)? {
+        return Err(Error::new(
+            "CONFLICT",
+            format!(
+                "store {id} already has instance role \"{}\"; a stored role never changes",
+                have.as_str()
+            ),
+        ));
+    }
+    let mut write = WriteOptions::default();
+    write.set_sync(true);
+    db.put_opt(KEY, role.as_str(), &write)?;
+    Ok(id)
+}
+
+fn not_a_store(path: &Path, why: &str) -> Error {
+    Error::new(
+        "INVALID_ARGUMENT",
+        format!("{} is not a Sparrow store: {why}", path.display()),
+    )
 }

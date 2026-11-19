@@ -26071,3 +26071,69 @@ fn the_instance_role_is_fixed_at_creation_and_checked_at_every_open() {
         None
     );
 }
+
+/// Every row of the default family, for comparing a closed store before and after an offline act.
+fn default_rows(path: &std::path::Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let db = catalog_db(path).unwrap();
+    db.iterator(rocksdb::IteratorMode::Start)
+        .map(|row| {
+            let (key, value) = row.unwrap();
+            (key.to_vec(), value.to_vec())
+        })
+        .collect()
+}
+
+/// Value (#384): the offline stamp writes the one role row into a stopped store that has none.
+/// Protects: the stamp returns the store id; the store then opens with the matching configured
+/// role and reports it; the only change to the store is the one `instance_role` row (the format
+/// and every other row are as they were); a second stamp is refused naming the stored role and
+/// leaves the row alone; and a store held open, standing in for the running daemon, is refused.
+#[test]
+fn the_offline_stamp_writes_one_role_row_and_refuses_a_stamped_or_open_store() {
+    use sparrow_core::InstanceRole;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let id = store.store_id().unwrap();
+    assert_eq!(store.instance_role(), None);
+
+    let held = sparrow_core::stamp(dir.path(), InstanceRole::Scratch).unwrap_err();
+    assert_eq!(held.code, "CONFLICT", "{held}");
+    drop(store);
+
+    let before = default_rows(dir.path());
+    assert_eq!(
+        sparrow_core::stamp(dir.path(), InstanceRole::Scratch).unwrap(),
+        id
+    );
+    let mut expected = before;
+    expected.push((b"instance_role".to_vec(), b"scratch".to_vec()));
+    expected.sort();
+    assert_eq!(default_rows(dir.path()), expected);
+
+    let reopened = Store::open(
+        dir.path(),
+        Config {
+            instance_role: Some(InstanceRole::Scratch),
+            ..config()
+        },
+    )
+    .unwrap();
+    assert_eq!(reopened.instance_role(), Some(InstanceRole::Scratch));
+    assert_eq!(reopened.store_id().unwrap(), id);
+    drop(reopened);
+
+    let refused = sparrow_core::stamp(dir.path(), InstanceRole::Production).unwrap_err();
+    assert_eq!(refused.code, "CONFLICT", "{refused}");
+    assert!(refused.to_string().contains("\"scratch\""), "{refused}");
+    assert_eq!(default_rows(dir.path()), expected);
+}
+
+/// Value (#384): the offline stamp never creates a store. Protects: an empty directory is
+/// refused as not a Sparrow store and is left empty.
+#[test]
+fn the_offline_stamp_refuses_a_directory_that_is_not_a_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let refused = sparrow_core::stamp(dir.path(), sparrow_core::InstanceRole::Scratch).unwrap_err();
+    assert_eq!(refused.code, "INVALID_ARGUMENT", "{refused}");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}

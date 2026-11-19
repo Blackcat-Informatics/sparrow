@@ -67,7 +67,7 @@ pub use storage::ingest_status::{
     IngestDeletion, IngestIndexCounts, IngestReadLimits, IngestSelector, IngestStatus, PartReceipt,
     PartReceiptState,
 };
-pub use storage::instance_role::InstanceRole;
+pub use storage::instance_role::{InstanceRole, stamp};
 pub use storage::intake::{INGEST_SOCKET, Intake, PeerCredential, admit_import};
 pub use storage::listing_build::BuildProgress;
 pub use storage::log_time::LogTimeCapture;

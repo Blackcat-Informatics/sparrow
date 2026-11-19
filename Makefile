@@ -27,7 +27,7 @@ build-runtime: tools-check
 # (tools/install-bin.sh); deploy/install.sh installs from there.
 install-bin: tools-check
 	@git diff --quiet HEAD -- || { echo "error: commit first; ./bin names images for HEAD"; exit 1; }
-	cargo build --locked --release -p sparrow-server --bins --example recovery
+	cargo build --locked --release -p sparrow-server --bins --example recovery --example stamp
 	tools/install-bin.sh
 
 # Every exclusion in .config/wt.toml names something this host keeps (tools/seed-excludes-check.sh).
