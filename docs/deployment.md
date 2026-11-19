@@ -828,42 +828,67 @@ Check what the window needs.
 
 Give the notice (below) and wait for the go.
 
-#### Before the stop: the stop timeout and the quiesce
+#### Before the stop: the stop timeout, the quiesce and the watch
 
-Two acts precede the script, in this order. Neither stops the daemon or touches the store.
+Three acts precede or accompany the script's stop, in this order.
 
-1. Raise the unit's stop timeout for the window. The live user unit sets `TimeoutStopSec=120` and
-   `KillSignal=SIGINT`; a stop that outlasts it ends in SIGKILL. A stop of the new image after
-   ingest outlasted 120 s at scratch scale ("What the measurement covers", below). The proposed value for the
-   live store of about 39 GB is `TimeoutStopSec=2400`. Its basis, all arithmetic: the longest
-   per-byte stop measured is 234.4 s on a store of 4.33 GB on disk before the ingest (log
-   `35-stop-new.log`; `31-lift-measure.log` for the size), which is 54.1 s per GB; times 39 GB is
-   2,111 s; 2,400 s adds about 14 percent. The shortest per-byte stop measured, 18.5 s on a store of
-   1.57 GB (`143-C-bigOld-stop-timed.log`, `113-C-copies.log`), gives 461 s at 39 GB by the same
-   arithmetic. The assumption that the stop grows in proportion to the store is not measured; the
-   measurements also fit a stop driven by the ingest backlog rather than the store's size. A longer
-   timeout costs nothing when the stop is quick, because the unit is stopped when the daemon exits;
-   a shorter one risks SIGKILL. The user unit is not in the repository (Sparrow issue 386), and the
-   script refuses any drop-in under `~/.config/systemd/user/sparrow.service.d` but its own
-   `limits.conf`, so the value goes in a runtime drop-in, outside that directory, which a logout
-   or reboot removes:
+1. Install a runtime drop-in that raises the unit's stop timeout for the window. The first stop of
+   Switch 1 is the stop of the installed old image, `sparrowd-schema71-fda2812`, under the live
+   user unit's `TimeoutStopSec=120` and `KillSignal=SIGINT`. A stop that outlasts the timeout ends
+   in SIGKILL. The fix for the stop (#394, below) cannot reach that first stop, because it is in
+   the new image. The old image under the unit's limits stopped in 98.8 s, 82 percent of 120 s,
+   on a store of 4.76 GB status `physical_bytes` at `/332` after six artifacts of 5,000 records
+   (`220-E-diag-old.log`; no kill). The new image under the same limits stopped in 50.5 s, 25.6 s
+   and 13.1 s on a base of 3.46 GB (`210-D-diag-new.log`, `212-D-diag-new2.log`,
+   `213-D-diag-quiesce.log`; the 13.1 s run waited first for the compaction threads to go idle).
+
+   The proposed value is `TimeoutStopSec=1800`. Basis, all arithmetic: 98.8 s at 4.76 GB scales by
+   the live status `physical_bytes` of 38.98 GB (the reading before the window; read it again
+   from `before.json`) to 98.8 / 4.76 x 38.98 = 809 s, and 1800 s is 2.2 times that. The scaling
+   assumes the stop follows the store's size, which the measurements neither prove nor refute: the
+   stops at 1.57 GB, 3.46 GB, 4.33 GB and 4.76 GB do not order by store size alone (the figures are
+   under "What the measurement covers"). A longer timeout costs nothing when the stop is quick,
+   because the unit is stopped when the daemon exits.
+
+   The user unit is not in the repository (Sparrow issue 386). The script refuses any drop-in
+   under `~/.config/systemd/user/sparrow.service.d` but its own `limits.conf` (it reads only that
+   directory), so the timeout goes in the runtime directory, which the script does not read and a
+   reboot removes:
 
    ```bash
    RT=${XDG_RUNTIME_DIR:?}/systemd/user/sparrow.service.d
    mkdir -p -- "$RT"
-   printf '[Service]\nTimeoutStopSec=2400\n' > "$RT/timeout.conf"
+   printf '[Service]\nTimeoutStopSec=1800\n' > "$RT/timeout.conf"
    systemctl --user daemon-reload
-   systemctl --user show -p TimeoutStopUSec --value sparrow.service     # 40min
+   systemctl --user show -p TimeoutStopUSec --value sparrow.service     # 30min
    ```
 
-   The daemon keeps running through the reload. If the last command prints `2min`, another
-   setting overrides the drop-in: do not start the window. This route has not been run. A stop
-   that has to end early is ended on purpose with `systemctl --user kill -s SIGKILL
-   sparrow.service`, with the consequences under "A stop that ends in SIGKILL". The drop-in stays
-   until the unit file carries the value (#386), and then its one path is removed.
-2. Quiesce. Read `status` until `pressure.pending_flushes` and `pressure.pending_compactions` are
-   both 0 and `durability.pending_writes` is 0 on three consecutive reads, ten seconds apart,
-   within a bound of 10 minutes:
+   The daemon keeps running through the reload. If the last command prints `2min`, another setting
+   overrides the drop-in: do not start the window. `systemctl --user set-property --runtime ...
+   TimeoutStopSec=N` is refused (`Cannot set property TimeoutStopUSec, or unknown property`,
+   `230-E-runtime-timeout.log`). The drop-in took effect both before a stop and 3 s into a stop
+   in progress (`231-E-runtime-dropin.log`), on a scratch user unit running a stand-in process,
+   not the daemon. This route has not been run on the real daemon or its unit.
+
+   Remove the drop-in when the switch is complete: the script exited 0 and the checks after the
+   window passed. The reload that the script runs after its stop does not touch the runtime
+   drop-in, and a logout or reboot removes it earlier, which returns the stop to the unit's 120 s.
+   The way back stops the new image under the same timeout, so write the same file again before
+   that stop. Remove it as one command on one exact path, typed in full after listing it:
+
+   ```bash
+   ls -l "$XDG_RUNTIME_DIR/systemd/user/sparrow.service.d/timeout.conf"
+   ```
+
+   ```bash
+   rm -- "$XDG_RUNTIME_DIR/systemd/user/sparrow.service.d/timeout.conf"
+   ```
+
+   then `systemctl --user daemon-reload`.
+
+2. Quiesce, as a precondition check. Read `status` until `pressure.pending_flushes` and
+   `pressure.pending_compactions` are both 0 and `durability.pending_writes` is 0 on three
+   consecutive reads, ten seconds apart, within a bound of 10 minutes:
 
    ```bash
    ~/.local/bin/sparrow "$SOCK" status | python3 -I -c 'import json,sys
@@ -873,34 +898,69 @@ Two acts precede the script, in this order. Neither stops the daemon or touches 
 
    The bound is a proposal: 10 minutes is 300 flush intervals of the 2,000 ms
    `buffered_flush_interval_ms` (arithmetic), long enough for the daemon's own buffered work and
-   short enough to hold a window. At scratch scale every read after an ingest was already 0
-   (`33-post-ingest-status.log`, `102-C-new-pre-stop-status.log`, `122-C-bigNew-status.log`,
-   `152-C-kill-pre-status.log`); no wait was needed. The counters read above 0 under a pressure
-   phase of `requested` (`pend_comp=3`, logs `52-A-ingest.log` to `59-A-ingest3.log`), so a nonzero
-   reading is real.
+   short enough to hold a window. The quiesce does not shorten the stop. The counters read 0 before
+   every stop that had a status read, including the stops of 50.5 s and 98.8 s
+   (`210-D-diag-new.log`, `220-E-diag-old.log`, `33-post-ingest-status.log`,
+   `122-C-bigNew-status.log`); a zero reading did not predict a short stop. The counters read above 0 under a pressure phase of `requested` (`pend_comp=3`,
+   `52-A-ingest.log` to `59-A-ingest3.log`), so a nonzero reading is real. If the bound passes
+   with a counter above 0, do not stop the daemon under that load: wait, read `pressure.phase` and
+   the journal, and report the figures to the coordination session. Stopping anyway, which
+   accepts a longer stop and the SIGKILL risk below, is the coordination session's decision.
 
-   What the quiesce does not do. The same counters read 0 before the 234.4 s stop
-   (`33-post-ingest-status.log`, read 25 s before the stop began) and before the 61.4 s stop
-   (`122-C-bigNew-status.log`), so a zero reading did not predict a short stop, and no measurement
-   shows that the quiesce shortens one. The `TimeoutStopSec` above is the protection against
-   SIGKILL, not the quiesce. If the bound passes with a counter above 0, do not stop the daemon
-   under that load. Wait, read `pressure.phase` and the journal, and report the figures to the
-   coordination session. Stopping anyway, which accepts the longer stop and the SIGKILL risk
-   below, is the coordination session's decision.
+3. Watch the stop, and wait it out. The cause of a long stop, at thread level: the daemon's own
+   shutdown steps (worker joins, admission drain and `store.flush`) end at the journal line
+   `sparrowd: closed store=` 0.5 to 1.2 s after SIGINT in every run of the series (`210`, `212`,
+   `213`, `220`); the process then lives on for 12 to 233 s in store teardown. In the 50.5 s run
+   the three `rocksdb:low` (compaction) threads ran, used about 30 CPU-seconds, and the cgroup
+   wrote 343 MB in 44 s, the last thread leaving at +44 s (`211-D-diag-derived.log`). In the
+   13.1 s run nothing was computing: threads were in IO wait at `IOWeight=20` (`213-D-diag-quiesce.log`).
+   The exact RocksDB call is inferred: every stack sampler is refused without root (`ptrace`
+   fails under `ptrace_scope=1`, the daemon has no symbols, and `/proc/PID/task/TID/stack` does
+   not exist). The 234 s stop of an earlier run did not reproduce and is unexplained.
 
-A stop that ends in SIGKILL. The daemon's own shutdown steps (worker joins, admission drain and
-the final flush) finished in 0.2 to 1 s after SIGINT in every measured stop, including the longest,
-and the rest was process exit and store teardown, during which the storage engine's low-priority
-compaction threads ran (`133-C-bigNew-d-stop-timed.log`). After a SIGKILL of the new image, three
-acknowledged ingests (15,000 records) on a store of 1.57 GB at `/387`, the next open took 2,058 ms
-in the storage engine, against 14 to 36 ms for the clean opens of the stores of that series
-(`154-C-kill-daemon2.log`; clean opens in logs `100`, `120`, `125` and `128`), and read 165,000 live records, the 150,000 of the base
-and all 15,000 acknowledged (`155-C-kill-post-status.log`). Not measured: a SIGKILL during an
-in-flight ingest, a SIGKILL of the old image, and a kept copy taken from a store left by SIGKILL.
-The script goes on after a stop that ended in SIGKILL (it checks only that the unit has settled and
-no `sparrowd` remains; this is read from the script, not run). The script's log stamps the lines
-`stop sparrow.service` and `daemon stopped`; a gap equal to `TimeoutStopSec` means SIGKILL ended
-the stop.
+   While the script waits in `stop sparrow.service`, read these from a second shell, none of which
+   needs root. A long stop is waited out, never ended by hand.
+   - `journalctl --user -u sparrow.service -g 'closed store='` shows the line within about a second
+     of SIGINT. From then on the process is in teardown.
+   - `systemctl --user status sparrow.service` shows `deactivating (stop-sigterm)` while the stop
+     runs.
+   - The cgroup's written bytes advance while compaction runs:
+
+     ```bash
+     CG=/sys/fs/cgroup$(systemctl --user show sparrow.service -p ControlGroup --value)
+     grep wbytes "$CG/io.stat"
+     ```
+
+   - The compaction threads' CPU time advances while they compute:
+     `ps -L -o tid,comm,stat,time -p "$(systemctl --user show sparrow.service -p MainPID --value)"`
+     lists the `rocksdb:low` threads, `R` when running and `D` in IO wait.
+
+   Judge a stop stuck only if neither the cgroup's written bytes nor the `rocksdb:low` threads'
+   CPU time advance for 10 consecutive minutes. That bound is a proposal. In the logs the longest
+   interval without an advance of the cgroup's written bytes is one sample interval of 10.7 s
+   (`220-E-diag-old.log`, +33.3 s to +44.0 s), so 10 minutes is 56 times it (arithmetic: 600
+   over 10.7). A stuck stop is still not ended by hand before the unit's timeout. Report it to
+   the coordination session and wait. At `TimeoutStopSec` systemd sends SIGKILL, and the way back
+   stands, because the script takes the kept copy only after the stop.
+
+   What a kill leaves. The live store is left as a SIGKILL leaves it. Measured on a store of 1.57 GB
+   at `/387` after three acknowledged ingests (15,000 records): the next open took 2,058 ms in the
+   storage engine, against 14 to 36 ms for the clean opens of that series, and read 165,000 live
+   records, the 150,000 of the base and all 15,000 acknowledged (`154-C-kill-daemon2.log`,
+   `155-C-kill-post-status.log`). This is not measured at live size. Not measured: a SIGKILL during
+   an in-flight ingest, a SIGKILL of the old image, and a kept copy taken from a store a SIGKILL
+   left. The script's own checks decide whether it continues: it requires the unit to have settled and
+   no `sparrowd` process to remain, and `keep_store_copy` refuses an open store (read from
+   `deploy/user-unit-upgrade.sh` and `deploy/lib.sh`, not run). The script's log stamps the lines
+   `stop sparrow.service` and `daemon stopped`; a gap equal to `TimeoutStopSec` means SIGKILL ended
+   the stop.
+
+The stop of the new image after #394. Issue #394 is open. The proposed fix cancels background
+work after the shutdown flush (`Store::cancel_background_work()` called after `store.flush()`
+succeeds); it is not built and not on `main`, and no stop time with it is measured. The fix is to
+be measured with and without it on a store with a compaction backlog, with a check that every
+acknowledged record is present after a stop that cancelled a compaction. Until it exists, the
+stop of the new image has the times above.
 
 #### The window
 
@@ -973,9 +1033,8 @@ the script has one the rehearsal cannot gate the live open.
    ```
 
    `text_lexicon_dir` must equal the live one, so the analyzer is the live analyzer. The
-   `--no-intake` mode is not what the scratch measurement ran (it ran the full configuration with
-   an ingest socket on a store with no watches); it is read from `docs/interfaces.md` and the
-   daemon's option check, and has not been run by this procedure.
+   mode was measured on a scratch store ("What the measurement covers", the `--no-intake`
+   paragraph); it was not run on a lifted copy of the live store.
 
 3. Open. Start the new image on the copy in a scratch scope with the live unit's limits, never the
    live unit and never the live socket. The descriptor limit is raised in the scope's shell, as the
@@ -1093,9 +1152,12 @@ only during expiry or eviction; with no `[archive]` it never retires (`retire_wi
 false in `sparrow-server/src/config.rs`), and with `[archive]` the format is the `/341` to `/351`
 family. An image from before that gate with a tiny budget reached `phase=requested` with no pass
 and no eviction (logs `50` to `59`), and then wedged ingest. The lift keeps the family index (read
-from the code, not run from `/340`), so `/340` lifts to `/395`. No test of the `/340` identity is
-on `main` at this revision; the gap is covered only by the rehearsal on the live store's own copy,
-and the refusal text on a lifted `/340` store is not yet observed.
+from the code, not run from `/340`), so `/340` lifts to `/395`. The core test
+`a_340_intake_manifest_store_is_lifted_to_395_at_open_and_stays_there` (#398) proves that a
+`/340` intake-manifest store, built synthetically from the legacy fixture, is lifted to `/395` at
+open and stays there. It does not prove what the live store holds: no older writer is in the tree,
+and what retirement left in the live store cannot be built. The rehearsal on the live store's own
+copy covers that, and the refusal text on a lifted `/340` store is not yet observed.
 
 Lift at a store of 4.32 GB on disk, 101 artifacts, 392,095 live records, `/332` to `/387`
 (`21-pre-lift-old-status.log`, `31-lift-measure.log`):
@@ -1161,11 +1223,34 @@ after the same ingest, 6 artifacts of 5,000 records:
 - No new ingest: 0.015 to 0.025 s on the 8,160-artifact store (`76`, `85`, `92`), 1.85 s and 3.47 s
   on the 4.32 GB store (`38`, `47`).
 
-The slow stop is not particular to the new image: the old image took 18.5 s after the same ingest.
-The pending counters read 0 before the slow stops that had a status read (see "Before the stop"). During a 25 s stop the
-storage engine's low-priority compaction threads ran and the process wrote about 351 MB in 18 s
-(`133-C-bigNew-d-stop-timed.log`, `write_bytes` 7,523,508,224 at 2 s and 7,874,908,160 at 20 s).
-That the teardown waits on compaction is an inference: no stacks were taken.
+Stop time on a 3.46 GB base (186,285 records, `/332`) after six artifacts of 5,000 records, SIGINT
+with a 600 s deadline, under the limits. The new image, lifted to `/387` by the run, status
+`physical_bytes` 5.11 GB at the SIGINT: 50.5 s (`210-D-diag-new.log`) and 25.6 s
+(`212-D-diag-new2.log`); 13.1 s after waiting for the compaction threads to go idle
+(`213-D-diag-quiesce.log`). The old image at `/332`, status `physical_bytes` 4.76 GB: 98.8 s, no
+kill (`220-E-diag-old.log`). In every run the `closed store` journal line came 0.5 to 1.2 s after
+SIGINT; the rest was teardown. The slow stop is not particular to the new image. In the 50.5 s run
+the compaction threads ran (about 30 CPU-seconds, 343 MB written in 44 s;
+`211-D-diag-derived.log`); in the 13.1 s run threads were in IO wait. The exact call is inferred
+(no stack sampler works without root), and the 234.4 s stop above did not reproduce. At the older
+1.57 GB series the process wrote about 351 MB in 18 s during a 25 s stop (`133-C-bigNew-d-stop-timed.log`,
+`write_bytes` 7,523,508,224 at 2 s and 7,874,908,160 at 20 s).
+
+The stop does not order by store size across these runs: 61.4 s and 25.0 s at 1.57 GB, 13.1 s to 50.5 s
+at 3.46 GB, 98.8 s at 4.76 GB with the old image, 234.4 s at 4.33 GB. The `TimeoutStopSec` above
+scales one of them by size and is arithmetic.
+
+`--no-intake`, on a scratch store at `/387` (`300-F-setup.log` to `311-F-control-stop.log`). A store
+with one consume watch, bootstrapped from a `[[consume]]` block into the catalog, and three files
+waiting in the watched root was reflink-copied twice. The copy opened with `sparrowd --no-intake`
+and a configuration that sets neither `consume` nor `ingest_socket_path` (a `--no-intake`
+configuration may not set them) logged `intake=false`; after it ran, the three files were present
+with identical sha256 sums (`304-F-root-before.log`, `307-F-nointake-after.log`), `status` and a
+payload lookup answered (exact, one artifact), the watch read `reconciling`, and the stop took
+1.25 s (`308-F-nointake-stop.log`). The control copy without the flag consumed and deleted all three
+files (`candidates=3`) and `live_records` went from 200 to 320 (`310-F-control-after.log`; stop
+0.31 s). Limits: a scratch store with 200 records at `/387`, not a lifted copy of the live store, one
+watch and three files.
 
 Pending-compaction observation. `pressure.pending_flushes` and `pressure.pending_compactions` read 0
 before the stops that had a status read (`33-post-ingest-status.log`, `102-C-new-pre-stop-status.log`,
