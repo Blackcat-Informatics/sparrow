@@ -122,10 +122,12 @@ SYSTEMCTL
 # run W [env...]: runs the script in world W with the given extra env and the script arguments
 # in extra; sets rc and out.
 extra=()
+# wrap: a command prefix for the script's process (empty by default).
+wrap=()
 run() {
     local w=$1; shift
     set +e
-    out=$(env -i PATH="$w/stubs:/usr/bin:/bin" HOME="$w/home" STATE="$w/state" \
+    out=$("${wrap[@]}" env -i PATH="$w/stubs:/usr/bin:/bin" HOME="$w/home" STATE="$w/state" \
         SPARROW_BIN="$w/kept" \
         "$@" "$script" --from sparrowd-schema68-aaa --to sparrowd-schema71-bbb "${extra[@]}" 2>&1)
     rc=$?
@@ -319,13 +321,26 @@ echo "ok   hangup during the abort: restore completed and recorded"
 # 13. The "no sparrowd process remains" check fails closed (issue #410): a ps that errors stops the
 #     script before the store copy (the daemon's state is unknown), a listed sparrowd still stops it
 #     with the listing, and a list of other processes passes.
-for mode in fail daemon bigdaemon other; do
+# "bigdaemon-notmp" runs the big list in a mount namespace whose /tmp and /var/tmp are 4 KiB tmpfs
+# mounts and TMPDIR is unset, so a here-string over the pipe capacity cannot write bash's temp file
+# (it would print "cannot create temp file" and read as no match); the match must do no I/O. The
+# script refuses root, so the wrapper maps the operator's uid back in a nested user namespace.
+for mode in fail daemon bigdaemon bigdaemon-notmp other; do
     w=$(world "ps-$mode")
+    wrap=()
+    if [[ $mode == *-notmp ]]; then
+        printf '%s\n' '#!/bin/sh' 'mount -t tmpfs -o size=4k tmpfs /tmp && mount -t tmpfs -o size=4k tmpfs /var/tmp || exit 99' \
+            "exec unshare -U --map-user=$(id -u) \"\$@\"" >"$w/notmp.sh"
+        chmod +x "$w/notmp.sh"
+        unshare -rm true || fail "ps $mode: unshare -rm (user and mount namespaces) is unavailable on this host"
+        wrap=(unshare -rm "$w/notmp.sh")
+    fi
     chattr +C -- "$w/store"
     touch "$w/state/sparrow-ship.timer.active"
     extra=(--keep-copy "$w/store.before")
-    run "$w" STUB_PS=$mode
+    run "$w" STUB_PS=${mode%-notmp}
     extra=()
+    wrap=()
     case $mode in
         other) ((rc == 0)) || { echo "$out" >&2; fail "ps listing other processes exited $rc"; } ;;
         *)
@@ -338,7 +353,7 @@ for mode in fail daemon bigdaemon other; do
     esac
     case $mode in
         fail) grep -q 'whether a sparrowd still runs is unknown' <<<"$out" || fail "ps fail: no unknown-state message: $out" ;;
-        daemon | bigdaemon)
+        daemon | bigdaemon | bigdaemon-notmp)
             grep -q 'a sparrowd process remains' <<<"$out" || fail "ps daemon: no refusal message: $out"
             grep -q '300 sparrowd' <<<"$out" || fail "ps daemon: no listing: $out" ;;
     esac

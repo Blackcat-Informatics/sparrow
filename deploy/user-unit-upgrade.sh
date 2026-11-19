@@ -354,9 +354,10 @@ settled sparrow.service || die "sparrow.service has not settled"
 # prefix match (the kernel cuts comm to 15 characters; the unit runs the link named sparrowd).
 procs=$(ps -e -o comm=) \
     || die "cannot list processes (ps failed), so whether a sparrowd still runs is unknown; sparrow.service was stopped and the store is untouched: read 'systemctl --user is-active sparrow.service' and 'ps -e -o comm=' by hand, then follow the recovery note in deploy/user-unit-upgrade.sh --help"
-# A here-string, not a pipe: under pipefail grep -q's early exit would kill the writer with SIGPIPE
-# and a listed sparrowd would read as no match.
-if grep -q '^sparrowd' <<<"$procs"; then
+# A glob over the list, with no pipe and no here-string: under pipefail grep -q's early exit kills
+# the writer with SIGPIPE, and a here-string over 64 KiB needs a temp file that bash may not be able
+# to write; either reads a listed sparrowd as no match. The match is a line start (^sparrowd).
+if [[ $'\n'$procs == *$'\n'sparrowd* ]]; then
     ps -e -o pid=,comm=,args= | awk '$2 ~ /^sparrowd/' >&2 || true
     die "a sparrowd process remains"
 fi
