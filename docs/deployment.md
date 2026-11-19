@@ -889,9 +889,11 @@ Check what the window needs.
 
   The loop prints a line for each unit that does not pass, and the last line exits 0 only when all
   three pass. It covers those three names. A `sparrowd` started outside them does not show there:
-  read `ps -e -ww -o pid,user,comm,args` and expect one `sparrowd` line, the live daemon, whose pid is
-  `MainPID` of `sparrow.service`. The listing is read by the operator; the script's own check after
-  the stop is the one that fails closed on a process.
+  read `ps -e -ww -o pid,user,comm,args` and expect exactly one `sparrowd` line, the live daemon, whose pid
+  equals `MainPID` of `sparrow.service`. A `failed` unit can keep a process that survived systemd's final
+  SIGKILL, in practice one stuck in uninterruptible I/O, such as a call blocked on the hard NFS mount, and
+  the `failed` state passes the gate above; this listing catches it. The listing is read by the operator;
+  the script's own check after the stop is the one that fails closed on a process.
 - The recorded `text_analyzer` and `rdf_profile` stay the same after the switch. The new image
   reads the lexicon bundle that `text_lexicon_dir` names; the PurRDF revision in
   `registry/compatibility.toml` is unchanged since `fda2812`, so the bundle built with the image
@@ -1920,7 +1922,9 @@ worker tries again after `check_secs`. A call that hangs instead of failing bloc
 thread inside the system call: the watchdog journals `sparrowd: archive stalled step=...` every
 `stall_warn_secs`, and a step that ran `io_timeout_secs` marks the pass as overrun, which is checked only after the
 write and the read-back succeed (`archive_segment`). A slow call that returns an error fails the pass as `ARCHIVE_IO`, and a later
-failing step fails with its own code (`ARCHIVE_IO` or `ARCHIVE_VERIFY`); `ARCHIVE_OVERRAN` is the result only
+failing step fails with its own code (for example `ARCHIVE_IO`, `ARCHIVE_VERIFY`, `ARCHIVE_NOT_ON_MOUNT` or
+`ARCHIVE_ROOT`: after a slow step that succeeds, the mount and root checks that follow can fail too; these are
+examples, not a complete list); `ARCHIVE_OVERRAN` is the result only
 when every step succeeded. The segment is not committed in any of these cases. The daemon keeps serving in each case. A segment file
 that a failed pass left in `<store_id>/` is kept and read back on the next pass, never overwritten
 (`write_segment`); one that differs from what the worker prepared fails as
