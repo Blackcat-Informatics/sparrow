@@ -883,6 +883,7 @@ async fn continue_draft(
     }
     crate::imports::cancel(
         &client.endpoint,
+        client.expectation(),
         &client.discovery().store_id,
         &draft.import_id,
     )
