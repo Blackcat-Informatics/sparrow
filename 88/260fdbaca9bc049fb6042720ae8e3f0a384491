@@ -1,0 +1,18 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 88260fdbaca9bc049fb6042720ae8e3f0a384491
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 402
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/402
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 783845fb687742946f287fa74a43cc6546dacd40
+GhpRsq-Head-Ref: paudley/398-prove-the-open-time-fence-lifts-a-340
+GhpRsq-Head-OID: 88260fdbaca9bc049fb6042720ae8e3f0a384491
+GhpRsq-Result-Tree: 67487f6d7dd0e68303235ad7a418501538f48e3a
+GhpRsq-Result-Commit: 05737e899b0c1b425ab91fd04a2ba2fbe42aeef4
+GhpRsq-Parent-Hashes: 88260fdbaca9bc049fb6042720ae8e3f0a384491
+GhpRsq-Squash-Notes-SHA256: c3c9ae6309ad8b7632638d10ee22955ac6d4faa977f678497e17f660a58e021d
+GhpRsq-Stage-Evidence: none
