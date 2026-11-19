@@ -64,7 +64,9 @@ impl Input {
                     let ranked_iri: String = relation.required("ranked_iri")?;
                     let spans_iri: String = relation.required("spans_iri")?;
                     relation.deny_unknown()?;
-                    if ranked_iri.len() > 1024 || spans_iri.len() > 1024 {
+                    if ranked_iri.len() > sparrow_core::TEXT_RELATION_IRI_BYTES
+                        || spans_iri.len() > sparrow_core::TEXT_RELATION_IRI_BYTES
+                    {
                         return Err(json::record::DecodeError::custom(
                             "text relation IRI exceeds 1024 UTF-8 bytes",
                         ));

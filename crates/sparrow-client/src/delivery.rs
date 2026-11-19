@@ -1813,11 +1813,6 @@ mod tests {
         assert_eq!(shared.state.lock().unwrap().quarantine_failures, 1);
     }
 
-    /// INVARIANT: the client's own refusal is classed permanent and `save` writes it under the
-    /// client's own code with the encoder's reason, so those bytes are kept too. This covers
-    /// the classification and the file only: the worker validates each batch before the send,
-    /// so no deterministic run drives a batch the queue built into that error (it ends
-    /// delivery as a terminal failure, saved by `save_held`, which the held-events test covers).
     /// INVARIANT (#397): a `RESOURCE_LIMIT` the daemon marks non-retryable is a bound on this
     /// batch and quarantines it; one it marks retryable is occupancy and is held, never
     /// quarantined.
@@ -1834,6 +1829,11 @@ mod tests {
         }
     }
 
+    /// INVARIANT: the client's own refusal is classed permanent and `save` writes it under the
+    /// client's own code with the encoder's reason, so those bytes are kept too. This covers
+    /// the classification and the file only: the worker validates each batch before the send,
+    /// so no deterministic run drives a batch the queue built into that error (it ends
+    /// delivery as a terminal failure, saved by `save_held`, which the held-events test covers).
     #[test]
     fn a_batch_the_client_cannot_encode_is_quarantined_under_a_client_code() {
         let refusal = Error::InvalidArgument("event text exceeds 16 KiB");

@@ -100,8 +100,8 @@ pub(crate) fn render_capture(
     if ranked.is_empty()
         || spans.is_empty()
         || ranked == spans
-        || ranked.len() > 1024
-        || spans.len() > 1024
+        || ranked.len() > sparrow_core::TEXT_RELATION_IRI_BYTES
+        || spans.len() > sparrow_core::TEXT_RELATION_IRI_BYTES
         || ready
             .checked_add(failed)
             .and_then(|count| count.checked_add(not_applicable))

@@ -19,7 +19,8 @@ pub(crate) const MAX_NODES: usize = 512;
 pub(crate) const MAX_BYTES: usize = 256 * 1024;
 
 use crate::rpc::invalid;
-/// The request's forest is over a fixed bound: no retry of the same request passes.
+/// The forest is over a fixed bound: no retry of the same request passes. The bound also
+/// backstops result pages the daemon encodes, which no caller can change.
 fn capacity() -> Error {
     Error::input_bound("RDF transport forest exceeds 512 expanded nodes or 256 KiB admission")
 }
