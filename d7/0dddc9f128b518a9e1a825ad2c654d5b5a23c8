@@ -1,0 +1,19 @@
+ghprsq source head backlink metadata
+
+parent_hashes: d70dddc9f128b518a9e1a825ad2c654d5b5a23c8
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 405
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/405
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 6b4d4b444704246a6de91c5face6fbba89687115
+GhpRsq-Head-Ref: paudley/400-switch-1-steps-measured-figures
+GhpRsq-Head-OID: d70dddc9f128b518a9e1a825ad2c654d5b5a23c8
+GhpRsq-Result-Tree: ecaa3d7233070c23e79352848fe50e42c66958d4
+GhpRsq-Result-Commit: a50820efc9ebd8d146eecc1d4966ebc2410f7e7a
+GhpRsq-Parent-Hashes: d70dddc9f128b518a9e1a825ad2c654d5b5a23c8
+GhpRsq-Squash-Notes-SHA256: 807d14d9a21c22c3776b3d2581b40d70a383770f1b88e0ddb563a3baf0da3875
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
