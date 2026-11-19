@@ -124,10 +124,10 @@ returns only after tombstone compaction.
 
 Repeated refusals can drive `physical_bytes` to `STORAGE_PRESSURE`. Five
 back-to-back refusals of 32,769 records took it to 152, 324, 535, 436 and
-642 MB. Three refusals of the 100 MB file took it from 713 MB to 2.54 GB, and the
-next ingest answered `STORAGE_PRESSURE` at 3.13 GB against a
-3.22 GB budget. The lockout is temporary: native compaction cut physical bytes
-from 3.45 GB to 2.55 GB in about 20 s, and a one-record ingest succeeded while
+642 MB. Two refusals of the 100 MB file took it from 713 MB to 2.54 GB, and the
+third ingest answered `STORAGE_PRESSURE` at 3.13 GB against a
+3.22 GB budget. The lockout is temporary: native compaction later brought physical
+bytes from 3.45 GB to 2.55 GB, and a one-record ingest succeeded while
 the pressure phase was still `requested`, though a 2.7 MB file was refused
 `STORAGE_PRESSURE`. Not measured: the 16-journal limit (`MAX_IMPORTS`), where an
 unreclaimed refusal holds its slot (about 10 were reached), the exact staging
