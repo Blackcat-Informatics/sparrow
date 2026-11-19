@@ -699,7 +699,8 @@ revision, `a50820e`, names the source the binaries were built from: the pair was
 `make install-bin` at that commit, which holds the shutdown cancel of #394 (`6b4d4b4`) and every
 change Switch 1 takes. A commit that changes only documentation after it does not change the
 binaries, so the image revision stays `a50820e` while `main` moves; `git diff a50820e..HEAD --stat`
-at a later head shows whether anything but documentation changed. The image revision names the
+at a later head shows whether anything but documentation changed. At `caeb2b7`, `git diff a50820e..caeb2b7 --stat` lists only `docs/deployment.md`,
+`deploy/user-unit-upgrade.sh` and `tools/user-unit-upgrade-timers-check.sh`: no crate and no lock file changed, so the image revision is `a50820e` at that head. The image revision names the
 `--to` pair in `SPARROW_BIN`, whose sums the pull request that merged this procedure records; the
 script requires that pair byte-identical to the kept copy in `~/.local/libexec/sparrow`. The
 checkout that runs `deploy/user-unit-upgrade.sh` is `main` at or after that merge, because only
@@ -835,6 +836,33 @@ Check what the window needs.
   keeps every extent the running store later rewrites or compacts away and can grow to the
   store's whole size. `COPY` must not exist and its parent must be on the store's
   filesystem; the script refuses otherwise before it stops anything.
+- No scratch or rehearsal daemon from an earlier session runs. The script's check after the stop of
+  `sparrow.service` (`deploy/user-unit-upgrade.sh`, the `ps -e -o comm=` list and the glob over it)
+  stops the switch when any process whose name begins `sparrowd` is listed, and by then the live
+  daemon is already stopped. The process list alone cannot be the gate before the stop, because the
+  live daemon runs and is listed. The gate here reads each unit's `ActiveState`, and only `inactive`
+  or `failed` passes: `active`, `activating`, `deactivating`, `reloading`, an empty value and a
+  failing `systemctl` all stop. `is-active` is not used, because its exit 3 also covers a failed
+  unit and, from systemd's source, a unit that is still activating or deactivating, whose `sparrowd`
+  may still run. `show` of a unit that does not exist prints `inactive` and exits 0 (seen on this
+  host with `LoadState=not-found`), so an absent unit passes, as it should:
+
+  ```bash
+  ok=1
+  for u in sparrow-deploytest.service sparrow-rehearsal.scope sparrow-rehearsal-old.scope; do
+      v=$(systemctl --user show -p ActiveState --value "$u") \
+          || { ok=0; printf '%s: systemctl show failed, stop\n' "$u"; continue; }
+      [[ $v == inactive || $v == failed ]] \
+          || { ok=0; printf '%s: ActiveState %s, stop\n' "$u" "${v:-empty}"; }
+  done
+  ((ok))
+  ```
+
+  The loop prints a line for each unit that does not pass, and the last line exits 0 only when all
+  three pass. It covers those three names. A `sparrowd` started outside them does not show there:
+  read `ps -e -ww -o pid,user,comm,args` and expect one `sparrowd` line, the live daemon, whose pid is
+  `MainPID` of `sparrow.service`. The listing is read by the operator; the script's own check after
+  the stop is the one that fails closed on a process.
 - The recorded `text_analyzer` and `rdf_profile` stay the same after the switch. The new image
   reads the lexicon bundle that `text_lexicon_dir` names; the PurRDF revision in
   `registry/compatibility.toml` is unchanged since `fda2812`, so the bundle built with the image
@@ -1161,6 +1189,17 @@ with `echo proceed > FIFO`.
 7. Answer the prompt: `proceed` only if every check passed, which switches the links and starts
    the new image on the live store. Otherwise answer `abort`.
 
+The script's check for a remaining `sparrowd` runs once, after the stop of `sparrow.service` and
+before the copy and the hold (`deploy/user-unit-upgrade.sh` lists processes in one place only). No
+check runs while the hold waits for an answer, and none runs after it. The rehearsal's scratch
+daemon has the image's name, which begins `sparrowd`, so a check would match it; no check does
+during the hold. Step 4 stops it, and the steps end it before step 7: the stop is confirmed by the
+`closed store=` line and an exit, and the old image of step 5 exits by itself with its refusal. A
+scratch daemon left running at `proceed` is not seen by the script, which goes on to switch the
+links and start the unit. The way-back chain for an opened store ("The way back", below) runs later and begins with the same
+process test, so a leftover `sparrowd` blocks it: confirm that no scratch daemon runs before
+answering.
+
 An `abort` starts the old image again on the unchanged store, waits for its first status answer
 (up to 600 s), starts `sparrow-ship.timer` again only if the old image answered, writes the outcome
 to `COPY.abort.log` beside the kept copy, to the journal and to the terminal, and exits 1. End of
@@ -1429,7 +1468,7 @@ where the format fence commits.
   still draining, a unit that never stopped, or a `ps` that fails moves nothing. The daemon runs as
   the `sparrowd` link, so its name is `sparrowd`; a name cut to 15 characters from an image name
   still begins `sparrowd`. If a test fails, wait for the stop to end, read `ActiveState` and
-  `ps -e -o pid,args`, and begin the chain again. A `sparrowd` process outside the unit that blocks
+  `ps -e -ww -o pid,args`, and begin the chain again. A `sparrowd` process outside the unit that blocks
   the guard is reported to the coordination session; the operator never kills it.
 
   The chain starts the daemon only when `/SPARROW/store` exists as the restored copy and both links
@@ -1517,7 +1556,7 @@ coordination session's order, and the configuration keeps `instance_role` out un
 
 Switch 2 adds the `[archive]` table to `server.toml` and restarts the same image. It begins only
 after switch 1 is complete (every migration `done` equal to `total`) and when the archive
-directory's mount is present: the mount is host state this procedure never changes. It is a second
+directory's share is mounted and the daemon's account can write there (the checks follow): the mount is host state this procedure never changes. It is a second
 one-way fence: the first open with a policy lifts the store from the payload index intake family
 (`/395` after switch 1) into the payload index archive family, `/396` to `/406` (the store keeps its
 position in the family, so `/395` becomes `/406`; `docs/archive-format.md`, section 7,
@@ -1526,22 +1565,107 @@ fails with `INVALID_ARGUMENT`. The worker then
 archives the whole backlog to the NAS before anything is retired, and from then on an unpinned item
 is retired once it is due and archived.
 
-Verify the mount first; the worker refuses a directory that is on the root filesystem's device or
-on a local filesystem of the root's type, and never creates `dir`:
+Check the mount first. The worker refuses a directory that is on the root filesystem's device or
+on a local filesystem of the root's type, and never creates `dir`
+(`crates/sparrow-server/src/archive.rs`, `require_own_mount` and `archive_segment`). The share is
+`/net/synology/archives` (nfs4, source `192.168.1.1:/volume1/archives`, mounted `hard`: `findmnt -no OPTIONS -T "$SHARE"` shows it, so a lost server hangs a call and the stall path applies rather than an error); the directory `dir` names
+lies inside it, so the share's mount point is never `dir` itself. Each command chain below ends in
+an exit status and stops at its first failure, and a lookup that errors stops the chain: no result
+is read from a pipe or from text that an error could leave empty. Run the chains in bash. The mount, directory and write blocks share `SHARE`, `ARCH` and `my_uid`, so run them in one shell.
 
 ```bash
-ARCH=/net/synology/archives/sparrow-archive
-findmnt -no TARGET,FSTYPE,SOURCE -T "$ARCH"      # TARGET is the share's mount point, not /, and not $ARCH itself; FSTYPE is nfs4 or another network type
-[[ $(stat -c %d "$ARCH") != $(stat -c %d /) ]]   # its own device
-[[ -d $ARCH ]]                                   # the directory exists on the share
-t=$(mktemp -d -p "$ARCH" .probe.XXXXXX) && rmdir -- "$t"   # writable by the operator; leaves the directory empty
-ls -A "$ARCH"                                    # empty, or this store's STORE_ID and <store_id>/ only
+SHARE=/net/synology/archives
+ARCH=$SHARE/sparrow-archive
+m=$(findmnt -no TARGET,FSTYPE,SOURCE -T "$SHARE") \
+    && [[ $m == "$SHARE nfs4 "* ]] \
+    && mountpoint -q -- "$SHARE" \
+    && share_dev=$(stat -c %d -- "$SHARE") \
+    && root_dev=$(stat -c %d -- /) \
+    && [[ -n $share_dev && -n $root_dev && $share_dev != "$root_dev" ]] \
+    && printf 'on its own mount: %s\n' "$m"
 ```
 
-If the directory is missing on a mounted share, confirm with `findmnt -T /net/synology/archives`
-that the parent is the share's mount (a local directory on `/` means the mount is absent: stop),
-then the operator creates that one directory with `mkdir`; no other change is made to the share. A directory that holds other entries without a
-`STORE_ID` is refused by the worker and is not adopted.
+The chain exits 0 only when `findmnt` names the share's mount point as the mount of the path,
+with type `nfs4`, `mountpoint` agrees, and the share's device number differs from `/`'s. An unmounted
+share leaves a directory on `/`: `findmnt` then names `/`, or the devices are equal, and the chain
+exits nonzero. A `findmnt`, `mountpoint` or `stat` that fails, or prints nothing, exits nonzero
+too. The type test is stricter than the worker, which accepts any of its network types; `nfs4` is the
+type this share has. Stop when the chain exits nonzero: the mount is host state this procedure never
+changes.
+
+The directory `sparrow-archive` does not exist on the share. Neither the daemon, nor the worker, nor
+any script of the repository creates it, and nothing in this procedure's preparation does. The
+operator creates it as an ordered step of this switch, once, after the mount check passes and
+before the write test:
+
+```bash
+mkdir -m 0700 -- "$ARCH"
+```
+
+The owner is the account that runs the daemon, so the command runs in that account's shell, not
+under `sudo`, and not as root (a root-squashed export would store it as `nobody`). The mode is 0700
+because the worker needs only its own account: it lists `dir`, creates `STORE_ID` and
+`<store_id>/` in it and writes below, and the archive code sets no mode or ownership
+(files take the account's umask, `write_synced`; the data directory's mode is set elsewhere, in `config.rs`). The account must hold read, write and search on
+the directory, which 0700 gives. `sparrow-archive verify` run by the same account reads it. Another
+account that must read the archive needs a mode and a group chosen for that reader, which the code does not
+require. `mkdir` without `-p` fails when the directory exists, so a second run changes nothing; no other change is made to the share.
+
+Check the directory and the account next. The daemon's account is the owner of the running
+`sparrow.service` process; a user unit runs in its owner's user manager, and this text
+names no other account. The commands compare the daemon's process owner with the shell's own uid,
+and the directory's stored owner and mode with both:
+
+```bash
+pid=$(systemctl --user show -p MainPID --value sparrow.service) \
+    && [[ $pid != 0 ]] \
+    && daemon_uid=$(stat -c %u -- "/proc/$pid") \
+    && my_uid=$(id -u) \
+    && [[ -n $daemon_uid && $daemon_uid == "$my_uid" ]] \
+    && t=$(findmnt -no TARGET -T "$ARCH") \
+    && [[ $t == "$SHARE" ]] \
+    && [[ -d $ARCH ]] \
+    && stored=$(stat -c '%u %a' -- "$ARCH") \
+    && [[ $stored == "$my_uid 700" ]] \
+    && printf 'directory %s: owner uid %s, mode 700, on %s\n' "$ARCH" "$my_uid" "$t"
+```
+
+`MainPID` is 0 for a stopped unit, which stops the chain; the second `findmnt` stops it when
+`$ARCH` is a local directory under the mount point of an absent share.
+
+Write a small file there from the daemon's own account, read it back and remove it. This runs on the
+share itself and covers identity mapping and root squash, which the worker meets on its first
+`STORE_ID` write. The file has one literal name:
+
+```bash
+f=$ARCH/.switch2-write-test
+printf 'switch 2 write test\n' > "$f" \
+    && sync -- "$f" \
+    && cmp -- "$f" <(printf 'switch 2 write test\n') \
+    && owner=$(stat -c %u -- "$f") \
+    && [[ $owner == "$my_uid" ]] \
+    && stat -c 'stored owner %U %u mode %a' -- "$f"
+```
+
+The chain exits 0 only when the write, the flush to the server (`sync` of the one file, as the
+worker syncs each file it writes), the read-back and the owner comparison all succeed. A failure is
+one of these. `Permission denied` (EACCES) or `Operation not permitted` (EPERM) at the write: the
+mode or owner of `$ARCH` is wrong, or the export squashes this account. A file that is created and
+stored as `nobody` or uid 65534: root squash or all-squash on the export (an all-squash export can map to another uid; the owner comparison catches any uid but this account's), or an identity mapping that
+does not map this account (`stat -c '%U %u'` shows the owner the server stored; the chain's
+comparison fails on it). A differing read-back: the client cache or the export. The server's export
+options are not visible from the client, and the exported `sync` option that
+[the archive format](archive-format.md) requires cannot be read here; this test does not prove it.
+Then remove the file by its literal path, whatever the chain's result, and check the directory is empty:
+
+```bash
+rm -- "$ARCH/.switch2-write-test"
+ls -A "$ARCH"
+```
+
+`ls -A` prints nothing, or this store's `STORE_ID` and `<store_id>/` only. A directory that holds other entries without a
+`STORE_ID` is refused by the worker and is not adopted. Do not start the switch until every chain above exits 0 in
+the daemon's account, the file is removed and the directory is empty.
 
 Verify memory next:
 
@@ -1601,6 +1725,37 @@ appear under `$ARCH/<store_id>/`; and `sparrow-archive verify "$ARCH"` reads the
 `failure` naming `ARCHIVE_NOT_ON_MOUNT`, `ARCHIVE_ROOT` or `ARCHIVE_IO` means the mount is wrong or the
 share refuses: the daemon serves, the worker retries each pass, and nothing is deleted. The first
 pass's length and its demand on the NAS: [to be measured].
+
+If the mount goes away while the daemon runs, the code shows this (`crates/sparrow-server/src/archive.rs`).
+The worker checks the mount once per segment, at its start: `archive_segment` tests that `dir` is a
+directory (`is_dir` reports any error, `ESTALE` and `EIO` included, as false) and then
+reads its device and filesystem type (`require_mounted`). A directory that is gone fails
+as `ARCHIVE_IO` ("not a directory; is it mounted?"); a directory left on the root disk fails as
+`ARCHIVE_NOT_ON_MOUNT`. Once past the check, each later step (create, write, sync, rename, read back)
+fails as `ARCHIVE_IO` with the step, the path and the operating system's error, and the check is not
+repeated inside the segment. Every failure leaves the watermark where it was
+(`archive_commit` runs only after the read-back), the pass ends, `status` reports
+`archive_worker.phase` `holding` with the code, the segment file and the reason, the daemon
+journals `sparrowd: archive pass failed; the watermark did not move: ...`, and the
+worker tries again after `check_secs`. A call that hangs instead of failing blocks the worker's
+thread inside the system call: the watchdog journals `sparrowd: archive stalled step=...` every
+`stall_warn_secs`, and a step that ran `io_timeout_secs` marks the pass as overrun, which is checked only after the
+write and the read-back succeed (`archive_segment`). A slow call that returns an error fails the pass as `ARCHIVE_IO`, and a later
+failing step fails with its own code (`ARCHIVE_IO` or `ARCHIVE_VERIFY`); `ARCHIVE_OVERRAN` is the result only
+when every step succeeded. The segment is not committed in any of these cases. The daemon keeps serving in each case. A segment file
+that a failed pass left in `<store_id>/` is kept and read back on the next pass, never overwritten
+(`write_segment`); one that differs from what the worker prepared fails as
+`ARCHIVE_VERIFY` and the operator moves it aside.
+
+Nothing is retired because of the loss. Expiry and pressure eviction both stop at the first entry the
+watermark does not cover (`ExpiryFrontier::ArchiveLag`, `crates/sparrow-core/src/storage/expiry.rs`;
+`EvictionFrontier::ArchiveLag`, `eviction.rs`), and only `archive_commit` moves the
+watermark. Entries the watermark already covered stay retirable while the mount is away: neither
+path reads the mount, so an archived entry is retired when it is due. The code reading does not
+show these: whether a write that the kernel acknowledged before the mount vanished reached the NAS
+(the worker syncs each file and its directory, but the export's `sync` option is not visible
+from the client); how long a `hard` mount holds a call before an error, if one ever comes (`timeo` and `retrans` are set, but no run was made); and any
+run of the worker against a lost mount on the live daemon, where the worker is not running.
 
 The way back. If the new unit failed before `sparrowd: store_open_ms`, restore `$CONF.before-archive`
 over `$CONF`, stop the unit (it may be in its restart loop), run
