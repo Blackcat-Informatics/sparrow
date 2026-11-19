@@ -622,6 +622,17 @@ copy's file list with the store's, and gives `DIR` its name only then. The way b
 has opened the store is that copy in the store's place ("Switch 1"); without a copy the only way
 out is forward on `--to`.
 
+`--hold-after-copy` (with `--keep-copy`) pauses the switch after the copy is complete and before
+the links change or `--to` starts, so a rehearsal can run on a second copy while the daemon is
+down. The script prints the kept copy and the seconds down, and waits with no timeout for
+`proceed` (switch and start as usual) or `abort` (start `--from` again on the unchanged store,
+restore the timer, exit non-zero). It reads the answer from the terminal, or, whenever
+`--hold-answer FIFO` is given, from that named pipe; the prompt goes to `/dev/tty` even when the
+output is redirected to a log. Ctrl-C, SIGTERM, a hangup, end of input and a removed or empty
+pipe abort; the abort starts the old image before it writes anything and records its outcome in
+`COPY.abort.log` beside the kept copy and in the journal. It refuses the option without
+`--keep-copy` and without a terminal or pipe.
+
 Before anything changes it refuses unless all of these hold:
 
 - The daemon link names `--from`.

@@ -153,3 +153,88 @@ fn the_migration_indexes_artifacts_ingested_before_it_existed_and_new_ingest_sta
     let index = report.iter().find(|m| m.name == "payload-index").unwrap();
     assert!(index.complete(), "{index:?}");
 }
+
+/// INVARIANT (#398): the open-time payload-index fence lifts the format the live store reads,
+/// `sparrow.store/340` (the intake family's manifest retirement with a watch registry), to
+/// `sparrow.store/395`, an identity no earlier build wrote, so an older writer refuses it.
+/// The store is built through the production writers (an ingest-socket write, a manifest
+/// retirement, a watch registry and a receiver registry) and lowered to its `/340` image, so
+/// every companion row is the one that family carries. The lift keeps the retired artifact
+/// and the watch registry, serves the pending index honestly, survives a later write that
+/// restages the manifest family, and a second open changes nothing.
+#[test]
+fn a_340_intake_manifest_store_is_lifted_to_395_at_open_and_stays_there() {
+    use sparrow_core::{
+        Durability, EvictionLimits, Intake, PeerCredential, ReceiverDiscard, SyslogReceiver,
+    };
+    let config = || sparrow_test_support::storage_config!(Config);
+    let format = |store: &Store, now| store.status(now).unwrap()["store_format"].clone();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    migrate(&store);
+    let intake = Some(Intake::IngestSocket(PeerCredential {
+        uid: 1,
+        gid: 1,
+        pid: 1,
+    }));
+    let held = store
+        .ingest_with_intake(
+            "held",
+            "src",
+            "log",
+            b"one\ntwo\n",
+            intake,
+            0,
+            Durability::Durable,
+        )
+        .unwrap();
+    store
+        .evict_oldest(
+            1,
+            EvictionLimits {
+                max_payload_refs: 1,
+                ..EvictionLimits::default()
+            },
+        )
+        .unwrap();
+    store.watch_registry_replace(None, b"watch-state").unwrap();
+    let receiver = SyslogReceiver::new("udp", "udp").unwrap();
+    store
+        .discard_syslog("receiver", &receiver, ReceiverDiscard::Truncated, 2)
+        .unwrap();
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    sparrow_core::remove_payload_index_for_legacy_fixture(&db).unwrap();
+    assert_eq!(
+        db.get("store_format").unwrap().as_deref(),
+        Some(b"sparrow.store/340".as_slice())
+    );
+    drop(db);
+
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(format(&store, 3), "sparrow.store/395");
+    assert_eq!(
+        store.watch_registry().unwrap().as_deref(),
+        Some(b"watch-state".as_slice())
+    );
+    store.artifact(&held.id).unwrap();
+    let pending = store.payload_lookup(&held.payload_id, None, 10).unwrap();
+    assert!(!pending.complete);
+    // A write after the lift restages the manifest family and must keep the fence.
+    store.ingest("later", "src", "log", b"later\n", 4).unwrap();
+    assert_eq!(format(&store, 4), "sparrow.store/395");
+    migrate(&store);
+    let report = store.migrations().unwrap();
+    assert!(
+        report
+            .iter()
+            .find(|m| m.name == "payload-index")
+            .unwrap()
+            .complete()
+    );
+    drop(store);
+
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(format(&store, 5), "sparrow.store/395");
+    assert!(store.migrate_step().unwrap().is_none());
+}

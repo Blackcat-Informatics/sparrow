@@ -37,8 +37,13 @@ pub use result_release::{ResultReleaseReceipt, release_result};
 mod receipt;
 pub use bytes::{decode_evidence, encode_evidence, read_bytes};
 pub use receipt::{ArtifactReceipt, Discovery, DurabilityWatermark, flush_through};
+mod expect;
+pub use expect::{Expect, RequiredRole, instance_role_label};
 mod imports;
-pub use imports::{CompletedFileIdentity, import_file, import_open_file, open_completed_file};
+pub use imports::{
+    CompletedFileIdentity, import_file, import_file_expecting, import_open_file,
+    open_completed_file,
+};
 mod import_progress;
 /// Part sets: a completed file above the import bound, cut and uploaded as ordered parts and
 /// a manifest (#280).
@@ -133,6 +138,7 @@ pub struct Client {
     connection: Connection,
     discovery: Discovery,
     endpoint: Endpoint,
+    expect: Option<Expect>,
 }
 
 impl Client {
@@ -196,6 +202,21 @@ impl Client {
 
     /// Connect and validate discovery through the selected typed transport.
     pub async fn connect_endpoint(endpoint: &Endpoint) -> Result<Self, Error> {
+        Self::open(endpoint, None).await
+    }
+
+    /// Connect as [`Client::connect_endpoint`] does and refuse a daemon whose discovery does not
+    /// meet `expect` (`INSTANCE_MISMATCH`), before any call is made over the connection. The
+    /// client keeps the expectation: the cancel connection a multi-part upload makes is checked
+    /// against it too.
+    pub async fn connect_endpoint_expecting(
+        endpoint: &Endpoint,
+        expect: &Expect,
+    ) -> Result<Self, Error> {
+        Self::open(endpoint, Some(expect)).await
+    }
+
+    async fn open(endpoint: &Endpoint, expect: Option<&Expect>) -> Result<Self, Error> {
         endpoint.validate()?;
         let mut connection = match endpoint {
             Endpoint::Unix(socket) => transport::connect_typed(socket).await?,
@@ -204,6 +225,7 @@ impl Client {
             }
         };
         let discovery = Discovery::fetch(&connection.client).await?;
+        expect::require(expect, &discovery)?;
         if let Endpoint::AuthenticatedTcp(_, secret) = endpoint {
             connection.client =
                 tcp_secret::authenticate(&connection.client, &discovery.store_id, secret).await?;
@@ -212,7 +234,13 @@ impl Client {
             connection,
             discovery,
             endpoint: endpoint.clone(),
+            expect: expect.cloned(),
         })
+    }
+
+    /// The expectation this connection was opened under, if any.
+    pub(crate) fn expectation(&self) -> Option<&Expect> {
+        self.expect.as_ref()
     }
 
     /// Destination this connection was opened to; resumable imports reconnect through it.
