@@ -339,14 +339,17 @@ The system unit filters system calls: `SystemCallFilter=@system-service`, then
 the entries in order, the first sets the default and each later one adds or
 removes calls, so the last entry returns exactly those two calls from the
 denied `@resources` group and leaves the rest of it denied. RocksDB's
-background threads call them: the store lowers the pool threads' CPU priority
-so flushes and compactions yield to foreground writes (this holds write stalls
-to 0.1 percent of the time, against 6.5 percent without it), and each thread
-makes `sched_setscheduler(SCHED_OTHER)` and `setpriority(PRIO_PROCESS, 19)` on
-its first job. A filter without the entry kills the daemon with SIGSYS and a
-core dump at the first flush or compaction, shortly after start, and the unit
-restarts into the same death. `RestrictRealtime=yes` is unaffected because
-`SCHED_OTHER` is not a real-time policy, and `ioprio_set`, also in
+low-priority pool calls them: the store lowers that pool's CPU priority so
+compactions yield to intake and to flushes, which run in the high-priority pool
+at unchanged priority (this holds write stalls to 0.1 percent of the time,
+against 6.5 percent without it). Each low-pool thread makes
+`sched_setscheduler(SCHED_OTHER)` and `setpriority(PRIO_PROCESS, 19)` once,
+before its first job. A filter without the entry kills the daemon with SIGSYS
+and a core dump at the first low-pool job, usually a compaction, shortly after
+start, and the unit restarts into the same death. The two calls only lower
+priority here: the unit keeps no capability but `CAP_NET_BIND_SERVICE`, sets
+`NoNewPrivileges=yes`, and with `RestrictRealtime=yes` and the kernel's own
+checks refuses real-time policies; `SCHED_OTHER` is not one. `ioprio_set`, also in
 `@resources`, stays denied because the store never lowers I/O priority.
 `deploy/install.sh` installs `deploy/systemd/sparrow.service` as
 `/etc/systemd/system/sparrow.service`; `deploy/test-instance.sh` renders the
