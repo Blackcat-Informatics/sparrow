@@ -436,7 +436,7 @@ never shares a path, socket or store with `/SPARROW`.
 | Store | `.stage/test-instance/data/store` in this repository (`SCRATCH/data/store` for another `SCRATCH`) |
 | Census socket | `.stage/test-instance/data/store/rpc.sock`, mode owner-only, every operation |
 | Ingest socket | `.stage/test-instance/ingest/ingest.sock`, producer operations only |
-| Ingest group | `SPARROW_TEST_INGEST_GROUP` at `setup`, default the invoking user's primary group; the socket directory is `2750` with that group, and a sender must belong to it |
+| Ingest group | `SPARROW_TEST_INGEST_GROUP` at `setup`, default the invoking user's primary group; `setup` gives `SCRATCH` that group with mode `0710` and the socket directory `2750`, so members can reach the socket but cannot list the scratch tree or read the store; a sender must belong to the group and be able to search every parent of `SCRATCH` |
 | Disk budget | 16 GiB (`SPARROW_TEST_DISK_BUDGET`, bytes); one roll measured 7.66 GB of cruft |
 | Free-space floor | 4 GiB (`SPARROW_TEST_MIN_FREE`, bytes) on the filesystem holding the store |
 | Archive | none: the configuration has no `archive` table, so nothing retires |
@@ -454,7 +454,7 @@ Free space on the filesystem must cover the budget plus the floor.
 `teardown` stops and removes the unit and keeps the store. Only the explicit
 step `deploy/test-instance.sh purge` removes the store, the intake and ingest
 directories and the staged files; it refuses while the unit exists or runs, and
-when `SCRATCH` holds no scratch-role configuration. A scratch store created
+when `SCRATCH` holds no configuration written by this script (it checks the script's header line, which every version wrote). A scratch store created
 before instance roles existed has no role row, so the daemon refuses to start
 on it once the configuration sets `instance_role`; `setup` detects it from its
 older configuration and refuses with this remedy: run `purge`, then `setup` for

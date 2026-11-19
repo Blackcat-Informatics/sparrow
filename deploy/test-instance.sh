@@ -33,7 +33,7 @@ setup stages a test instance in SCRATCH (default: .stage/test-instance in the re
 prints the environment that points the lifecycle scripts at it; env prints it again; teardown
 stops the test unit and removes it (the scratch directory, with its store, is kept); purge
 removes the scratch store, intake, ingest socket directory and staged files, and only when the
-unit is stopped and SCRATCH holds a scratch-role configuration. SPARROW_TEST_INGEST_GROUP,
+unit is stopped and SCRATCH holds a configuration written by this script. SPARROW_TEST_INGEST_GROUP,
 SPARROW_TEST_DISK_BUDGET (bytes, default 16 GiB) and SPARROW_TEST_MIN_FREE (bytes, default
 4 GiB) shape setup.
 USAGE
@@ -76,8 +76,11 @@ case $ACTION in
         # The daemon requires this directory to be a real directory owned by its account, with the
         # sender group and mode exactly 2750 (docs/deployment.md, "Ingest-only group socket").
         install -d -m 0700 -- "$INGEST"
-        chgrp -- "$gid" "$INGEST" || die "cannot give $INGEST to group $group; the invoking user must belong to it"
+        chgrp -- "$gid" "$INGEST" "$SCRATCH" || die "cannot give $SCRATCH to group $group; the invoking user must belong to it"
         chmod 2750 -- "$INGEST"
+        # A sender must traverse SCRATCH to reach the socket: the group gets search only, so it can
+        # neither list the scratch tree nor read the store (DATA, the store and ROOT stay 0700).
+        chmod 0710 -- "$SCRATCH"
         bundle=$(find "$SPARROW_BIN" -mindepth 1 -maxdepth 1 -type d -name 'lexicons-*' | head -n 1)
         [[ -n $bundle ]] || die "no lexicon bundle in $SPARROW_BIN; run make install-bin"
         lexicons=$ROOT/usr/local/share/sparrow/${bundle##*/}
@@ -111,6 +114,7 @@ max_directories = 1
 max_candidates = 64
 CONFIG
         SPARROW_DESTDIR=$ROOT "$DEPLOY_DIR/install.sh" --no-enable
+        chmod 0700 -- "$ROOT"
         install -d -m 0700 -- "$UNIT_DIR"
         sed -E \
             -e '/^(User|Group|LoadCredential|AppArmorProfile|AmbientCapabilities|CapabilityBoundingSet|Slice|Nice|OOMScoreAdjust|ManagedOOMPreference|RequiresMountsFor)=/d' \
@@ -136,8 +140,8 @@ CONFIG
         ;;
     purge)
         [[ $SCRATCH == /* ]] || { echo "test-instance.sh: SCRATCH must be absolute" >&2; exit 2; }
-        grep -q '^instance_role = "scratch"$' "$CONFIG" 2>/dev/null \
-            || die "$SCRATCH holds no scratch-role configuration ($CONFIG); nothing is removed"
+        grep -qx '# Test instance (deploy/test-instance.sh): scratch store and socket, no TCP listener.' "$CONFIG" 2>/dev/null \
+            || die "$SCRATCH holds no configuration written by test-instance.sh ($CONFIG); nothing is removed"
         ! systemctl --user is-active --quiet "$UNIT" || die "$UNIT is active; run teardown first"
         [[ ! -e $UNIT_DIR/$UNIT ]] || die "$UNIT_DIR/$UNIT still exists; run teardown first"
         rm -rf -- "$DATA" "$INGEST" "$ROOT"

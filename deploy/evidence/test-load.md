@@ -32,6 +32,9 @@ $ CLI SCRATCH/data/store/rpc.sock values --path /event --lexical deploytest-mark
           "artifact_id":"artifact:5c927537bdc19387658b0a68b8031982",
           "source":"deploytest-load","path":"/event","lexical":"deploytest-marker-369"}]}
 
+$ CLI SCRATCH/data/store/rpc.sock status
+{"ingest_socket":{"path":"SCRATCH/ingest/ingest.sock","gid":1000, ...}, ..., "instance_role":"scratch", ...}
+
 $ deploy/stop.sh
 stop.sh: sparrow-deploytest.service did not stop cleanly (pid ...); read RECOVERY.md ...
 [exit 1]
