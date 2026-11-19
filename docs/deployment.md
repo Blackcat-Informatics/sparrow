@@ -876,13 +876,19 @@ where the format fence commits.
 
   ```bash
   systemctl --user stop sparrow-ship.timer sparrow.service
-  ln -sfn "$OLD" "$LIB/.sparrowd.next" && mv -T -- "$LIB/.sparrowd.next" "$LIB/sparrowd"
-  ln -sfn "$LIB/$OLD_CLI" ~/.local/bin/.sparrow.next && mv -T -- ~/.local/bin/.sparrow.next ~/.local/bin/sparrow
-  systemctl --user reset-failed sparrow.service
-  systemctl --user start sparrow.service
+  ln -sfn "$OLD" "$LIB/.sparrowd.next" \
+    && mv -T -- "$LIB/.sparrowd.next" "$LIB/sparrowd" \
+    && ln -sfn "$LIB/$OLD_CLI" ~/.local/bin/.sparrow.next \
+    && mv -T -- ~/.local/bin/.sparrow.next ~/.local/bin/sparrow \
+    && test "$(readlink "$LIB/sparrowd")" = "$OLD" \
+    && test -d /SPARROW/store \
+    && systemctl --user reset-failed sparrow.service \
+    && systemctl --user start sparrow.service
   ```
 
-  Then check `status` against `before.json` and start `sparrow-ship.timer`. Remove `COPY` by the rule
+  The start runs only when both links name the old pair. If a link command fails, start nothing
+  (the new image would open and fence the store): read the message, fix the cause and repeat the
+  chain. Then check `status` against `before.json` and start `sparrow-ship.timer`. Remove `COPY` by the rule
   below once the old image has served a day.
 - Opened. The old image refuses the store, so the way back is the copy, which holds the store as it
   was when the daemon stopped:
@@ -891,13 +897,26 @@ where the format fence commits.
   systemctl --user stop sparrow-ship.timer sparrow.service     # SIGINT drain, up to 120 s
   systemctl --user show -p ActiveState --value sparrow.service  # inactive
   ps -C sparrowd                                                # prints no process
-  mv -T -- /SPARROW/store /SPARROW/store.opened-by-b420503    # kept, never deleted here
-  mv -T -- /SPARROW/store.before-b420503 /SPARROW/store
-  ln -sfn "$OLD" "$LIB/.sparrowd.next" && mv -T -- "$LIB/.sparrowd.next" "$LIB/sparrowd"
-  ln -sfn "$LIB/$OLD_CLI" ~/.local/bin/.sparrow.next && mv -T -- ~/.local/bin/.sparrow.next ~/.local/bin/sparrow
-  systemctl --user reset-failed sparrow.service
-  systemctl --user start sparrow.service
+  mv -T -- /SPARROW/store /SPARROW/store.opened-by-b420503 \
+    && mv -T -- /SPARROW/store.before-b420503 /SPARROW/store \
+    && test -d /SPARROW/store \
+    && test ! -e /SPARROW/store.before-b420503 \
+    && ln -sfn "$OLD" "$LIB/.sparrowd.next" \
+    && mv -T -- "$LIB/.sparrowd.next" "$LIB/sparrowd" \
+    && ln -sfn "$LIB/$OLD_CLI" ~/.local/bin/.sparrow.next \
+    && mv -T -- ~/.local/bin/.sparrow.next ~/.local/bin/sparrow \
+    && test "$(readlink "$LIB/sparrowd")" = "$OLD" \
+    && systemctl --user reset-failed sparrow.service \
+    && systemctl --user start sparrow.service
   ```
+
+  The chain starts the daemon only when `/SPARROW/store` exists as the restored copy and both links
+  name the old pair. A start on a missing store makes a new empty store with a new id, so when any
+  command fails, start nothing. If the first `mv` fails, nothing moved: fix the cause and repeat. If
+  the first succeeded and the second failed, `/SPARROW/store` is absent: put the opened store back
+  with `mv -T -- /SPARROW/store.opened-by-b420503 /SPARROW/store`, fix the cause, and begin the
+  chain again. If a link command failed after both moves, the store is in place: repeat the link
+  commands from the chain, then the `reset-failed` and the start.
 
   The configuration is unchanged: `data_dir` still names `$STORE`. Check `store_id`, `store_format`
   and the migrations against `before.json`, then start `sparrow-ship.timer`. The restored store
@@ -1056,9 +1075,22 @@ pass's length and its demand on the NAS: [to be measured].
 The way back. If the new unit failed before `sparrowd: store_open_ms`, restore `$CONF.before-archive`
 over `$CONF`, stop the unit (it may be in its restart loop), run
 `systemctl --user reset-failed sparrow.service`, start the unit, and check `status`. After it, the store is fenced and the old
-configuration refuses it, so the way back is the copy, exactly as in switch 1 with `COPY2`: stop,
-move `/SPARROW/store` to `/SPARROW/store.opened-archive`, move `/SPARROW/store.before-archive` to
-`/SPARROW/store`, restore `$CONF.before-archive`, `reset-failed`, start. The
+configuration refuses it, so the way back is the copy, with the guard of switch 1 (stop the timer and
+the unit first, and confirm the unit is inactive):
+
+```bash
+mv -T -- /SPARROW/store /SPARROW/store.opened-archive \
+    && mv -T -- /SPARROW/store.before-archive /SPARROW/store \
+    && test -d /SPARROW/store \
+    && test ! -e /SPARROW/store.before-archive \
+    && cp -p -- "$CONF.before-archive" "$CONF" \
+    && systemctl --user reset-failed sparrow.service \
+    && systemctl --user start sparrow.service
+```
+
+The start runs only when the copy is in place and the configuration is restored. When a command
+fails, start nothing, and recover as in switch 1: if the first `mv` fails, nothing moved; if only the
+second failed, run `mv -T -- /SPARROW/store.opened-archive /SPARROW/store` and begin again. The
 restored store lacks what the daemon took in after its start, and the archive directory holds
 segments for a store that no longer carries the matching watermark: leave the directory as it is
 and report it. Keep `/SPARROW/store.before-archive` under the same rule as the switch 1 copy, removed as one literal path: migrations done, a full day of clean
