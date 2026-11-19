@@ -1117,10 +1117,12 @@ with `echo proceed > FIFO`.
 5. Record the old image's refusal. The old image accepts `--no-intake`, so the log holds the
    fence refusal, not an argument error. At `fda2812`, `arguments()` in
    `crates/sparrow-server/src/main.rs` matches `"--no-intake"` (line 39) and its usage string lists
-   it (line 19). `main` then reads the configuration (line 33), which refuses a key that `fda2812`
-   does not know (`deny_unknown_fields`) at parse time, and calls `check_no_intake()` (line 145),
-   which refuses a configured `consume`, `syslog`, `rpc_tcp_address`, `ingest_socket_path` or
-   `archive` (`config.rs` lines 376-380 and `refuse_intake`); both happen before the store opens. `open_store()` runs at line 191 and fails on a lifted store with the
+   it (line 19). `main` then reads the configuration with `ServerConfig::read` (line 132; `config.rs` line 286),
+   which parses it with `toml::from_str` (`config.rs` line 298) and refuses a key that `fda2812`
+   does not know, because the struct is `deny_unknown_fields` (`config.rs` line 17). It then calls
+   `check_no_intake()` (line 145; `config.rs` lines 376-380, which delegates to `refuse_intake`,
+   line 402), which refuses a configured `consume`, `syslog`, `rpc_tcp_address`,
+   `ingest_socket_path` or `archive`. Both happen before the store opens. `open_store()` runs at line 191 and fails on a lifted store with the
    fence refusal; the consume worker starts only at line 224, in the branch that `!intake` skips
    (line 217). So the old image cannot start a consume worker on the live roots with `$REH_CONF`
    through either path: the open fails first on a lifted copy, and the flag skips the worker on any
@@ -1426,7 +1428,8 @@ where the format fence commits.
   still draining, a unit that never stopped, or a `ps` that fails moves nothing. The daemon runs as
   the `sparrowd` link, so its name is `sparrowd`; a name cut to 15 characters from an image name
   still begins `sparrowd`. If a test fails, wait for the stop to end, read `ActiveState` and
-  `ps -e -o pid,args`, and begin the chain again.
+  `ps -e -o pid,args`, and begin the chain again. A `sparrowd` process outside the unit that blocks
+  the guard is reported to the coordination session; the operator never kills it.
 
   The chain starts the daemon only when `/SPARROW/store` exists as the restored copy and both links
   name the old pair. A start on a missing store makes a new empty store with a new id, so when any
