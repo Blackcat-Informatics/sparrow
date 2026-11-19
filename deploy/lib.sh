@@ -407,7 +407,8 @@ free_bytes() {
 # link target itself, where a shell loop forks once per descriptor on the host.
 refuse_open_store() {
     local holder
-    holder=$(find /proc/[0-9]*/fd -maxdepth 1 -lname "$1/*" -print -quit 2>/dev/null || true)
+    local pattern=${1//[\\*?[]/\\&}   # -lname reads glob characters; the path is literal
+    holder=$(find /proc/[0-9]*/fd -maxdepth 1 -lname "$pattern/*" -print -quit 2>/dev/null || true)
     [[ -z $holder ]] || die "process ${holder#/proc/} still holds a file in $1 open; stop the daemon first"
 }
 

@@ -577,7 +577,7 @@ system unit's scripts refuse that unit. `deploy/user-unit-upgrade.sh` switches
 it from one kept image pair to another:
 
 ```bash
-deploy/user-unit-upgrade.sh --from sparrowd-schema71-fda2812 --to sparrowd-schema71-REV --keep-copy /SPARROW/store.before-REV
+deploy/user-unit-upgrade.sh --from sparrowd-schema71-fda2812 --to sparrowd-schema71-b420503 --keep-copy /SPARROW/store.before-b420503
 ```
 
 The live service runs `sparrowd-schema71-fda2812`. The next image keeps schema 71, so no CLI or
@@ -663,14 +663,36 @@ installed, which is the cutover of Sparrow issue 22, and it does not reach the u
 ### Switch 1: the payload index image, without an archive
 
 Switch 1 moves the live daemon from `sparrowd-schema71-fda2812` to the image built from `main`
-(`sparrowd-schema71-REV`; `REV` is the revision `make install-bin` names). The schema number stays
-71, so no client or producer needs a new build to keep working. The new image does not set
-`[archive]` in switch 1, so no archive worker runs. The switch crosses one one-way fence: the
-first open lifts the store format for the payload id index (#323), and from then on
-`sparrowd-schema71-fda2812` refuses the store with `UNSUPPORTED: unsupported store format;
-migration required`. The index fills in the background; until it is complete, `payload`
-answers `pending`. `deploy/lib.sh`'s downgrade check compares schema numbers only, so it cannot see
-this fence (Sparrow issue 385): the rule below, not the script, keeps the old image off the store.
+revision `b420503`, `sparrowd-schema71-b420503`. Two revisions are named separately. The image
+revision, `b420503`, names the `--to` pair in `SPARROW_BIN`, whose sums the pull request that
+merged this procedure records; the script requires that pair byte-identical to the kept copy in
+`~/.local/libexec/sparrow`. The checkout that runs `deploy/user-unit-upgrade.sh` is `main` at or
+after that merge, because only that script carries `--keep-copy`; its own revision has no bearing
+on the image.
+
+The schema number stays 71, so no client or producer needs a new build to keep working. The live
+store reads `sparrow.store/340` (status of 2026-11-19). The new image does not set `[archive]` in
+switch 1, so no archive worker runs, and the switch crosses only the payload index:
+
+- At the first open, before the daemon serves, one synced batch lifts the store format from `/340`
+  to `/395` (the payload index family, #323), deletes any stale `payload-id:` keys and seeds the
+  `payload-index-upgrade` checkpoint and two zero counter rows. The batch is atomic: a kill leaves
+  `/340` untouched or the whole of `/395`. It is the point of no return:
+  `sparrowd-schema71-fda2812` refuses `/395` with `UNSUPPORTED: unsupported store format;
+  migration required`. The downgrade check in `deploy/lib.sh` compares schema numbers only, so it
+  cannot see this fence (Sparrow issue 385); the rules below, not the script, keep the old image
+  off the store.
+- The online `payload-index` migration then runs in the maintenance worker, with the daemon
+  serving throughout. Pages of 1,024 artifacts or 64 MiB each commit atomically with their
+  checkpoint, the migration resumes after a kill or power loss without redoing or skipping a
+  page, and it waits below the free-space floor. The format stays `/395`. Until it completes,
+  `payload` answers `pending`.
+- Nothing else is crossed at `/340`: the store counters, owner-graph index, source summary and
+  source context are already complete, the RDF profile does not advance, and no archive fence
+  applies. The format after switch 1 is `/395`.
+
+The stopped-daemon copy (below) holds the store before the first open, so it covers both the fence
+and the migration. Restoring it discards everything the new image ingested after the switch.
 
 Run it only on the coordination session's go, which names the window. The switch is a restart of
 the live service: the coordination session announces it, before and after (see "While the daemon
@@ -681,12 +703,12 @@ Variables used below (set them in the shell that runs the steps):
 ```bash
 LIB=~/.local/libexec/sparrow
 OLD=sparrowd-schema71-fda2812;  OLD_CLI=sparrow-schema71-fda2812
-NEW=sparrowd-schema71-REV;      NEW_CLI=sparrow-schema71-REV
+NEW=sparrowd-schema71-b420503;  NEW_CLI=sparrow-schema71-b420503
 CONF=~/.config/sparrow/server.toml
 SOCK=$(sed -n 's/^socket_path *= *"\([^"]*\)".*/\1/p' "$CONF")
 STORE=$(sed -n 's/^data_dir *= *"\([^"]*\)".*/\1/p' "$CONF")      # /SPARROW/store
-COPY=$STORE.before-REV                                             # a sibling, a new name
-BIN=…/bin       # the directory holding the new pair; the script reads it as SPARROW_BIN
+COPY=/SPARROW/store.before-b420503     # a new sibling of $STORE (check: "$STORE" is /SPARROW/store)
+BIN=…/bin       # the directory holding the b420503 pair; the script reads it as SPARROW_BIN
 RECORD=…/.stage/image/switch-1   # under the main checkout's .stage/, never /tmp
 ```
 
@@ -699,11 +721,12 @@ holds the only copies of the `fda2812` pair today:
 
 ```bash
 for f in "$OLD" "$OLD_CLI" sparrow-recovery-schema71-fda2812; do
-    cp -p -- "$LIB/$f" "$BIN/$f" && cmp -- "$LIB/$f" "$BIN/$f"
+    [[ -e $BIN/$f ]] || cp -p -- "$LIB/$f" "$BIN/$f"
+    cmp -- "$LIB/$f" "$BIN/$f"
 done
 ```
 
-`BIN` holds the new pair and its `sparrow-recovery-schema71-REV` from `make install-bin`; check the
+`BIN` holds the new pair and its `sparrow-recovery-schema71-b420503` from `make install-bin`; check the
 pair's `sha256sum` against the sums recorded with the pull request that merged this
 procedure.
 Install the new pair, never over a name that holds other bytes, then have a human with root
@@ -772,7 +795,7 @@ Give the notice (below) and wait for the go.
 #### The window
 
 ```bash
-cd CHECKOUT_AT_REV     # the script finds lib.sh and limits.conf beside itself
+cd MAIN_CHECKOUT       # main at or after the merge of this procedure; the script finds lib.sh beside itself
 SPARROW_BIN="$BIN" deploy/user-unit-upgrade.sh --from "$OLD" --to "$NEW" --keep-copy "$COPY" \
     > "$RECORD/switch.log" 2>&1; echo "EXIT=$?" >> "$RECORD/switch.log"
 ```
@@ -807,8 +830,9 @@ and reads and hashes the named artifacts and records (up to 1,024 targets, 1 GiB
 qualification"). It is a selected-evidence probe, not a scrub of the whole engine, and opening
 the copy adds a WAL and manifest to it, so run it only on a second reflink copy
 (`deploy/copy-on-write.sh copy "$COPY" "$COPY.probe"`) whose configuration names that directory
-for `data_dir` and `socket_path`, and remove that one probe path afterwards. It cannot run
-against the new image: that image would upgrade the copy.
+for `data_dir` and `socket_path`, and remove that one probe path afterwards. Neither the new daemon
+nor `sparrow-recovery-schema71-b420503` may open `COPY` or `COPY.probe`: either lifts the format and
+spoils the copy as a way back.
 
 #### After the window
 
@@ -867,8 +891,8 @@ where the format fence commits.
   systemctl --user stop sparrow-ship.timer sparrow.service     # SIGINT drain, up to 120 s
   systemctl --user show -p ActiveState --value sparrow.service  # inactive
   ps -C sparrowd                                                # prints no process
-  mv -T -- "$STORE" "$STORE.opened-by-REV"    # kept, never deleted here
-  mv -T -- "$COPY" "$STORE"
+  mv -T -- /SPARROW/store /SPARROW/store.opened-by-b420503    # kept, never deleted here
+  mv -T -- /SPARROW/store.before-b420503 /SPARROW/store
   ln -sfn "$OLD" "$LIB/.sparrowd.next" && mv -T -- "$LIB/.sparrowd.next" "$LIB/sparrowd"
   ln -sfn "$LIB/$OLD_CLI" ~/.local/bin/.sparrow.next && mv -T -- ~/.local/bin/.sparrow.next ~/.local/bin/sparrow
   systemctl --user reset-failed sparrow.service
@@ -880,22 +904,27 @@ where the format fence commits.
   lacks everything the new image accepted between its start and the stop: the records and files it
   ingested, and the files its consume watches took and deleted. Count that loss before the
   swap (`live_records` in `after.json` less `before.json`, the start and stop times) and report it
-  with those figures; `$STORE.opened-by-REV` still holds it, and the new image can open that
+  with those figures; `/SPARROW/store.opened-by-b420503` still holds it, and the new image can open that
   directory later from a configuration that names it. Fixing forward on the new image is the
   other choice, and the way back is for a defect that forward cannot fix.
 
 Keep the copy until both hold: every migration reports `done` equal to `total` with no failure,
 and a full day has passed since the first status answer with `pressure.failure`,
 `durability.failure` and every migration `failure` null and no `online migration failed` line in the
-journal. The operator then removes it with one command on one exact path, after listing it:
+journal. The operator then removes it with one command on one exact path, typed in full in a fresh shell
+and after listing it:
 
 ```bash
-ls -ld "$COPY"
-rm -r -- "$COPY"
+ls -ld /SPARROW/store.before-b420503
 ```
 
-If the way back was taken, the same rule applies to `$STORE.opened-by-REV`, which is the new
-store and is removed only on the coordination session's word.
+```bash
+rm -r -- /SPARROW/store.before-b420503
+```
+
+If the way back was taken, the copy is the store now, and the path to remove under the same rule,
+on the coordination session's word, is the new store the new image opened:
+`/SPARROW/store.opened-by-b420503`.
 
 #### While the daemon is down
 
@@ -940,8 +969,11 @@ configuration keeps `instance_role` out until then.
 Switch 2 adds the `[archive]` table to `server.toml` and restarts the same image. It begins only
 after switch 1 is complete (every migration `done` equal to `total`) and when the archive
 directory's mount is present: the mount is host state this procedure never changes. It is a second
-one-way fence: the first open with a policy fences the store at formats 99 to 109, older images
-refuse it, and reopening it without `[archive]` fails with `INVALID_ARGUMENT`. The worker then
+one-way fence: the first open with a policy lifts the store from the payload index intake family
+(`/395` after switch 1) into the payload index archive family, `/396` to `/406` (the store keeps its
+position in the family, so `/395` becomes `/406`; `docs/archive-format.md`, section 7,
+"Deletion gate and store fence"). Older images refuse it, and reopening it without `[archive]`
+fails with `INVALID_ARGUMENT`. The worker then
 archives the whole backlog to the NAS before anything is retired, and from then on an unpinned item
 is retired once it is due and archived.
 
@@ -957,8 +989,9 @@ t=$(mktemp -d -p "$ARCH" .probe.XXXXXX) && rmdir -- "$t"   # writable by the ope
 ls -A "$ARCH"                                    # empty, or this store's STORE_ID and <store_id>/ only
 ```
 
-If the directory is missing on a mounted share, the operator creates that one directory with
-`mkdir`; no other change is made to the share. A directory that holds other entries without a
+If the directory is missing on a mounted share, confirm with `findmnt -T /net/synology/archives`
+that the parent is the share's mount (a local directory on `/` means the mount is absent: stop),
+then the operator creates that one directory with `mkdir`; no other change is made to the share. A directory that holds other entries without a
 `STORE_ID` is refused by the worker and is not adopted.
 
 Verify memory next:
@@ -982,14 +1015,27 @@ scope's peak resident memory (`memory.peak`) and any throttling (`memory.events`
 counter). The default segment settings stay unless that measurement says otherwise; lowering
 `max_segment_quads` in `[archive]` shrinks the bound.
 
-The window, with the daemon stopped around a copy as in switch 1 (variables as above;
-`COPY2` is a new name, `$STORE.before-archive`):
+The window, with the daemon stopped around a copy as in switch 1:
 
 ```bash
+COPY2=/SPARROW/store.before-archive    # a new sibling of $STORE
 cp -p -- "$CONF" "$CONF.before-archive"
 systemctl --user stop sparrow-ship.timer       # wait until sparrow-ship.service is inactive
 systemctl --user stop sparrow.service          # SIGINT drain
-deploy/copy-on-write.sh copy "$STORE" "$COPY2"   # from the checkout at the merged revision
+```
+
+Make the copy from the checkout at the merged revision. Go on only when it exits 0:
+
+```bash
+deploy/copy-on-write.sh copy "$STORE" "$COPY2"; echo "copy exit $?"
+```
+
+If it exits nonzero the store is untouched and `[archive]` is not set. Remove the one
+`/SPARROW/store.before-archive.partial` path if it exists, start `sparrow.service` and
+`sparrow-ship.timer` as they were, and stop the switch: the cause (name exists, open file, space)
+is read from the command's message, and the switch starts again from the notice. Only on exit 0:
+
+```bash
 printf '\n[archive]\ndir = "%s"\n' "$ARCH" >> "$CONF"
 systemctl --user start sparrow.service
 sparrow "$SOCK" status                          # repeat until it answers
@@ -1008,12 +1054,14 @@ share refuses: the daemon serves, the worker retries each pass, and nothing is d
 pass's length and its demand on the NAS: [to be measured].
 
 The way back. If the new unit failed before `sparrowd: store_open_ms`, restore `$CONF.before-archive`
-over `$CONF`, start the unit, and check `status`. After it, the store is fenced and the old
+over `$CONF`, stop the unit (it may be in its restart loop), run
+`systemctl --user reset-failed sparrow.service`, start the unit, and check `status`. After it, the store is fenced and the old
 configuration refuses it, so the way back is the copy, exactly as in switch 1 with `COPY2`: stop,
-move the store aside, move the copy into its place, restore `$CONF.before-archive`, start. The
+move `/SPARROW/store` to `/SPARROW/store.opened-archive`, move `/SPARROW/store.before-archive` to
+`/SPARROW/store`, restore `$CONF.before-archive`, `reset-failed`, start. The
 restored store lacks what the daemon took in after its start, and the archive directory holds
 segments for a store that no longer carries the matching watermark: leave the directory as it is
-and report it. Keep `COPY2` under the same rule as `COPY`: migrations done, a full day of clean
+and report it. Keep `/SPARROW/store.before-archive` under the same rule as the switch 1 copy, removed as one literal path: migrations done, a full day of clean
 status and a clean `archive_worker`.
 
 ### Part sets and older builds
