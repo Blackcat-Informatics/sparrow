@@ -851,9 +851,9 @@ Three acts precede or accompany the script's stop, in this order.
    Switch 1 is the stop of the installed old image, `sparrowd-schema71-fda2812`, under the live
    user unit's `TimeoutStopSec=120` and `KillSignal=SIGINT`. A stop that outlasts the timeout ends
    in SIGKILL. The fix for the stop (#394, below) cannot reach that first stop, because it is in
-   the new image; the stops of the new image measured below ran without it. The old image under the unit's limits stopped in 98.8 s, 82 percent of 120 s,
+   the new image; the stops of the new image measured below ran without it. The image `a50820e` differs from `b420503` in more than that fix (`git log b420503..a50820e` also lists, for example, the #392 upload cancellation changes and the instance role label), so the `b420503` figures below describe an image that is not the one switched to. The old image under the unit's limits stopped in 98.8 s, 82 percent of 120 s,
    on a store of 4.76 GB status `physical_bytes` at `/332` after six artifacts of 5,000 records
-   (`220-E-diag-old.log`; no kill). The new image built before the fix, under the same limits, stopped in 50.5 s, 25.6 s
+   (`220-E-diag-old.log`; no kill). The new image built from `b420503` (before the fix), under the same limits, stopped in 50.5 s, 25.6 s
    and 13.1 s on a base of 3.46 GB (`210-D-diag-new.log`, `212-D-diag-new2.log`,
    `213-D-diag-quiesce.log`; the 13.1 s run waited first for the compaction threads to go idle).
 
@@ -962,7 +962,8 @@ Three acts precede or accompany the script's stop, in this order.
    the coordination session and wait. At `TimeoutStopSec` systemd sends SIGKILL, and the way back
    stands, because the script takes the kept copy only after the stop.
 
-   What a kill leaves. The live store is left as a SIGKILL leaves it. Measured on a store of 1.57 GB
+   What a kill leaves. The live store is left as a SIGKILL leaves it. Measured with the image
+   built from `b420503`, on a store of 1.57 GB
    at `/387` after three acknowledged ingests (15,000 records): the next open took 2,058 ms in the
    storage engine, against 23 to 65 ms for the new image's other opens of that store under the limits (clean
    opens 23, 27, 36 and 37 ms in logs `120`, `125`, `128` and `131`, and 65 ms in `150` before the
@@ -1116,10 +1117,10 @@ with `echo proceed > FIFO`.
 5. Record the old image's refusal. The old image accepts `--no-intake`, so the log holds the
    fence refusal, not an argument error. At `fda2812`, `arguments()` in
    `crates/sparrow-server/src/main.rs` matches `"--no-intake"` (line 39) and its usage string lists
-   it (line 19). `main` then reads the configuration and calls `check_no_intake()` (line 145), which
-   refuses a configured `consume`, `syslog`, `rpc_tcp_address`, `ingest_socket_path` or `archive`
-   (`config.rs` lines 376-380 and `refuse_intake`) and, through `deny_unknown_fields`, any other
-   key, before the store opens. `open_store()` runs at line 191 and fails on a lifted store with the
+   it (line 19). `main` then reads the configuration (line 33), which refuses a key that `fda2812`
+   does not know (`deny_unknown_fields`) at parse time, and calls `check_no_intake()` (line 145),
+   which refuses a configured `consume`, `syslog`, `rpc_tcp_address`, `ingest_socket_path` or
+   `archive` (`config.rs` lines 376-380 and `refuse_intake`); both happen before the store opens. `open_store()` runs at line 191 and fails on a lifted store with the
    fence refusal; the consume worker starts only at line 224, in the branch that `!intake` skips
    (line 217). So the old image cannot start a consume worker on the live roots with `$REH_CONF`
    through either path: the open fails first on a lifted copy, and the flag skips the worker on any
@@ -1128,7 +1129,8 @@ with `echo proceed > FIFO`.
    remains unproven is the exact text and exit status of this open on the live store's own lift;
    this step records them.
 
-   Run the step only when the configuration holds none of those keys; it prints nothing otherwise:
+   Run the step only when the configuration holds none of those keys, that is, when this command
+   prints nothing:
 
    ```bash
    grep -nE '^(\[\[consume|consume|\[\[syslog|syslog|rpc_tcp_address|ingest_socket_path|\[archive|archive)' "$REH_CONF"
@@ -1216,7 +1218,7 @@ Record `status > "$RECORD/after.json"` and compare with `before.json`:
 
 Every figure below was measured on a scratch store under a user scope with the live unit's
 limits (`MemoryHigh=2G`, `MemoryMax=4G`, `CPUQuota=100%`, `IOWeight=20`, `nice 10`, read back from
-the cgroup) with the image `sparrowd-schema71-b420503`, built before the #394 fix and not the image `a50820e`, unless a line
+the cgroup) with the image `sparrowd-schema71-b420503`, built before the #394 fix and not the image `a50820e`, which differs from it in more than that fix, unless a line
 says otherwise. Logs are under `.stage/372-measure/logs/` in the main checkout. Nothing was
 measured at live size: the live store is about 39 GB and holds an unknown number of artifacts, and
 the pages of the migration number `ceil(artifacts / 1024)`, or more where 64 MiB cuts a page. The
@@ -1397,12 +1399,15 @@ where the format fence commits.
   chain. Then check `status` against `before.json` and start `sparrow-ship.timer`. Remove `COPY` by the rule
   below once the old image has served a day.
 - Opened. The old image refuses the store, so the way back is the copy, which holds the store as it
-  was when the daemon stopped:
+  was when the daemon stopped. Write the runtime timeout drop-in again before the stop (the
+  commands under "Before the stop: the stop timeout, the quiesce and the watch"): the stop of the
+  new image runs under the unit's own `TimeoutStopSec=120` otherwise.
 
   ```bash
   systemctl --user stop sparrow-ship.timer sparrow.service     # SIGINT drain, up to TimeoutStopSec
   test "$(systemctl --user show -p ActiveState --value sparrow.service)" = inactive \
-    && test -z "$(ps -C sparrowd -o pid=)" \
+    && procs=$(ps -e -o comm=) \
+    && ! printf '%s\n' "$procs" | grep -q '^sparrowd' \
     && mv -T -- /SPARROW/store /SPARROW/store.opened-by-a50820e \
     && mv -T -- /SPARROW/store.before-a50820e /SPARROW/store \
     && test -d /SPARROW/store \
@@ -1416,12 +1421,12 @@ where the format fence commits.
     && systemctl --user start sparrow.service
   ```
 
-  Write the runtime timeout drop-in again (the commands under "Before the stop: the stop timeout, the quiesce and the watch") before the first
-  command: the stop of the new image runs under the unit's own `TimeoutStopSec=120` otherwise. The
-  chain begins with two tests, and it stops there unless the unit's `ActiveState` is `inactive` and
-  no `sparrowd` process exists: a stop that is still draining, or a unit that never stopped, moves
-  nothing. If a test fails, wait for the stop to end, read `ActiveState` and `ps -C sparrowd -o pid,args`,
-  and begin the chain again. It never moves the store of a running daemon.
+  The chain begins with tests, and it stops there unless the unit's `ActiveState` is `inactive`,
+  the process list can be read, and no process whose name begins `sparrowd` is in it: a stop that is
+  still draining, a unit that never stopped, or a `ps` that fails moves nothing. The daemon runs as
+  the `sparrowd` link, so its name is `sparrowd`; a name cut to 15 characters from an image name
+  still begins `sparrowd`. If a test fails, wait for the stop to end, read `ActiveState` and
+  `ps -e -o pid,args`, and begin the chain again.
 
   The chain starts the daemon only when `/SPARROW/store` exists as the restored copy and both links
   name the old pair. A start on a missing store makes a new empty store with a new id, so when any
