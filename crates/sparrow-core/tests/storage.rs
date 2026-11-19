@@ -11318,7 +11318,7 @@ fn native_import_publishes_files_above_buffered_limit_without_a_whole_file_batch
             0,
         )
         .unwrap();
-    for (index, chunk) in input.chunks(IMPORT_CHUNK_BYTES).enumerate() {
+    for (index, chunk) in input.chunks(sparrow_core::IMPORT_CHUNK_BYTES).enumerate() {
         store
             .import_append(&journal.id, (index * IMPORT_CHUNK_BYTES) as u64, chunk, 0)
             .unwrap();
@@ -11434,7 +11434,11 @@ fn bounded_staging_ranges_preserve_exact_binary_bytes_and_committed_frontiers() 
         store.import_bytes(&journal.id, 100, 77, 0).unwrap(),
         input[100..177]
     );
-    for (index, chunk) in input.chunks(IMPORT_CHUNK_BYTES).enumerate().skip(1) {
+    for (index, chunk) in input
+        .chunks(sparrow_core::IMPORT_CHUNK_BYTES)
+        .enumerate()
+        .skip(1)
+    {
         store
             .import_append(&journal.id, (index * IMPORT_CHUNK_BYTES) as u64, chunk, 0)
             .unwrap();
@@ -11519,7 +11523,7 @@ fn streaming_layout_preserves_cross_chunk_delimiters_long_records_and_pages() {
             .code,
         "CONFLICT"
     );
-    for (index, chunk) in input.chunks(IMPORT_CHUNK_BYTES).enumerate() {
+    for (index, chunk) in input.chunks(sparrow_core::IMPORT_CHUNK_BYTES).enumerate() {
         store
             .import_append(&journal.id, (index * IMPORT_CHUNK_BYTES) as u64, chunk, 0)
             .unwrap();
@@ -17272,6 +17276,91 @@ fn producer_batch_over_the_whole_data_budget_is_refused_non_retryable() {
         );
         assert!(store.records(0).unwrap().is_empty(), "{which}");
     }
+}
+
+/// INVARIANT (#397): the wire's retry class follows what caused a `RESOURCE_LIMIT`. A bound on
+/// the input itself (more than 32,768 records in one publication, or an input over the whole data
+/// budget) is not retryable and names its bound; the staged import refuses it while laying out
+/// records, before any record is prepared. Transient occupancy (all 16 import journals taken)
+/// stays retryable. The code is `RESOURCE_LIMIT` in both cases.
+#[test]
+fn an_input_bound_refusal_is_not_retryable_while_occupancy_stays_retryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut limits = config();
+    limits.max_records = 100_000;
+    let store = Store::open(dir.path(), limits).unwrap();
+    let digest = |bytes: &[u8]| {
+        format!(
+            "blake3:{}",
+            purrdf_hash::hex::encode(purrdf_hash::blake3::hash(bytes).as_bytes())
+        )
+    };
+    let bound = 32_768_usize;
+    for (records, refused) in [(bound, false), (bound + 1, true)] {
+        let input = b"a\n".repeat(records);
+        let request = format!("records-{records}");
+        let journal = store
+            .import_begin(
+                &request,
+                "source",
+                "log",
+                input.len() as u64,
+                &digest(&input),
+                0,
+            )
+            .unwrap();
+        for (index, chunk) in input.chunks(sparrow_core::IMPORT_CHUNK_BYTES).enumerate() {
+            let offset = (index * sparrow_core::IMPORT_CHUNK_BYTES) as u64;
+            store.import_append(&journal.id, offset, chunk, 0).unwrap();
+        }
+        store.import_seal(&journal.id, 0).unwrap();
+        let layout = store.import_prepare_layout(&journal.id, 0);
+        if refused {
+            let error = layout.unwrap_err();
+            assert_eq!(error.code, "RESOURCE_LIMIT", "{error}");
+            assert!(!error.is_retryable(), "{error}");
+            assert!(error.message.contains(&bound.to_string()), "{error}");
+        } else {
+            assert_eq!(layout.unwrap().layout_records, records as u64);
+        }
+        store.import_cancel(&journal.id, 0).unwrap();
+    }
+    let small = tempfile::tempdir().unwrap();
+    let mut tight = config();
+    tight.disk_budget = 2 * 1024 * 1024;
+    tight.maintenance_reserve = 1024 * 1024;
+    let impossible = Store::open(small.path(), tight)
+        .unwrap()
+        .ingest(
+            "whole-budget",
+            "source",
+            "log",
+            &vec![b'x'; 2 * 1024 * 1024],
+            1,
+        )
+        .unwrap_err();
+    assert_eq!(impossible.code, "RESOURCE_LIMIT", "{impossible}");
+    assert!(!impossible.is_retryable(), "{impossible}");
+    // The two cancelled journals above keep their slots until reclaimed.
+    for index in 0..14 {
+        let input = format!("slot-{index}");
+        store
+            .import_begin(
+                &input,
+                "source",
+                "log",
+                input.len() as u64,
+                &digest(input.as_bytes()),
+                0,
+            )
+            .unwrap();
+    }
+    let occupied = store
+        .import_begin("slot-16", "source", "log", 1, &digest(b"x"), 0)
+        .unwrap_err();
+    assert_eq!(occupied.code, "RESOURCE_LIMIT");
+    assert_eq!(occupied.message, sparrow_core::IMPORT_JOURNALS_OCCUPIED);
+    assert!(occupied.is_retryable(), "{occupied}");
 }
 
 #[test]

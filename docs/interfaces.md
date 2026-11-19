@@ -115,6 +115,8 @@ as `opaque`. The smallest triggers measured are 32,769 records of `{"a":N}` (382
 KB), refused after 125 s with the source-context message, and 60,000 such
 records (840 KB), refused after 204 s for RDF write staging.
 
+A staged import of more than 32,768 records is now refused while its layout is prepared, before any record is prepared, so that refusal leaves no prepared records and costs the layout read. The measurements above predate that check. The paragraphs below describe the refusals that still arrive after preparation, such as RDF write staging.
+
 A refused file ingest leaves its prepared records. Preparation commits in
 checkpoints of at most 256 records or 256 KiB of source, each a synced write, so
 the 100 MB file with lines of about 3 KB commits about 85 records at a time.
@@ -150,16 +152,17 @@ its size. The measurements support this guidance and no more:
 
 - Send `jsonl` in bounded chunks of whole lines, each of at most 32,768 records:
   one publication holds at most that many distinct records, and a larger
-  artifact is refused with `RESOURCE_LIMIT` (the RDF staging message may come
-  first, as at 60,000 records). Ten files of 10 MB with lines of about 3 KB (100
+  artifact is refused with the non-retryable `RESOURCE_LIMIT` (the RDF staging message
+  may come first, as at 60,000 records). Ten files of 10 MB with lines of about 3 KB (100
   MB; 112.7 MB with the two earlier files) ingested. A single 100 MB file and a
   10 MB file of tiny records did not. No safe chunk size is measured for small
   records, and 100 MB of log-like `jsonl` was not run.
 - Send large files, and any file whose records need no search by value, as
   `opaque`. A file between 16 MiB and the import bound goes through the staged
   import as one artifact with one payload id; a larger one is cut into parts.
-- Back off on `STORAGE_PRESSURE` and `RESOURCE_LIMIT`; do not retry either at a
-  fixed interval.
+- Back off on `STORAGE_PRESSURE` and on a `RESOURCE_LIMIT` marked retryable; do not
+  retry either at a fixed interval. A `RESOURCE_LIMIT` that is not retryable names a
+  bound on the input: cut the input, because the same bytes fail the same way.
 
 **Finding a sent item.** The one key for a file or an opaque item is its payload
 id: `blake3:` and 64 lower-case hex digits, the BLAKE3 hash of the artifact's exact
@@ -885,7 +888,7 @@ not split. A client learns the bound before it declares from
 schema version changes and no stored format changes; an older client reads the
 refusal as an ordinary non-retryable domain error. An artifact of many small
 records can still need more chunks or record identities than its size implies.
-Layout preparation then refuses it with `RESOURCE_LIMIT` when its row would
+Layout preparation then refuses it with a non-retryable `RESOURCE_LIMIT` when its row would
 exceed the retirement pass, and publication
 checks again for layouts prepared earlier and refuses record rows that would
 exceed the batch. An inline `ingest` is held to the same retirement check.
@@ -897,7 +900,7 @@ bound.
 An intake stages its RDF in memory before commit: at most 32 MiB of new dictionary
 terms and 64 MiB of anticipated writes per batch (the RDF index rows and manifest, plus
 the batch's other pending writes, so earlier records in the batch count). A graph that
-would pass either is refused with `RESOURCE_LIMIT` ("RDF dictionary staging exceeds 32
+would pass either is refused with the non-retryable `RESOURCE_LIMIT` ("RDF dictionary staging exceeds 32
 MiB", "RDF write staging exceeds 64 MiB"). The refusal is counted where the write
 raises it, so every intake path that stages through a counted write is covered:
 inline `ingest`, record batches and the import publication's artifact graph. A
@@ -1007,7 +1010,7 @@ additive, with no schema version change: `maxImportBytes @11`, `rawRecordBytes @
 (the longest record a layout keeps whole), and the joint retirement bound
 `retireRowBudget @13`, `retireChunkCharge @14` and `retireRecordCharge @15`. A staged
 artifact of `chunks` chunks (the sum over its records of the record length over
-65536, rounded up) and `records` records is refused `RESOURCE_LIMIT` at layout
+65536, rounded up) and `records` records is refused with the non-retryable `RESOURCE_LIMIT` at layout
 exactly when `retireChunkCharge * chunks + retireRecordCharge * records` exceeds
 `retireRowBudget`. Each value comes from the store's own properties
 (`max_raw_record_bytes`, `retire_row_budget`, `retire_chunk_charge`,
@@ -3798,7 +3801,7 @@ which is not retryable, and the client quarantines it; an operator who raises `m
 can replay the quarantine file. The size of the joined write, which includes source context
 and authority metadata, is judged at write time against the same whole data budget and
 answers the same non-retryable code. The `ingest` call answers an inline payload over 16 MiB
-with `INVALID_ARGUMENT` too. Other callers keep `RESOURCE_LIMIT`. An input-only refusal
+with `INVALID_ARGUMENT` too. Other callers keep the code `RESOURCE_LIMIT`, answered non-retryable (#397). An input-only refusal
 (record count, sequence count) is decided before the source mapping is bound, so a refused
 batch leaves no mapping behind. A batch refused after the mapping is bound (at the write-size
 checks, a record-level check, or when the write is applied) can still leave the mapping of its
@@ -4340,7 +4343,9 @@ while an attempt advances the checkpoint; the held-connection paths return it wi
 ID answers `IMPORT_EXPIRED` until reclamation has removed the journal; the caller then
 begins again under the same ID, with bounded backoff. An input-bound refusal is not resent:
 `RESOURCE_LIMIT` for more than 32,768 records in one publication or for RDF write staging
-over 64 MiB fails the same way on the same bytes, so the caller cuts the input.
+over 64 MiB fails the same way on the same bytes, so the daemon answers it non-retryable and the
+caller cuts the input. The 32,768-record bound is checked while the layout is prepared, before
+any record is prepared.
 
 `sparrow_client` is the producer interface. It depends on no `sparrow-core`, and a crate
 outside this workspace depends on it by git revision (`publish = false`). It builds with
@@ -4433,7 +4438,7 @@ or semantic engine. The public surface includes:
   every batch before it is sent, so the failure ends delivery and the batch is saved by the
   terminal save under the code `CLIENT_REFUSED`, not by the per-batch route above. The
   daemon storing a refused batch as a malformed record with its reason is the preferred form
-  and is not yet implemented (issue 216). A busy refusal (`RESOURCE_LIMIT`) is never quarantined:
+  and is not yet implemented (issue 216). A busy refusal (a retryable `RESOURCE_LIMIT`) is never quarantined:
   the client holds the batch, bounded by the queue limits, with overflow counted
   as `Full`. A full producer registry is not a refusal any more (#215): the daemon
   stores the batch and counts the lost gap evidence, so the client no longer holds
@@ -4629,7 +4634,7 @@ refusal and every refusal of an older daemon.
 | `CONFLICT` | Retry identity reuse, revision mismatch, or conflicting source generation. |
 | `EVIDENCE_INCOMPLETE` | A `require_complete_index` read selected evidence whose interpretation is permanently unknown or failed at ingest (a failed projection, unknown captured diagnostics, a recordless artifact under a diagnostic filter, a reclaimed parent's unknown origin). Not retryable; no online migration causes it. |
 | `RESULT_EXPIRED` | Bounded snapshot/result lease ended. |
-| `RESOURCE_LIMIT` / `RESULT_TOO_LARGE` | Host admission/output refusal. Native certified governor outcomes retain their read receipts. |
+| `RESOURCE_LIMIT` / `RESULT_TOO_LARGE` | Host admission/output refusal. `RESOURCE_LIMIT` is retryable when transient occupancy caused it (a full import journal table, a busy admission queue, a held read slot) and not retryable when a bound on the input itself caused it (more than 32,768 records in one publication, RDF write or dictionary staging over its cap, an input over the record, batch or whole-budget bound); the wire `retryable` flag says which and the message names the bound. Native certified governor outcomes retain their read receipts. |
 | `STORAGE_PRESSURE` | Insufficient safe write capacity, with retry state. |
 | `STORAGE_FAILURE` | Typed I/O, integrity, or commit failure; retryability follows the actual cause. |
 | `ARCHIVE_WATERMARK` | Publication at or behind the archive watermark. Not retryable as sent. |

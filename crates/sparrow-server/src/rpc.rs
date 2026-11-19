@@ -79,10 +79,7 @@ fn encode_durability(
 }
 
 fn refusal(refusal: crate::admission::Refusal) -> Error {
-    Error {
-        code: refusal.code,
-        message: refusal.message.into(),
-    }
+    Error::new(refusal.code, refusal.message)
 }
 
 /// Read the server's millisecond acceptance clock.
@@ -469,10 +466,7 @@ impl Rpc {
             operation(store, now()?)
         })
         .await
-        .map_err(|e| Error {
-            code: "STORAGE_FAILURE",
-            message: format!("storage task failed: {e}"),
-        })?
+        .map_err(|e| Error::new("STORAGE_FAILURE", format!("storage task failed: {e}")))?
     }
 
     async fn read_work<T: Send + 'static>(
@@ -567,10 +561,10 @@ impl Rpc {
 
     fn check_store(&self, store: &str) -> Result<(), Error> {
         if store != self.store.store_id()? {
-            return Err(Error {
-                code: "STORE_MISMATCH",
-                message: "reference belongs to a different store".into(),
-            });
+            return Err(Error::new(
+                "STORE_MISMATCH",
+                "reference belongs to a different store",
+            ));
         }
         Ok(())
     }
@@ -974,10 +968,7 @@ pub(crate) fn failure<T: capnp::traits::Owned + 'static>(
     let mut out = output.init_error();
     out.set_code(error.code);
     out.set_message(&error.message);
-    out.set_retryable(matches!(
-        error.code,
-        "STORAGE_PRESSURE" | "RESOURCE_LIMIT" | "SHUTTING_DOWN"
-    ));
+    out.set_retryable(error.is_retryable());
     // Additive label (#257): the code and the retryable flag stay what older clients read.
     out.set_class(if error.is_free_space_floor() {
         wire::FailureClass::FreeSpaceFloor
@@ -1451,14 +1442,14 @@ fn selection(
 
 fn scope(value: wire::scope::Reader<'_>, rpc: &Rpc) -> capnp::Result<Result<QueryScope, Error>> {
     if value.get_schema_version() != sparrow_client::SCHEMA_VERSION {
-        return Ok(Err(Error {
-            code: "UNSUPPORTED",
-            message: format!(
+        return Ok(Err(Error::new(
+            "UNSUPPORTED",
+            format!(
                 "query schema {} is unsupported; require schema {} and current discovery",
                 value.get_schema_version(),
                 sparrow_client::SCHEMA_VERSION
             ),
-        }));
+        )));
     }
     let source = optional(value.get_source()?)?;
     let filters = value.get_diagnostics()?;
@@ -3030,10 +3021,7 @@ impl wire::sparrow::Server for Rpc {
         if fields.len() > 32 {
             failure(
                 results.get().init_result(),
-                Error {
-                    code: "RESOURCE_LIMIT",
-                    message: "at most 32 field constraints".into(),
-                },
+                Error::input_bound("at most 32 field constraints"),
             );
             return Ok(());
         }
@@ -3404,10 +3392,10 @@ impl wire::sparrow::Server for Rpc {
             failure(
                 results.get().init_result(),
                 // No retry shortens the request: not retryable (#227).
-                Error {
-                    code: "INVALID_ARGUMENT",
-                    message: "inline ingestion carries at most 16 MiB; stage a larger artifact through importBegin".into(),
-                },
+                Error::new(
+                    "INVALID_ARGUMENT",
+                    "inline ingestion carries at most 16 MiB; stage a larger artifact through importBegin",
+                ),
             );
             return Ok(());
         }
@@ -3561,10 +3549,7 @@ impl wire::sparrow::Server for Rpc {
         if targets.len() as usize > self.max_pin_members {
             failure(
                 results.get().init_result(),
-                Error {
-                    code: "RESOURCE_LIMIT",
-                    message: "pin input exceeds configured membership limit".into(),
-                },
+                Error::input_bound("pin input exceeds configured membership limit"),
             );
             return Ok(());
         }
@@ -4138,10 +4123,10 @@ impl wire::sparrow::Server for Rpc {
                 .store_id()
                 .map_err(|e| capnp::Error::failed(e.to_string()))?
         {
-            Err(Error {
-                code: "STORE_MISMATCH",
-                message: "pin belongs to a different store".into(),
-            })
+            Err(Error::new(
+                "STORE_MISMATCH",
+                "pin belongs to a different store",
+            ))
         } else {
             self.work(move |store, now| store.release_retry(&request_id, &pin_id, now))
                 .await
@@ -4878,7 +4863,8 @@ mod tests {
         let wire::result::Error(error) = reply.which().unwrap() else {
             panic!("a refusal rendered a successful reply");
         };
-        assert!(error.unwrap().get_retryable());
+        // The client's retry class is the wire flag: occupancy stays retryable (#397).
+        assert!(sparrow_client::Error::domain(error.unwrap()).retryable());
         let waits = rpc.admission.writer_waits();
         assert_eq!((waits.waits, waits.waiting, waits.timeouts), (1, 0, 1));
         assert!(waits.longest_ms >= 3000);

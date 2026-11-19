@@ -250,14 +250,14 @@ fn read_chunk_range(
 /// A bound this batch can never meet. An immutable producer batch is held by its client and
 /// retried, so a retryable `RESOURCE_LIMIT` would stall the producer behind it for a cause no
 /// retry changes (#227). It is answered `INVALID_ARGUMENT`, which the client quarantines.
-/// Other callers keep `RESOURCE_LIMIT`: they size their own input and some retry it.
+/// Other callers keep the code `RESOURCE_LIMIT` as an input-bound refusal, which the wire
+/// answers non-retryable (#397).
 fn batch_bound(origin: ingest::Origin<'_>, message: impl Into<String>) -> Error {
-    let code = if origin.producer().is_some() {
-        "INVALID_ARGUMENT"
+    if origin.producer().is_some() {
+        Error::new("INVALID_ARGUMENT", message)
     } else {
-        "RESOURCE_LIMIT"
-    };
-    Error::new(code, message)
+        Error::input_bound(message)
+    }
 }
 
 /// The most one atomic ingestion write may carry.
@@ -313,6 +313,8 @@ pub struct Error {
     pub code: &'static str,
     /// Actionable diagnostic.
     pub message: String,
+    /// The refusal is a bound on the input itself, so no retry of the same bytes changes it.
+    input_bound: bool,
 }
 
 impl Error {
@@ -321,6 +323,28 @@ impl Error {
         Self {
             code,
             message: message.into(),
+            input_bound: false,
+        }
+    }
+
+    /// A `RESOURCE_LIMIT` refusal that a bound on the input itself caused. The message names
+    /// the bound. Transient occupancy is raised with [`Error::new`] and stays retryable; this
+    /// refusal is not, because the same bytes meet the same bound again (#397).
+    pub fn input_bound(message: impl Into<String>) -> Self {
+        Self {
+            input_bound: true,
+            ..Self::new("RESOURCE_LIMIT", message)
+        }
+    }
+
+    /// Whether a client may retry the same request and expect another outcome. The wire's
+    /// `retryable` flag is this value and nothing else decides it.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match self.code {
+            "STORAGE_PRESSURE" | "SHUTTING_DOWN" => true,
+            "RESOURCE_LIMIT" => !self.input_bound,
+            _ => false,
         }
     }
 }

@@ -109,8 +109,7 @@ impl<'a> RecordBatch<'a> {
 
     pub(super) fn record(&mut self, input: RecordInput<'_>) -> Result<Record, Error> {
         if self.record_count >= self.writer.config.max_records as u64 {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
+            return Err(Error::input_bound(
                 "prepared batch exceeds configured record count",
             ));
         }

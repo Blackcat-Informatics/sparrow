@@ -491,7 +491,7 @@ impl<'a> RdfWrite<'a> {
                 bytes: bytes as u64,
             });
         }
-        Error::new("RESOURCE_LIMIT", message)
+        Error::input_bound(message)
     }
 
     fn lookup(&mut self, bytes: &[u8]) -> Result<Option<u64>, Error> {

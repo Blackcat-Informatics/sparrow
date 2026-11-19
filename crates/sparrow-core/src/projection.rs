@@ -15,10 +15,8 @@ pub(crate) const RECORD_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The exact native ordered-JSON profile used for stored occurrence and RDF facts.
 pub fn json_profile() -> Result<json::Profile, Error> {
-    let vocabulary = json::Vocabulary::standard().map_err(|e| Error {
-        code: "PROJECTION_FAILURE",
-        message: e.to_string(),
-    })?;
+    let vocabulary = json::Vocabulary::standard()
+        .map_err(|e| Error::new("PROJECTION_FAILURE", e.to_string()))?;
     json::Profile::new(
         "sparrow-json-occurrences",
         1,
@@ -30,10 +28,7 @@ pub fn json_profile() -> Result<json::Profile, Error> {
             max_pointer_bytes: 2 * 1024 * 1024,
         },
     )
-    .map_err(|e| Error {
-        code: "PROJECTION_FAILURE",
-        message: e.to_string(),
-    })
+    .map_err(|e| Error::new("PROJECTION_FAILURE", e.to_string()))
 }
 
 pub(crate) fn json_facts(
