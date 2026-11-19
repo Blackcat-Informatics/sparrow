@@ -1,0 +1,18 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 1c6d95abd0b762062cac1a7eaf108135f4a46467
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 380
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/380
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: bbac0b2bb8e7a3c0cecaf26851d27ffce40ca11d
+GhpRsq-Head-Ref: paudley/375-daemon-takes-sigsys-from-sched
+GhpRsq-Head-OID: 1c6d95abd0b762062cac1a7eaf108135f4a46467
+GhpRsq-Result-Tree: 67bbd2056c931c86d051e9a368c5789956823a7f
+GhpRsq-Result-Commit: ebab6ca528ffd7e4e4f69b23c6184afd1ee7d281
+GhpRsq-Parent-Hashes: 1c6d95abd0b762062cac1a7eaf108135f4a46467
+GhpRsq-Squash-Notes-SHA256: 7bd9e856ada6d2213bba101865515c59f1e2a090f4dcd3659d0ffa8ebe6d04b8
+GhpRsq-Stage-Evidence: none
