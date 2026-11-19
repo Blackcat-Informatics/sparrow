@@ -100,7 +100,9 @@ it holds and asks.
   several records still lists the payload id of its whole bytes. A segment that
   lacks it is refused by `list`, `verify` and `extract`.
 - **Not held.** Live: a first page (no cursor) that is empty with `complete = true`.
-  Archive: no payload id in the listing of any segment. Not held anywhere means
+  Archive: no payload id in the listing of any segment, from a `list` that exits 0
+  (`list` prints the segments it decoded before it fails on a bad one, so a
+  failed run proves nothing). Not held anywhere means
   both, with the archive read after the archive worker has run on that data.
 - **Limits.** Whole artifacts only: a line inside a JSONL record has no payload
   id. Live holding differs from archive holding: the live index lists an artifact
@@ -108,12 +110,16 @@ it holds and asks.
   not listed live though the archive may hold it, and not held live is not not
   held. Until the `payload-index` migration completes (`complete = false`), a
   listed artifact is held and an empty list means unknown, never not held. A
-  file cut into parts (a consume-root source or an import larger than the inline
-  cap) is found by its parts, each under its own payload id; the whole file's
-  hash is no artifact's payload id. A tail checkpoint's payload id is the hash of
+  file that is cut into parts is found by its parts, each under its own payload
+  id, and the whole file's hash is no artifact's payload id. A file is cut only
+  where one artifact cannot hold it (the import bound, the record limit or the
+  joint retirement bound; see [Part sets for consume roots](#part-sets-for-consume-roots-280)),
+  and a syslog file over the packet limit is cut too. A file below those limits,
+  including a staged import above the 16 MiB inline bound, is one artifact found by
+  the hash of all its bytes. A tail checkpoint's payload id is the hash of
   its checkpointed range. The `payload` lookup is not scoped to a source.
 
-For a record convenience, `values_search` over a source finds a JSONL record by an
+As a convenience for records, `values_search` over a source finds a JSONL record by an
 exact JSON field value, such as a `digest` the sender put in it; that is not the
 contract. `records` over a source lists its records.
 
