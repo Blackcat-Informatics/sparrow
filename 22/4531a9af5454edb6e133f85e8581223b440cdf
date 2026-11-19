@@ -1,0 +1,19 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 224531a9af5454edb6e133f85e8581223b440cdf
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 415
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/415
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 11426cf32e29ad0d381ffeec5ec2f83e05093608
+GhpRsq-Head-Ref: paudley/397-resource-limit-is-always-retryable
+GhpRsq-Head-OID: 224531a9af5454edb6e133f85e8581223b440cdf
+GhpRsq-Result-Tree: 50915927b1bdde6157dcb48cd9305123c10c1b8d
+GhpRsq-Result-Commit: 5ec6c7c16325b444bf27575ef9286fb77c9e3639
+GhpRsq-Parent-Hashes: 224531a9af5454edb6e133f85e8581223b440cdf
+GhpRsq-Squash-Notes-SHA256: 8329fae7bb100433d679f747475a8e3a6ea25e7d93661dbba84f67d352ee42dc
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
