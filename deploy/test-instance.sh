@@ -13,6 +13,12 @@
 # unprivileged user manager cannot apply: the user and group, the credential, the AppArmor
 # profile, the capability, the slice, negative nice and OOM adjustment. ProtectHome= becomes
 # read-only because the scratch directory is under /home. deploy/evidence/lifecycle.md records a run.
+#
+# The instance serves test loads too (deploy/README.md, "Test instance"): a second socket for
+# senders, readable by one group (SPARROW_TEST_INGEST_GROUP, default the invoking user's primary
+# group), and a disk budget (SPARROW_TEST_DISK_BUDGET) and free-space floor
+# (SPARROW_TEST_MIN_FREE) sized for a load. It is a separate store with its own store_id and
+# instance_role = "scratch", never the live store.
 set -euo pipefail
 umask 077
 
@@ -21,10 +27,15 @@ usage() {
 Usage: deploy/test-instance.sh setup [SCRATCH]
        deploy/test-instance.sh env [SCRATCH]
        deploy/test-instance.sh teardown [SCRATCH]
+       deploy/test-instance.sh purge [SCRATCH]
 
 setup stages a test instance in SCRATCH (default: .stage/test-instance in the repository) and
 prints the environment that points the lifecycle scripts at it; env prints it again; teardown
-stops the test unit and removes it (the scratch directory is left for inspection).
+stops the test unit and removes it (the scratch directory, with its store, is kept); purge
+removes the scratch store, intake, ingest socket directory and staged files, and only when the
+unit is stopped and SCRATCH holds a configuration written by this script. SPARROW_TEST_INGEST_GROUP,
+SPARROW_TEST_DISK_BUDGET (bytes, default 16 GiB) and SPARROW_TEST_MIN_FREE (bytes, default
+4 GiB) shape setup.
 USAGE
 }
 (($# >= 1)) || { usage >&2; exit 2; }
@@ -37,6 +48,8 @@ UNIT=sparrow-deploytest.service
 UNIT_DIR=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required}/systemd/user
 ROOT=$SCRATCH/root
 DATA=$SCRATCH/data
+INGEST=$SCRATCH/ingest
+CONFIG=$ROOT/etc/sparrow/server.toml
 
 environment() {
     printf 'export SPARROW_SCOPE=user SPARROW_UNIT=%s\n' "$UNIT"
@@ -48,18 +61,40 @@ case $ACTION in
     setup)
         [[ $SCRATCH == /* ]] || { echo "test-instance.sh: SCRATCH must be absolute" >&2; exit 2; }
         require_socket_length "$DATA/store/rpc.sock"
+        require_socket_length "$INGEST/ingest.sock"
+        # A store made before the role row existed has none, and the daemon refuses to start on it
+        # once the configuration names a role. Its old configuration, still on disk, lacks the key.
+        if [[ -e $DATA/store/CURRENT && -f $CONFIG ]] && ! grep -q '^instance_role = ' "$CONFIG"; then
+            die "the store in $DATA/store was created before instance roles and has no role row, so the daemon refuses to start on it; run 'deploy/test-instance.sh purge $SCRATCH' to remove it and set up a fresh one"
+        fi
+        group=${SPARROW_TEST_INGEST_GROUP:-$(id -gn)}
+        gid=$(getent group "$group" | cut -d: -f3)
+        [[ -n $gid ]] || die "no group named $group for SPARROW_TEST_INGEST_GROUP"
+        disk_budget=${SPARROW_TEST_DISK_BUDGET:-17179869184}
+        min_free=${SPARROW_TEST_MIN_FREE:-4294967296}
         install -d -m 0700 -- "$SCRATCH" "$DATA" "$DATA/intake" "$DATA/intake/deploytest"
+        # The daemon requires this directory to be a real directory owned by its account, with the
+        # sender group and mode exactly 2750 (docs/deployment.md, "Ingest-only group socket").
+        install -d -m 0700 -- "$INGEST"
+        chgrp -- "$gid" "$INGEST" "$SCRATCH" || die "cannot give $SCRATCH to group $group; the invoking user must belong to it"
+        chmod 2750 -- "$INGEST"
+        # A sender must traverse SCRATCH to reach the socket: the group gets search only, so it can
+        # neither list the scratch tree nor read the store (DATA, the store and ROOT stay 0700).
+        chmod 0710 -- "$SCRATCH"
         bundle=$(find "$SPARROW_BIN" -mindepth 1 -maxdepth 1 -type d -name 'lexicons-*' | head -n 1)
         [[ -n $bundle ]] || die "no lexicon bundle in $SPARROW_BIN; run make install-bin"
         lexicons=$ROOT/usr/local/share/sparrow/${bundle##*/}
         # Written first, so install.sh keeps it instead of the production template and its secret.
         install -d -m 0750 -- "$ROOT/etc/sparrow"
-        cat >"$ROOT/etc/sparrow/server.toml" <<CONFIG
+        cat >"$CONFIG" <<CONFIG
 # Test instance (deploy/test-instance.sh): scratch store and socket, no TCP listener.
 socket_path = "$DATA/store/rpc.sock"
 data_dir = "$DATA/store"
 instance_role = "scratch"
-disk_budget = 1073741824
+ingest_socket_path = "$INGEST/ingest.sock"
+ingest_socket_gid = $gid
+disk_budget = $disk_budget
+min_free_bytes = $min_free
 maintenance_reserve = 67108864
 max_records = 100000
 max_pin_members = 10000
@@ -79,12 +114,13 @@ max_directories = 1
 max_candidates = 64
 CONFIG
         SPARROW_DESTDIR=$ROOT "$DEPLOY_DIR/install.sh" --no-enable
+        chmod 0700 -- "$ROOT"
         install -d -m 0700 -- "$UNIT_DIR"
         sed -E \
             -e '/^(User|Group|LoadCredential|AppArmorProfile|AmbientCapabilities|CapabilityBoundingSet|Slice|Nice|OOMScoreAdjust|ManagedOOMPreference|RequiresMountsFor)=/d' \
             -e "s|^ExecStart=.*|ExecStart=$ROOT/usr/local/libexec/sparrow/sparrowd --config $ROOT/etc/sparrow/server.toml|" \
             -e "s|^WorkingDirectory=.*|WorkingDirectory=$DATA|" \
-            -e "s|^ReadWritePaths=.*|ReadWritePaths=$DATA|" \
+            -e "s|^ReadWritePaths=.*|ReadWritePaths=$DATA $INGEST|" \
             -e 's|^ProtectHome=.*|ProtectHome=read-only|' \
             -e 's|^Description=.*|Description=Sparrow deploy test instance (deploy/test-instance.sh)|' \
             -e '/^\[Install\]/,$d' \
@@ -100,7 +136,16 @@ CONFIG
         systemctl --user stop "$UNIT" 2>/dev/null || true
         rm -f -- "$UNIT_DIR/$UNIT"
         systemctl --user daemon-reload
-        echo "test-instance.sh: $UNIT removed; $SCRATCH kept"
+        echo "test-instance.sh: $UNIT removed; $SCRATCH and its store kept; 'test-instance.sh purge' removes the store"
+        ;;
+    purge)
+        [[ $SCRATCH == /* ]] || { echo "test-instance.sh: SCRATCH must be absolute" >&2; exit 2; }
+        grep -qx '# Test instance (deploy/test-instance.sh): scratch store and socket, no TCP listener.' "$CONFIG" 2>/dev/null \
+            || die "$SCRATCH holds no configuration written by test-instance.sh ($CONFIG); nothing is removed"
+        ! systemctl --user is-active --quiet "$UNIT" || die "$UNIT is active; run teardown first"
+        [[ ! -e $UNIT_DIR/$UNIT ]] || die "$UNIT_DIR/$UNIT still exists; run teardown first"
+        rm -rf -- "$DATA" "$INGEST" "$ROOT"
+        echo "test-instance.sh: scratch store, intake, ingest directory and staged files in $SCRATCH removed"
         ;;
     *)
         usage >&2

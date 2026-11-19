@@ -403,9 +403,8 @@ scratch store and socket, no TCP listener, and a user unit
 `sparrow-deploytest.service` rendered from `systemd/sparrow.service` with the
 production sandbox minus what an unprivileged manager cannot apply. It prints
 the environment that points `start.sh`, `stop.sh`, `restart.sh`
-and `check.sh` at it;
-`deploy/test-instance.sh teardown` removes the unit.
-[evidence/lifecycle.md](evidence/lifecycle.md) records a run.
+and `check.sh` at it.
+[evidence/lifecycle.md](evidence/lifecycle.md) records a lifecycle run.
 
 ```bash
 SPARROW_BIN=$PWD/bin deploy/test-instance.sh setup
@@ -420,6 +419,44 @@ Set `SPARROW_BIN` when the kept images are not in this checkout's `./bin`.
 `check.sh` needs `SPARROW_MAX_EXPOSURE=3.5` because the test unit drops the
 root-only hardening, and it exits 2 with `NOT CHECKED` for AppArmor, the
 timers and the slice, which a user unit does not have. A Unix socket path is
-limited to 107 bytes; when the default scratch path makes the socket longer,
+limited to 107 bytes; when the default scratch path makes a socket longer,
 `setup` refuses, so pass a shorter absolute `SCRATCH` as its second argument
-(and to `env` and `teardown`).
+(and to `env`, `teardown` and `purge`).
+
+### A scratch instance for a test load
+
+A full test load sends its cruft to a scratch instance, never to the live
+store. The instance is a separate store: it has its own `store_id`, created
+when the daemon first starts on `SCRATCH/data/store`, its configuration sets
+`instance_role = "scratch"`, and `discover` and `status` report that role. It
+never shares a path, socket or store with `/SPARROW`.
+
+| Item | Value |
+| --- | --- |
+| Store | `.stage/test-instance/data/store` in this repository (`SCRATCH/data/store` for another `SCRATCH`) |
+| Census socket | `.stage/test-instance/data/store/rpc.sock`, mode owner-only, every operation |
+| Ingest socket | `.stage/test-instance/ingest/ingest.sock`, producer operations only |
+| Ingest group | `SPARROW_TEST_INGEST_GROUP` at `setup`, default the invoking user's primary group; `setup` gives `SCRATCH` that group with mode `0710` and the socket directory `2750`, so members can reach the socket but cannot list the scratch tree or read the store; a sender must belong to the group and be able to search every parent of `SCRATCH` |
+| Disk budget | 16 GiB (`SPARROW_TEST_DISK_BUDGET`, bytes); one roll measured 7.66 GB of cruft |
+| Free-space floor | 4 GiB (`SPARROW_TEST_MIN_FREE`, bytes) on the filesystem holding the store |
+| Archive | none: the configuration has no `archive` table, so nothing retires |
+
+A sender configures the ingest socket path and nothing else; it ingests with
+the repository's CLI or client, for example `sparrow
+SCRATCH/ingest/ingest.sock ingest REQUEST_ID SOURCE FORMAT FILE`. The ingest
+socket refuses every other operation. A census reads each file's fate from the
+census socket with the same CLI, for example `sparrow SCRATCH/data/store/rpc.sock
+values --source SOURCE`, or `records`, `text` and `sparql`. Size the budget and
+floor for the load before `setup`: a load that exceeds the budget is refused
+with `STORAGE_PRESSURE`, and free space below the floor pauses writes.
+Free space on the filesystem must cover the budget plus the floor.
+
+`teardown` stops and removes the unit and keeps the store. Only the explicit
+step `deploy/test-instance.sh purge` removes the store, the intake and ingest
+directories and the staged files; it refuses while the unit exists or runs, and
+when `SCRATCH` holds no configuration written by this script (it checks the script's header line, which every version wrote). A scratch store created
+before instance roles existed has no role row, so the daemon refuses to start
+on it once the configuration sets `instance_role`; `setup` detects it from its
+older configuration and refuses with this remedy: run `purge`, then `setup` for
+a fresh store. [evidence/test-load.md](evidence/test-load.md) records a run: setup, one
+artifact ingested over the ingest socket, found by `values_search`, teardown and purge.

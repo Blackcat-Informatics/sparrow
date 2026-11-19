@@ -80,11 +80,19 @@ because they were sample inputs.
 store when the daemon creates it, and `discover` and `status` report it as
 `instanceRole` (`unspecified` for a store with no role). At startup a configured
 role that differs from the stored one stops the daemon with a message naming both
-values; so does a configured role on a store that has none. The role never
-changes after creation, and the daemon does not stamp an existing store: stamping
-is a separate operator step. `deploy/test-instance.sh` writes
-`instance_role = "scratch"` into the scratch configuration it generates. Leave
-the key out of a configuration for a store that has no role row.
+values. A configured role on a store that has none also stops it; that message
+names only the configured role and offers two remedies: remove the key, or stamp
+the store as a separate operator step. The role never changes after creation, and
+the daemon does not stamp an existing store. Leave the key out of a configuration
+for a store that has no role row.
+
+`deploy/test-instance.sh` writes `instance_role = "scratch"` into the scratch
+configuration it generates, together with an ingest socket for senders, a disk
+budget and a free-space floor sized for a test load, and no `archive` table.
+A scratch store created before roles existed has no role row, so the daemon
+refuses to start on it; `test-instance.sh setup` detects it and asks for
+`test-instance.sh purge` followed by a fresh `setup`. `deploy/README.md`,
+"Test instance", gives the paths and teardown steps.
 
 `max_concurrent_requests` admits simultaneous storage work, including intake
 workers (1..64). `max_rpc_connections` independently admits Unix and TCP RPC
