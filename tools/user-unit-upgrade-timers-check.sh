@@ -66,6 +66,8 @@ STUB
     # shellcheck disable=SC2016 # the stub expands its own variables
     printf '#!/bin/sh\necho "$*" >>"$STATE/logger"\n' >"$w/stubs/logger"
     # STUB_PS: unset lists nothing, "other" lists unrelated processes, "daemon" lists a sparrowd,
+    # "bigdaemon" lists a sparrowd first and then over 1 MiB of other names (a pipe to grep -q would
+    # be cut by SIGPIPE under pipefail and read the daemon as gone),
     # "fail" exits 1 with no output the way ps does when it cannot read the process table.
     cat >"$w/stubs/ps" <<'STUB'
 #!/bin/sh
@@ -75,13 +77,14 @@ if [ "$*" = "-e -o comm=" ]; then
         fail) exit 1 ;;
         other) echo systemd; echo bash ;;
         daemon) echo systemd; echo sparrowd ;;
+        bigdaemon) echo sparrowd; yes systemd | head -c 1200000 ;;
     esac
     exit 0
 fi
 case ${STUB_PS:-} in
     fail) exit 1 ;;
     other) echo "    1 systemd systemd"; echo "  200 bash bash" ;;
-    daemon) echo "    1 systemd systemd"; echo "  300 sparrowd sparrowd --config x" ;;
+    daemon|bigdaemon) echo "    1 systemd systemd"; echo "  300 sparrowd sparrowd --config x" ;;
 esac
 exit 0
 STUB
@@ -316,7 +319,7 @@ echo "ok   hangup during the abort: restore completed and recorded"
 # 13. The "no sparrowd process remains" check fails closed (issue #410): a ps that errors stops the
 #     script before the store copy (the daemon's state is unknown), a listed sparrowd still stops it
 #     with the listing, and a list of other processes passes.
-for mode in fail daemon other; do
+for mode in fail daemon bigdaemon other; do
     w=$(world "ps-$mode")
     chattr +C -- "$w/store"
     touch "$w/state/sparrow-ship.timer.active"
@@ -335,7 +338,7 @@ for mode in fail daemon other; do
     esac
     case $mode in
         fail) grep -q 'whether a sparrowd still runs is unknown' <<<"$out" || fail "ps fail: no unknown-state message: $out" ;;
-        daemon)
+        daemon | bigdaemon)
             grep -q 'a sparrowd process remains' <<<"$out" || fail "ps daemon: no refusal message: $out"
             grep -q '300 sparrowd' <<<"$out" || fail "ps daemon: no listing: $out" ;;
     esac

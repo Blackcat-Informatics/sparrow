@@ -1409,7 +1409,7 @@ where the format fence commits.
   systemctl --user stop sparrow-ship.timer sparrow.service     # SIGINT drain, up to TimeoutStopSec
   test "$(systemctl --user show -p ActiveState --value sparrow.service)" = inactive \
     && procs=$(ps -e -o comm=) \
-    && ! printf '%s\n' "$procs" | grep -q '^sparrowd' \
+    && ! grep -q '^sparrowd' <<<"$procs" \
     && mv -T -- /SPARROW/store /SPARROW/store.opened-by-a50820e \
     && mv -T -- /SPARROW/store.before-a50820e /SPARROW/store \
     && test -d /SPARROW/store \
@@ -1423,7 +1423,7 @@ where the format fence commits.
     && systemctl --user start sparrow.service
   ```
 
-  The chain begins with tests, and it stops there unless the unit's `ActiveState` is `inactive`,
+  The chain is bash (the here-string needs it) and does not depend on `pipefail`. It begins with tests, and it stops there unless the unit's `ActiveState` is `inactive`,
   the process list can be read, and no process whose name begins `sparrowd` is in it: a stop that is
   still draining, a unit that never stopped, or a `ps` that fails moves nothing. The daemon runs as
   the `sparrowd` link, so its name is `sparrowd`; a name cut to 15 characters from an image name
