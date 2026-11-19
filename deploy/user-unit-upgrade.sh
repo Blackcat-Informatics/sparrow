@@ -20,7 +20,7 @@ umask 077
 
 usage() {
     cat <<'USAGE'
-Usage: deploy/user-unit-upgrade.sh --from DAEMON_IMAGE --to DAEMON_IMAGE [--keep-copy DIR]
+Usage: deploy/user-unit-upgrade.sh --from DAEMON_IMAGE --to DAEMON_IMAGE [--keep-copy DIR [--hold-after-copy [--hold-answer FIFO]]]
 
 Switch the user unit sparrow.service (systemctl --user) from the kept daemon image --from to
 --to, both names under the libexec directory such as sparrowd-schema68-2aa56a9 and
@@ -38,6 +38,18 @@ then. DIR must be a new name in an existing directory outside the store, and the
 must hold the store's size plus 10 GiB. The way back after TO has opened the store is to put
 that copy in the store's place (docs/deployment.md, "Switch 1"); without it the only way out is
 forward on TO.
+
+--hold-after-copy (needs --keep-copy) pauses the switch once the copy is complete and before the
+links change or TO starts, so a rehearsal of the lift can run on a second copy under a scratch
+unit while the daemon is down. The script prints the kept copy, the seconds since the daemon
+stopped and the instructions, then waits, with no timeout (the daemon is down for the whole
+hold; each prompt repeats the elapsed time). Answer "proceed" to switch the links and start TO as
+usual, or "abort" to start the FROM image again on the unchanged store, start sparrow-ship.timer
+if it was active, and exit non-zero. End of input on the terminal, Ctrl-C, SIGTERM and SIGHUP
+abort the same way. The answer is read from the terminal; without one (stdin is not a terminal)
+--hold-answer FIFO names an existing named pipe the answer is written to, for example
+"echo proceed > FIFO". The script refuses the option, before anything changes, without
+--keep-copy, and without a terminal or a FIFO.
 
 Before anything changes it refuses unless: the daemon link names --from; all four images are
 executable; the --to pair is byte-identical to the kept pair in SPARROW_BIN; the --to daemon
@@ -62,6 +74,9 @@ Environment (defaults are the user-unit layout):
   SPARROW_BIN      the kept images the --to pair must match      <repository>/bin
 
 Recovery depends on where it failed; the FAILED line names the unit and timer states.
+- An aborted hold: the FROM image runs again on the unchanged store and the timer is restored;
+  the exit status is 1 and the message says so. If the FROM image does not answer status, read
+  journalctl --user -u sparrow.service.
 - Before "stop timers": nothing stopped and the links name FROM. Fix the cause and rerun.
 - From "stop timers" up to "switch links": the links still name FROM and the store is untouched.
   Start sparrow.service (if stopped) and sparrow-ship.timer. An installed limits.conf may stay:
@@ -80,7 +95,7 @@ Recovery depends on where it failed; the FAILED line names the unit and timer st
 USAGE
 }
 
-FROM='' TO='' KEEP_COPY=''
+FROM='' TO='' KEEP_COPY='' HOLD=0 HOLD_ANSWER=''
 while (($#)); do
     case $1 in
         -h | --help) usage; exit 0 ;;
@@ -94,11 +109,27 @@ while (($#)); do
             KEEP_COPY=$2
             shift 2
             ;;
+        --hold-after-copy) HOLD=1; shift ;;
+        --hold-answer)
+            (($# >= 2)) && [[ -n $2 ]] || { printf 'user-unit-upgrade.sh: --hold-answer needs a named pipe path\n' >&2; exit 2; }
+            HOLD_ANSWER=$2
+            shift 2
+            ;;
         *) printf 'user-unit-upgrade.sh: unknown argument %s (see --help)\n' "$1" >&2; exit 2 ;;
     esac
 done
 [[ -n $FROM ]] || { printf 'user-unit-upgrade.sh: --from is required (see --help)\n' >&2; exit 2; }
 [[ -n $TO ]] || { printf 'user-unit-upgrade.sh: --to is required (see --help)\n' >&2; exit 2; }
+if ((HOLD)); then
+    [[ -n $KEEP_COPY ]] || { printf 'user-unit-upgrade.sh: --hold-after-copy is defined after the store copy and needs --keep-copy DIR\n' >&2; exit 2; }
+    if [[ -n $HOLD_ANSWER ]]; then
+        [[ -p $HOLD_ANSWER ]] || { printf 'user-unit-upgrade.sh: --hold-answer %s is not an existing named pipe (mkfifo it first)\n' "$HOLD_ANSWER" >&2; exit 2; }
+    else
+        [[ -t 0 ]] || { printf 'user-unit-upgrade.sh: --hold-after-copy needs a terminal on stdin or --hold-answer FIFO\n' >&2; exit 2; }
+    fi
+elif [[ -n $HOLD_ANSWER ]]; then
+    printf 'user-unit-upgrade.sh: --hold-answer needs --hold-after-copy\n' >&2; exit 2
+fi
 
 # The user-unit layout, set before lib.sh applies its system-unit defaults. lib.sh's own scope
 # stays system: its unit helpers address SPARROW_UNIT, and it refuses user scope for
@@ -178,6 +209,68 @@ if [[ -n $KEEP_COPY ]]; then
     copy_plan=$(check_store_copy "$STORE" "$KEEP_COPY") || exit 1
     log "store copy planned at $KEEP_COPY: ${copy_plan%% *} copy of $STORE, ${copy_plan##* } bytes"
 fi
+# Start sparrow-ship.timer again if it was active before this script stopped it.
+restore_ship_timer() {
+    ((ship_timer_was_active == 0)) || "${USER_SYSTEMCTL[@]}" start sparrow-ship.timer
+}
+# Wait for the first status answer, not for pressure "ready". pressure.phase is the disk-budget
+# maintenance state (sparrow-core storage/pressure.rs): it opens ready, or awaitingReclamation
+# when a recovered marker says so, and only data-budget admission and pressure passes move it.
+# The schema 69 migrations never set it, so it is not a migration signal, and gating on it would
+# wait on budget maintenance, which a switch cannot hurry. It is reported by the switch instead.
+# Sets out to the status answer.
+wait_first_status() {
+    local state deadline
+    out=''
+    deadline=$((SECONDS + STATUS_SECONDS))
+    while :; do
+        state=$("${USER_SYSTEMCTL[@]}" show -p ActiveState --value sparrow.service)
+        if [[ $state == inactive || $state == failed ]]; then
+            "${USER_SYSTEMCTL[@]}" status --no-pager --lines=20 sparrow.service >&2 || true
+            die "sparrow.service is $state before its first status answer"
+        fi
+        if out=$("$CLI_LINK" "$SOCKET" status 2>/dev/null); then break; fi
+        ((SECONDS < deadline)) || die "no status answer within ${STATUS_SECONDS}s, the switch gate; the daemon is left running"
+        sleep 5
+    done
+}
+elapsed_since_stop() { awk -v a="$EPOCHREALTIME" -v b="$T0" 'BEGIN{printf "%.1f", a-b}'; }
+# The hold's abort: nothing has changed since the copy (links name FROM, the store is untouched),
+# so the old image starts again, the timer comes back and the script exits non-zero.
+abort_hold() {
+    trap - INT TERM HUP
+    log "hold aborted ($1) after $(elapsed_since_stop) s down: starting $FROM again on the unchanged store"
+    "${USER_SYSTEMCTL[@]}" start sparrow.service
+    wait_first_status
+    restore_ship_timer
+    log "the daemon runs $FROM again; the links name $FROM and the store is unchanged; the kept copy $KEEP_COPY remains"
+    die "switch aborted at the hold; nothing was switched"
+}
+# Wait for proceed or abort, with no timeout: the daemon is down for the whole hold.
+hold_after_copy() {
+    local answer=''
+    trap 'abort_hold SIGINT' INT
+    trap 'abort_hold SIGTERM' TERM
+    trap 'abort_hold SIGHUP' HUP
+    while :; do
+        printf '%s HOLD: sparrow.service has been down %s s. The closed store is kept at %s.\n' \
+            "$(stamp)" "$(elapsed_since_stop)" "$KEEP_COPY"
+        printf 'Rehearse the lift on a second copy now, then answer: "proceed" switches the links and starts %s; "abort" starts %s again on the unchanged store.\n' "$TO" "$FROM"
+        if [[ -n $HOLD_ANSWER ]]; then
+            read -r answer <"$HOLD_ANSWER" || answer=''
+            [[ -n $answer ]] || continue
+        else
+            read -r -p 'proceed or abort> ' answer || { printf '\n'; abort_hold "end of input"; }
+        fi
+        case $answer in
+            proceed) break ;;
+            abort) abort_hold "operator" ;;
+            *) printf 'not an answer: %s\n' "$answer" ;;
+        esac
+    done
+    trap - INT TERM HUP
+    log "hold released after $(elapsed_since_stop) s down: proceeding"
+}
 # After the preconditions, a failure says what state it left (the recovery note is in --help).
 report_failure() {
     local rc=$?
@@ -203,7 +296,7 @@ for _ in $(seq 360); do
     sleep 5
 done
 if ! settled sparrow-ship.service; then
-    ((ship_timer_was_active == 0)) || "${USER_SYSTEMCTL[@]}" start sparrow-ship.timer
+    restore_ship_timer
     die "the shipper is still running; sparrow-ship.timer is started again if it was active before, nothing else changed"
 fi
 T0=$EPOCHREALTIME
@@ -219,6 +312,9 @@ if [[ -n $KEEP_COPY ]]; then
     log "copy the closed store to $KEEP_COPY"
     keep_store_copy "$STORE" "$KEEP_COPY"
 fi
+if ((HOLD)); then
+    hold_after_copy
+fi
 
 log "install $DROPIN_DIR/limits.conf (LimitNOFILE=$LIMIT_NOFILE)"
 install -D -m 0644 -- "$LIMITS_SOURCE" "$DROPIN_DIR/limits.conf"
@@ -233,25 +329,8 @@ swap_link "$CLI_LINK" "$LIBEXEC/$TO_CLI"
 log "start sparrow.service ($TO)"
 "${USER_SYSTEMCTL[@]}" start sparrow.service
 
-# Wait for the first status answer, not for pressure "ready". pressure.phase is the disk-budget
-# maintenance state (sparrow-core storage/pressure.rs): it opens ready, or awaitingReclamation
-# when a recovered marker says so, and only data-budget admission and pressure passes move it.
-# The schema 69 migrations never set it, so it is not a migration signal, and gating on it would
-# wait on budget maintenance, which a switch cannot hurry. It is reported below instead.
-out=''
-deadline=$((SECONDS + STATUS_SECONDS))
-while :; do
-    state=$("${USER_SYSTEMCTL[@]}" show -p ActiveState --value sparrow.service)
-    if [[ $state == inactive || $state == failed ]]; then
-        "${USER_SYSTEMCTL[@]}" status --no-pager --lines=20 sparrow.service >&2 || true
-        die "sparrow.service is $state before its first status answer"
-    fi
-    if out=$("$CLI_LINK" "$SOCKET" status 2>/dev/null); then break; fi
-    ((SECONDS < deadline)) || die "no status answer within ${STATUS_SECONDS}s, the switch gate; the daemon is left running"
-    sleep 5
-done
-T1=$EPOCHREALTIME
-log "status answers; downtime $(awk -v a="$T1" -v b="$T0" 'BEGIN{printf "%.1f", a-b}') s"
+wait_first_status
+log "status answers; downtime $(elapsed_since_stop) s"
 python3 -I -c 'import json, sys
 v = json.load(sys.stdin)
 # counts=pending (schema 70 and newer, while the store counters seed): live_records is exact

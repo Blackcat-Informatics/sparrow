@@ -10,7 +10,7 @@
 # configuration and a status-answering CLI, and stub systemctl, getcap, lsattr, ps and sleep first
 # on PATH. The stub systemctl keeps timer state in files and logs every call, so the assertions read
 # what the script asked of the user manager. Nothing here reaches a real unit, timer, store or
-# daemon. It stays out of `make check` (it needs python3 and runs the whole script four times); run
+# daemon. It stays out of `make check` (it needs python3 and runs the whole script several times); run
 # it after any change to the script's timer handling.
 #
 # Usage: tools/user-unit-upgrade-timers-check.sh SCRATCH_DIR   (absolute; created if absent, never emptied)
@@ -171,5 +171,59 @@ grep -q 'already exists' <<<"$out" || fail "keep-copy refusal did not say the na
 [[ ! -e $w/state/calls ]] || ! grep -Eq '^(stop|start) ' "$w/state/calls" || fail "keep-copy-exists path touched a unit"
 extra=()
 echo "ok   keep-copy name exists: refused before any change"
+
+# 7. --hold-after-copy pauses after the copy and before the link switch; "proceed" continues to the
+#    switch and the start, as without the hold. The answer comes through a named pipe.
+w=$(world hold-proceed)
+chattr +C -- "$w/store"
+mkfifo -- "$w/answer"
+touch "$w/state/sparrow-ship.timer.active"
+extra=(--keep-copy "$w/store.before" --hold-after-copy --hold-answer "$w/answer")
+echo proceed >"$w/answer" &
+writer=$!
+run "$w"
+kill "$writer" 2>/dev/null || true
+((rc == 0)) || { echo "$out" >&2; fail "hold-proceed path exited $rc"; }
+copied=$(grep -n 'kept a reflink copy' <<<"$out" | cut -d: -f1)
+held=$(grep -n 'HOLD:' <<<"$out" | head -1 | cut -d: -f1)
+switched=$(grep -n 'switch links' <<<"$out" | cut -d: -f1)
+((copied < held && held < switched)) || fail "the hold did not fall between the copy and the link switch: $out"
+[[ $(readlink "$w/home/.local/libexec/sparrow/sparrowd") == sparrowd-schema71-bbb ]] || fail "hold-proceed path did not switch the link"
+[[ -e $w/state/sparrow-ship.timer.active ]] || fail "hold-proceed path left the shipper timer stopped"
+echo "ok   hold + proceed: held between the copy and the link switch, then switched"
+
+# 8. "abort" at the hold starts the old image again on the unchanged store, switches nothing, restores
+#    the timer and exits non-zero.
+w=$(world hold-abort)
+chattr +C -- "$w/store"
+mkfifo -- "$w/answer"
+touch "$w/state/sparrow-ship.timer.active"
+extra=(--keep-copy "$w/store.before" --hold-after-copy --hold-answer "$w/answer")
+echo abort >"$w/answer" &
+writer=$!
+run "$w"
+kill "$writer" 2>/dev/null || true
+((rc != 0)) || fail "hold-abort path exited 0"
+[[ $(readlink "$w/home/.local/libexec/sparrow/sparrowd") == sparrowd-schema68-aaa ]] || fail "hold-abort path moved the daemon link"
+[[ $(readlink "$w/home/.local/bin/sparrow") == "$w/home/.local/libexec/sparrow/sparrow-schema68-aaa" ]] || fail "hold-abort path moved the CLI link"
+! grep -q 'switch links' <<<"$out" || fail "hold-abort path switched links"
+[[ ! -e $w/home/.config/systemd/user/sparrow.service.d/limits.conf ]] || fail "hold-abort path installed the drop-in"
+[[ -e $w/state/sparrow.service.active ]] || fail "hold-abort path left sparrow.service stopped"
+[[ -e $w/state/sparrow-ship.timer.active ]] || fail "hold-abort path did not restore the timer"
+[[ $(grep -En '^(stop|start) sparrow\.service' "$w/state/calls" | cut -d: -f2 | tr '\n' ';') == 'stop sparrow.service;start sparrow.service;' ]] \
+    || fail "hold-abort path did not stop then start sparrow.service once"
+[[ -d $w/store.before ]] || fail "hold-abort path lost the kept copy"
+echo "ok   hold + abort: old image started again, nothing switched, exit $rc"
+
+# 9. --hold-after-copy without --keep-copy is refused before anything is touched.
+w=$(world hold-no-copy)
+touch "$w/state/sparrow-ship.timer.active"
+extra=(--hold-after-copy)
+run "$w"
+((rc != 0)) || fail "hold-no-copy path exited 0"
+grep -q 'needs --keep-copy' <<<"$out" || fail "hold refusal did not name --keep-copy: $out"
+[[ ! -e $w/state/calls ]] || fail "hold-no-copy path called systemctl"
+extra=()
+echo "ok   hold without keep-copy: refused before any change"
 
 echo PASS
