@@ -14592,7 +14592,7 @@ async fn discover_and_status_report_the_configured_instance_role() {
 /// Value (#377): `discover` answers on the ingest socket with the store id and the instance role,
 /// the one guard a sender has against sending test cruft to the live store. A store created with
 /// `instance_role = "scratch"` reads `scratch` there; a store with no role reads `unspecified`,
-/// which a sender refuses like `production`. The same socket still refuses `status`.
+/// which a sender refuses like `production`.
 #[tokio::test(flavor = "current_thread")]
 async fn the_ingest_socket_discover_reports_the_instance_role_and_store() {
     tokio::task::LocalSet::new()

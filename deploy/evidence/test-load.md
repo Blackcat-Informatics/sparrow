@@ -161,7 +161,13 @@ $ CLI SCRATCH/data/store/rpc.sock status                                        
                   "intent_in_flight":false,"failure":null}
 ```
 
-`through` was empty before and names the segment's last record afterward, so the worker advanced
+`status` read `phase` `idle` every time: at start (`through` empty), after the first ingest
+(empty), after the refused ingest (empty) and at 06:29 (`through` naming the segment's last
+record). The worker sets `idle` at start and after every successful pass
+(`archive/status.rs`, `pass_succeeded`; `archive.rs` `Worker::start`) and `preparing`, `writing`
+and `verifying` only while a pass runs (`archive.rs`), so `idle` is its normal phase between passes
+and no read landed inside the pass. The watermark `through` is the evidence that the worker ran:
+it was empty before and names the segment's last record afterward, so the worker advanced
 `archive:through`. The same payload id is found in the archive offline, and the extracted bytes
 match:
 
@@ -203,7 +209,40 @@ linked bytes. The refusals left `linked_bytes` at 65513925 with no artifact stor
 whole store (the 2.7 MB artifact raised it by about 116 MB), so a test sizes its budget by reading
 `status`. A setup without `SPARROW_TEST_ARCHIVE_DIR` produced a configuration with no `archive` text,
 no `archive-dir` record and `ReadWritePaths=SCRATCH/data SCRATCH/ingest`, as before. Not run: a
-retirement of the archived item by disk pressure, and a segment cut into several files.
+retirement of the archived item by disk pressure, and a segment cut into several files. The
+transcripts of the refusals, the refused ingest with `linked_bytes` 165898649 and the purge beside
+`keep.txt` are in `.stage/377-agent/run1-transcripts.txt`, copied from the session.
+
+# Purge never removes another store's archive (issue 377)
+
+`setup` refuses a directory that holds anything, because the daemon adopts only an empty one and a
+filled one may be another store's archive; `purge` removes the archive subtree only when `STORE_ID`
+names this instance's own store (`teardown` saves the id in `SCRATCH/store-id` while the unit runs;
+`purge` falls back to the unit's journal line for the socket) and otherwise removes nothing. Run
+from the working tree before commit, with a hand-made `STORE_ID` and subtree standing for another
+store (`.stage/377-agent/r1.log`, `r1b.log`, `r1c.log`; the scripts are `r1.sh`, `r1b.sh`):
+
+```text
+$ SPARROW_TEST_ARCHIVE_DIR=/dev/shm/sparrow-377-share deploy/test-instance.sh setup SCRATCH
+test-instance.sh: the archive directory /dev/shm/sparrow-377-share is not empty, so it may hold another store's archive, which the daemon refuses and which purge must never remove; use an empty directory (it holds: STORE_ID store:aaaa... )
+[exit 1]
+
+# an empty directory at setup; the foreign STORE_ID and subtree appear before purge
+$ deploy/test-instance.sh purge SCRATCH
+test-instance.sh: /dev/shm/sparrow-377-share/STORE_ID names store:aaaa... but this instance's store is store:e962...: that archive belongs to another store; nothing is removed. Delete SCRATCH/archive-dir to leave it in place and purge the rest
+[exit 1]
+$ find /dev/shm/sparrow-377-share           # STORE_ID, store:aaaa..., store:aaaa.../seg.gts all remain
+
+# the instance's own id (read from the journal after stop.sh, no saved record), keep.txt beside it
+$ deploy/test-instance.sh purge SCRATCH
+test-instance.sh: archive subtree /dev/shm/sparrow-377-share/store:f743... and .../STORE_ID removed; /dev/shm/sparrow-377-share kept
+$ find /dev/shm/sparrow-377-share           # keep.txt only
+```
+
+Also refused, with the cause named: a path with `&` (`/dev/shm/a&b`), and a directory on another
+btrfs subvolume (device 40 against `/` on 41) for its filesystem type `0x9123683e`, the same local
+type as `/`. A `setup` without the variable after one with it drops the recorded directory and
+leaves the directory itself.
 
 # The instance role on the ingest socket (issue 377)
 

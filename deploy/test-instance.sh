@@ -42,6 +42,9 @@ and on a different device than SCRATCH (a tmpfs such as /dev/shm/NAME), adds the
 and its ReadWritePaths entry; unset, the instance has no archive. setup records the directory in
 SCRATCH/archive-dir, and purge then removes that directory's STORE_ID file and <store_id>/
 subtree, never the directory itself or anything else in it.
+The directory must also be empty and satisfy the daemon's own-mount rule. purge removes the
+subtree only when STORE_ID names this instance's store (teardown saves the id in
+SCRATCH/store-id while the unit runs), and otherwise removes nothing.
 USAGE
 }
 (($# >= 1)) || { usage >&2; exit 2; }
@@ -57,7 +60,39 @@ DATA=$SCRATCH/data
 INGEST=$SCRATCH/ingest
 # The archive directory setup was given, recorded so that purge removes only what the daemon wrote there.
 ARCHIVE_RECORD=$SCRATCH/archive-dir
+# The store id of this instance's store, saved by teardown while the unit still answers, so purge can
+# tell this instance's archive from another store's.
+STORE_RECORD=$SCRATCH/store-id
 CONFIG=$ROOT/etc/sparrow/server.toml
+
+# The store id of this instance: the saved record, else the unit's journal line for this socket.
+own_store_id() {
+    local id=
+    if [[ -f $STORE_RECORD ]]; then
+        id=$(<"$STORE_RECORD")
+    else
+        id=$(journalctl --user -u "$UNIT" -o cat --no-pager 2>/dev/null \
+            | grep -F "capnp=$DATA/store/rpc.sock" | tail -n 1 \
+            | sed -nE 's/.*store=(store:[0-9a-f]{32}) .*/\1/p' || true)
+    fi
+    [[ $id =~ ^store:[0-9a-f]{32}$ ]] && printf '%s\n' "$id"
+    return 0
+}
+
+# The daemon's own-mount rule (crates/sparrow-server/src/archive.rs, require_own_mount): a device other
+# than the root's, and a filesystem type that is a network filesystem or differs from the root's.
+require_own_mount() {
+    local dir=$1 type root_type
+    [[ $(stat -c %d -- "$dir") != "$(stat -c %d -- /)" ]] \
+        || die "the archive directory $dir is on the same device as /, which the daemon refuses; use a directory on its own mount, such as one under /dev/shm"
+    type=$(stat -f -c %t -- "$dir")
+    root_type=$(stat -f -c %t -- /)
+    case $type in
+        6969 | 517b | ff534d42 | fe534d42 | c36400 | 6b414653 | 1021997 | bd00bd0 | 564c | 73757245) return 0 ;;
+    esac
+    [[ $type != "$root_type" ]] \
+        || die "the archive directory $dir has filesystem type 0x$type, the same local type as / and not a network filesystem, which the daemon refuses; use a directory on its own mount, such as one under /dev/shm"
+}
 
 environment() {
     printf 'export SPARROW_SCOPE=user SPARROW_UNIT=%s\n' "$UNIT"
@@ -83,8 +118,8 @@ case $ACTION in
         min_free=${SPARROW_TEST_MIN_FREE:-4294967296}
         archive_dir=${SPARROW_TEST_ARCHIVE_DIR:-}
         if [[ -n $archive_dir ]]; then
-            [[ $archive_dir == /* && $archive_dir != *[[:space:]\"\\]* ]] \
-                || die "SPARROW_TEST_ARCHIVE_DIR must be an absolute path without spaces, quotes or backslashes: $archive_dir"
+            [[ $archive_dir =~ ^/[A-Za-z0-9._/+@:=,-]+$ ]] \
+                || die "SPARROW_TEST_ARCHIVE_DIR must be an absolute path of letters, digits and . _ / + @ : = , - only (the path goes into a unit file and a sed command): $archive_dir"
             [[ /$archive_dir/ != */../* ]] || die "SPARROW_TEST_ARCHIVE_DIR must not contain '..': $archive_dir"
             [[ -d $archive_dir ]] \
                 || die "the archive directory $archive_dir does not exist; the daemon never creates it, so create it on its own mount first (for example mkdir -m 0700 /dev/shm/NAME)"
@@ -99,6 +134,16 @@ case $ACTION in
             case $archive_dir/ in
                 "$SCRATCH"/*) die "the archive directory $archive_dir lies inside the scratch tree $SCRATCH" ;;
             esac
+            require_own_mount "$archive_dir"
+            # The daemon adopts only an empty directory, and purge removes what is recorded here, so a
+            # directory that holds anything may be another store's archive. Only this instance's own
+            # directory, already recorded with its own store id, may be set up again.
+            if [[ -n $(find "$archive_dir" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+                own=$(own_store_id)
+                if [[ ! -f $ARCHIVE_RECORD || $(<"$ARCHIVE_RECORD") != "$archive_dir" || -z $own || ! -f $archive_dir/STORE_ID || $(<"$archive_dir/STORE_ID") != "$own" ]]; then
+                    die "the archive directory $archive_dir is not empty, so it may hold another store's archive, which the daemon refuses and which purge must never remove; use an empty directory (it holds: $(find "$archive_dir" -mindepth 1 -maxdepth 1 -printf '%f ' | head -c 200))"
+                fi
+            fi
         fi
         install -d -m 0700 -- "$SCRATCH" "$DATA" "$DATA/intake" "$DATA/intake/deploytest"
         # The daemon requires this directory to be a real directory owned by its account, with the
@@ -142,6 +187,10 @@ max_directories = 1
 max_candidates = 64
 CONFIG
         read_write_paths="$DATA $INGEST"
+        if [[ -z $archive_dir && -f $ARCHIVE_RECORD ]]; then
+            echo "test-instance.sh: dropping the archive directory recorded by an earlier setup ($(<"$ARCHIVE_RECORD")); it and what the daemon wrote there are left in place"
+            rm -f -- "$ARCHIVE_RECORD"
+        fi
         if [[ -n $archive_dir ]]; then
             printf '\n[archive]\ndir = "%s"\n' "$archive_dir" >>"$CONFIG"
             printf '%s\n' "$archive_dir" >"$ARCHIVE_RECORD"
@@ -167,6 +216,12 @@ CONFIG
         environment
         ;;
     teardown)
+        # While the unit still answers, save the store's id: it is how purge tells this instance's archive
+        # from another store's after the unit is gone.
+        if systemctl --user is-active --quiet "$UNIT" 2>/dev/null && [[ -x $ROOT/usr/local/bin/sparrow ]]; then
+            running=$("$ROOT/usr/local/bin/sparrow" "$DATA/store/rpc.sock" status 2>/dev/null | grep -o '"store_id":"store:[0-9a-f]\{32\}"' | head -n 1 | cut -d'"' -f4 || true)
+            [[ -z $running ]] || printf '%s\n' "$running" >"$STORE_RECORD"
+        fi
         systemctl --user stop "$UNIT" 2>/dev/null || true
         rm -f -- "$UNIT_DIR/$UNIT"
         systemctl --user daemon-reload
@@ -183,10 +238,17 @@ CONFIG
         if [[ -f $ARCHIVE_RECORD ]]; then
             archive_dir=$(<"$ARCHIVE_RECORD")
             [[ $archive_dir == /* && $archive_dir != *..* ]] || die "$ARCHIVE_RECORD names no absolute archive directory ($archive_dir); nothing is removed"
-            if [[ -f $archive_dir/STORE_ID ]]; then
+            if [[ ! -d $archive_dir ]]; then
+                echo "test-instance.sh: the recorded archive directory $archive_dir no longer exists (a tmpfs is gone after a reboot); nothing there to remove"
+            elif [[ -f $archive_dir/STORE_ID ]]; then
                 archive_store=$(<"$archive_dir/STORE_ID")
                 [[ $archive_store =~ ^store:[0-9a-f]{32}$ ]] \
                     || die "$archive_dir/STORE_ID holds '$archive_store', not a store id; nothing is removed"
+                own=$(own_store_id)
+                [[ -n $own ]] \
+                    || die "this instance's store id is unknown (no $STORE_RECORD, which teardown writes while the unit runs, and no journal line), so $archive_dir/STORE_ID ($archive_store) cannot be shown to be this instance's; nothing is removed. Delete $ARCHIVE_RECORD to leave the archive in place and purge the rest"
+                [[ $own == "$archive_store" ]] \
+                    || die "$archive_dir/STORE_ID names $archive_store but this instance's store is $own: that archive belongs to another store; nothing is removed. Delete $ARCHIVE_RECORD to leave it in place and purge the rest"
                 [[ ! -e $archive_dir/$archive_store || ( -d $archive_dir/$archive_store && ! -L $archive_dir/$archive_store ) ]] \
                     || die "$archive_dir/$archive_store is not a directory; nothing is removed"
                 rm -rf -- "${archive_dir:?}/${archive_store:?}"
@@ -197,7 +259,7 @@ CONFIG
             fi
         fi
         rm -rf -- "$DATA" "$INGEST" "$ROOT"
-        rm -f -- "$ARCHIVE_RECORD"
+        rm -f -- "$ARCHIVE_RECORD" "$STORE_RECORD"
         echo "test-instance.sh: scratch store, intake, ingest directory and staged files in $SCRATCH removed"
         ;;
     *)

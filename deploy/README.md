@@ -471,13 +471,17 @@ Free space on the filesystem must cover the budget plus the floor.
 worker on. It appends `[archive]` with `dir = "DIR"` and every other key at its
 default to the configuration, adds `DIR` to the unit's `ReadWritePaths`, and
 records `DIR` in `SCRATCH/archive-dir`. It refuses a `DIR` that is absent (the
-daemon never creates the directory), that the invoking user cannot write, or that
-is on the same device as the scratch tree, and says which. `DIR` must also be on
-its own mount: the daemon refuses a directory on the root filesystem's device or
-of the root filesystem's type
-([Archive-before-delete gate](../docs/interfaces.md#archive-before-delete-gate-schema-63)),
-and the scratch tree lives on the root btrfs. A tmpfs such as `/dev/shm` satisfies
-the rule on this host, so create `mkdir -m 0700 /dev/shm/NAME` first and pass it.
+daemon never creates the directory), that the invoking user cannot write, that is
+not empty (it may hold another store's archive), that is on the same device as
+the scratch tree, or that breaks the daemon's own-mount rule, and says which. A
+path may hold only letters, digits and `. _ / + @ : = , -`. The own-mount rule is
+the daemon's
+([Archive-before-delete gate](../docs/interfaces.md#archive-before-delete-gate-schema-63)):
+a device other than the root filesystem's, and a filesystem type that is a
+network filesystem or differs from the root's; `setup` applies the same two
+tests. The scratch tree lives on the root btrfs, so a btrfs directory on another
+subvolume is refused for its type. A tmpfs such as `/dev/shm` satisfies the rule
+on this host, so create `mkdir -m 0700 /dev/shm/NAME` first and pass it.
 The daemon writes `DIR/STORE_ID` and `DIR/<store_id>/` on its first pass, and only
 into an empty directory.
 
@@ -503,7 +507,13 @@ load for it.
 step `deploy/test-instance.sh purge` removes the store, the intake and ingest
 directories and the staged files, and the recorded archive directory's
 `STORE_ID` file and `<store_id>/` subtree (never the directory or anything else
-in it); it refuses while the unit exists or runs, and
+in it). It removes the subtree only when `STORE_ID` names this instance's own
+store: `teardown` saves the store id in `SCRATCH/store-id` while the unit runs,
+and `purge` falls back to the unit's journal line for this socket. When the id
+is unknown or differs, `purge` removes nothing and names the cause; delete
+`SCRATCH/archive-dir` to leave that archive in place and purge the rest. A
+`setup` without `SPARROW_TEST_ARCHIVE_DIR` drops the stale record and leaves the
+directory alone; it refuses while the unit exists or runs, and
 when `SCRATCH` holds no configuration written by this script (it checks the script's header line, which every version wrote). A scratch store created
 before instance roles existed has no role row, so the daemon refuses to start
 on it once the configuration sets `instance_role`; `setup` detects it from its
