@@ -246,7 +246,11 @@ impl Client {
     /// Accept a complete artifact with explicit buffered or durable acknowledgment.
     /// An input above the discovered inline bound is staged in 64 KiB appends and
     /// acknowledged durably; the store refuses one above `MAX_IMPORT_BYTES` before
-    /// any byte is uploaded.
+    /// any byte is uploaded. A refused or failed upload cancels its staging journal over
+    /// this connection, so it does not hold an import slot unless the cancel also fails.
+    /// A hold (`STORAGE_PRESSURE`, `SHUTTING_DOWN`) or a lost connection is returned
+    /// unchanged and cancels nothing: the journal stays intact and a retry under the same
+    /// request ID resumes it. See [`Client::import_file`].
     pub async fn ingest_with_durability(
         &self,
         request_id: &str,
@@ -267,7 +271,7 @@ impl Client {
         if bytes.len() as u64 > self.discovery.max_inline_artifact_bytes {
             // One message cannot carry it: stream it through the resumable import,
             // which acknowledges durably whatever durability was requested.
-            return imports::upload(
+            return imports::upload_or_cancel(
                 self.capability(),
                 &self.discovery,
                 request_id,
@@ -312,8 +316,23 @@ impl Client {
     }
 
     /// Upload a completed regular file once over this connection. Unlike the free
-    /// `import_file(endpoint, ...)` used by the CLI, it neither reconnects nor
-    /// cancels; a caller that abandons a failed import should cancel it.
+    /// `import_file(endpoint, ...)` used by the CLI, it never reconnects or resumes: any
+    /// error ends the attempt. A hold (`STORAGE_PRESSURE`, `SHUTTING_DOWN`) or a lost
+    /// connection is returned unchanged and cancels nothing: the journal stays staged and a
+    /// retry under the same request ID resumes it. Any other failed attempt cancels its
+    /// staging journal over this connection, releasing its import slot; a retry under the
+    /// same request ID then fails with `IMPORT_EXPIRED` until reclamation. A cancel answered
+    /// `CONFLICT` means the publication committed although its reply was lost, or the
+    /// daemon's file watcher owns the staging; the upload is retried once, returning the
+    /// receipt or that attempt's error, and a watcher-owned journal is left intact. When the
+    /// connection is lost before the cancel arrives, or the daemon refuses the cancel with a
+    /// retryable hold (free-space floor, restart, busy admission), the error is the
+    /// retryable `IMPORT_RESUMABLE` naming the import and keeping the refusal's class: a
+    /// retry under the same request ID resumes the journal if it is still staged. If the
+    /// cancel committed and its reply was lost, that ID answers `IMPORT_EXPIRED` until
+    /// reclamation has removed the journal, then begins afresh. When the cancel fails for
+    /// good, for example `PERMISSION_DENIED`, the error is `IMPORT_ABANDONED` naming the
+    /// import, whose slot stays occupied until the retry window ends.
     pub async fn import_file(
         &self,
         request_id: &str,
@@ -350,7 +369,7 @@ impl Client {
         file: &mut std::fs::File,
         progress: Option<std::sync::Arc<parts::PartsProgress>>,
     ) -> Result<ArtifactReceipt, Error> {
-        imports::upload(
+        imports::upload_or_cancel(
             self.capability(),
             &self.discovery,
             request_id,

@@ -7302,6 +7302,10 @@ struct EventRelayState {
     drop_first: std::cell::Cell<bool>,
     corrupt_receipt: std::cell::Cell<bool>,
     corrupt_publication: std::cell::Cell<bool>,
+    /// Answer `importPublish` with this daemon-style refusal `(code, retryable)` instead of forwarding it.
+    refuse_publish: std::cell::Cell<Option<(&'static str, bool)>>,
+    /// Answer `importCancel` with this daemon refusal `(code, retryable)` instead of forwarding it.
+    refuse_cancel: std::cell::Cell<Option<(&'static str, bool)>>,
     /// Daemon-style refusals `(code, retryable)` answered, in order, to the next event batches
     /// instead of forwarding them.
     refusals: std::cell::RefCell<std::collections::VecDeque<(&'static str, bool)>>,
@@ -7456,11 +7460,38 @@ impl wire::sparrow::Server for EventRelay {
         let response = request.send().promise.await?;
         results.get().set_result(response.get()?.get_result()?)
     }
+    async fn import_cancel(
+        self: std::rc::Rc<Self>,
+        params: wire::sparrow::ImportCancelParams,
+        mut results: wire::sparrow::ImportCancelResults,
+    ) -> capnp::Result<()> {
+        if let Some((code, retryable)) = self.0.refuse_cancel.get() {
+            let mut failure = results.get().init_result().init_error();
+            failure.set_code(code);
+            failure.set_message("injected refusal");
+            failure.set_retryable(retryable);
+            if code == "STORAGE_PRESSURE" {
+                failure.set_class(wire::FailureClass::FreeSpaceFloor);
+            }
+            return Ok(());
+        }
+        let mut request = self.0.backend.borrow().import_cancel_request();
+        request.get().set_import(params.get()?.get_import()?)?;
+        let response = request.send().promise.await?;
+        results.get().set_result(response.get()?.get_result()?)
+    }
     async fn import_publish(
         self: std::rc::Rc<Self>,
         params: wire::sparrow::ImportPublishParams,
         mut results: wire::sparrow::ImportPublishResults,
     ) -> capnp::Result<()> {
+        if let Some((code, retryable)) = self.0.refuse_publish.get() {
+            let mut failure = results.get().init_result().init_error();
+            failure.set_code(code);
+            failure.set_message("injected refusal");
+            failure.set_retryable(retryable);
+            return Ok(());
+        }
         let mut request = self.0.backend.borrow().import_publish_request();
         request.get().set_import(params.get()?.get_import()?)?;
         let response = request.send().promise.await?;
@@ -7586,6 +7617,216 @@ async fn cli_ingest_resumes_across_lost_connections_and_cancels_a_stalled_import
         .await;
 }
 
+/// Stage an unpublishable import above the inline bound through `client` and return the
+/// error it ends with. The relay refuses `importPublish`, as the daemon refuses a prepared import.
+async fn refused_large_ingest(
+    client: &sparrow_client::Client,
+    request_id: &str,
+) -> sparrow_client::Error {
+    let bytes = vec![b'x'; sparrow_core::INLINE_ARTIFACT_BYTES + 1];
+    client
+        .ingest(request_id, "large", wire::Format::Opaque, &bytes)
+        .await
+        .unwrap_err()
+}
+
+/// A refused import through `Client::ingest` above the inline bound cancels its staging
+/// journal, so the refusal does not hold an import slot until the retry window ends (#392).
+#[tokio::test(flavor = "current_thread")]
+async fn refused_large_ingest_over_a_connection_cancels_its_staging_journal() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let _daemon = start(&config, &socket).await;
+            let genuine = sparrow_client::Client::connect(&socket).await.unwrap();
+            let proxy_socket = dir.path().join("proxy.sock");
+            let (state, proxy) = relay(&proxy_socket, genuine.capability().clone());
+            state.refuse_publish.set(Some(("RESOURCE_LIMIT", true)));
+            let client = sparrow_client::Client::connect(&proxy_socket)
+                .await
+                .unwrap();
+            let error = refused_large_ingest(&client, "refused-large").await;
+            assert!(
+                matches!(&error, sparrow_client::Error::Domain { code, .. } if code == "RESOURCE_LIMIT"),
+                "{error}"
+            );
+            // A live journal would report its staging; a canceled one has ended its lease.
+            let status = sparrow_client::get_ingest_status(
+                genuine.capability(),
+                &genuine.discovery().store_id,
+                &sparrow_client::IngestSelector::Request("refused-large".into()),
+                Default::default(),
+            )
+            .await;
+            assert!(
+                matches!(&status, Err(sparrow_client::Error::Domain { code, .. })
+                    if code == "IMPORT_EXPIRED" || code == "NOT_FOUND"),
+                "refused import still holds its import slot: {:?}",
+                status.err()
+            );
+            proxy.abort();
+        })
+        .await;
+}
+
+/// A refused import whose cancel the daemon answers with an error returns `IMPORT_ABANDONED`
+/// naming the import, and leaves its journal staged for the retry window (#392).
+#[tokio::test(flavor = "current_thread")]
+async fn refused_large_ingest_whose_cancel_is_refused_reports_import_abandoned() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let _daemon = start(&config, &socket).await;
+            let genuine = sparrow_client::Client::connect(&socket).await.unwrap();
+            let proxy_socket = dir.path().join("proxy.sock");
+            let (state, proxy) = relay(&proxy_socket, genuine.capability().clone());
+            state.refuse_publish.set(Some(("RESOURCE_LIMIT", true)));
+            state.refuse_cancel.set(Some(("PERMISSION_DENIED", false)));
+            let client = sparrow_client::Client::connect(&proxy_socket)
+                .await
+                .unwrap();
+            let error = refused_large_ingest(&client, "abandoned-large").await;
+            assert!(
+                matches!(&error, sparrow_client::Error::Domain { code, message, retryable: false, .. }
+                    if code == "IMPORT_ABANDONED" && message.contains("RESOURCE_LIMIT")),
+                "{error}"
+            );
+            let status = sparrow_client::get_ingest_status(
+                genuine.capability(),
+                &genuine.discovery().store_id,
+                &sparrow_client::IngestSelector::Request("abandoned-large".into()),
+                Default::default(),
+            )
+            .await;
+            assert!(status.is_ok(), "uncancelled journal must stay staged: {:?}", status.err());
+            proxy.abort();
+        })
+        .await;
+}
+
+/// A large ingest over a held connection that loses the connection, as the daemon's
+/// connection lease does, returns the retryable transport error without a cancel: the journal
+/// is intact and the same request ID completes on a new connection (#392).
+#[tokio::test(flavor = "current_thread")]
+async fn large_ingest_over_a_lost_connection_is_retryable_and_resumes_under_its_request_id() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let _daemon = start(&config, &socket).await;
+            let cutting = dir.path().join("cutting.sock");
+            let relay = lease_cutting_relay(
+                &cutting,
+                socket.clone(),
+                4 * 1024 * 1024,
+                std::rc::Rc::new(std::cell::Cell::new(0)),
+            );
+            let lossy = sparrow_client::Client::connect(&cutting).await.unwrap();
+            let bytes = vec![b'x'; sparrow_core::INLINE_ARTIFACT_BYTES + 1];
+            let error = lossy
+                .ingest("cut-large", "large", wire::Format::Opaque, &bytes)
+                .await
+                .unwrap_err();
+            assert!(error.retryable(), "{error}");
+            assert!(
+                matches!(&error, sparrow_client::Error::Transport(_)),
+                "a lost connection is returned unchanged: {error}"
+            );
+            let fresh = sparrow_client::Client::connect(&socket).await.unwrap();
+            let receipt = fresh
+                .ingest("cut-large", "large", wire::Format::Opaque, &bytes)
+                .await
+                .unwrap();
+            assert_eq!(receipt.byte_length, bytes.len() as u64);
+            relay.abort();
+        })
+        .await;
+}
+
+/// A cancel the daemon refuses with a retryable hold (the free-space floor) leaves the journal
+/// intact: the error stays retryable, names the import and keeps its class, and the same
+/// request ID then completes on a fresh connection (#392).
+#[tokio::test(flavor = "current_thread")]
+async fn large_ingest_whose_cancel_is_held_by_the_floor_is_retryable_and_resumes() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let _daemon = start(&config, &socket).await;
+            let genuine = sparrow_client::Client::connect(&socket).await.unwrap();
+            let proxy_socket = dir.path().join("proxy.sock");
+            let (state, proxy) = relay(&proxy_socket, genuine.capability().clone());
+            state.refuse_publish.set(Some(("RESOURCE_LIMIT", true)));
+            state.refuse_cancel.set(Some(("STORAGE_PRESSURE", true)));
+            let client = sparrow_client::Client::connect(&proxy_socket)
+                .await
+                .unwrap();
+            let error = refused_large_ingest(&client, "held-large").await;
+            assert!(error.retryable(), "{error}");
+            assert!(error.is_free_space_floor(), "{error}");
+            assert!(
+                matches!(&error, sparrow_client::Error::Domain { code, message, .. }
+                    if code == "IMPORT_RESUMABLE" && message.contains("import:")),
+                "{error}"
+            );
+            let bytes = vec![b'x'; sparrow_core::INLINE_ARTIFACT_BYTES + 1];
+            let receipt = genuine
+                .ingest("held-large", "large", wire::Format::Opaque, &bytes)
+                .await
+                .unwrap();
+            assert_eq!(receipt.byte_length, bytes.len() as u64);
+            proxy.abort();
+        })
+        .await;
+}
+
+/// A hold refused mid-upload over a held connection (`STORAGE_PRESSURE`) is returned unchanged
+/// and cancels nothing: the journal stays staged and the same request ID then completes (#392).
+#[tokio::test(flavor = "current_thread")]
+async fn large_ingest_held_by_the_floor_is_returned_unchanged_and_resumes() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let _daemon = start(&config, &socket).await;
+            let genuine = sparrow_client::Client::connect(&socket).await.unwrap();
+            let proxy_socket = dir.path().join("proxy.sock");
+            let (state, proxy) = relay(&proxy_socket, genuine.capability().clone());
+            state.refuse_publish.set(Some(("STORAGE_PRESSURE", true)));
+            // A cancel would answer with a different code, so reaching the daemon shows.
+            state.refuse_cancel.set(Some(("PERMISSION_DENIED", false)));
+            let client = sparrow_client::Client::connect(&proxy_socket)
+                .await
+                .unwrap();
+            let error = refused_large_ingest(&client, "hold-large").await;
+            assert!(
+                matches!(&error, sparrow_client::Error::Domain { code, retryable: true, .. }
+                    if code == "STORAGE_PRESSURE"),
+                "{error}"
+            );
+            let bytes = vec![b'x'; sparrow_core::INLINE_ARTIFACT_BYTES + 1];
+            let receipt = genuine
+                .ingest("hold-large", "large", wire::Format::Opaque, &bytes)
+                .await
+                .unwrap();
+            assert_eq!(receipt.byte_length, bytes.len() as u64);
+            proxy.abort();
+        })
+        .await;
+}
+
 fn relay(
     socket: &Path,
     backend: wire::sparrow::Client,
@@ -7598,6 +7839,8 @@ fn relay(
         drop_first: std::cell::Cell::new(true),
         corrupt_receipt: std::cell::Cell::new(false),
         corrupt_publication: std::cell::Cell::new(false),
+        refuse_publish: std::cell::Cell::new(None),
+        refuse_cancel: std::cell::Cell::new(None),
         refusals: std::cell::RefCell::new(std::collections::VecDeque::new()),
         connections: std::cell::Cell::new(0),
         mutate_file: std::cell::RefCell::new(None),
@@ -7782,17 +8025,17 @@ async fn producer_receipt_mismatch_never_certifies_or_retires_pending_input() {
             *state.mutate_file.borrow_mut() = None;
             std::fs::write(&input, b"initial").unwrap();
             state.corrupt_publication.set(true);
-            assert!(matches!(
-                client
-                    .import_file(
-                        "bad-publication-reply",
-                        "publication",
-                        wire::Format::Opaque,
-                        &input
-                    )
-                    .await,
-                Err(sparrow_client::Error::Protocol(_))
-            ));
+            // The publication committed but its reply is unusable: the cancel is answered
+            // CONFLICT, so the genuine receipt is retrieved instead of an error.
+            let retrieved = client
+                .import_file(
+                    "bad-publication-reply",
+                    "publication",
+                    wire::Format::Opaque,
+                    &input,
+                )
+                .await
+                .unwrap();
             assert_eq!(std::fs::read(&input).unwrap(), b"initial");
             let committed = genuine
                 .ingest(
@@ -7803,6 +8046,7 @@ async fn producer_receipt_mismatch_never_certifies_or_retires_pending_input() {
                 )
                 .await
                 .unwrap();
+            assert_eq!(committed.id, retrieved.id);
             assert_eq!(committed.durability, wire::Durability::Durable);
             state.corrupt_publication.set(false);
             *state.mutate_published_file.borrow_mut() = Some(input.clone());

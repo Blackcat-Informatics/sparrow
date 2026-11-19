@@ -4287,7 +4287,30 @@ nothing, cancels the staging journal with `importCancel`, so the daemon's bounde
 reclamation releases its import slot instead of holding it for the 48-hour retry
 window. Until then, retrying the canceled request ID fails with `IMPORT_EXPIRED`.
 If the cancellation also fails, the CLI reports `IMPORT_ABANDONED` with both
-causes. The SDK `import_file(endpoint, ...)` is this implementation.
+causes. A cancellation answered `CONFLICT` means the publication committed although
+its reply was lost, and the receipt is returned. The SDK `import_file(endpoint, ...)` is
+this implementation.
+
+The SDK upload paths over a held connection (`Client::ingest` and
+`ingest_with_durability` above the inline bound, `Client::import_file`,
+`Client::import_open_file` and the free `import_open_file`) share the cancellation
+rule but never reconnect or resume: any error ends the attempt. A hold
+(`STORAGE_PRESSURE`, `SHUTTING_DOWN`) or a lost connection is returned unchanged and
+cancels nothing: the journal stays staged and a retry under the same request ID
+resumes it. Any other attempt that fails after its journal began cancels the journal
+over the same connection, so a refused import does not hold an import slot for the
+retry window. A cancellation answered `CONFLICT` retries the upload once: the publication committed, or the
+daemon's file watcher owns the staging and its journal stays intact. When the
+connection is lost before the cancellation arrives, for example at the 60-second
+connection lease, or the daemon refuses the cancellation with a retryable hold
+(free-space floor, restart, busy admission), the error is the retryable
+`IMPORT_RESUMABLE` naming the import and keeping the refusal's class. A retry under
+the same request ID resumes the journal if it is still staged. If the cancellation
+committed and its reply was lost, that ID answers `IMPORT_EXPIRED` until reclamation
+has removed the journal, then begins afresh. When the cancellation
+fails for good, for example `PERMISSION_DENIED`, the caller receives
+`IMPORT_ABANDONED` naming the import, and its slot stays occupied until the retry
+window ends.
 
 The binaries are `sparrowd` for the daemon and `sparrow` for its client.
 Every client invocation takes an optional `--secret-file PATH` and then an
