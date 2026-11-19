@@ -26137,3 +26137,48 @@ fn the_offline_stamp_refuses_a_directory_that_is_not_a_store() {
     assert_eq!(refused.code, "INVALID_ARGUMENT", "{refused}");
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
+
+/// The daemon's teardown flushes, cancels RocksDB background work and drops the store: every
+/// acknowledged durable record must be present on the next open and the format unchanged (#394).
+#[test]
+fn cancelling_background_work_after_the_final_flush_loses_no_acknowledged_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let format = store.properties().unwrap()["store_format"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let acknowledged: Vec<_> = (0..200u64)
+        .map(|n| {
+            let body = format!("acknowledged line {n}\n").repeat(40);
+            let artifact = store
+                .ingest(
+                    &format!("cancel-{n}"),
+                    "cancel",
+                    "log",
+                    body.as_bytes(),
+                    1000 + n,
+                )
+                .unwrap();
+            (artifact, body)
+        })
+        .collect();
+    store.flush().unwrap();
+    store.cancel_background_work();
+    drop(store);
+    let reopened = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        reopened.properties().unwrap()["store_format"].as_str(),
+        Some(format.as_str())
+    );
+    for (artifact, body) in &acknowledged {
+        assert_eq!(
+            reopened.bytes(&artifact.id, 0, body.len(), 2000).unwrap(),
+            body.as_bytes()
+        );
+        assert_eq!(
+            reopened.artifact(&artifact.id).unwrap().record_ids,
+            artifact.record_ids
+        );
+    }
+}
