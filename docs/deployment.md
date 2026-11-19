@@ -746,7 +746,8 @@ CONF=~/.config/sparrow/server.toml
 SOCK=$(sed -n 's/^socket_path *= *"\([^"]*\)".*/\1/p' "$CONF")
 STORE=$(sed -n 's/^data_dir *= *"\([^"]*\)".*/\1/p' "$CONF")      # /SPARROW/store
 COPY=/SPARROW/store.before-a50820e     # a new sibling of $STORE (check: "$STORE" is /SPARROW/store)
-BIN=…/bin       # the directory holding the a50820e pair; the script reads it as SPARROW_BIN
+BIN=…/bin       # the main checkout's ./bin, which holds the a50820e pair; the script reads it as SPARROW_BIN
+SUMS=…/.stage/408/sha256-a50820e.txt   # the recorded sha256 sums of the pair, named as they are in $BIN
 RECORD=…/.stage/image/switch-1   # under the main checkout's .stage/, never /tmp
 REH=/SPARROW/store.rehearsal-a50820e   # the rehearsal copy, a new sibling of $STORE
 REH_CONF=$RECORD/rehearsal.toml        # its configuration; its socket is $REH/rpc.sock
@@ -766,9 +767,20 @@ for f in "$OLD" "$OLD_CLI" sparrow-recovery-schema71-fda2812; do
 done
 ```
 
-`BIN` holds the new pair and its `sparrow-recovery-schema71-a50820e` from `make install-bin`; check the
-pair's `sha256sum` against the sums recorded with the pull request that merged this
-procedure.
+`BIN` is the main checkout's `./bin` (the variables block writes the checkout's path as `…`), never
+the `./bin` of a worktree: a worktree's `./bin` goes when the worktree goes, and a worktree that
+holds the only copy of an image, or of the pair, is not cleaned. It holds the new pair and
+`sparrow-recovery-schema71-a50820e` from `make install-bin`. The pair (`sparrowd` and `sparrow`) is
+kept twice, in `BIN` and in `~/.local/libexec/sparrow`; the recovery binary is kept in `BIN`. The
+sums are recorded in `$SUMS`, and the pair built from `a50820e` carries exactly those sums, so a
+rebuild from that revision gives the same bytes (`rebuild.log` and `sha256-bin.txt` under
+`.stage/image/switch-1/`). Check them; `--strict` makes a malformed line of the sums file fail, and the command exits nonzero on
+any difference, a missing file or a malformed line:
+
+```bash
+( cd "$BIN" && sha256sum --strict -c -- "$SUMS" )
+```
+
 Install the new pair, never over a name that holds other bytes, then have a human with root
 give the daemon its bind capability (the script checks it with `getcap` and never runs
 `setcap`):
@@ -808,17 +820,42 @@ the copy, and the ingest figures `flush_lag_ms`, `oldest_pending_ms` and `pendin
 stand for ingest latency and which the new image's figures are compared with. The CLI link
 today names an older CLI than the daemon (Sparrow issue 387), so the live `sparrow` may lack
 commands the image has; the script switches the link to the new CLI.
-Record a payload sample for the rehearsal: at least 50 artifacts whose exact bytes the operator
-still holds (a file the shipper sent and that is still on disk, or a file kept beside an ingest
-receipt), each as one artifact. The payload id of an artifact is `blake3:` and the BLAKE3 hash of
-its bytes:
+No payload sample is taken here, and nothing in this section depends on a file the operator
+holds. The sample is taken in the rehearsal, from the copy ("The rehearsal on a copy", step 4):
+the live `fda2812` daemon answers `payload` with `Unimplemented: Method not implemented` (one
+lookup with the `a50820e` CLI, `.stage/image/switch-1/report-372.md`), so it cannot verify one.
+
+Read free space on the store's filesystem again immediately before the window and state it in the
+notice. The room rule is two copies (`COPY` and `REH`), each the store's bytes plus 10 GiB, against
+free space. This command reads both figures, writes them to `$RECORD/room-now.txt` and exits
+nonzero when `du` fails, when the Python step fails, or when free space is below the two copies. The
+subshell runs with `set -e`, so the first failing step ends it with that step's status, and
+`EXIT` is that status:
 
 ```bash
-for f in SAMPLE_FILE...; do printf 'blake3:%s\n' "$(b3sum --no-names -- "$f")"; done > "$RECORD/payload-sample.txt"
+( set -euo pipefail
+du -s -B1 -- "$STORE" > "$RECORD/store-bytes-now.txt"
+python3 -I - "$STORE" "$RECORD/store-bytes-now.txt" > "$RECORD/room-now.txt" <<'ROOM'
+import os, sys
+used = int(open(sys.argv[2]).read().split()[0])
+if used <= 0:
+    sys.exit("du read 0 bytes for the store")
+st = os.statvfs(os.path.dirname(sys.argv[1]))
+free, need = st.f_bavail * st.f_frsize, 2 * (used + (10 << 30))
+line = f"free {free} store {used} two copies {need} margin {free - need}"
+print(line)
+sys.exit(0 if free >= need else "room rule fails: free space is below two copies: " + line)
+ROOM
+cat "$RECORD/room-now.txt" )
+echo "EXIT=$?"
 ```
 
-The sample size is a choice; the scratch measurement checked every artifact of its store (8,160),
-and nothing measured fixes a live size.
+The reading of 2026-11-19 (`df-before.txt`, `store-bytes.txt` and `06-arithmetic.log` under
+`.stage/image/switch-1/`) is one reading, not a constant. Arithmetic on it: `du` 38,924,779,520
+plus 10 GiB is 49,662,197,760 bytes (49.66 GB) per copy and 99,324,395,520 bytes (99.32 GB) for
+two, against 115,870,515,200 bytes free: a margin of 16,546,119,680 bytes (16.55 GB). The
+coordination session tells the other sessions that no large build runs during the window, which
+removes the builds that would consume that margin; other writers to the filesystem remain.
 
 Check what the window needs.
 - `status` shows `pressure.failure` and `durability.failure` null, every migration with `done`
@@ -860,9 +897,11 @@ Check what the window needs.
 
   The loop prints a line for each unit that does not pass, and the last line exits 0 only when all
   three pass. It covers those three names. A `sparrowd` started outside them does not show there:
-  read `ps -e -ww -o pid,user,comm,args` and expect one `sparrowd` line, the live daemon, whose pid is
-  `MainPID` of `sparrow.service`. The listing is read by the operator; the script's own check after
-  the stop is the one that fails closed on a process.
+  read `ps -e -ww -o pid,user,comm,args` and expect exactly one `sparrowd` line, the live daemon, whose pid
+  equals `MainPID` of `sparrow.service`. A `failed` unit can keep a process that survived systemd's final
+  SIGKILL, in practice one stuck in uninterruptible I/O, such as a call blocked on the hard NFS mount, and
+  the `failed` state passes the gate above; this listing catches it. The listing is read by the operator;
+  the script's own check after the stop is the one that fails closed on a process.
 - The recorded `text_analyzer` and `rdf_profile` stay the same after the switch. The new image
   reads the lexicon bundle that `text_lexicon_dir` names; the PurRDF revision in
   `registry/compatibility.toml` is unchanged since `fda2812`, so the bundle built with the image
@@ -1084,6 +1123,178 @@ too, and answer in the first. A
 shell that cannot hold the terminal gives `--hold-answer FIFO` an existing named pipe and answers
 with `echo proceed > FIFO`.
 
+Write the payload check of step 4 once, in the second shell, before the rehearsal starts. It is a
+read-only client of the rehearsal daemon's socket:
+
+```bash
+cat > "$RECORD/payload-check.py" <<'CHECK'
+import datetime, json, os, pathlib, subprocess, sys
+
+cli, sock, record = sys.argv[1], sys.argv[2], pathlib.Path(sys.argv[3])
+CEILING = int(sys.argv[4]) if len(sys.argv) > 4 else 4 << 30   # most bytes the check reads
+TARGET, LARGEST, CHUNK, PAGE_ROWS = 50, 5, 1 << 20, 31          # the server returns at most 31 artifact rows a page
+AGE_DAYS = [0, 1, 3, 7, 14, 21]   # window edges, days before now; the last window is open-ended
+
+
+def fail(why):
+    sys.exit("payload check FAILED: " + why)
+
+
+def run(argv):
+    done = subprocess.run(argv, capture_output=True, text=True)
+    if done.returncode != 0:
+        fail(f"{' '.join(argv[:4])} exited {done.returncode}: {done.stdout.strip()} {done.stderr.strip()}")
+    return done.stdout
+
+
+def call(*args):
+    return json.loads(run([cli, sock, *args]))
+
+
+def pages(limit, *args):
+    cursor = []
+    for _ in range(limit):
+        page = call(*args, *cursor)
+        yield page
+        if page.get("next_cursor") is None:
+            return
+        cursor = ["--cursor", page["next_cursor"]]
+    fail(f"{' '.join(args[:2])}: still more pages after {limit} calls")
+
+
+def length_of(row):
+    origin = row["origin"]
+    if origin is None or origin.get("byte_length") is None:
+        fail(f"{row['artifact_id']}: the catalog row has no byte_length")
+    return int(origin["byte_length"])
+
+
+status = call("status")
+store = status["store_id"]
+rows = [m for m in status["migrations"] if m["name"] == "payload-index"]
+if len(rows) != 1:
+    fail("status has no single payload-index migration row")
+row = rows[0]
+if row["failure"] is not None or row["watermark"] is not None or row["done"] != row["total"]:
+    fail(f"payload-index migration is not complete: {row}")
+total = int(row["total"])
+
+sources = [r for p in pages(100000, "sources", store) for r in p["rows"]]
+held = {r["source_id"]: int(r["complete_artifacts"]) + int(r["fragment_parents"]) for r in sources}
+if total != sum(held.values()):
+    fail(f"migration total {total} != sources complete_artifacts + fragment_parents {sum(held.values())}")
+
+# One full walk of the artifact listing: no call sorts by size or filters by it, and a page holds at most 31 rows.
+walk_calls, listed, last = 0, {}, None
+for page in pages(2 * (total // PAGE_ROWS) + 1000, "artifacts", store, "--page-size", "1000"):
+    walk_calls += 1
+    last = page
+    for r in page["rows"]:
+        listed[r["artifact_id"]] = r
+if last is None or last["answer_certainty"] != "exact" or int(last["matching_artifacts"]) != len(listed):
+    fail(f"the listing walk is not complete and exact: {len(listed)} rows after {walk_calls} calls, "
+         f"last page answers {last and last['answer_certainty']}, {last and last['matching_artifacts']} matching")
+per_source = {}
+for r in listed.values():
+    per_source[r["source"]] = per_source.get(r["source"], 0) + 1
+for source, count in held.items():
+    if per_source.get(source, 0) < count:
+        fail(f"source {source}: sources reports {count} artifacts, the listing returned {per_source.get(source, 0)}")
+
+if len(listed) != total:
+    fail(f"the listing holds {len(listed)} artifacts, the migration total is {total}")
+
+now = datetime.datetime.now(datetime.timezone.utc)
+edges = [now - datetime.timedelta(days=d) for d in AGE_DAYS]
+
+
+def window_of(row):
+    at = datetime.datetime.fromisoformat(row["origin"]["received_at"])
+    return next((i for i, edge in enumerate(edges[1:]) if at >= edge), len(edges) - 1)
+
+
+eligible = [r for r in listed.values()
+            if r["origin"] is not None and r["complete_bytes_available"] and length_of(r) > 0]
+cells = {}
+for r in eligible:
+    cells.setdefault((r["source"], window_of(r)), []).append(r)
+names = sorted({r["source"] for r in eligible})
+
+
+def select():
+    chosen = sorted(eligible, key=lambda r: (-length_of(r), r["artifact_id"]))[:LARGEST]
+    seen = {r["artifact_id"] for r in chosen}
+    spent = sum(length_of(r) for r in chosen)
+    if chosen and length_of(chosen[0]) > CEILING:
+        fail(f"the largest artifact, {chosen[0]['artifact_id']} of {length_of(chosen[0])} bytes, exceeds the "
+             f"ceiling of {CEILING} bytes; raise the ceiling (fourth argument)")
+    if spent > CEILING:
+        fail(f"the {LARGEST} largest artifacts total {spent} bytes, over the ceiling of {CEILING}; raise the ceiling")
+    while True:
+        before = len(chosen)
+        for lap in range(len(edges)):
+            for j, source in enumerate(names):
+                pool = cells.get((source, (lap + j) % len(edges)), [])
+                fits = next((r for r in pool if r["artifact_id"] not in seen and spent + length_of(r) <= CEILING), None)
+                if fits:
+                    seen.add(fits["artifact_id"])
+                    chosen.append(fits)
+                    spent += length_of(fits)
+                if len(chosen) >= TARGET:
+                    return chosen
+        if len(chosen) == before:
+            fail(f"only {len(chosen)} artifacts found within the ceiling of {CEILING} bytes, need {TARGET}; "
+                 "raise the ceiling or find why the copy has so few")
+
+
+def read_whole(artifact, length, path):
+    # successive reads of at most CHUNK bytes, appended to one file that is hashed as one stream
+    piece = path.with_suffix(".chunk")
+    offset = 0
+    with open(path, "xb") as whole:
+        while offset < length:
+            want = min(CHUNK, length - offset)
+            call("bytes", store, artifact, str(offset), str(want), str(piece))
+            data = piece.read_bytes()
+            os.unlink(piece)
+            if len(data) != want:
+                fail(f"{artifact}: read at offset {offset} returned {len(data)} bytes, asked for {want}")
+            whole.write(data)
+            offset += want
+    if path.stat().st_size != length:
+        fail(f"{artifact}: chunks total {path.stat().st_size} bytes, the catalog says {length}")
+
+
+chosen = select()
+out = record / "payload-sample-bytes"
+out.mkdir()
+report, read = [], 0
+for n, hit in enumerate(chosen):
+    artifact, length = hit["artifact_id"], length_of(hit)
+    path = out / f"{n:04d}.bin"
+    read_whole(artifact, length, path)
+    read += length
+    payload_id = "blake3:" + run(["b3sum", "--no-names", str(path)]).strip()
+    answers = list(pages(100000, "payload", store, payload_id, "--page-size", "1000"))
+    if not all(isinstance(p["artifact_ids"], list) for p in answers):
+        fail(f"{artifact}: payload answered artifact_ids that is not a list")
+    exact = all(p["answer_certainty"] == "exact" for p in answers)
+    listed_here = any(artifact in p["artifact_ids"] for p in answers)
+    if not exact or not listed_here:
+        fail(f"{artifact}: payload {payload_id} exact={exact}, lists the artifact={listed_here}")
+    report.append(f"{artifact}\t{hit['source']}\t{hit['origin']['received_at']}\t{length}\t{payload_id}")
+(record / "payload-sample.tsv").write_text("\n".join(report) + "\n")
+sizes = [length_of(h) for h in chosen]
+print(f"payload check passed: {len(report)} artifacts; sources holding artifacts {len([s for s, c in held.items() if c])}, "
+      f"with readable artifacts {len(names)}, sampled {len({h['source'] for h in chosen})}; "
+      f"age windows covered {len({window_of(h) for h in chosen})} of {len(edges)}; "
+      f"sizes {min(sizes)} to {max(sizes)} bytes, {read} bytes read of the {CEILING} ceiling; "
+      f"listing walk of {walk_calls} calls, {len(listed)} artifacts; "
+      f"payload-index done=total={total}")
+CHECK
+```
+
+
 1. Copy. Take a reflink copy of `COPY` with the repository's own script, which refuses an open
    store, compares the file lists and gives `REH` its name only when they agree:
 
@@ -1130,11 +1341,77 @@ with `echo proceed > FIFO`.
      reads show `migrations[]` `payload-index` `done` rising toward `total` with `failure` null, and
      the completion line appears. The lookup check below needs the completion line, so completion
    gates `proceed`.
-   - A sample of payload lookups is exact. After the completion line, for each line of
-     `$RECORD/payload-sample.txt`, run
-     `"$LIB/$NEW_CLI" "$REH/rpc.sock" payload STORE_ID PAYLOAD_ID`: each answers
-     `answer_certainty` `exact` and lists the artifact that holds those bytes. A lookup that lists
-     none, or answers `pending` after the completion line, fails the rehearsal.
+   - A sample of payload lookups is exact, and the counts agree. After the completion line, the
+     check below chooses at least 50 artifacts from the rehearsal copy: the 5 largest in the copy,
+     and a spread over its sources and ages. No call lists artifacts by size or filters by it. The
+     check therefore walks the whole `artifacts STORE_ID` listing once, without a source or an
+     interval; the listing orders rows by source, then receipt time, and gives each row's source,
+     `received_at` and `byte_length`. The server returns at most 31 rows a page whatever
+     `--page-size` asks (`PAGE_ITEMS` in `crates/sparrow-core/src/storage/artifact_read.rs`), so the
+     walk takes about the artifact count divided by 31 calls, plus any pages that carry no rows
+     (about 1,260 calls for the 39,061 artifacts that `before.json` implies, which is arithmetic on
+     the source-summary and source-context totals). The check's page limit is twice that count plus 1,000
+     calls; a walk that passes it, or that ends without an exact final page, or whose rows differ from
+     the listing's own `matching_artifacts` count or from the migration `total`, fails. It also
+     fails when a source that `sources` reports as holding `complete_artifacts` plus
+     `fragment_parents` artifacts returns fewer rows than that. The 5 largest artifacts by
+     `byte_length` come from the whole walk, and the spread is drawn from the same rows by source and
+     by age window (the last 1, 1 to 3, 3 to 7, 7 to 14 and 14 to 21 days, and everything older;
+     source `j` takes window `(lap + j) mod 6` in each lap, so ages mix across sources). Only rows that report
+     `complete_bytes_available` and a `byte_length` above 0 can be sampled: an expired artifact is
+     refused by `bytes`, so the oldest window holds only artifacts still within retention or
+     pinned, and an empty artifact has no bytes to hash. A row without `byte_length` fails the check.
+     For each artifact it fetches the exact bytes from the rehearsal daemon with
+     `bytes STORE_ID ARTIFACT_ID OFFSET LENGTH FILE`, in successive reads of at most 1 MiB
+     (the call's limit), appended in order to one file under `$RECORD`, and hashes that file with
+     `b3sum --no-names` outside the daemon, so an artifact over 1 MiB is hashed as one stream. It
+     then asks `payload STORE_ID blake3:HASH`. The hash comes from the bytes read back, not from the
+     index. Each lookup must answer `answer_certainty` `exact` on every page, return `artifact_ids`
+     as a list and list that artifact. A lookup that lists none, or answers `pending` after the
+     completion line, fails the rehearsal.
+     The check fails when any read returns fewer bytes than asked (a short read, a truncated last
+     chunk, an empty last chunk), when the chunks total other than the catalog's `byte_length`, and,
+     through the hash, when a read returns bytes from the wrong offset. The server refuses a range
+     that passes the artifact's end with `INVALID_ARGUMENT` ("byte range is outside evidence";
+     `in_range` in `crates/sparrow-core/src/storage.rs`) and never truncates it.
+     The check also requires the `payload-index` migration `done` to equal its
+     `total` with `failure` and `watermark` null, and `total` (the `artifacts` counter) to equal
+     the artifact count the copy reports: the sum of `complete_artifacts` and `fragment_parents`
+     over every `sources` row; `status` itself reports no artifact count. That identity can break
+     once anything has been evicted: an evicted entry with no retained record counts in neither
+     figure. A mismatch fails the check and is then read, not waved through.
+     The total bytes read are capped by a ceiling, 4 GiB by default (a choice; the optional fourth
+     argument, in bytes, changes it). If the largest artifact alone exceeds the ceiling, or the
+     5 largest together do, the check fails and says to raise it; it never skips them silently. No
+     read rate has been measured, so no duration is stated; at an assumed 100 MiB/s, which is an
+     assumption and not a measurement, 4 GiB is about 41 s of reading (arithmetic) before hashing,
+     the lookups and the listing walk. The check prints the artifact count, how many sources hold
+     artifacts, how many hold readable ones and how many were sampled, how many of the 6 age windows
+     the sample covers, the smallest and the largest artifact in bytes, the total bytes read and the
+     walk's call count. Any failure exits nonzero and names the artifact. `bytes` is a read call that the `--no-intake` daemon serves
+     (only `--query-only` refuses writes, and `bytes` writes nothing in the store); this is read
+     from `bytes_read` in `crates/sparrow-server/src/rpc.rs` and `Store::bytes` in
+     `crates/sparrow-core/src/storage.rs`, and was not run on a no-intake daemon.
+
+     Run it once the completion line has appeared; `EXIT=0` is the pass:
+
+     ```bash
+     python3 -I "$RECORD/payload-check.py" "$LIB/$NEW_CLI" "$REH/rpc.sock" "$RECORD" > "$RECORD/payload-check.log" 2>&1
+     echo "EXIT=$?"
+     cat "$RECORD/payload-check.log"
+     ```
+
+     The script refuses to reuse `$RECORD/payload-sample-bytes`, so a repeat needs a new `RECORD` or
+     that directory removed by itself, one exact path. The sample's bytes stay under `$RECORD` with
+     `payload-sample.tsv`, which lists artifact, source, receipt time, length and payload id. The 5
+     largest artifacts are kept whole, so the files total at most the ceiling (4 GiB by default, or
+     the fourth argument); `$RECORD` needs that much space. Each 1 MiB chunk file is removed right
+     after it is appended, so the peak extra space is one chunk beyond the sample files; a run that
+     fails during a read can leave that one chunk file. `$RECORD` is under the main checkout's `.stage/`
+     on the same filesystem `/` as the store, so its space adds to the room rule's two copies.
+     Arithmetic on the reading of 2026-11-19: 99,324,395,520 bytes for two copies plus 4,294,967,296
+     bytes (4 GiB) is 103,619,362,816 bytes, against 115,870,515,200 bytes free: a margin of
+     12,251,152,384 bytes (12.25 GB). Read it again with the room command before the window.
    - A stop of the scratch daemon is clean: SIGINT to the one process in the scope, then the journal
      line `sparrowd: closed store=` and an exit.
 
@@ -1519,17 +1796,31 @@ only figures are scratch measurements at other sizes (see "What the measurement 
 notice states this and gives the length only after the rehearsal has read `N`.
 
 - Ingest socket (`ingest_socket_path`, the `sparrow-ingest` group) and the public TCP listener on port
-  518 refuse connections. Every daemon that logs into Sparrow (`katamari-stored`, the Lillith daemons
-  and `lillith_memetics`' cruft sender) is affected. A client that holds and retries, such as the
+  518 refuse connections. Every daemon that logs into Sparrow (the Lillith daemons and
+  `lillith_memetics`' cruft sender) is affected. No Katamari process connects to Sparrow:
+  `katamari-stored`, `katamari-unlock` and `katamari-gitd` log only to the local journal, the
+  console and an optional file (Katamari issue 83; Sparrow issue 372, comment 19354), so the window
+  changes nothing for them. A client that holds and retries, such as the
   Rust client with its queue, delivers after the start; a sender without a queue loses what it emits
   meanwhile and the store cannot count that loss ("A floor refusal requests reclamation"). The
   coordination session holds which senders queue, so the notice goes to it before the stop, and
   asks it to say whether the organism runs in the window: her logs are the logs of those daemons.
 - The consume and tail roots under `~/.local/state/sparrow` stay on disk: a file that arrives waits and
   the watches read it after the start. The script stops `sparrow-ship.timer` first and starts it
-  again at the end; the shipper reads only the producers' files and writes only into the roots, so the
-  spool units (`katamari-journal-spool`, `katamari-manager-spool`) keep writing their files and lose
-  nothing. A producer that rotates or deletes its own file in the window is outside Sparrow's reach.
+  again at the end; the shipper reads only the producers' files and writes only into the roots.
+  `katamari-journal-spool` and `katamari-manager-spool` are interim user units on the operator's
+  host: this repository holds their scripts (`deploy/libexec/`) and unit files
+  (`deploy/systemd/user/`), and the operator's user manager runs the copies under
+  `~/.local/libexec/sparrow/` with `Restart=always`. They read the local journal and write JSON
+  Lines files under `~/.local/state/sparrow/katamari-journal/`; they never connect to Sparrow, so
+  they keep writing from their own units while the daemon is down, and the shipper sends those files
+  after the start. Each unit deletes its own spool files (`katamari-stored-*.jsonl` and `katamari-manager-*.jsonl`) when it
+  starts: `ExecStartPre` runs `find ... -mtime +3 -delete`, which matches files whose age, rounded down to
+  whole days, is more than 3, that is, last modified four or more full days ago. A restart of either unit
+  in a window that long deletes files the shipper has not sent. The repository names no other owner and does not show whether the two units are
+  enabled and running on the live host; read that before the window with
+  `systemctl --user is-active katamari-journal-spool.service katamari-manager-spool.service`
+  (not run). A producer that rotates or deletes its own file in the window is outside Sparrow's reach.
 - `lillith_decodes`, the CLI and the MCP tools get connection refused until the first status answer.
 - No syslog listener is configured at the last recorded status, so no datagram is exposed; check
   `syslog_listeners` in `before.json`.
@@ -1538,7 +1829,8 @@ Notice. Before: the window's start; that its length is unbounded until the rehea
 because the hold has no timeout and the migration at live size is not measured (the parts listed
 under "What the measurement covers" are scratch figures, and the live total is not measured), with
 the length given when the rehearsal has read `N`; that the live daemon stops, that senders without a queue lose their output, that the switch is one-way once
-the store opens, and that a copy of the store is taken and kept. After: the first status answer's
+the store opens, that a copy of the store is taken and kept, the free space read immediately before the
+window with its two-copy figure ("Before the window"), and that no large build runs during it. After: the first status answer's
 time, the image, `store_id`, that `payload` lookups read `pending` until the index migration
 completes (and `exact` after), that nothing needs a new client, and the day on which the copy goes.
 
@@ -1741,7 +2033,9 @@ worker tries again after `check_secs`. A call that hangs instead of failing bloc
 thread inside the system call: the watchdog journals `sparrowd: archive stalled step=...` every
 `stall_warn_secs`, and a step that ran `io_timeout_secs` marks the pass as overrun, which is checked only after the
 write and the read-back succeed (`archive_segment`). A slow call that returns an error fails the pass as `ARCHIVE_IO`, and a later
-failing step fails with its own code (`ARCHIVE_IO` or `ARCHIVE_VERIFY`); `ARCHIVE_OVERRAN` is the result only
+failing step fails with its own code (for example `ARCHIVE_IO`, `ARCHIVE_VERIFY`, `ARCHIVE_NOT_ON_MOUNT` or
+`ARCHIVE_ROOT`: after a slow step that succeeds, the mount and root checks that follow can fail too; these are
+examples, not a complete list); `ARCHIVE_OVERRAN` is the result only
 when every step succeeded. The segment is not committed in any of these cases. The daemon keeps serving in each case. A segment file
 that a failed pass left in `<store_id>/` is kept and read back on the next pass, never overwritten
 (`write_segment`); one that differs from what the worker prepared fails as
