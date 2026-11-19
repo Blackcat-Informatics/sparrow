@@ -85,7 +85,10 @@ case $1 in
                 elif [[ -e $STATE/$5.active ]]; then echo active; else echo inactive; fi ;;
             LimitNOFILESoft) echo 65536 ;;
         esac ;;
-    start) shift; for u; do touch "$STATE/$u.active"; done ;;
+    start) shift
+        # STUB_HUP_ON_START=1: the login shell's SIGHUP reaches the script as it starts the service.
+        [[ ${STUB_HUP_ON_START:-0} == 1 && $1 == sparrow.service ]] && kill -HUP "$PPID"
+        for u; do touch "$STATE/$u.active"; done ;;
     stop) shift; for u; do rm -f -- "$STATE/$u.active"; done ;;
 esac
 exit 0
@@ -272,5 +275,23 @@ kill "$writer" 2>/dev/null || true
 extra=()
 ((rc == 0)) || { echo "$out" >&2; fail "hold answer without newline exited $rc"; }
 echo "ok   hold answer without a trailing newline: accepted"
+
+# 12. A hangup that arrives while the abort restores (the login shell's SIGHUP after the terminal
+#     read ended) does not stop the restore: the service and timer come back and the abort is recorded.
+w=$(world hold-hangup-in-abort)
+chattr +C -- "$w/store"
+mkfifo -- "$w/answer"
+touch "$w/state/sparrow-ship.timer.active"
+extra=(--keep-copy "$w/store.before" --hold-after-copy --hold-answer "$w/answer")
+echo abort >"$w/answer" &
+writer=$!
+run "$w" STUB_HUP_ON_START=1
+kill "$writer" 2>/dev/null || true
+extra=()
+((rc != 0)) || fail "hangup-in-abort path exited 0"
+[[ -e $w/state/sparrow.service.active ]] || fail "hangup-in-abort path left sparrow.service stopped"
+[[ -e $w/state/sparrow-ship.timer.active ]] || fail "hangup-in-abort path did not restore the timer"
+grep -q 'hold aborted (operator)' "$w/store.before.abort.log" || fail "hangup-in-abort path wrote no abort record"
+echo "ok   hangup during the abort: restore completed and recorded"
 
 echo PASS

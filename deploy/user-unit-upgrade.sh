@@ -261,9 +261,10 @@ abort_note() {
 # so the old image starts again, the timer comes back and the script exits non-zero. The restore
 # comes first and does not depend on any output succeeding (the terminal may be gone: SIGHUP).
 abort_hold() {
-    local started=1 answered=1 down
-    trap - INT TERM HUP
-    trap '' PIPE
+    local started=1 answered=1 timer_ok=1 down
+    # Ignored, not reset: a later hangup or interrupt (the login shell's SIGHUP after the terminal
+    # read ended, or a second Ctrl-C) must not kill the restore half way.
+    trap '' INT TERM HUP PIPE
     set +e
     down=$(elapsed_since_stop)
     "${USER_SYSTEMCTL[@]}" start sparrow.service || started=0
@@ -271,8 +272,12 @@ abort_hold() {
         (wait_first_status) >/dev/null 2>&1 || answered=0
     fi
     if ((started && answered)); then
-        restore_ship_timer
-        abort_note "hold aborted ($1) after $down s down: $FROM runs again on the unchanged store, the links name $FROM, sparrow-ship.timer is restored if it was active; the kept copy $KEEP_COPY remains"
+        restore_ship_timer || timer_ok=0
+        if ((timer_ok)); then
+            abort_note "hold aborted ($1) after $down s down: $FROM runs again on the unchanged store, the links name $FROM, sparrow-ship.timer is restored if it was active; the kept copy $KEEP_COPY remains"
+        else
+            abort_note "hold aborted ($1) after $down s down: $FROM runs again on the unchanged store and the links name $FROM, but starting sparrow-ship.timer FAILED (timer: $("${USER_SYSTEMCTL[@]}" is-active sparrow-ship.timer)); start it by hand; the kept copy $KEEP_COPY remains"
+        fi
     else
         abort_note "hold aborted ($1) after $down s down: starting $FROM again FAILED or it does not answer status (sparrow.service: $("${USER_SYSTEMCTL[@]}" is-active sparrow.service)); the links name $FROM, the store is unchanged, sparrow-ship.timer is NOT restarted; read journalctl --user -u sparrow.service and deploy/user-unit-upgrade.sh --help"
     fi
