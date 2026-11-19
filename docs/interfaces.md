@@ -4295,10 +4295,16 @@ The SDK upload paths over a held connection (`Client::ingest` and
 `ingest_with_durability` above the inline bound, `Client::import_file`,
 `Client::import_open_file` and the free `import_open_file`) share the cancellation
 rule but never reconnect or resume: any error ends the attempt. An attempt that
-fails after its journal began cancels the journal over the same connection, with the
-same `CONFLICT` and `IMPORT_ABANDONED` handling, so a refused import does not hold an
-import slot for the retry window. When the connection is lost, the cancellation fails
-and the caller receives `IMPORT_ABANDONED` naming the import.
+fails after its journal began cancels the journal over the same connection, so a
+refused import does not hold an import slot for the retry window. A cancellation
+answered `CONFLICT` retries the upload once: the publication committed, or the
+daemon's file watcher owns the staging and its journal stays intact. When the
+connection is lost before the cancellation arrives, for example at the 60-second
+connection lease, the journal and its checkpoint are intact and the error is the
+retryable `IMPORT_RESUMABLE` naming the import; a retry under the same request ID
+resumes. When the daemon answers the cancellation with an error, the caller receives
+`IMPORT_ABANDONED` naming the import, and its slot stays occupied until the retry
+window ends.
 
 The binaries are `sparrowd` for the daemon and `sparrow` for its client.
 Every client invocation takes an optional `--secret-file PATH` and then an

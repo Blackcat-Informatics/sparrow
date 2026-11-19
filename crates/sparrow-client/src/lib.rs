@@ -247,7 +247,8 @@ impl Client {
     /// An input above the discovered inline bound is staged in 64 KiB appends and
     /// acknowledged durably; the store refuses one above `MAX_IMPORT_BYTES` before
     /// any byte is uploaded. A refused or failed upload cancels its staging journal over
-    /// this connection, so it never holds an import slot; see [`Client::import_file`].
+    /// this connection, so it does not hold an import slot unless the cancel also fails;
+    /// see [`Client::import_file`].
     pub async fn ingest_with_durability(
         &self,
         request_id: &str,
@@ -317,10 +318,13 @@ impl Client {
     /// error ends the attempt. A failed attempt cancels its staging journal over this
     /// connection, releasing its import slot; a retry under the same request ID then fails
     /// with `IMPORT_EXPIRED` until reclamation. A cancel answered `CONFLICT` means the
-    /// publication committed although its reply was lost, and the receipt is returned.
-    /// When the cancel also fails, for example because the connection is lost, the error is
-    /// `IMPORT_ABANDONED` naming the import, whose slot stays occupied until the retry
-    /// window ends.
+    /// publication committed although its reply was lost, or the daemon's file watcher owns
+    /// the staging; the upload is retried once, returning the receipt or that attempt's
+    /// error, and a watcher-owned journal is left intact. When the connection is lost before
+    /// the cancel arrives, the journal is intact and the error is the retryable
+    /// `IMPORT_RESUMABLE`: a retry under the same request ID resumes it. When the daemon
+    /// answers the cancel with an error, the error is `IMPORT_ABANDONED` naming the import,
+    /// whose slot stays occupied until the retry window ends.
     pub async fn import_file(
         &self,
         request_id: &str,

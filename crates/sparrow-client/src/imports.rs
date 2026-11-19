@@ -49,22 +49,38 @@ pub async fn import_file(
     settle(
         error,
         checkpoint.import.clone(),
+        Session::Replaceable,
         async |store: &str, id: &str| cancel(endpoint, store, id).await,
         async || attempt(&mut file, &mut checkpoint).await,
     )
     .await
 }
 
+/// Whether a failed cancel can be retried on a new connection.
+#[derive(Clone, Copy)]
+enum Session {
+    /// The caller holds one connection; it cannot be replaced.
+    Held,
+    /// The cancel reconnects, so its failure is not a lost connection.
+    Replaceable,
+}
+
 /// Settle an upload that ended in `error`: cancel the staging journal `import` names, so an
 /// abandoned import never holds an import slot for the retry window.
 ///
-/// A cancel answered `CONFLICT` means the publication committed although its reply was lost,
-/// so `retry` fetches the receipt. A cancel that itself fails returns `IMPORT_ABANDONED`
-/// naming the journal. An error before any journal existed is returned unchanged. This is the
-/// one implementation behind the free `import_file` and every `Client` upload path.
+/// A cancel answered `CONFLICT` retries the upload through `retry`. The daemon answers it when
+/// the publication committed although its reply was lost, so the retry fetches the receipt.
+/// It also answers it for staging the daemon's own file watcher owns; there the journal stays
+/// intact and the retry resumes it, returning that attempt's result. A cancel that cannot
+/// reach the daemon on a [`Session::Held`] connection leaves the journal and checkpoint
+/// intact, so the result is the retryable `IMPORT_RESUMABLE`: a retry under the same request
+/// ID resumes. Any other failed cancel returns `IMPORT_ABANDONED` naming the journal. An
+/// error before any journal existed is returned unchanged. This is the one implementation
+/// behind the free `import_file` and every `Client` upload path.
 async fn settle(
     error: Error,
     import: Option<(String, String)>,
+    session: Session,
     cancel: impl AsyncFnOnce(&str, &str) -> Result<(), Error>,
     retry: impl AsyncFnOnce() -> Result<ArtifactReceipt, Error>,
 ) -> Result<ArtifactReceipt, Error> {
@@ -73,8 +89,19 @@ async fn settle(
     };
     match cancel(&store, &id).await {
         Ok(()) => Err(error),
-        // Publication committed although its reply was lost; retrieve the receipt.
         Err(Error::Domain { code, .. }) if code == "CONFLICT" => retry().await,
+        Err(Error::Transport(lost))
+            if matches!(session, Session::Held) && lost.kind == capnp::ErrorKind::Disconnected =>
+        {
+            Err(Error::Domain {
+                code: "IMPORT_RESUMABLE".into(),
+                message: format!(
+                    "{error}; the connection was lost before import {id} could be canceled ({lost}); its journal is intact, so retrying under the same request ID resumes it"
+                ),
+                retryable: true,
+                class: crate::FailureClass::Unclassified,
+            })
+        }
         Err(cancel) => Err(Error::Domain {
             code: "IMPORT_ABANDONED".into(),
             message: format!(
@@ -89,7 +116,8 @@ async fn settle(
 /// Upload over one held connection and cancel the staging journal when the attempt fails.
 ///
 /// A held connection cannot be replaced, so any error ends the attempt. The cancel uses the
-/// same connection; when that is lost too, the result is `IMPORT_ABANDONED`.
+/// same connection; when that is lost too, the journal stays resumable and the result is the
+/// retryable `IMPORT_RESUMABLE`.
 pub(crate) async fn upload_or_cancel(
     client: &wire::sparrow::Client,
     discovery: &crate::Discovery,
@@ -111,6 +139,7 @@ pub(crate) async fn upload_or_cancel(
     settle(
         error,
         import,
+        Session::Held,
         async |store: &str, id: &str| cancel_on(client, store, id).await,
         async || {
             upload(
