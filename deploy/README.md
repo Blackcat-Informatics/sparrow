@@ -21,7 +21,7 @@ lives.
 | `MANUAL.md` | Running the daemon by hand without systemd, with the unit's environment. |
 | `install.sh` | Idempotent install of everything below onto the host; prints what changed. |
 | `uninstall.sh` | Undoes `install.sh`'s host changes so the old user unit can serve `/SPARROW` again. |
-| `user-unit-upgrade.sh` | Switches the old user unit's image, and installs its `LimitNOFILE` drop-in (`systemd/user/sparrow.service.d/limits.conf`), until #22 retires that unit. |
+| `user-unit-upgrade.sh` | Switches the old user unit's image, with `--keep-copy DIR` keeping a copy of the closed store, and installs its `LimitNOFILE` drop-in (`systemd/user/sparrow.service.d/limits.conf`), until #22 retires that unit. |
 | `start.sh`, `stop.sh`, `restart.sh` | The lifecycle scripts; `restart.sh --rollback` swaps back. |
 | `check.sh` | Post-deploy verification. |
 | `test-instance.sh` | A disposable unprivileged test instance for rehearsing the scripts. |
@@ -348,10 +348,14 @@ still held.
 ### Interim user unit
 
 While the live store runs under the operator's old user unit,
-`deploy/user-unit-upgrade.sh --from FROM --to TO` switches images. It takes no backup and
-requires none: it relies on the kept previous image and the link swap, and a
-format-changing upgrade has no undo (the store fence), so the only way out is forward on the
-new image. It starts only `sparrow-ship.timer` again. If the shipper is still running when the
+`deploy/user-unit-upgrade.sh --from FROM --to TO [--keep-copy DIR]` switches images. It takes no
+backup and requires none: it relies on the kept previous image and the link swap, which end when the
+new image opens the store and upgrades its format (the store fence). For a format-changing switch,
+`--keep-copy DIR` copies the closed store to the new directory `DIR` between the daemon's stop
+and the new image's start, and that copy is the way back (`docs/deployment.md`, "Switch 1" and
+"Switch 2" for the live procedures); without one the only way out is forward on the
+new image. `deploy/copy-on-write.sh copy SOURCE DEST` makes the same copy for a restart that
+changes the store without switching images. It starts only `sparrow-ship.timer` again. If the shipper is still running when the
 script has stopped the timer, it starts the timer again if it was active before and changes
 nothing else. Before it stops anything it refuses while `SPARROW_CONFIG` still sets `backup_root`
 or `backup_keep`: those keys were removed and the new image refuses the file, so delete those

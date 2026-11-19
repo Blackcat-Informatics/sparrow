@@ -162,7 +162,8 @@ every watch in `consume_watches` names a root that exists.
   `start.sh` and `restart.sh` therefore refuse an image whose schema number
   (`sparrowd-schemaN-REV`) is lower than the current image's, before stopping
   anything. There is no backup to restore: a format-changing upgrade has no undo, so stay on
-  the new image and fix forward. The kept previous image and the link swap are all an
+  the new image and fix forward. The one exception is the copy a user-unit switch keeps with
+  `deploy/user-unit-upgrade.sh --keep-copy` (`docs/deployment.md`, "Switch 1"). The kept previous image and the link swap are all an
   upgrade relies on ([evidence/lifecycle.md](evidence/lifecycle.md) shows a schema 62 image
   refusing a store a schema 63 image had opened).
 - Limit without a schema change: the move to PurRDF fb02dd38b (#28) keeps
