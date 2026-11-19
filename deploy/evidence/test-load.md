@@ -55,5 +55,37 @@ store.
 `stop.sh` reported a stop that was not clean: the daemon, asked to stop, was killed by SIGSYS
 (`code=dumped`) in a `sched_setscheduler` call from a thread of the storage engine, which the
 unit's `SystemCallFilter=~@privileged @resources` refuses. The ingest and search above had
-completed before the stop. The unit filter is the production one, so the production unit may
-stop the same way (not checked); that is a separate defect from the scratch-instance contract.
+completed before the stop. Issue 375 fixes it; the next section records the cause and the run.
+
+# SIGSYS from the storage engine's priority lowering (issue 375)
+
+Run 2026-11-19 (UTC) from commit `8897383` plus the unit change, images from `make install-bin`,
+the same scratch instance and user unit. Logs: `.stage/375-agent/baseline.log` (unit without the
+entry) and `.stage/375-agent/fixed.log` (with it), kept in the canonical checkout.
+
+The store calls `lower_thread_pool_cpu_priority()`. RocksDB's pool threads then run
+`SetCpuPriority(0, kLow)` before their first job (`util/threadpool_imp.cc`, `port/port_posix.cc`):
+`sched_setscheduler(SCHED_OTHER)` and `setpriority(PRIO_PROCESS, 19)`. Both are in `@resources`.
+It makes no `ioprio_set` call (that runs only after `LowerThreadPoolIOPriority`, which the store
+never calls) and no `sched_setattr`.
+
+Without the entry the daemon takes SIGSYS about 13 seconds after every start, in
+`__sched_setscheduler` on a background thread, with a core (`coredumpctl`, status
+`31/SYS`); the unit restarts into the same death (`NRestarts=4` within a minute) and the ingest
+socket refuses connections. With `SystemCallFilter=sched_setscheduler setpriority` after the deny
+line, the daemon ingested 40 artifacts (160000 payload chunks) over 35 minutes with background
+flushes and compaction, and the `rocksdb:low` threads ran at nice 19 while `rocksdb:high` and the
+others stayed at 0, which shows the priority call took effect:
+
+```text
+NRestarts=0
+2498441  19  TS rocksdb:low   (five threads)
+2498446   0  TS rocksdb:high
+$ deploy/stop.sh
+stop.sh: sparrow-deploytest.service stopped through its drain (pid 2498234); socket removed
+[exit 0]   Result=success ExecMainCode=0 ExecMainStatus=0
+```
+
+`coredumpctl` lists no `sparrowd` core from the run. Not run: a production-unit rehearsal with
+the live filter on the live store (the live user unit has no filter), and an explicit `flush`
+request (the script's call lacked its arguments; the daemon's own buffered flush ran).

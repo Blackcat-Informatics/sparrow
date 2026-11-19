@@ -119,6 +119,12 @@ RemoveIPC=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
+# The storage engine lowers its background threads' CPU priority (table_options.rs,
+# lower_thread_pool_cpu_priority) with sched_setscheduler(SCHED_OTHER) and setpriority(PRIO_PROCESS, 19), both
+# in @resources, so the denial above kills the daemon with SIGSYS at its first flush or compaction. Later
+# entries edit the set the first one started, so these two are added back and the rest of @resources stays
+# denied. RestrictRealtime=yes already refuses real-time policies, and SCHED_OTHER is not one.
+SystemCallFilter=sched_setscheduler setpriority
 
 [Install]
 WantedBy=multi-user.target
