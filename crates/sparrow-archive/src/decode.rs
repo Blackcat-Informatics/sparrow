@@ -82,6 +82,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded, String> {
             Some("sourceByteStart") => entry.byte_start = Some(object),
             Some("sourceByteEnd") => entry.byte_end = Some(object),
             Some("byteLength") => entry.byte_length = Some(object),
+            Some("payload") => entry.artifact_payload = Some(object),
             _ => {}
         }
     }
@@ -101,6 +102,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded, String> {
                 format: need(facts.format, "format")?,
                 received_at: instant(&id, &need(facts.received_at, "receivedAt")?)?,
                 byte_length: integer(&id, "byteLength", facts.byte_length)?,
+                payload_id: payload_id(&id, facts.artifact_payload)?,
                 id,
             }),
             Kind::Record => {
@@ -156,6 +158,24 @@ struct Facts {
     byte_end: Option<String>,
     byte_length: Option<String>,
     payload: Option<String>,
+    artifact_payload: Option<String>,
+}
+
+/// An artifact's payload id from its metadata graph's `payload` fact, an IRI
+/// `urn:sparrow:payload:<64 hex digits>` over the BLAKE3 hash of all the artifact's bytes
+/// (the store writes it from the artifact's `payload_id`, however many records the artifact
+/// has), rendered `blake3:<hex>` as the live store names it.
+fn payload_id(id: &str, value: Option<String>) -> Result<String, String> {
+    const PREFIX: &str = "urn:sparrow:payload:";
+    let text = value.ok_or_else(|| format!("{id} has no payload"))?;
+    match text.strip_prefix(PREFIX) {
+        Some(hex)
+            if hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+        {
+            Ok(format!("blake3:{hex}"))
+        }
+        _ => Err(format!("{id} has a malformed payload {text:?}")),
+    }
 }
 
 fn integer(id: &str, what: &str, value: Option<String>) -> Result<u64, String> {

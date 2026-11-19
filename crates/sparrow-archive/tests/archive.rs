@@ -41,6 +41,13 @@ fn archive(
                 .id
         })
         .collect();
+    let paths = drain(&origin, root);
+    (ids, paths)
+}
+
+/// Prepare and commit segments until nothing is due at `T2 + 30 days`, writing each as
+/// `<root>/segments/<name>.gts`; returns the files in the order they were written.
+fn drain(origin: &Store, root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     while let Some(segment) = origin.archive_prepare(T2 + 30 * DAY).unwrap() {
         assert_eq!(segment.files.len(), 1);
@@ -51,7 +58,7 @@ fn archive(
         origin.archive_commit(&segment.segment_id).unwrap();
         paths.push(path);
     }
-    (ids, paths)
+    paths
 }
 
 /// Two artifacts in one segment, as `archive_two` always did.
@@ -244,4 +251,47 @@ fn verify_reports_a_damaged_segment_and_never_passes_silently() {
         assert!(text.contains("\"corrupt\":1"), "{text}");
         std::fs::write(path, &good).unwrap();
     }
+}
+
+/// Value (#362): one key finds a sent item live and in the archive. An artifact of several
+/// records (a multi-record log) is found live by the BLAKE3 payload id of its whole bytes
+/// (`complete`, the artifact listed); after it ages out through archive prepare and commit,
+/// `list` shows that same payload id on the artifact's entry and `extract` returns its bytes
+/// byte for byte. Bytes never sent are not held live (empty first page, `complete`) and
+/// their payload id is in no listed entry.
+#[test]
+fn an_artifact_is_found_by_payload_id_live_and_in_the_archive() {
+    let origin_dir = tempfile::tempdir().unwrap();
+    let origin = Store::open(
+        origin_dir.path(),
+        Config {
+            archive: Some(ArchivePolicy::default()),
+            ..sparrow_test_support::storage_config!(Config)
+        },
+    )
+    .unwrap();
+    let sent = origin.ingest("req-a", "host-a", "log", FIRST, T1).unwrap();
+    let key = purrdf::gts::writer::digest_string(FIRST);
+    let never_sent = purrdf::gts::writer::digest_string(b"never sent\n");
+
+    let live = origin.payload_lookup(&key, None, 10).unwrap();
+    assert!(live.complete);
+    assert_eq!(live.artifacts, std::slice::from_ref(&sent.id));
+    let absent = origin.payload_lookup(&never_sent, None, 10).unwrap();
+    assert!(absent.complete && absent.artifacts.is_empty() && absent.next.is_none());
+
+    let archive_dir = tempfile::tempdir().unwrap();
+    let paths = drain(&origin, archive_dir.path());
+    assert_eq!(paths.len(), 1);
+    let listed = run(&["list", archive_dir.path().to_str().unwrap()]);
+    let listing = String::from_utf8(listed.stdout).unwrap();
+    assert!(
+        listing.contains(&format!("\"id\":\"{}\"", sent.id))
+            && listing.contains(&format!("\"payload_id\":\"{key}\"")),
+        "{listing}"
+    );
+    assert!(!listing.contains(&never_sent), "{listing}");
+    let output = extract(archive_dir.path(), &sent.id);
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, FIRST);
 }

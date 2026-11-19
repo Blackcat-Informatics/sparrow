@@ -36,18 +36,20 @@ fn counts(summary: Summary) -> String {
     )
 }
 
-/// The segment's artifacts, so a person can find an artifact id and extract it.
+/// The segment's artifacts, so a person can find an artifact id, or match content by its
+/// payload id, and extract it.
 fn entries(segment: &Segment) -> String {
     let items: Vec<String> = segment
         .artifacts()
         .iter()
         .map(|artifact| {
             format!(
-                "{{\"id\":{},\"source\":{},\"received_at\":{},\"byte_length\":{}}}",
+                "{{\"id\":{},\"source\":{},\"received_at\":{},\"byte_length\":{},\"payload_id\":{}}}",
                 quote(&artifact.id),
                 quote(&artifact.source),
                 artifact.received_at,
-                artifact.byte_length
+                artifact.byte_length,
+                quote(&artifact.payload_id)
             )
         })
         .collect();
