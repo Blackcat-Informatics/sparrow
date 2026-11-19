@@ -65,7 +65,26 @@ echo "---------------C------ $a"
 STUB
     # shellcheck disable=SC2016 # the stub expands its own variables
     printf '#!/bin/sh\necho "$*" >>"$STATE/logger"\n' >"$w/stubs/logger"
-    printf '#!/bin/sh\nexit 0\n' >"$w/stubs/ps"
+    # STUB_PS: unset lists nothing, "other" lists unrelated processes, "daemon" lists a sparrowd,
+    # "fail" exits 1 with no output the way ps does when it cannot read the process table.
+    cat >"$w/stubs/ps" <<'STUB'
+#!/bin/sh
+# "-e -o comm=" prints names only; the listing form prints pid, name and arguments.
+if [ "$*" = "-e -o comm=" ]; then
+    case ${STUB_PS:-} in
+        fail) exit 1 ;;
+        other) echo systemd; echo bash ;;
+        daemon) echo systemd; echo sparrowd ;;
+    esac
+    exit 0
+fi
+case ${STUB_PS:-} in
+    fail) exit 1 ;;
+    other) echo "    1 systemd systemd"; echo "  200 bash bash" ;;
+    daemon) echo "    1 systemd systemd"; echo "  300 sparrowd sparrowd --config x" ;;
+esac
+exit 0
+STUB
     printf '#!/bin/sh\nexit 0\n' >"$w/stubs/sleep"
     cat >"$w/stubs/systemctl" <<'SYSTEMCTL'
 #!/bin/bash
@@ -293,5 +312,34 @@ extra=()
 [[ -e $w/state/sparrow-ship.timer.active ]] || fail "hangup-in-abort path did not restore the timer"
 grep -q 'hold aborted (operator)' "$w/store.before.abort.log" || fail "hangup-in-abort path wrote no abort record"
 echo "ok   hangup during the abort: restore completed and recorded"
+
+# 13. The "no sparrowd process remains" check fails closed (issue #410): a ps that errors stops the
+#     script before the store copy (the daemon's state is unknown), a listed sparrowd still stops it
+#     with the listing, and a list of other processes passes.
+for mode in fail daemon other; do
+    w=$(world "ps-$mode")
+    chattr +C -- "$w/store"
+    touch "$w/state/sparrow-ship.timer.active"
+    extra=(--keep-copy "$w/store.before")
+    run "$w" STUB_PS=$mode
+    extra=()
+    case $mode in
+        other) ((rc == 0)) || { echo "$out" >&2; fail "ps listing other processes exited $rc"; } ;;
+        *)
+            ((rc != 0)) || fail "ps $mode: the script exited 0"
+            grep -q 'stop sparrow.service' "$w/state/calls" || fail "ps $mode: the daemon was not stopped first"
+            [[ ! -e $w/store.before && ! -e $w/store.before.partial ]] || fail "ps $mode: the store copy started"
+            ! grep -q 'daemon stopped' <<<"$out" || fail "ps $mode: the script went on past the check"
+            [[ $(readlink "$w/home/.local/libexec/sparrow/sparrowd") == sparrowd-schema68-aaa ]] || fail "ps $mode: a link moved"
+            ;;
+    esac
+    case $mode in
+        fail) grep -q 'whether a sparrowd still runs is unknown' <<<"$out" || fail "ps fail: no unknown-state message: $out" ;;
+        daemon)
+            grep -q 'a sparrowd process remains' <<<"$out" || fail "ps daemon: no refusal message: $out"
+            grep -q '300 sparrowd' <<<"$out" || fail "ps daemon: no listing: $out" ;;
+    esac
+done
+echo "ok   ps fails, lists sparrowd, lists others: stops before the copy, stops, passes"
 
 echo PASS
