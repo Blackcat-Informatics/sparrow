@@ -881,7 +881,8 @@ creation batch. At every open, a configured role that differs from the stored
 role stops startup with a message naming both values, and a configured role
 meeting a store with no row stops startup with a message saying so. No
 operation changes a stored role. Stamping an existing store is a separate
-operator step; the daemon never performs it. A daemon without the key accepts
+operator step, the offline `sparrow-stamp` tool
+([deployment](deployment.md#stamp-the-role)); the daemon never performs it. A daemon without the key accepts
 any store.
 
 ### Archive prepare halvings and the daemon's library warnings (#324)

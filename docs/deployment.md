@@ -17,11 +17,12 @@ configuration and the behavior those procedures rely on.
 ## Kept images and seeded builds
 
 Run `make check`, commit through the normal verification hook, then run
-`make install-bin`. It builds the release daemon, CLI and recovery probe
+`make install-bin`. It builds the release daemon, CLI, recovery probe and role stamp
 through the managed cargo wrapper and copies them into `./bin` with
 `cp --reflink=auto` under revision-qualified names:
-`bin/sparrowd-schemaN-REV`, `bin/sparrow-schemaN-REV` and
-`bin/sparrow-recovery-schemaN-REV`, where `N` is the client schema version and
+`bin/sparrowd-schemaN-REV`, `bin/sparrow-schemaN-REV`,
+`bin/sparrow-recovery-schemaN-REV` and `bin/sparrow-stamp-schemaN-REV` (the
+offline role stamp), where `N` is the client schema version and
 `REV` the short commit. It also copies the five native CBOR lexicons, with
 their provenance manifest, notices and licenses, from the PurRDF revision the
 lockfile resolves into `bin/lexicons-PURRDF_REV/`. It refuses an uncommitted
@@ -82,9 +83,28 @@ store when the daemon creates it, and `discover` and `status` report it as
 role that differs from the stored one stops the daemon with a message naming both
 values. A configured role on a store that has none also stops it; that message
 names only the configured role and offers two remedies: remove the key, or stamp
-the store as a separate operator step. The role never changes after creation, and
-the daemon does not stamp an existing store. Leave the key out of a configuration
-for a store that has no role row.
+the store as a separate operator step (see [Stamp the role](#stamp-the-role)). The
+role never changes after creation, and the daemon does not stamp an existing store.
+Leave the key out of a configuration for a store that has no role row.
+
+#### Stamp the role
+
+`bin/sparrow-stamp-schemaN-REV DATA_DIR production|scratch`, installed by
+`make install-bin` beside the other images, writes the one `instance_role` row into
+a stopped store that has none. It runs only with the daemon stopped: the daemon
+holds the store's lock while it runs, so a running daemon makes the tool refuse
+(`CONFLICT`). It opens the existing store without the daemon's open path, so no
+format upgrade, fence or migration runs, and writes the single row with a synced
+write. It writes nothing else and changes no format. It prints `store_id` and
+`instance_role`, which the operator records. It refuses, leaving the store
+unchanged, a store that already has a role row (`CONFLICT`, naming it; a stored
+role never changes), a store at a format this build does not know
+(`UNSUPPORTED`; run it from the build that opens the store) and a directory that is
+not a Sparrow store (`INVALID_ARGUMENT`).
+
+After the stamp, start the daemon with the key set to the stamped word or absent;
+`sparrow SOCK discover` reports the role. Running the tool against the live store is
+a lifecycle act ordered by the coordination session; no procedure runs it unordered.
 
 `deploy/test-instance.sh` writes `instance_role = "scratch"` into the scratch
 configuration it generates, together with an ingest socket for senders, a disk
@@ -774,7 +794,7 @@ Check what the window needs.
 - The configuration names no `[archive]` table, no `instance_role` and no `backup_root` or
   `backup_keep`: `grep -nE '^(\[archive\]|instance_role|backup_root|backup_keep)' "$CONF"` prints
   nothing. A configured `instance_role` on a store that has no role row stops the daemon at its
-  open, and no stamp tool exists yet (Sparrow issue 384); leave the key out.
+  open; leave the key out (stamping is a later separate act, [Stamp the role](#stamp-the-role)).
 - The copy has a home. The store directory and every file in it must have copy-on-write off for
   a reflink copy: `lsattr -d "$STORE"` shows `C`, and
   `find "$STORE" -type f -exec lsattr -- {} + | awk '$1 !~ /C/' | wc -l` prints 0. Then the
@@ -979,9 +999,9 @@ The live store has no role row, so `discover` and `status` report `instance_role
 after the switch as before it. A sender that must not reach the live store sends only when the
 role reads `scratch` and refuses `production` and `unspecified`, so a scratch-only sender, such as
 the test-load sender, refuses the live store. Senders to the live store do not check the role and
-see no change. Stamping the live store `production` is a separate later step by an offline stamp tool
-(Sparrow issue 384), run against the stopped store on the coordination session's order; the
-configuration keeps `instance_role` out until then.
+see no change. Stamping the live store `production` is a separate later act, not part of switch 1: the
+offline stamp ([Stamp the role](#stamp-the-role)) runs against the stopped store on the
+coordination session's order, and the configuration keeps `instance_role` out until then.
 
 ### Switch 2: the archive worker
 

@@ -1605,6 +1605,22 @@ fn put<T: Catalog>(batch: &mut WriteBatch, key: &str, value: &T) {
     batch.put(key, json::write_compact(&value.encode()));
 }
 
+/// Whether this build opens a store at `format`; any other identity needs a migration.
+fn is_known_format(format: &[u8]) -> bool {
+    format == FORMAT
+        || format == consumption::FORMAT
+        || format == watch_registry::FORMAT
+        || format == handoff::FORMAT
+        || format == consumption::TAIL_FORMAT
+        || format == pressure::FORMAT
+        || format == pressure::WATCH_FORMAT
+        || format == receiver_stream::FORMAT
+        || format == receiver_stream::WATCH_FORMAT
+        || format == manifest_retire::FORMAT
+        || format == manifest_retire::WATCH_FORMAT
+        || recordless::legacy_format(format).is_some()
+}
+
 impl Store {
     /// Actual single-writer database location, for excluding it from intake roots.
     pub fn data_path(&self) -> Result<std::path::PathBuf, Error> {
@@ -1627,20 +1643,7 @@ impl Store {
         let fingerprint = hex::encode(&config.text_analyzer.fingerprint());
         let rdf_fingerprint = rdf_index::profile_identity()?;
         let id = match writer_format::read(&db)? {
-            Some(format)
-                if format == FORMAT
-                    || format == consumption::FORMAT
-                    || format == watch_registry::FORMAT
-                    || format == handoff::FORMAT
-                    || format == consumption::TAIL_FORMAT
-                    || format == pressure::FORMAT
-                    || format == pressure::WATCH_FORMAT
-                    || format == receiver_stream::FORMAT
-                    || format == receiver_stream::WATCH_FORMAT
-                    || format == manifest_retire::FORMAT
-                    || format == manifest_retire::WATCH_FORMAT
-                    || recordless::legacy_format(&format).is_some() =>
-            {
+            Some(format) if is_known_format(&format) => {
                 if recordless::requires_watch_registry(&format)
                     != db.get("watch_registry")?.is_some()
                 {
