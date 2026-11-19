@@ -191,8 +191,7 @@ impl Store {
             relations.validate().map_err(Arc::new)?;
         }
         if read.request.query.len() > crate::query::RECORD_QUERY_TEXT_BYTES {
-            return Err(Arc::new(Error::new(
-                "RESOURCE_LIMIT",
+            return Err(Arc::new(Error::input_bound(
                 "SPARQL query exceeds 64 KiB input",
             )));
         }

@@ -126,8 +126,7 @@ pub(crate) fn markdown_graph(
     profile: &purrdf::markdown::Profile,
 ) -> Result<std::sync::Arc<purrdf::RdfDataset>, Error> {
     if byte_length > RECORD_BYTES {
-        return Err(Error::new(
-            "RESOURCE_LIMIT",
+        return Err(Error::input_bound(
             "native Markdown source exceeds 16 MiB materialization bound",
         ));
     }
@@ -146,10 +145,7 @@ pub(crate) fn markdown_graph(
     let mut text = String::new();
     for claim in claims {
         if text.len().saturating_add(claim.turtle.len()) > 16 * 1024 * 1024 {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                "native Markdown RDF exceeds 16 MiB",
-            ));
+            return Err(Error::input_bound("native Markdown RDF exceeds 16 MiB"));
         }
         text.push_str(&claim.turtle);
     }

@@ -75,8 +75,7 @@ pub(crate) fn facts(
             .into());
     }
     let result = if byte_length > 1024 * 1024 {
-        Err(Error::new(
-            "RESOURCE_LIMIT",
+        Err(Error::input_bound(
             "aligned text record exceeds 1 MiB profile bound",
         ))
     } else {
@@ -171,8 +170,7 @@ fn append(
         .map_err(|e| Error::new("PROJECTION_FAILURE", e.to_string()))?;
     for projection in analysis.lexical {
         if *length == MAX_OCCURRENCES {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
+            return Err(Error::input_bound(
                 "text record exceeds 16,384 token occurrences",
             ));
         }

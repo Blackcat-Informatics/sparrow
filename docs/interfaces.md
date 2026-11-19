@@ -128,22 +128,17 @@ cancels on the failure. A refused SDK `ingest` or `ingest_with_durability` above
 does not cancel: it keeps its prepared records and its journal slot until the 2-day
 retry window ends. Reclaim removes one prepared record per pass, at between about 14
 and 147 records per second in the logged idle windows, and is starved while an ingest
-runs: one 935 s refusal drained about 2,000 records. Space returns only after
-tombstone compaction.
+runs. Space returns only after tombstone compaction.
 
 Repeated refusals that arrive after preparation can drive `physical_bytes` to
-`STORAGE_PRESSURE`. Refusals of two different 100 MB files took it from 713 MB to 2.54
-GB, and the next ingest answered `STORAGE_PRESSURE` at 3.13 GB against a 3.22 GB
-budget. The lockout is temporary. A one-record ingest succeeded at 3.15 GB, 13 s
+`STORAGE_PRESSURE`: an ingest answered `STORAGE_PRESSURE` at 3.13 GB against a 3.22 GB
+budget after refusals that left their prepared records. The lockout is temporary. A one-record ingest succeeded at 3.15 GB, 13 s
 after the last sample that read pressure phase `requested`; a sample in the same
 second read `ready`. A 2.7 MB file was then refused `STORAGE_PRESSURE`, and native
 compaction later brought physical bytes from 3.45 GB to 2.55 GB. Not measured: the
 16-journal limit (`MAX_IMPORTS`), where an unreclaimed refusal holds its slot (no log
 counts the journals held), the exact staging threshold, and reclaim to zero after the
-60,000-record refusal. At about 0.9 GB per 100 MB refusal, a live status with about
-14.7 GB of headroom reaches the ceiling after about 16 refusals (14.7 GB divided by
-0.9 GB, before the reserve and the batch estimate); that is an estimate, not a
-measurement. Issue #389 tracks the fault.
+60,000-record refusal. Issue #389 tracks the fault.
 
 **Choosing the form.** An item sent `opaque` costs at most about its size (0.21x to
 0.27x for log text, 1.03x to 1.08x for random bytes) and is found by payload id only

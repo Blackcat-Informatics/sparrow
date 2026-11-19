@@ -337,11 +337,17 @@ impl Error {
         }
     }
 
-    /// This refusal with `context` appended to its message; the code and the retry class stay.
+    /// This refusal with `message` in place of its own; the code and the retry class stay.
+    #[must_use]
+    pub(crate) fn with_message(self, message: String) -> Self {
+        Self { message, ..self }
+    }
+
+    /// This refusal with `context` appended to its message.
     #[must_use]
     pub(crate) fn with_context(self, context: &str) -> Self {
         let message = format!("{self}; {context}");
-        Self { message, ..self }
+        self.with_message(message)
     }
 
     /// Whether a client may retry the same request and expect another outcome. The wire's
@@ -2308,7 +2314,7 @@ impl Store {
                 // context and authority metadata included). A write over the whole data
                 // allowance can never fit, so a producer is told so and does not retry.
                 match refusal {
-                    pressure::WriteRefusal::Ceiling => {
+                    pressure::WriteRefusal::Ceiling { .. } => {
                         batch_bound(origin, Error::from(refusal).message)
                     }
                     pressure::WriteRefusal::Other(error) => error,

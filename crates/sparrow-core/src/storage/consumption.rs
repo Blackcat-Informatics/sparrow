@@ -995,8 +995,7 @@ impl Store {
             && journal.observed.byte_length
                 > writer.config.disk_budget - writer.config.maintenance_reserve
         {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
+            return Err(Error::input_bound(
                 "source generation exceeds the available disk budget",
             ));
         }
@@ -1028,8 +1027,7 @@ impl Store {
         if json::write_compact(&journal.encode()).len()
             > JOURNAL_BYTES - COMPLETION_ROOM - CLAIMED_ROOM - HISTORY_ROOM
         {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
+            return Err(Error::input_bound(
                 "source ownership proof exceeds the 8 KiB journal budget",
             ));
         }

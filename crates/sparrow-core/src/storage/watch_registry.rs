@@ -35,8 +35,7 @@ impl Store {
         next: &[u8],
     ) -> Result<(), Error> {
         if next.is_empty() || next.len() > MAX_WATCH_REGISTRY_BYTES {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
+            return Err(Error::input_bound(
                 "watch registry requires 1..524288 bytes",
             ));
         }

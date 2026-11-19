@@ -20,7 +20,9 @@ pub(crate) fn decode_relations(
             let value = value.map_err(invalid)?;
             let ranked = value.get_ranked_iri().map_err(invalid)?;
             let spans = value.get_spans_iri().map_err(invalid)?;
-            if ranked.len() > 1024 || spans.len() > 1024 {
+            if ranked.len() > sparrow_core::TEXT_RELATION_IRI_BYTES
+                || spans.len() > sparrow_core::TEXT_RELATION_IRI_BYTES
+            {
                 return Err(Error::input_bound("text relation IRI exceeds 1024 bytes"));
             }
             Ok(Some(SparqlTextRelations {

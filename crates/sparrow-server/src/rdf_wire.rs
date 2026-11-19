@@ -19,11 +19,14 @@ pub(crate) const MAX_NODES: usize = 512;
 pub(crate) const MAX_BYTES: usize = 256 * 1024;
 
 use crate::rpc::invalid;
+/// The request's forest is over a fixed bound: no retry of the same request passes.
 fn capacity() -> Error {
-    Error::new(
-        "RESOURCE_LIMIT",
-        "RDF transport forest exceeds 512 expanded nodes or 256 KiB admission",
-    )
+    Error::input_bound("RDF transport forest exceeds 512 expanded nodes or 256 KiB admission")
+}
+
+/// The daemon could not allocate the decoded forest: occupancy, so retryable.
+fn allocation() -> Error {
+    Error::new("RESOURCE_LIMIT", "RDF transport forest allocation refused")
 }
 
 fn language(value: wire::optional_text::Reader<'_>) -> Result<Option<&str>, Error> {
@@ -111,7 +114,7 @@ pub(crate) fn decode(
     let mut costs = Vec::<usize>::new();
     costs
         .try_reserve_exact(nodes.len() as usize)
-        .map_err(|_| capacity())?;
+        .map_err(|_| allocation())?;
     let mut raw = 0usize;
     for (index, node) in nodes.iter().enumerate() {
         let (text, links) = match node.which().map_err(invalid)? {
@@ -166,7 +169,7 @@ pub(crate) fn decode(
     let mut values = Vec::new();
     values
         .try_reserve_exact(roots.len())
-        .map_err(|_| capacity())?;
+        .map_err(|_| allocation())?;
     for root in roots {
         let value = purrdf::ir::try_fold_nested(
             *root,
@@ -234,11 +237,11 @@ pub(crate) fn encode<'a>(
         }
     }
     let mut nodes = Vec::<Node<'_>>::new();
-    nodes.try_reserve_exact(count).map_err(|_| capacity())?;
+    nodes.try_reserve_exact(count).map_err(|_| allocation())?;
     let mut root_ids = Vec::new();
     root_ids
         .try_reserve_exact(roots.len())
-        .map_err(|_| capacity())?;
+        .map_err(|_| allocation())?;
     for root in roots {
         let id = purrdf::ir::try_fold_nested(
             *root,

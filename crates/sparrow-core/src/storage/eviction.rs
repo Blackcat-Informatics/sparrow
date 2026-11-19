@@ -330,10 +330,8 @@ impl Writer {
         )?;
         // A pending claim's single-path and manifest artifacts stay until its source is removed.
         protected.extend(writer.journal_holds().map_err(|error| {
-            Error::new(
-                error.code,
-                format!("eviction pass blocked by the consumption registry: {error}"),
-            )
+            let message = format!("eviction pass blocked by the consumption registry: {error}");
+            error.with_message(message)
         })?);
         let mut cursor = self.eviction.borrow_mut();
         if cursor.protected == protected && cursor.exhausted {

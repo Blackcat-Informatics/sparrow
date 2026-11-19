@@ -17306,8 +17306,8 @@ fn an_input_bound_refusal_is_not_retryable_while_occupancy_stays_retryable() {
                 0,
             )
             .unwrap();
-        for (index, chunk) in input.chunks(sparrow_core::IMPORT_CHUNK_BYTES).enumerate() {
-            let offset = (index * sparrow_core::IMPORT_CHUNK_BYTES) as u64;
+        for (index, chunk) in input.chunks(IMPORT_CHUNK_BYTES).enumerate() {
+            let offset = (index * IMPORT_CHUNK_BYTES) as u64;
             store.import_append(&journal.id, offset, chunk, 0).unwrap();
         }
         store.import_seal(&journal.id, 0).unwrap();

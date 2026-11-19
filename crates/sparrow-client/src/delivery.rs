@@ -280,7 +280,7 @@ pub struct DeliveryStats {
     /// Last transient failure, cleared when a batch is acknowledged.
     pub last_transient_failure: Option<Arc<Error>>,
     /// Admitted events whose batch the daemon permanently refused (a non-retryable
-    /// `INVALID_ARGUMENT` or `CONFLICT`, or a batch the client itself cannot send): an answer
+    /// `INVALID_ARGUMENT`, `CONFLICT` or `RESOURCE_LIMIT`, or a batch the client itself cannot send): an answer
     /// retrying the same batch can never change. Their bytes are in quarantine files, not
     /// lost. They kept their sequence; the daemon sees a gap only if it later accepts a
     /// higher sequence of an instance it already recorded, so this counter and the fence are
@@ -1818,6 +1818,22 @@ mod tests {
     /// the classification and the file only: the worker validates each batch before the send,
     /// so no deterministic run drives a batch the queue built into that error (it ends
     /// delivery as a terminal failure, saved by `save_held`, which the held-events test covers).
+    /// INVARIANT (#397): a `RESOURCE_LIMIT` the daemon marks non-retryable is a bound on this
+    /// batch and quarantines it; one it marks retryable is occupancy and is held, never
+    /// quarantined.
+    #[test]
+    fn a_resource_limit_quarantines_only_when_the_daemon_marks_it_non_retryable() {
+        for (retryable, quarantined) in [(false, true), (true, false)] {
+            let refusal = Error::Domain {
+                code: "RESOURCE_LIMIT".into(),
+                message: "bound".into(),
+                retryable,
+                class: crate::FailureClass::Unclassified,
+            };
+            assert_eq!(permanent_refusal(&refusal), quarantined, "{retryable}");
+        }
+    }
+
     #[test]
     fn a_batch_the_client_cannot_encode_is_quarantined_under_a_client_code() {
         let refusal = Error::InvalidArgument("event text exceeds 16 KiB");

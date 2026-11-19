@@ -14,6 +14,9 @@ mod tests;
 /// Retained-record lexical corpus law shared with ordinary text searches.
 pub const STORED_TEXT_CORPUS_PROFILE: &str = crate::text::PROFILE;
 /// Stored ranking/span column shapes and cooperative source-work law.
+/// Most bytes of either text relation IRI.
+pub const TEXT_RELATION_IRI_BYTES: usize = 1024;
+/// The profile of the stored text relations.
 pub const STORED_TEXT_RELATION_PROFILE: &str = "sparrow-stored-text-relations-v1";
 
 /// Caller-selected predicates for retained-record ranking and source spans.
@@ -35,11 +38,8 @@ impl SparqlTextRelations {
             ));
         }
         for iri in [&self.ranked_iri, &self.spans_iri] {
-            if iri.len() > 1024 {
-                return Err(Error::new(
-                    "RESOURCE_LIMIT",
-                    "text relation IRI exceeds 1024 bytes",
-                ));
+            if iri.len() > TEXT_RELATION_IRI_BYTES {
+                return Err(Error::input_bound("text relation IRI exceeds 1024 bytes"));
             }
             let parsed = purrdf_core::parse_iri(iri)
                 .map_err(|error| Error::new("INVALID_ARGUMENT", error.to_string()))?;
