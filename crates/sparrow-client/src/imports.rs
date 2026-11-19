@@ -147,8 +147,8 @@ fn is_hold(error: &Error) -> bool {
 /// A held connection cannot be replaced, so any error ends the attempt. A hold
 /// (`STORAGE_PRESSURE`, `SHUTTING_DOWN`) or a lost connection is returned unchanged without a
 /// cancel: the journal and checkpoint stay intact and a retry under the same request ID resumes.
-/// Any other error cancels the journal. The cancel uses the same connection; when that is lost too, the journal stays resumable and the result is the
-/// retryable `IMPORT_RESUMABLE`.
+/// Any other error cancels the journal. The cancel uses the same connection; when that is
+/// lost too, the journal stays resumable and the result is the retryable `IMPORT_RESUMABLE`.
 pub(crate) async fn upload_or_cancel(
     client: &wire::sparrow::Client,
     discovery: &crate::Discovery,
