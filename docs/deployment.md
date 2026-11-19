@@ -1184,18 +1184,18 @@ total = int(row["total"])
 
 sources = [r for p in pages(100000, "sources", store) for r in p["rows"]]
 held = {r["source_id"]: int(r["complete_artifacts"]) + int(r["fragment_parents"]) for r in sources}
-if total != sum(held.values()):
-    fail(f"migration total {total} != sources complete_artifacts + fragment_parents {sum(held.values())}")
+counted = sum(held.values())
 
 # One full walk of the artifact listing: no call sorts by size or filters by it. A page holds at most 31
 # rows and fewer when its charged catalog bytes run out first, so a page can hold none. A page that ends
 # having consumed nothing happens only for a resumed artifact whose next record cannot fit a fresh page
 # (a record entry over 512 KiB, or pins that use up the page's admission) and at the edge of the
-# source-summary window (only while that migration runs). The live store has neither: the source-summary
-# migration is complete, and the records are under that size. Without them every page consumes at least one
-# catalog entry. A run of pages without a new row then folds one artifact, which has at most
-# max_records_per_artifact records, so more than that many plus 1 consecutive pages without a new row is a
-# stalled walk. The store-counters total counts every catalog entry and is the last backstop on the calls.
+# source-summary window (only while that migration runs), so the check requires that migration complete.
+# Otherwise every page consumes at least one catalog entry. The listing omits a counted artifact that has
+# no live bytes and no live record, and the omitted ones of a source sit together at its head, so one run of
+# pages without a new row can cross all of them: the code gives no bound on a run shorter than the walk. The
+# stall limit is a size-based heuristic that fails a stalled walk early: one artifact's records plus 1. The
+# store-counters total counts every catalog entry and is the backstop on the calls that the code guarantees.
 # Cursors carry a new snapshot id on every page, so a repeated cursor is not a stall signal and is not checked.
 counters = [m for m in status["migrations"] if m["name"] == "store-counters"]
 if len(counters) != 1 or counters[0]["watermark"] is not None or counters[0]["done"] != counters[0]["total"]:
@@ -1233,12 +1233,16 @@ if last is None or last["answer_certainty"] != "exact" or int(last["matching_art
 per_source = {}
 for r in listed.values():
     per_source[r["source"]] = per_source.get(r["source"], 0) + 1
-for source, count in held.items():
-    if per_source.get(source, 0) < count:
-        fail(f"source {source}: sources reports {count} artifacts, the listing returned {per_source.get(source, 0)}")
-
-if len(listed) != total:
-    fail(f"the listing holds {len(listed)} artifacts, the migration total is {total}")
+# The listing walks the per-source index, which holds exactly the artifacts that are complete or have a
+# retained record, the same artifacts `sources` counts. The listing drops those with no live bytes and no
+# live record (expired and not retired), so it is never larger than the counts and may be smaller.
+for source, count in per_source.items():
+    if count > held.get(source, 0):
+        fail(f"source {source}: the listing returned {count} artifacts, sources reports {held.get(source, 0)}")
+if len(listed) > counted:
+    fail(f"the listing holds {len(listed)} artifacts, sources reports {counted}")
+omitted = counted - len(listed)
+unlisted_sources = len([s for s, c in held.items() if c and not per_source.get(s)])
 
 now = datetime.datetime.now(datetime.timezone.utc)
 edges = [now - datetime.timedelta(days=d) for d in AGE_DAYS]
@@ -1326,7 +1330,9 @@ print(f"payload check passed: {len(report)} artifacts; sources holding artifacts
       f"age windows covered {len({window_of(h) for h in chosen})} of {len(edges)}; "
       f"sizes {min(sizes)} to {max(sizes)} bytes, {read} bytes read of the {CEILING} ceiling; "
       f"listing walk of {walk_calls} calls and {walk_seconds:.0f} s, {len(listed)} artifacts; "
-      f"payload-index done=total={total}")
+      f"payload-index done=total={total}; artifacts counted by sources {counted}, listed {len(listed)}, "
+      f"omitted from the listing {omitted} (counts expired or without live bytes and records; {unlisted_sources} "
+      f"sources list none); artifacts counter {total}, gap to sources {total - counted}")
 CHECK
 ```
 
@@ -1407,11 +1413,20 @@ CHECK
      (512 KiB) or pins that use up the page's admission, and the edge of the source-summary window
      (`Listed::Window`), which exists only while the `source-summary` migration runs. The check
      requires that migration complete, and the live store at its last reading has it complete and no
-     active pins (`.stage/image/switch-1/before.json`); a record entry over 512 KiB is not seen
-     (inference: the dry run read 409,300 records without refusal). Under those conditions a run of
-     pages without a new row folds one artifact, which has at most `max_records_per_artifact`
-     records (100,000 in that `before.json`), so the check fails a walk with more than that count
-     plus 1 consecutive pages without a new row. Every page carries a new random snapshot id in its
+     active pins (`.stage/image/switch-1/before.json`); whether a record entry over 512 KiB exists on
+     the live store is not verified, and the stall check below catches it. Under those conditions every
+     page consumes at least one catalog entry. The listing omits a counted artifact that has no live
+     bytes and no live record, and the omitted artifacts of a source sit together at its head (rows
+     are ordered by source, then receipt time), so one run of pages without a new row can cross all
+     of them, not one artifact. The code gives no bound on such a run shorter than the walk. The stall
+     limit is therefore a size-based heuristic that fails a stalled walk early, not a code guarantee:
+     it fails a walk with more than `max_records_per_artifact` (100,000 in that `before.json`)
+     plus 1 consecutive pages without a new row. Sizing the worst case (arithmetic): `physical_bytes`
+     38,896,138,877 over 2,981,454 `live_records` is at most 13,046 bytes per record, so a page reads at
+     least 40 records (524,288 bytes divided by 13,046), and even if every record were in one run of
+     omitted artifacts the run is at most 74,200 pages, under the limit of 100,001; records past their
+     deadline may not be in `live_records`, so their number is unknown and this holds only while it is
+     small. Every page carries a new random snapshot id in its
      cursor, so a repeated cursor does not signal a stall and is not checked. At 27.9 calls per
      second that bound is 100,001 calls, about 3,584 s (arithmetic). The walk also ends within the
      `store-counters` migration `total` plus 1 calls, which counts every catalog entry; the check
@@ -1419,24 +1434,32 @@ CHECK
      (`.stage/image/switch-1/before.json`, not the window's own `before.json`) is 17,764,215 calls,
      about 636,710 s or 7.4 days at 27.9 calls per second (arithmetic). The check also fails when the
      listing returns an artifact twice, when the walk ends without an exact final
-     page, or when its rows differ from the listing's own `matching_artifacts` count or from the
-     migration `total`. The call limit is a bound, not an expectation. The dry run's scratch store,
+     page, or when its rows differ from the listing's own `matching_artifacts` count. The call limit is a bound, not an expectation. The dry run's scratch store,
      308 artifacts of about 1,330 records (409,300 records, arithmetic), took 694 calls: 424 pages
      held no row, 232 one and 38 two, at 27.9 calls per second (`.stage/372-dryrun/logs/12-walk-rate.log`),
      about 590 records per call (arithmetic). Scaling the calls by records to the live
      2,981,454 `live_records` (`.stage/image/switch-1/before.json`) gives about 5,055 calls and, at
-     27.9 calls per second, about 181 s (arithmetic; the rate came from one scratch store under
-     concurrent build load, the load was not logged, and live record entries may differ in size, which
+     27.9 calls per second, about 181 s (arithmetic; the rate came from one scratch store, the host
+     load was not logged, and live record entries may differ in size, which
      moves the call count). The check prints a progress line every 1,000 calls and the walk's calls and seconds
-     at the end. It also
-     fails when a source that `sources` reports as holding `complete_artifacts` plus
-     `fragment_parents` artifacts returns fewer rows than that. The 5 largest artifacts by
+     at the end. The `sources` rows and the per-source index count an artifact until it is retired,
+     whatever its deadline (`source_summary.rs`, module header), and the listing omits an artifact with
+     no live bytes and no live record (`finish_row` in `artifact_read.rs`). Nothing retires on the live
+     daemon, which has no archive (`archived` in `archive.rs`, `retire_without_archive` false in
+     `config.rs`), so artifacts past their 30-day deadline stay counted and are not listed; no
+     field of `before.json` counts them, so their number on the copy is not known until the check prints it. The
+     check therefore does not require equality. It fails when a source's listed rows exceed that
+     source's `complete_artifacts` plus `fragment_parents`, or the listed total exceeds the sum of
+     those counts, which the code excludes, and it prints the counted, listed and omitted numbers, the
+     sources that list none, and the gap between the `artifacts` counter and the `sources` sum (which
+     evicted artifacts and parents whose entry is gone also move). A smaller listing means artifacts
+     without live bytes or live records, the rehearsal reads the printed gap and does not fail on it. The 5 largest artifacts by
      `byte_length` come from the whole walk, and the spread is drawn from the same rows by source and
      by age window (the last 1, 1 to 3, 3 to 7, 7 to 14 and 14 to 21 days, and everything older;
      source `j` takes window `(lap + j) mod 6` in each lap, so ages mix across sources). Only rows that report
-     `complete_bytes_available` and a `byte_length` above 0 can be sampled: an expired artifact is
-     refused by `bytes`, so the oldest window holds only artifacts still within retention or
-     pinned, and an empty artifact has no bytes to hash. A row without `byte_length` fails the check.
+     `complete_bytes_available` and a `byte_length` above 0 can be sampled: an expired artifact has no
+     live bytes, appears as no row and is never sampled, so the oldest window holds only artifacts
+     still within retention or pinned, and an empty artifact has no bytes to hash. A row without `byte_length` fails the check.
      For each artifact it fetches the exact bytes from the rehearsal daemon with
      `bytes STORE_ID ARTIFACT_ID OFFSET LENGTH FILE`, in successive reads of at most 1 MiB
      (the call's limit), appended in order to one file under `$RECORD`, and hashes that file with
@@ -1451,11 +1474,7 @@ CHECK
      that passes the artifact's end with `INVALID_ARGUMENT` ("byte range is outside evidence";
      `in_range` in `crates/sparrow-core/src/storage.rs`) and never truncates it.
      The check also requires the `payload-index` migration `done` to equal its
-     `total` with `failure` and `watermark` null, and `total` (the `artifacts` counter) to equal
-     the artifact count the copy reports: the sum of `complete_artifacts` and `fragment_parents`
-     over every `sources` row; `status` itself reports no artifact count. That identity can break
-     once anything has been evicted: an evicted entry with no retained record counts in neither
-     figure. A mismatch fails the check and is then read, not waved through.
+     `total` with `failure` and `watermark` null.
      The total bytes read are capped by a ceiling, 4 GiB by default (a choice; the optional fourth
      argument, in bytes, changes it). If the largest artifact alone exceeds the ceiling, or the
      5 largest together do, the check fails and says to raise it; it never skips them silently. No
