@@ -1,0 +1,18 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 12d866d4d6357eb71ee0c09ea7352614e609adba
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 390
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/390
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: fdfe30396854a10202518d2e31e5b4523564ac6c
+GhpRsq-Head-Ref: paudley/370-size-mentation-intake-against-the-live
+GhpRsq-Head-OID: 12d866d4d6357eb71ee0c09ea7352614e609adba
+GhpRsq-Result-Tree: da740f69b551fc00f1acb0eacdf685aa32388287
+GhpRsq-Result-Commit: b2b27650d5f4543f4d22aa77fa97b4880680c1fb
+GhpRsq-Parent-Hashes: 12d866d4d6357eb71ee0c09ea7352614e609adba
+GhpRsq-Squash-Notes-SHA256: 5a5b7964b6cbebb58bdd4c5b5e947223495ccdde68d2b55c4c951228c2295beb
+GhpRsq-Stage-Evidence: none
