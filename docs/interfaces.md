@@ -393,6 +393,10 @@ through Tokio's fair admission queue. Fresh storage dispatch cannot overtake
 that reservation; admitted workers retain their slots until they finish, even
 when their caller disappears. Once the reservation completes, admission closes
 and remains reserved through the final store flush and endpoint cleanup.
+After the final flush succeeds, teardown asks RocksDB to cancel its background flushes
+and compactions (`Store::cancel_background_work`) before the store drops. The flush has
+made every acknowledged write durable, and a cancelled compaction leaves its input files
+live, so cancellation loses no evidence. A store is not used after the call.
 Closed storage admission returns retryable `SHUTTING_DOWN`; preserve the same
 immutable intent when reconnecting. When the reservation begins, every waiting
 writer and every later one is answered `SHUTTING_DOWN` at once. A failed admission drain is reported

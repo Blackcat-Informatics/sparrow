@@ -58,6 +58,9 @@ pub(super) async fn finish(
         let closed = flushed.is_ok();
         record_failure(&mut errors, "store flush", flushed);
         if closed {
+            // The flush made every acknowledged write durable. Abort background compaction
+            // now so the store's drop does not wait for a running job to finish its output.
+            store.cancel_background_work();
             // Every worker has stopped and admission is closed, so nothing can change the count
             // again; the journal line records the count at the stop.
             // While the store counters seed the count is not a total, so the line says pending.

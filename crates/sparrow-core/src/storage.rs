@@ -2949,6 +2949,18 @@ impl Store {
         Ok(())
     }
 
+    /// Tell RocksDB to abort its background flushes and compactions, for the daemon's
+    /// teardown only. It returns at once; dropping the last `Store` handle then waits for the
+    /// aborted jobs, which stop at their next key and leave their inputs live. Call it after
+    /// the final [`Store::flush`] and after every writer and maintenance worker has stopped:
+    /// the flush makes the write-ahead log durable and writes the memtables as table files, so
+    /// nothing acknowledged depends on a background job. A store used after this call is not
+    /// supported: RocksDB schedules no further flush or compaction, so a write may stall or
+    /// fail once its memtables fill.
+    pub fn cancel_background_work(&self) {
+        self.unlocked.db.cancel_all_background_work(false);
+    }
+
     /// Read constant-size store and admission properties without scanning evidence or
     /// taking the writer lock. Does not measure physical bytes or count records, pins,
     /// references or projections.
