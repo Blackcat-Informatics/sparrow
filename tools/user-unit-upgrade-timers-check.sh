@@ -65,7 +65,29 @@ echo "---------------C------ $a"
 STUB
     # shellcheck disable=SC2016 # the stub expands its own variables
     printf '#!/bin/sh\necho "$*" >>"$STATE/logger"\n' >"$w/stubs/logger"
-    printf '#!/bin/sh\nexit 0\n' >"$w/stubs/ps"
+    # STUB_PS: unset lists nothing, "other" lists unrelated processes, "daemon" lists a sparrowd,
+    # "bigdaemon" lists a sparrowd first and then over 1 MiB of other names (a pipe to grep -q would
+    # be cut by SIGPIPE under pipefail and read the daemon as gone),
+    # "fail" exits 1 with no output the way ps does when it cannot read the process table.
+    cat >"$w/stubs/ps" <<'STUB'
+#!/bin/sh
+# "-e -o comm=" prints names only; the listing form prints pid, name and arguments.
+if [ "$*" = "-e -o comm=" ]; then
+    case ${STUB_PS:-} in
+        fail) exit 1 ;;
+        other) echo systemd; echo bash ;;
+        daemon) echo systemd; echo sparrowd ;;
+        bigdaemon) echo sparrowd; yes systemd | head -c 1200000 ;;
+    esac
+    exit 0
+fi
+case ${STUB_PS:-} in
+    fail) exit 1 ;;
+    other) echo "    1 systemd systemd"; echo "  200 bash bash" ;;
+    daemon|bigdaemon) echo "    1 systemd systemd"; echo "  300 sparrowd sparrowd --config x" ;;
+esac
+exit 0
+STUB
     printf '#!/bin/sh\nexit 0\n' >"$w/stubs/sleep"
     cat >"$w/stubs/systemctl" <<'SYSTEMCTL'
 #!/bin/bash
@@ -100,10 +122,12 @@ SYSTEMCTL
 # run W [env...]: runs the script in world W with the given extra env and the script arguments
 # in extra; sets rc and out.
 extra=()
+# wrap: a command prefix for the script's process (empty by default).
+wrap=()
 run() {
     local w=$1; shift
     set +e
-    out=$(env -i PATH="$w/stubs:/usr/bin:/bin" HOME="$w/home" STATE="$w/state" \
+    out=$("${wrap[@]}" env -i PATH="$w/stubs:/usr/bin:/bin" HOME="$w/home" STATE="$w/state" \
         SPARROW_BIN="$w/kept" \
         "$@" "$script" --from sparrowd-schema68-aaa --to sparrowd-schema71-bbb "${extra[@]}" 2>&1)
     rc=$?
@@ -293,5 +317,47 @@ extra=()
 [[ -e $w/state/sparrow-ship.timer.active ]] || fail "hangup-in-abort path did not restore the timer"
 grep -q 'hold aborted (operator)' "$w/store.before.abort.log" || fail "hangup-in-abort path wrote no abort record"
 echo "ok   hangup during the abort: restore completed and recorded"
+
+# 13. The "no sparrowd process remains" check fails closed (issue #410): a ps that errors stops the
+#     script before the store copy (the daemon's state is unknown), a listed sparrowd still stops it
+#     with the listing, and a list of other processes passes.
+# "bigdaemon-notmp" runs the big list in a mount namespace whose /tmp and /var/tmp are 4 KiB tmpfs
+# mounts and TMPDIR is unset, so a here-string over the pipe capacity cannot write bash's temp file
+# (it would print "cannot create temp file" and read as no match); the match must do no I/O. The
+# script refuses root, so the wrapper maps the operator's uid back in a nested user namespace.
+for mode in fail daemon bigdaemon bigdaemon-notmp other; do
+    w=$(world "ps-$mode")
+    wrap=()
+    if [[ $mode == *-notmp ]]; then
+        printf '%s\n' '#!/bin/sh' 'mount -t tmpfs -o size=4k tmpfs /tmp && mount -t tmpfs -o size=4k tmpfs /var/tmp || exit 99' \
+            "exec unshare -U --map-user=$(id -u) \"\$@\"" >"$w/notmp.sh"
+        chmod +x "$w/notmp.sh"
+        unshare -rm true || fail "ps $mode: unshare -rm (user and mount namespaces) is unavailable on this host"
+        wrap=(unshare -rm "$w/notmp.sh")
+    fi
+    chattr +C -- "$w/store"
+    touch "$w/state/sparrow-ship.timer.active"
+    extra=(--keep-copy "$w/store.before")
+    run "$w" STUB_PS=${mode%-notmp}
+    extra=()
+    wrap=()
+    case $mode in
+        other) ((rc == 0)) || { echo "$out" >&2; fail "ps listing other processes exited $rc"; } ;;
+        *)
+            ((rc != 0)) || fail "ps $mode: the script exited 0"
+            grep -q 'stop sparrow.service' "$w/state/calls" || fail "ps $mode: the daemon was not stopped first"
+            [[ ! -e $w/store.before && ! -e $w/store.before.partial ]] || fail "ps $mode: the store copy started"
+            ! grep -q 'daemon stopped' <<<"$out" || fail "ps $mode: the script went on past the check"
+            [[ $(readlink "$w/home/.local/libexec/sparrow/sparrowd") == sparrowd-schema68-aaa ]] || fail "ps $mode: a link moved"
+            ;;
+    esac
+    case $mode in
+        fail) grep -q 'whether a sparrowd still runs is unknown' <<<"$out" || fail "ps fail: no unknown-state message: $out" ;;
+        daemon | bigdaemon | bigdaemon-notmp)
+            grep -q 'a sparrowd process remains' <<<"$out" || fail "ps daemon: no refusal message: $out"
+            grep -q '300 sparrowd' <<<"$out" || fail "ps daemon: no listing: $out" ;;
+    esac
+done
+echo "ok   ps fails, lists sparrowd, lists others: stops before the copy, stops, passes"
 
 echo PASS
