@@ -94,7 +94,8 @@ async fn settle(
         // On a held connection the cancel never reached the daemon, or the daemon refused it
         // with a hold (free-space floor, restart, busy admission): the journal is intact
         // unless a committed cancel's reply was lost, so a retry resumes it, or finds it
-        // canceled and starts a fresh one under the same ID. The refusal's class is kept.
+        // canceled (`IMPORT_EXPIRED`) until reclamation has removed it, then begins afresh.
+        // The refusal's class is kept.
         Err(cancel) if matches!(session, Session::Held) && resumable(&cancel) => {
             let class = match &cancel {
                 Error::Domain { class, .. } => *class,
@@ -286,7 +287,9 @@ pub fn open_completed_file(path: &Path) -> Result<File, Error> {
 /// Upload an already opened completed regular file through the same resumable path.
 /// Reads positionally from byte zero, preserving the caller's cursor and path ownership.
 /// The caller's connection is not replaced; a failed attempt cancels its staging journal
-/// over it, and `IMPORT_ABANDONED` reports a cancel that also failed.
+/// over it, and `IMPORT_ABANDONED` reports a cancel that also failed. A hold
+/// (`STORAGE_PRESSURE`, `SHUTTING_DOWN`) or a lost connection is returned unchanged and
+/// cancels nothing: the journal stays intact and a retry under the same request ID resumes.
 pub async fn import_open_file(
     client: &wire::sparrow::Client,
     request_id: &str,

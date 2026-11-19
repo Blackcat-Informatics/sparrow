@@ -4297,16 +4297,17 @@ The SDK upload paths over a held connection (`Client::ingest` and
 rule but never reconnect or resume: any error ends the attempt. A hold
 (`STORAGE_PRESSURE`, `SHUTTING_DOWN`) or a lost connection is returned unchanged and
 cancels nothing: the journal stays staged and a retry under the same request ID
-resumes it. Any other attempt that fails after its journal began cancels the journal over the same connection, so a
-refused import does not hold an import slot for the retry window. A cancellation
-answered `CONFLICT` retries the upload once: the publication committed, or the
+resumes it. Any other attempt that fails after its journal began cancels the journal
+over the same connection, so a refused import does not hold an import slot for the
+retry window. A cancellation answered `CONFLICT` retries the upload once: the publication committed, or the
 daemon's file watcher owns the staging and its journal stays intact. When the
 connection is lost before the cancellation arrives, for example at the 60-second
 connection lease, or the daemon refuses the cancellation with a retryable hold
 (free-space floor, restart, busy admission), the error is the retryable
 `IMPORT_RESUMABLE` naming the import and keeping the refusal's class. A retry under
-the same request ID resumes the journal if it is still staged, or starts a fresh
-import if the cancellation committed and its reply was lost. When the cancellation
+the same request ID resumes the journal if it is still staged. If the cancellation
+committed and its reply was lost, that ID answers `IMPORT_EXPIRED` until reclamation
+has removed the journal, then begins afresh. When the cancellation
 fails for good, for example `PERMISSION_DENIED`, the caller receives
 `IMPORT_ABANDONED` naming the import, and its slot stays occupied until the retry
 window ends.
