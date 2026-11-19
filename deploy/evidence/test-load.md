@@ -204,3 +204,41 @@ whole store (the 2.7 MB artifact raised it by about 116 MB), so a test sizes its
 `status`. A setup without `SPARROW_TEST_ARCHIVE_DIR` produced a configuration with no `archive` text,
 no `archive-dir` record and `ReadWritePaths=SCRATCH/data SCRATCH/ingest`, as before. Not run: a
 retirement of the archived item by disk pressure, and a segment cut into several files.
+
+# The instance role on the ingest socket (issue 377)
+
+Run 2026-11-19 (UTC) from commit `573151d`, images from `make install-bin`. A sender's only guard
+against sending test cruft to the live store is the role that `discover` reports on the ingest
+socket. The ingest socket admits `discover` (`ingest_gate.rs`) and a connection learns it when it
+opens, but the CLI had no command that printed it, so `sparrow SOCKET discover` prints the
+connection's `store_id`, `schema_version` and `instance_role`. `deploy/test-instance.sh env` prints
+`export SPARROW_TEST_INGEST_SOCKET=<path>`.
+
+```text
+$ deploy/test-instance.sh env SCRATCH | tail -1
+export SPARROW_TEST_INGEST_SOCKET=/home/paudley/Active/sparrow/.stage/test-instance/ingest/ingest.sock
+
+$ sparrow $SPARROW_TEST_INGEST_SOCKET discover        # setup as usual, instance_role = "scratch"
+{"operation":"discover","store_id":"store:df8f491d8bac3928332eaa46fdb45974","schema_version":71,"instance_role":"scratch"}
+
+$ sparrow $SPARROW_TEST_INGEST_SOCKET status
+Error: AgentError { code: "PERMISSION_DENIED", message: "the ingest socket admits only discover, ingest, import, eventsIngest and flush; ..." }
+```
+
+A second, throwaway instance in `.stage/test-instance-norole` (its own `SCRATCH`, ingest socket and
+store) had the `instance_role` line deleted from its generated configuration before its first
+start, which is how a store with no role is created, as the live daemon's image creates it today.
+It was stopped, torn down and purged after the call:
+
+```text
+$ sparrow .stage/test-instance-norole/ingest/ingest.sock discover
+{"operation":"discover","store_id":"store:04c7d8a02e8fff2412b27b0150226656","schema_version":71,"instance_role":"unspecified"}
+$ sparrow .stage/test-instance-norole/data/store/rpc.sock status    # instance_role only
+"instance_role":"unspecified"
+```
+
+A store with a role reads `scratch` and a store without one reads `unspecified`, so a sender that
+sends only to `scratch` refuses both `production` and `unspecified`. `production` was not run: no
+instance with that role was created. The test
+`the_ingest_socket_discover_reports_the_instance_role_and_store` covers the `scratch` and
+`unspecified` answers over the ingest socket.
