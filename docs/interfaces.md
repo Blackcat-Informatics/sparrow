@@ -123,8 +123,7 @@ preparation state. The CLI `ingest` cancels on the failure, and every measured
 ingest used it. A refused SDK `ingest` or `ingest_with_durability` above 16 MiB
 does not cancel: it keeps its prepared records and its journal slot until the
 2-day retry window ends. Reclaim removes one prepared record per pass, at
-between about 14 and 147 records per second in the logged idle windows, most of
-them 40 to 72. Reclaim is starved while an ingest runs: one 935 s refusal
+between about 14 and 147 records per second in the logged idle windows. Reclaim is starved while an ingest runs: one 935 s refusal
 drained about 2,000 records. Space returns only after tombstone compaction.
 
 Repeated refusals can drive `physical_bytes` to `STORAGE_PRESSURE`. Five
