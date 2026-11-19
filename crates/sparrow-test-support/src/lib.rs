@@ -73,6 +73,7 @@ macro_rules! storage_config {
                     .expect("standard storage fixture analyzer"),
                 archive: None,
                 retire_without_archive: true,
+                instance_role: None,
             })
             .clone()
     }};

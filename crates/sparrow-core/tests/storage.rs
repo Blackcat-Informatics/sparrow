@@ -26021,3 +26021,53 @@ fn an_intake_refused_for_rdf_staging_is_counted_and_named_in_status() {
     assert_eq!(status["staging_refused_last_graph"], last.graph.as_str());
     assert_eq!(status["staging_refused_last_bytes"], last.bytes.to_string());
 }
+
+/// Value (#371): the instance role is fixed at creation and checked at every open. Protects:
+/// a store created with `scratch` reports `scratch` when reopened with the same configuration;
+/// a store created with no role reports none and opens as before; a stored `scratch` store
+/// opened with `production` refuses with a message naming both values; and a configured role
+/// meeting a store with no row refuses instead of stamping it.
+#[test]
+fn the_instance_role_is_fixed_at_creation_and_checked_at_every_open() {
+    use sparrow_core::InstanceRole;
+    let with = |role| Config {
+        instance_role: role,
+        ..config()
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let store = Store::open(scratch.path(), with(Some(InstanceRole::Scratch))).unwrap();
+    assert_eq!(store.instance_role(), Some(InstanceRole::Scratch));
+    drop(store);
+    let reopened = Store::open(scratch.path(), with(Some(InstanceRole::Scratch))).unwrap();
+    assert_eq!(reopened.instance_role(), Some(InstanceRole::Scratch));
+    drop(reopened);
+    let unconfigured = Store::open(scratch.path(), with(None)).unwrap();
+    assert_eq!(unconfigured.instance_role(), Some(InstanceRole::Scratch));
+    drop(unconfigured);
+    let refused = Store::open(scratch.path(), with(Some(InstanceRole::Production)))
+        .err()
+        .expect("a production configuration must not open a scratch store");
+    let message = refused.to_string();
+    assert!(
+        message.contains("\"production\"") && message.contains("\"scratch\""),
+        "{message}"
+    );
+
+    let none = tempfile::tempdir().unwrap();
+    let store = Store::open(none.path(), with(None)).unwrap();
+    assert_eq!(store.instance_role(), None);
+    drop(store);
+    let refused = Store::open(none.path(), with(Some(InstanceRole::Scratch)))
+        .err()
+        .expect("a configured role must not stamp a store with no row");
+    assert!(
+        refused.to_string().contains("no instance role"),
+        "{refused}"
+    );
+    assert_eq!(
+        Store::open(none.path(), with(None))
+            .unwrap()
+            .instance_role(),
+        None
+    );
+}

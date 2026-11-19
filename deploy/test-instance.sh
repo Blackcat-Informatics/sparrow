@@ -58,6 +58,7 @@ case $ACTION in
 # Test instance (deploy/test-instance.sh): scratch store and socket, no TCP listener.
 socket_path = "$DATA/store/rpc.sock"
 data_dir = "$DATA/store"
+instance_role = "scratch"
 disk_budget = 1073741824
 maintenance_reserve = 67108864
 max_records = 100000

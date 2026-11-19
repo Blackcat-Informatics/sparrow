@@ -70,6 +70,9 @@ pub struct Discovery {
     pub retire_chunk_charge: u64,
     /// Charge of one record against `retire_row_budget`.
     pub retire_record_charge: u64,
+    /// The store's role fixed at creation; `Unspecified` for a store with none and from a
+    /// daemon that does not advertise it.
+    pub instance_role: crate::sparrow_capnp::InstanceRole,
 }
 
 impl Discovery {
@@ -96,6 +99,7 @@ impl Discovery {
             retire_row_budget: value.get_retire_row_budget(),
             retire_chunk_charge: value.get_retire_chunk_charge(),
             retire_record_charge: value.get_retire_record_charge(),
+            instance_role: value.get_instance_role()?,
         };
         if discovery.schema_version != crate::SCHEMA_VERSION
             || !discovery.store_id.starts_with("store:")

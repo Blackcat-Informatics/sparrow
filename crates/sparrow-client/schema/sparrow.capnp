@@ -325,7 +325,14 @@ struct Status {
   # Additive (#365): the archive worker's phase, durable watermark and last failure, as the
   # worker last published them. A reader that does not know this field sees no change.
   archiveWorker @64 :ArchiveWorkerStatus;
+  # Additive (#371): the role fixed when the store was created; `unspecified` for a store with
+  # no role row. A reader that does not know this field sees no change.
+  instanceRole @65 :InstanceRole;
 }
+# What a store is for, fixed at creation from the `instance_role` configuration key. A sender
+# that must refuse the live store reads it from `Discovery`. `unspecified` is a store with no
+# role row, which behaves as stores did before the role existed.
+enum InstanceRole { unspecified @0; production @1; scratch @2; }
 # The archive worker as of the end of its last step. `through` is the durable `archive:through`
 # watermark, empty before the first commit and read from the store when the worker starts; `intentInFlight` is true while a prepared segment
 # is recorded and not yet committed. `failure` is the last failed pass and is absent once a
@@ -459,6 +466,8 @@ struct Discovery {
   retireRowBudget @13 :UInt64;
   retireChunkCharge @14 :UInt64;
   retireRecordCharge @15 :UInt64;
+  # Additive (#371): the store's role; `unspecified` from an older daemon or a store with none.
+  instanceRole @16 :InstanceRole;
 }
 
 enum PressurePhase { ready @0; requested @1; awaitingReclamation @2; blocked @3; awaitingArchive @4; }

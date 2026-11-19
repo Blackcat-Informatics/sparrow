@@ -14557,6 +14557,38 @@ async fn sources_listing_does_not_hold_the_writer_lock() {
         .await;
 }
 
+/// Value (#371): a daemon configured with `instance_role = "scratch"` reports `scratch` in both
+/// `discover` and `status`, which is what a sender that must refuse the live store reads.
+#[tokio::test(flavor = "current_thread")]
+async fn discover_and_status_report_the_configured_instance_role() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str("instance_role = \"scratch\"\n");
+            std::fs::write(&config, text).unwrap();
+            let _daemon = start(&config, &socket).await;
+            let connection = connect(&socket).await.unwrap();
+            let client = connection.client.clone();
+            let discovered = client.discover_request().send().promise.await.unwrap();
+            let discovery = rpc_ok(discovered.get().unwrap().get_result().unwrap());
+            assert_eq!(
+                discovery.get_instance_role().unwrap(),
+                wire::InstanceRole::Scratch
+            );
+            let status = client.status_request().send().promise.await.unwrap();
+            let status = rpc_ok(status.get().unwrap().get_result().unwrap());
+            assert_eq!(
+                status.get_instance_role().unwrap(),
+                wire::InstanceRole::Scratch
+            );
+        })
+        .await;
+}
+
 /// INVARIANT (#280): a declaration above the import bound answers a non-retryable
 /// INVALID_ARGUMENT that names the bound and the remedy, Discovery advertises that same bound
 /// before any declaration, status counts the refusal, and an in-bound import begins unchanged.

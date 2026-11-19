@@ -836,6 +836,26 @@ the failure and returns the phase to `idle`. CLI and MCP status render the field
 `archive_worker` with `phase`, `through`, `intent_in_flight` and `failure` (`code`, `segment`,
 `reason`, `since` as an instant or null, or the whole failure null).
 
+### Instance role (#371)
+
+A store records whether it is the live store or a scratch one in one metadata
+row, `instance_role`, holding `production` or `scratch`. No record or segment
+encoding changes. `Discovery.instanceRole` (field 16) and `Status.instanceRole`
+(field 65) carry it as the enum `InstanceRole`: `unspecified` (0), `production`
+(1) and `scratch` (2). Both fields are additive; a reader that does not know
+them sees no change. A store with no row reports `unspecified` and behaves as
+before. The Rust client decodes the discovery field as `Discovery.instance_role`,
+and CLI and MCP status render the status field as `instance_role`.
+
+The server configuration key `instance_role` (`"production"` or `"scratch"`)
+names the role. A store created while the key is set records the role in its
+creation batch. At every open, a configured role that differs from the stored
+role stops startup with a message naming both values, and a configured role
+meeting a store with no row stops startup with a message saying so. No
+operation changes a stored role. Stamping an existing store is a separate
+operator step; the daemon never performs it. A daemon without the key accepts
+any store.
+
 ### Archive prepare halvings and the daemon's library warnings (#324)
 
 `Status.archiveHalvings` (field 63, additive; a reader that does not know it sees no

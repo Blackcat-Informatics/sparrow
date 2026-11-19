@@ -45,6 +45,7 @@ pub(crate) mod handoff;
 pub(crate) mod import;
 mod ingest;
 pub(crate) mod ingest_status;
+pub(crate) mod instance_role;
 pub(crate) mod intake;
 pub(crate) mod listing_build;
 pub(crate) mod log_time;
@@ -381,6 +382,9 @@ pub struct Config {
     /// fixtures that exercise retention without an archive; the daemon never sets it, so a
     /// production store with no policy holds its evidence.
     pub retire_without_archive: bool,
+    /// Role to record when the store is created, and to require of an existing store. `None`
+    /// records nothing and accepts any store.
+    pub instance_role: Option<instance_role::InstanceRole>,
 }
 
 impl Config {
@@ -581,6 +585,7 @@ pub type RetentionWaker = Arc<dyn Fn() + Send + Sync>;
 #[derive(Clone)]
 pub struct Store {
     id: Arc<str>,
+    role: Option<instance_role::InstanceRole>,
     open_files: open_files::OpenFiles,
     space: space::SpaceFloor,
     inner: Arc<Mutex<Writer>>,
@@ -1670,12 +1675,16 @@ impl Store {
                 batch.put("rdf:term-count", 0_u64.to_be_bytes());
                 batch.put("rdf:max-encoded", 0_u64.to_be_bytes());
                 batch.put("rdf:next", 0_u64.to_be_bytes());
+                if let Some(role) = config.instance_role {
+                    batch.put(instance_role::KEY, role.as_str());
+                }
                 let mut write = WriteOptions::default();
                 write.set_sync(true);
                 db.write_opt(batch, &write)?;
                 id
             }
         };
+        let role = instance_role::resolve(&db, config.instance_role)?;
         match db.get("text_analyzer")? {
             Some(stored) if stored != fingerprint.as_bytes() => {
                 return Err(Error::new(
@@ -1769,6 +1778,7 @@ impl Store {
         let staging = Arc::new(staging_refusal::StagingLedger::default());
         let mut store = Self {
             id: Arc::from(id.as_str()),
+            role,
             open_files,
             space: space.clone(),
             unlocked: Arc::new(Unlocked {
@@ -1859,6 +1869,12 @@ impl Store {
     /// Return the immutable identity validated at open, without waiting for a writer.
     pub fn store_id(&self) -> Result<String, Error> {
         Ok(self.id.to_string())
+    }
+
+    /// The instance role fixed at creation, `None` for a store with no role row.
+    #[must_use]
+    pub fn instance_role(&self) -> Option<instance_role::InstanceRole> {
+        self.role
     }
 
     /// The descriptor limit at open and the table cache bound derived from it.

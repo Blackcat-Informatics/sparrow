@@ -172,6 +172,7 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         .with("recompression", recompression(value.get_recompression()?)?)
         .with("migrations", migrations(value.get_migrations()?)?)
         .with("query_only", value.get_query_only())
+        .with("instance_role", instance_role(value.get_instance_role()?))
         .with(
             "stream_evidence_loss",
             stream_evidence_loss(value.get_stream_evidence_loss()?)?,
@@ -592,4 +593,12 @@ fn admission(status: wire::admission_status::Reader<'_>) -> capnp::Result<Value>
         )
         .with("rpc_connections", connections)
         .into())
+}
+
+fn instance_role(role: wire::InstanceRole) -> &'static str {
+    match role {
+        wire::InstanceRole::Unspecified => "unspecified",
+        wire::InstanceRole::Production => "production",
+        wire::InstanceRole::Scratch => "scratch",
+    }
 }
