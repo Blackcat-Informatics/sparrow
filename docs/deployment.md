@@ -978,7 +978,7 @@ stop of the new image has the times above.
 ```bash
 cd MAIN_CHECKOUT       # main at or after the merge of this procedure; the script finds lib.sh beside itself
 SPARROW_BIN="$BIN" deploy/user-unit-upgrade.sh --from "$OLD" --to "$NEW" --keep-copy "$COPY" \
-    > "$RECORD/switch.log" 2>&1; echo "EXIT=$?" >> "$RECORD/switch.log"
+    --hold-after-copy > "$RECORD/switch.log" 2>&1; echo "EXIT=$?" >> "$RECORD/switch.log"
 ```
 
 Read `$RECORD/switch.log`. The script refuses, before anything changes, unless the daemon link names
@@ -987,8 +987,8 @@ daemon has `cap_net_bind_service`, `server.toml` carries the ingest keys and no 
 keys, the store is no-COW, the drop-in directory holds only the repository's `limits.conf` (the
 live host already has an identical one), the running daemon reports the `--from` schema and the
 copy's name and room are sound. Then it stops `sparrow-ship.timer` and waits for the shipper,
-stops the unit through the SIGINT drain (up to `TimeoutStopSec`), **copies the closed store to `COPY`**, links
-the new pair, starts the unit and waits up to 600 s for the first status answer. It checks the
+stops the unit through the SIGINT drain (up to `TimeoutStopSec`), **copies the closed store to `COPY`**, holds
+for the rehearsal's answer ("The rehearsal on a copy"), links the new pair, starts the unit and waits up to 600 s for the first status answer. It checks the
 store id and the schema, prints the migrations and the ingest socket, starts the timer and exits 0.
 The online backfill continues in the running daemon.
 
@@ -1020,9 +1020,14 @@ spoils the copy as a way back.
 The rehearsal opens a second copy of the closed store with the new image and proceeds to the live
 open only if the copy passes. It runs after `COPY` exists and before the new image opens the live
 store. The first copy, `COPY`, stays untouched as the way back; the rehearsal copy is taken from it.
-`deploy/user-unit-upgrade.sh` runs from the stop to the start with no pause, so it cannot hold the
-start for this step. The step needs a pause after the copy that the script does not have, and until
-the script has one the rehearsal cannot gate the live open.
+`--hold-after-copy` (see the paragraph on it under "Switching the user unit's image") holds the switch at
+that point: the daemon is down, the links name the old pair and the store is untouched. The hold has
+no timeout, and the daemon is down for all of it; the script repeats the seconds down at each
+prompt. It prints `HOLD: sparrow.service has been down N s. The closed store is kept at COPY.` and
+the prompt `proceed or abort> ` on the terminal (`/dev/tty`, even though the window command writes
+its output to a log). Run the rehearsal steps below in a second shell and answer in the first. A
+shell that cannot hold the terminal gives `--hold-answer FIFO` an existing named pipe and answers
+with `echo proceed > FIFO`.
 
 1. Copy. Take a reflink copy of `COPY` with the repository's own script, which refuses an open
    store, compares the file lists and gives `REH` its name only when they agree:
@@ -1102,8 +1107,22 @@ the script has one the rehearsal cannot gate the live open.
    rm -r -- /SPARROW/store.rehearsal-b420503
    ```
 
-If any check fails, the new image does not open the live store. The live store is untouched, so the
-"Not opened" way back applies: point both links at the old pair and start the unit.
+7. Answer the prompt: `proceed` only if every check passed, which switches the links and starts
+   the new image on the live store. Otherwise answer `abort`.
+
+An `abort` starts the old image again on the unchanged store, waits for its first status answer
+(up to 600 s), starts `sparrow-ship.timer` again only if the old image answered, writes the outcome
+to `COPY.abort.log` beside the kept copy, to the journal and to the terminal, and exits 1. End of
+input, a removed answer pipe, Ctrl-C, SIGTERM and SIGHUP abort the same way. The new image never
+opens the live store after an abort, so the "Not opened" way back below is not needed; read
+`COPY.abort.log` for what the restore did.
+
+During the abort's restore the script ignores Ctrl-C, SIGTERM, SIGHUP and a closed pipe until the
+restore ends, so a Ctrl-C shows only `^C` on the terminal and does nothing. The restore ends when
+the old image answers status or its start fails. The way out of a restore that blocks is
+`systemctl --user stop sparrow.service` from another shell; the restore then fails at the end of
+its 600 s wait for a status answer and the script records the failure and exits 1 (read from the
+script, not run).
 
 What the rehearsal adds to the downtime, all arithmetic. The copy of `COPY` costs the copy time
 below. The migration costs `P` pages times the per-page time, 0.108 s median at 1,024 artifacts of
