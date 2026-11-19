@@ -89,13 +89,15 @@ SYSTEMCTL
     printf '%s\n' "$w"
 }
 
-# run W [env...]: runs the script in world W with the given extra env; sets rc and out.
+# run W [env...]: runs the script in world W with the given extra env and the script arguments
+# in extra; sets rc and out.
+extra=()
 run() {
     local w=$1; shift
     set +e
     out=$(env -i PATH="$w/stubs:/usr/bin:/bin" HOME="$w/home" STATE="$w/state" \
         SPARROW_BIN="$w/kept" \
-        "$@" "$script" --from sparrowd-schema68-aaa --to sparrowd-schema71-bbb 2>&1)
+        "$@" "$script" --from sparrowd-schema68-aaa --to sparrowd-schema71-bbb "${extra[@]}" 2>&1)
     rc=$?
     set -e
 }
@@ -138,5 +140,36 @@ grep -q 'backup_root or backup_keep' <<<"$out" || fail "stale-config refusal did
 [[ ! -e $w/state/calls ]] || ! grep -Eq '^(stop|start) ' "$w/state/calls" || fail "stale-config path touched a unit"
 [[ $(readlink "$w/home/.local/libexec/sparrow/sparrowd") == sparrowd-schema68-aaa ]] || fail "stale-config path moved a link"
 echo "ok   stale backup keys: refused before any change"
+
+# 5. --keep-copy copies the closed store after the daemon stops and before the links switch, and the
+#    copy lists the store's files and sizes. The copy is a reflink copy here (the store directory has
+#    copy-on-write off and the stub lsattr reports it off for every file), so the scratch directory
+#    must be on a btrfs filesystem.
+w=$(world keep-copy)
+chattr +C -- "$w/store"
+head -c 100000 /dev/zero >"$w/store/000001.sst"
+touch "$w/state/sparrow-ship.timer.active"
+extra=(--keep-copy "$w/store.before")
+run "$w"
+((rc == 0)) || { echo "$out" >&2; fail "keep-copy path exited $rc"; }
+[[ $(stat -c %s "$w/store.before/000001.sst") == 100000 ]] || fail "keep-copy path did not copy the store's file"
+[[ ! -e $w/store.before.partial ]] || fail "keep-copy path left its partial directory"
+stopped=$(grep -n 'daemon stopped' <<<"$out" | cut -d: -f1)
+copied=$(grep -n 'kept a reflink copy' <<<"$out" | cut -d: -f1)
+switched=$(grep -n 'switch links' <<<"$out" | cut -d: -f1)
+((stopped < copied && copied < switched)) || fail "the copy did not fall between the stop and the link switch: $out"
+echo "ok   keep-copy: copied between the stop and the link switch"
+
+# 6. A --keep-copy name that exists is refused before anything is touched.
+w=$(world keep-copy-exists)
+mkdir -- "$w/store.before"
+touch "$w/state/sparrow-ship.timer.active"
+extra=(--keep-copy "$w/store.before")
+run "$w"
+((rc != 0)) || fail "keep-copy-exists path exited 0"
+grep -q 'already exists' <<<"$out" || fail "keep-copy refusal did not say the name exists: $out"
+[[ ! -e $w/state/calls ]] || ! grep -Eq '^(stop|start) ' "$w/state/calls" || fail "keep-copy-exists path touched a unit"
+extra=()
+echo "ok   keep-copy name exists: refused before any change"
 
 echo PASS

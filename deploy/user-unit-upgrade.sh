@@ -7,9 +7,11 @@
 # What an upgrade relies on: Sparrow backs up nothing but the archive age-out to GTS files, so
 # this script takes no backup and requires none. The undo is the kept previous image (FROM stays in
 # the libexec directory) and the link swap that points the daemon and CLI links back at it. That
-# undo holds only while TO has not changed the store's format: a format-changing upgrade has no
-# undo, because the store's fence makes FROM refuse a store TO has upgraded, and the way out is to
-# fix forward on TO. It serves until Sparrow issue #22 moves the store to the system unit.
+# undo holds only while TO has not changed the store's format: the store's fence makes FROM refuse
+# a store TO has upgraded. For a format-changing TO, --keep-copy DIR keeps a copy of the closed
+# store, taken after the daemon stops and before TO opens it; the way back after TO has opened the
+# store is that copy (docs/deployment.md, "Switch 1"), and without one the way out is to fix
+# forward on TO. It serves until Sparrow issue #22 moves the store to the system unit.
 # Ported from the operator's restart-bundle.sh; its predecessor restart-schema68.sh ran clean on
 # the live host on 2026-11-07 (exit 0, 180 s down).
 # Every check that can refuse runs before anything changes. Run it only when the restart is authorized.
@@ -18,7 +20,7 @@ umask 077
 
 usage() {
     cat <<'USAGE'
-Usage: deploy/user-unit-upgrade.sh --from DAEMON_IMAGE --to DAEMON_IMAGE
+Usage: deploy/user-unit-upgrade.sh --from DAEMON_IMAGE --to DAEMON_IMAGE [--keep-copy DIR]
 
 Switch the user unit sparrow.service (systemctl --user) from the kept daemon image --from to
 --to, both names under the libexec directory such as sparrowd-schema68-2aa56a9 and
@@ -27,8 +29,15 @@ sparrow-; the schema numbers come from the names. Run as the operator, never as 
 
 What the upgrade relies on: no backup exists to restore from (Sparrow backs up nothing but the
 archive age-out to GTS files). The undo is the kept previous image and the link swap. A
-format-changing upgrade has no undo: once TO opens the store and upgrades its format, FROM
-refuses it (the store fence), so the only way out is forward on TO.
+format-changing upgrade has no undo of that kind: once TO opens the store and upgrades its
+format, FROM refuses it (the store fence). --keep-copy DIR keeps a copy of the store for that
+case: after the daemon has stopped and before TO starts, the store is copied to the new
+directory DIR (a reflink copy when the store and every file in it have copy-on-write off, a full
+copy otherwise), the copy's file list is compared with the store's and DIR takes its name only
+then. DIR must be a new name in an existing directory outside the store, and the filesystem
+must hold the store's size plus 10 GiB. The way back after TO has opened the store is to put
+that copy in the store's place (docs/deployment.md, "Switch 1"); without it the only way out is
+forward on TO.
 
 Before anything changes it refuses unless: the daemon link names --from; all four images are
 executable; the --to pair is byte-identical to the kept pair in SPARROW_BIN; the --to daemon
@@ -56,7 +65,8 @@ Recovery depends on where it failed; the FAILED line names the unit and timer st
 - Before "stop timers": nothing stopped and the links name FROM. Fix the cause and rerun.
 - From "stop timers" up to "switch links": the links still name FROM and the store is untouched.
   Start sparrow.service (if stopped) and sparrow-ship.timer. An installed limits.conf may stay:
-  either image needs it.
+  either image needs it. A failed --keep-copy leaves DIR.partial: inspect it, remove that one
+  path, and rerun.
 - At "switch links", before "start sparrow.service": check both links with readlink; one may
   name TO and the other FROM. Point both at FROM and recover as in the step above, or both at
   TO and start sparrow.service, then continue as below.
@@ -70,13 +80,18 @@ Recovery depends on where it failed; the FAILED line names the unit and timer st
 USAGE
 }
 
-FROM='' TO=''
+FROM='' TO='' KEEP_COPY=''
 while (($#)); do
     case $1 in
         -h | --help) usage; exit 0 ;;
         --from | --to)
             (($# >= 2)) && [[ -n $2 ]] || { printf 'user-unit-upgrade.sh: %s needs a daemon image name\n' "$1" >&2; exit 2; }
             if [[ $1 == --from ]]; then FROM=$2; else TO=$2; fi
+            shift 2
+            ;;
+        --keep-copy)
+            (($# >= 2)) && [[ -n $2 ]] || { printf 'user-unit-upgrade.sh: --keep-copy needs a new directory name\n' >&2; exit 2; }
+            KEEP_COPY=$2
             shift 2
             ;;
         *) printf 'user-unit-upgrade.sh: unknown argument %s (see --help)\n' "$1" >&2; exit 2 ;;
@@ -157,6 +172,12 @@ STORE=$(config_value data_dir) || exit 1
 SOCKET=$(config_value socket_path) || exit 1
 INGEST_SOCKET=$(config_value ingest_socket_path) || exit 1
 no_copy_on_write "$STORE" || die "$STORE is not no-COW (lsattr shows no C)"
+# The store copy's method and size, checked while nothing has changed; the copy itself is made in
+# the stopped window, below.
+if [[ -n $KEEP_COPY ]]; then
+    copy_plan=$(check_store_copy "$STORE" "$KEEP_COPY") || exit 1
+    log "store copy planned at $KEEP_COPY: ${copy_plan%% *} copy of $STORE, ${copy_plan##* } bytes"
+fi
 # After the preconditions, a failure says what state it left (the recovery note is in --help).
 report_failure() {
     local rc=$?
@@ -194,6 +215,10 @@ if [[ -n $(ps -C sparrowd -o pid=) ]]; then
     die "a sparrowd process remains"
 fi
 log "daemon stopped"
+if [[ -n $KEEP_COPY ]]; then
+    log "copy the closed store to $KEEP_COPY"
+    keep_store_copy "$STORE" "$KEEP_COPY"
+fi
 
 log "install $DROPIN_DIR/limits.conf (LimitNOFILE=$LIMIT_NOFILE)"
 install -D -m 0644 -- "$LIMITS_SOURCE" "$DROPIN_DIR/limits.conf"

@@ -403,12 +403,100 @@ free_bytes() {
     printf '%s\n' "$free"
 }
 
+# Refuse while any process holds a file under the store DIR open. find reads each descriptor's
+# link target itself, where a shell loop forks once per descriptor on the host.
+refuse_open_store() {
+    local holder
+    local pattern=${1//[\\*?[]/\\&}   # -lname reads glob characters; the path is literal
+    holder=$(find /proc/[0-9]*/fd -maxdepth 1 -lname "$pattern/*" -print -quit 2>/dev/null || true)
+    [[ -z $holder ]] || die "process ${holder#/proc/} still holds a file in $1 open; stop the daemon first"
+}
+
+# The listing the store copy is compared by: every directory (name, type, mode) and every other
+# entry (name, type, size, mode, link target) under DIR, sockets left out, sorted. A directory's
+# size counts its entry names, so it is not listed.
+store_listing() {
+    (cd -- "$1" && find . ! -type s \( -type d -printf '%P %y %m\n' -o -printf '%P %y %s %m %l\n' \) | sort)
+}
+
+# Whether a reflink copy of the store DIR can share its extents: DIR and every file in it have
+# copy-on-write off. A btrfs reflink needs the source and the destination file to agree on it.
+can_reflink_store() {
+    on_btrfs "$1" && no_copy_on_write "$1" && (($(copy_on_write_files "$1") == 0))
+}
+
+# The checks that precede a store copy, all before anything changes: DEST is a new name in an
+# existing directory outside SOURCE, and the filesystem has the room. Prints "reflink" or "full",
+# the method keep_store_copy will use, and the bytes SOURCE holds. Free space must exceed the
+# store's size plus 10 GiB in both methods: a reflink copy writes almost nothing at first, but it
+# holds every extent the running store later rewrites or compacts away, so in the end it can cost
+# the whole store.
+check_store_copy() {
+    local source dest parent method need free
+    source=$(realpath -e -- "$1") || die "$1 does not exist"
+    dest=$2
+    [[ $dest == /* && $dest != *..* ]] || die "the store copy $dest is not an absolute path without .."
+    [[ ! -e $dest && ! -L $dest ]] || die "the store copy $dest already exists; choose a new name"
+    [[ ! -e $dest.partial ]] || die "$dest.partial is left from an earlier attempt; inspect it and remove it"
+    parent=$(realpath -e -- "$(dirname -- "$dest")") || die "the directory of $dest does not exist"
+    [[ $parent/ != "$source"/* ]] || die "the store copy $dest lies inside $source"
+    [[ -d $parent && -w $parent && -x $parent ]] || die "$parent is not a directory this user can create in"
+    if can_reflink_store "$source"; then method=reflink; else method=full; fi
+    if [[ $method == reflink ]]; then
+        [[ $(findmnt -no SOURCE -T "$source" | sed 's/\[.*//') == "$(findmnt -no SOURCE -T "$parent" | sed 's/\[.*//')" ]] \
+            || die "$parent is not on the filesystem of $source; a reflink copy needs the same one"
+    fi
+    need=$(du -s -B1 -- "$source" | cut -f1)
+    free=$(free_bytes "$parent") || exit 1
+    ((free > need + 10 * 1024 ** 3)) \
+        || die "only $free bytes free in $parent; a copy of $source (${need} bytes) needs that plus 10 GiB"
+    printf '%s %s\n' "$method" "$need"
+}
+
+# Copy the closed store SOURCE to the new directory DEST: a reflink copy when check_store_copy says
+# reflink, a full copy with a byte comparison of every file when it says full. The copy is made
+# in DEST.partial, listed against SOURCE and renamed to DEST only when the listing matches, so a
+# DEST that exists is a complete copy. Nothing in SOURCE changes. The Unix sockets a closed store
+# can leave are neither copied nor compared.
+keep_store_copy() {
+    local source dest method file files bytes
+    source=$(realpath -e -- "$1") || die "$1 does not exist"
+    dest=$2
+    method=$(check_store_copy "$source" "$dest") || exit 1
+    method=${method%% *}
+    refuse_open_store "$source"
+    mkdir -- "$dest.partial"
+    match_copy_on_write "$source" "$dest.partial"
+    if [[ $method == reflink ]]; then
+        cp -a --reflink=always -- "$source/." "$dest.partial/" \
+            || die "reflink copy of $source failed; $source is unchanged and $dest.partial is kept for inspection"
+    else
+        cp -a --reflink=never -- "$source/." "$dest.partial/" \
+            || die "copy of $source failed; $source is unchanged and $dest.partial is kept for inspection"
+    fi
+    find "$dest.partial" -type s -delete
+    diff -q <(store_listing "$source") <(store_listing "$dest.partial") >/dev/null \
+        || die "the copy's file list differs from $source; $source is unchanged and $dest.partial is kept"
+    if [[ $method == full ]]; then
+        while IFS= read -r -d '' file; do
+            cmp -s -- "$source/$file" "$dest.partial/$file" \
+                || die "the copy of $file differs from $source; $source is unchanged and $dest.partial is kept"
+        done < <(cd -- "$source" && find . -type f -printf '%P\0')
+    fi
+    files=$(find "$dest.partial" -type f | wc -l)
+    bytes=$(find "$dest.partial" -type f -printf '%s\n' | awk '{s += $1} END {print s + 0}')
+    sync -f -- "$dest.partial"
+    mv -T -- "$dest.partial" "$dest"
+    sync -f -- "$dest"
+    note "kept a $method copy of $source at $dest: $files files, $bytes bytes"
+}
+
 # Rewrite the closed store DATA so that it and every file in it have copy-on-write off. The copy
 # is made in a no-copy-on-write sibling, its file list, sizes and bytes are compared with DATA, and
 # it then takes DATA's name. The original is kept, renamed DATA.cow-STAMP, for the operator to
 # remove once the converted store has been checked.
 convert_store_no_cow() {
-    local data partial kept need free link files
+    local data partial kept need free files
     data=$(realpath -e -- "$1") || die "$1 does not exist"
     [[ -d $data ]] || die "$data is not a directory"
     if ! on_btrfs "$data"; then
@@ -419,10 +507,7 @@ convert_store_no_cow() {
         note "copy-on-write is already off for $data and every file in it"
         return 0
     fi
-    for link in /proc/[0-9]*/fd/*; do
-        [[ $(readlink -- "$link" 2>/dev/null) != "$data"/* ]] \
-            || die "process ${link#/proc/} still holds a file in $data open; stop the daemon first"
-    done
+    refuse_open_store "$data"
     partial=$data.no-cow.partial
     kept=$data.cow-$(date -u +%Y%m%dT%H%M%SZ)
     [[ ! -e $partial ]] || die "$partial is left from an earlier attempt; inspect and remove it"
@@ -439,8 +524,7 @@ convert_store_no_cow() {
         || die "copying $data failed; $data is unchanged and $partial is kept for inspection"
     find "$partial" -type s -delete
     # A directory's size counts its entry names, so it is not compared.
-    diff -q <(cd -- "$data" && find . ! -type s \( -type d -printf '%P %y %m\n' -o -printf '%P %y %s %m %l\n' \) | sort) \
-        <(cd -- "$partial" && find . \( -type d -printf '%P %y %m\n' -o -printf '%P %y %s %m %l\n' \) | sort) >/dev/null \
+    diff -q <(store_listing "$data") <(store_listing "$partial") >/dev/null \
         || die "the copy's file list differs from $data; $data is unchanged and $partial is kept"
     while IFS= read -r -d '' file; do
         cmp -s -- "$data/$file" "$partial/$file" \
