@@ -75,6 +75,21 @@ pub struct ServerConfig {
     /// sets it too. It refuses every intake and archive key.
     #[serde(default)]
     pub query_only: bool,
+    /// Role recorded when the store is created and required of an existing store:
+    /// `production` or `scratch`. Absent records nothing and accepts any store.
+    #[serde(default, deserialize_with = "deserialize_instance_role")]
+    pub instance_role: Option<sparrow_core::InstanceRole>,
+}
+
+fn deserialize_instance_role<'de, D>(
+    deserializer: D,
+) -> Result<Option<sparrow_core::InstanceRole>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?
+        .map(|word| sparrow_core::InstanceRole::parse(&word).map_err(serde::de::Error::custom))
+        .transpose()
 }
 
 /// Paths the daemon writes, by configuration key. `server.toml` names no log file, so these are
@@ -487,6 +502,7 @@ impl ServerConfig {
                 text_analyzer: sparrow_core::resolve_text_analyzer(&self.text_lexicon_dir)?,
                 archive: self.archive.as_ref().map(ArchiveConfig::policy),
                 retire_without_archive: false,
+                instance_role: self.instance_role,
             },
         )?;
         // The daemon's group may traverse to the socket it binds here (mode 0660); it can

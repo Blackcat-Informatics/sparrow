@@ -1248,6 +1248,7 @@ mod tests {
             retire_row_budget: 0,
             retire_chunk_charge: 0,
             retire_record_charge: 0,
+            instance_role: crate::sparrow_capnp::InstanceRole::Unspecified,
         };
         // A daemon at the previous release sends the import bound and none of the rest.
         let missing = PartLimits::from_discovery(&discovery, 65_536).unwrap_err();

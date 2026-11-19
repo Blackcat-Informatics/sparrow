@@ -813,6 +813,7 @@ mod tests {
                 text_analyzer: sparrow_core::resolve_text_analyzer(&config.text_lexicon_dir)?,
                 archive: None,
                 retire_without_archive: true,
+                instance_role: config.instance_role,
             },
         )?)
     }

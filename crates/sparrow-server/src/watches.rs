@@ -430,10 +430,10 @@ struct Candidate {
     stable_since: Instant,
 }
 
-/// The tail owner is boxed: it is more than twice the size of a claim root, and every
-/// consume detector would otherwise carry its size (clippy::large_enum_variant).
+/// Both owners are boxed: each carries a store handle, and the enum would otherwise be as large
+/// as the larger one (clippy::large_enum_variant).
 enum Owner {
-    Consume(ClaimRoot),
+    Consume(Box<ClaimRoot>),
     Tail(Box<crate::tailing::TailRoot>),
 }
 impl Owner {
@@ -593,12 +593,9 @@ impl Detector {
     fn open(store: Store, watch: ManagedWatch, binding: RootBinding) -> Result<Self, Error> {
         let config = watch.definition;
         let owner = match config.producer_contract {
-            crate::ProducerContract::FinishedFiles => Owner::Consume(ClaimRoot::open_bound(
-                store,
-                &config.id,
-                &config.root,
-                binding,
-            )?),
+            crate::ProducerContract::FinishedFiles => Owner::Consume(Box::new(
+                ClaimRoot::open_bound(store, &config.id, &config.root, binding)?,
+            )),
             crate::ProducerContract::ActiveFilesRetain => Owner::Tail(Box::new(
                 crate::tailing::TailRoot::open(store, &config, watch.revision, binding)?,
             )),

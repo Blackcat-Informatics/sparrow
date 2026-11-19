@@ -76,6 +76,16 @@ seed only a missing catalog; typed watch administration controls later
 changes. Never add production sample directories as destructive watches merely
 because they were sample inputs.
 
+`instance_role` (`"production"` or `"scratch"`, optional) fixes the role of a
+store when the daemon creates it, and `discover` and `status` report it as
+`instanceRole` (`unspecified` for a store with no role). At startup a configured
+role that differs from the stored one stops the daemon with a message naming both
+values; so does a configured role on a store that has none. The role never
+changes after creation, and the daemon does not stamp an existing store: stamping
+is a separate operator step. `deploy/test-instance.sh` writes
+`instance_role = "scratch"` into the scratch configuration it generates. Leave
+the key out of a configuration for a store that has no role row.
+
 `max_concurrent_requests` admits simultaneous storage work, including intake
 workers (1..64). `max_rpc_connections` independently admits Unix and TCP RPC
 streams from one shared ceiling (1..256, default 16). An idle agent capability

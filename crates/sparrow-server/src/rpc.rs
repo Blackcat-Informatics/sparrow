@@ -48,6 +48,14 @@ fn catalog_receipt<B>(
     );
 }
 
+fn instance_role(role: Option<sparrow_core::InstanceRole>) -> wire::InstanceRole {
+    match role {
+        None => wire::InstanceRole::Unspecified,
+        Some(sparrow_core::InstanceRole::Production) => wire::InstanceRole::Production,
+        Some(sparrow_core::InstanceRole::Scratch) => wire::InstanceRole::Scratch,
+    }
+}
+
 fn encode_durability(
     mut state: wire::durability_status::Builder<'_>,
     durability: &sparrow_core::DurabilityStatus,
@@ -3178,6 +3186,7 @@ impl wire::sparrow::Server for Rpc {
                 out.set_max_event_batch_bytes(sparrow_client::MAX_EVENT_BATCH_BYTES as u32);
                 out.set_max_event_batch_events(sparrow_client::MAX_EVENT_BATCH_EVENTS as u32);
                 producer_limits(out.reborrow().init_producer_limits(), &value)?;
+                out.set_instance_role(instance_role(self.store.instance_role()));
                 encode_durability(out.init_durability_status(), &durability);
             }
         }
@@ -3282,6 +3291,7 @@ impl wire::sparrow::Server for Rpc {
                 out.set_store_format(field::<String>(&value, "store_format")?);
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
                 out.set_query_only(self.query_only);
+                out.set_instance_role(instance_role(self.store.instance_role()));
                 encode_stream_evidence_loss(
                     out.reborrow().init_stream_evidence_loss(),
                     &self.store.stream_evidence_loss(),
