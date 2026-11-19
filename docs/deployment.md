@@ -854,10 +854,14 @@ Three acts precede or accompany the script's stop, in this order.
    `213-D-diag-quiesce.log`; the 13.1 s run waited first for the compaction threads to go idle).
 
    The proposed value is `TimeoutStopSec=1800`. Basis, all arithmetic: 98.8 s at 4.76 GB scales by
-   the live status `physical_bytes` of 38.98 GB (the reading before the window; read it again
-   from `before.json`) to 98.8 / 4.76 x 38.98 = 809 s, and 1800 s is 2.2 times that. The scaling
-   assumes the stop follows the store's size, which the measurements neither prove nor refute: the
-   stops at 1.57 GB, 3.46 GB, 4.33 GB and 4.76 GB do not order by store size alone (the figures are
+   the live status `physical_bytes` of 38.98 GB to 98.8 / 4.76 x 38.98 = 809 s, and 1800 s is 2.2
+   times that. The 38.98 GB is a live status read saved on 2026-11-19 (`.stage/image/live-status-1.json`,
+   `physical_bytes` 38,980,324,844), not a measurement log; read it again from `before.json` in
+   the window and redo the arithmetic with that value. The scaling assumes the stop follows the
+   store's size, which the measurements neither prove nor refute. By status `physical_bytes` the
+   stops were 61.4 s at 2.38 GB (1.57 GB on disk before the ingest; `122-C-bigNew-status.log`), 13.1 s to 50.5 s at
+   about 5.1 to 5.4 GB (3.46 GB on disk before), 98.8 s at 4.76 GB with the old image, and 234.4 s
+   at 7.38 GB (4.32 GB on disk before): they do not order by store size alone (the figures are
    under "What the measurement covers"). A longer timeout costs nothing when the stop is quick,
    because the unit is stopped when the daemon exits.
 
@@ -885,7 +889,7 @@ Three acts precede or accompany the script's stop, in this order.
    window passed. The reload that the script runs after its stop does not touch the runtime
    drop-in, and a logout or reboot removes it earlier, which returns the stop to the unit's 120 s.
    The way back stops the new image under the same timeout, so write the same file again before
-   that stop. Remove it as one command on one exact path, typed in full after listing it:
+   that stop. Remove it as one command on one exact path, after listing it:
 
    ```bash
    ls -l "$XDG_RUNTIME_DIR/systemd/user/sparrow.service.d/timeout.conf"
@@ -920,14 +924,13 @@ Three acts precede or accompany the script's stop, in this order.
 
 3. Watch the stop, and wait it out. The cause of a long stop, at thread level: the daemon's own
    shutdown steps (worker joins, admission drain and `store.flush`) end at the journal line
-   `sparrowd: closed store=` 0.5 to 1.2 s after SIGINT in every run of the series (`210`, `212`,
+   `sparrowd: closed store=` 0.4 to 1.2 s after SIGINT in every run of the series (`210`, `212`,
    `213`, `220`); the process then lives on for 12 to 233 s in store teardown. In the 50.5 s run
    the three `rocksdb:low` (compaction) threads ran, used about 30 CPU-seconds, and the cgroup
    wrote 343 MB in 44 s, the last thread leaving at +44 s (`211-D-diag-derived.log`). In the
    13.1 s run nothing was computing: threads were in IO wait at `IOWeight=20` (`213-D-diag-quiesce.log`).
-   The exact RocksDB call is inferred: every stack sampler is refused without root (`ptrace`
-   fails under `ptrace_scope=1`, the daemon has no symbols, and `/proc/PID/task/TID/stack` does
-   not exist). The 234 s stop of an earlier run did not reproduce and is unexplained.
+   The exact RocksDB call is inferred: gdb and the other stack samplers are refused without
+   root (`ptrace: Operation not permitted` under `ptrace_scope=1`, `210-D-diag-new.log`). The 234 s stop of an earlier run did not reproduce and is unexplained.
 
    While the script waits in `stop sparrow.service`, read these from a second shell, none of which
    needs root. A long stop is waited out, never ended by hand.
@@ -956,7 +959,9 @@ Three acts precede or accompany the script's stop, in this order.
 
    What a kill leaves. The live store is left as a SIGKILL leaves it. Measured on a store of 1.57 GB
    at `/387` after three acknowledged ingests (15,000 records): the next open took 2,058 ms in the
-   storage engine, against 14 to 36 ms for the clean opens of that series, and read 165,000 live
+   storage engine, against 23 to 65 ms for the new image's other opens of that store under the limits (clean
+   opens 23, 27, 36 and 37 ms in logs `120`, `125`, `128` and `131`, and 65 ms in `150` before the
+   kill; the old image took 199 ms in `140` and the new image 229 ms without limits in `160`), and read 165,000 live
    records, the 150,000 of the base and all 15,000 acknowledged (`154-C-kill-daemon2.log`,
    `155-C-kill-post-status.log`). This is not measured at live size. Not measured: a SIGKILL during
    an in-flight ingest, a SIGKILL of the old image, and a kept copy taken from a store a SIGKILL
@@ -1025,7 +1030,8 @@ that point: the daemon is down, the links name the old pair and the store is unt
 no timeout, and the daemon is down for all of it; the script repeats the seconds down at each
 prompt. It prints `HOLD: sparrow.service has been down N s. The closed store is kept at COPY.` and
 the prompt `proceed or abort> ` on the terminal (`/dev/tty`, even though the window command writes
-its output to a log). Run the rehearsal steps below in a second shell and answer in the first. A
+its output to a log). Run the rehearsal steps below in a second shell, in which the variables block above is set
+too, and answer in the first. A
 shell that cannot hold the terminal gives `--hold-answer FIFO` an existing named pipe and answers
 with `echo proceed > FIFO`.
 
@@ -1069,14 +1075,15 @@ with `echo proceed > FIFO`.
    artifact count and `P` its page count, `ceil(N / 1024)` or more when 64 MiB cuts a page.
 
 4. Check. Proceed to the live open only if all of these hold.
-   - The copy lifts to the new format: `sparrow-schema71-b420503 "$REH/rpc.sock" status` shows
+   - The copy lifts to the new format: `"$LIB/$NEW_CLI" "$REH/rpc.sock" status` shows
      `store_format` `sparrow.store/395` and the recorded `store_id`.
-   - The payload-index migration completes, or is seen advancing page by page: successive `status`
+   - The payload-index migration is seen advancing page by page: successive `status`
      reads show `migrations[]` `payload-index` `done` rising toward `total` with `failure` null, and
-     the completion line appears.
+     the completion line appears. The lookup check below needs the completion line, so completion
+   gates `proceed`.
    - A sample of payload lookups is exact. After the completion line, for each line of
      `$RECORD/payload-sample.txt`, run
-     `sparrow-schema71-b420503 "$REH/rpc.sock" payload STORE_ID PAYLOAD_ID`: each answers
+     `"$LIB/$NEW_CLI" "$REH/rpc.sock" payload STORE_ID PAYLOAD_ID`: each answers
      `answer_certainty` `exact` and lists the artifact that holds those bytes. A lookup that lists
      none, or answers `pending` after the completion line, fails the rehearsal.
    - A stop of the scratch daemon is clean: SIGINT to the one process in the scope, then the journal
@@ -1120,9 +1127,10 @@ opens the live store after an abort, so the "Not opened" way back below is not n
 During the abort's restore the script ignores Ctrl-C, SIGTERM, SIGHUP and a closed pipe until the
 restore ends, so a Ctrl-C shows only `^C` on the terminal and does nothing. The restore ends when
 the old image answers status or its start fails. The way out of a restore that blocks is
-`systemctl --user stop sparrow.service` from another shell; the restore then fails at the end of
-its 600 s wait for a status answer and the script records the failure and exits 1 (read from the
-script, not run).
+`systemctl --user stop sparrow.service` from another shell; the script polls the unit every 5 s and
+ends the wait as soon as the unit is `inactive` or `failed`, and a stop during the start cancels the
+start. The restore then fails within seconds, the script records the failure and exits 1 (read
+from the script, not run).
 
 What the rehearsal adds to the downtime, all arithmetic. The copy of `COPY` costs the copy time
 below. The migration costs `P` pages times the per-page time, 0.108 s median at 1,024 artifacts of
@@ -1240,8 +1248,10 @@ The kept copy and the way back, on the 4.32 GB store (`23-keepcopy.log`, `24-int
   (`170-A-old-refuses-lifted.log`). The rehearsal's step 5 runs the old image with `--no-intake`,
   which was not measured.
 
-Stop time, SIGINT with a SIGKILL at 120 s as the live unit does (never reached), on small stores
-after the same ingest, 6 artifacts of 5,000 records:
+Stop time, SIGINT, on stores of 0.16 to 4.32 GB on disk after the same ingest, 6 artifacts of
+5,000 records. The runs of logs `104`, `124`, `133`, `143` and `163` (`stop_timed.sh`) had a
+SIGKILL at 120 s as the live unit does, never reached. The runs of logs `35`, `38`, `47`, `76`,
+`85` and `92` (`stopd.sh`) sent no SIGKILL and waited up to 300 s:
 
 - New image under the limits, 1.57 GB `/332` base (150,000 records): 61.4 s and 25.0 s
   (`124-C-bigNew-stop-timed.log`, `133-C-bigNew-d-stop-timed.log`).
@@ -1254,20 +1264,21 @@ after the same ingest, 6 artifacts of 5,000 records:
   on the 4.32 GB store (`38`, `47`).
 
 Stop time on a 3.46 GB base (186,285 records, `/332`) after six artifacts of 5,000 records, SIGINT
-with a 600 s deadline, under the limits. The new image, lifted to `/387` by the run, status
+under the limits, with a SIGKILL deadline of 600 s for the new image runs (logs `210`, `212`, `213`)
+and 120 s for the old image run (log `220`, the live unit's own timeout). The new image, lifted to `/387` by the run, status
 `physical_bytes` 5.11 GB at the SIGINT: 50.5 s (`210-D-diag-new.log`) and 25.6 s
 (`212-D-diag-new2.log`); 13.1 s after waiting for the compaction threads to go idle
 (`213-D-diag-quiesce.log`). The old image at `/332`, status `physical_bytes` 4.76 GB: 98.8 s, no
-kill (`220-E-diag-old.log`). In every run the `closed store` journal line came 0.5 to 1.2 s after
+kill (`220-E-diag-old.log`). In every run the `closed store` journal line came 0.4 to 1.2 s after
 SIGINT; the rest was teardown. The slow stop is not particular to the new image. In the 50.5 s run
 the compaction threads ran (about 30 CPU-seconds, 343 MB written in 44 s;
 `211-D-diag-derived.log`); in the 13.1 s run threads were in IO wait. The exact call is inferred
-(no stack sampler works without root), and the 234.4 s stop above did not reproduce. At the older
+(no stack sampler ran without root), and the 234.4 s stop above did not reproduce. At the older
 1.57 GB series the process wrote about 351 MB in 18 s during a 25 s stop (`133-C-bigNew-d-stop-timed.log`,
 `write_bytes` 7,523,508,224 at 2 s and 7,874,908,160 at 20 s).
 
 The stop does not order by store size across these runs: 61.4 s and 25.0 s at 1.57 GB, 13.1 s to 50.5 s
-at 3.46 GB, 98.8 s at 4.76 GB with the old image, 234.4 s at 4.33 GB. The `TimeoutStopSec` above
+at 3.46 GB, 98.8 s at 4.76 GB with the old image, 234.4 s at 4.32 GB on disk before the ingest (7.38 GB status `physical_bytes`, `33-post-ingest-status.log`). The `TimeoutStopSec` above
 scales one of them by size and is arithmetic.
 
 `--no-intake`, on a scratch store at `/387` (`300-F-setup.log` to `311-F-control-stop.log`). A store
