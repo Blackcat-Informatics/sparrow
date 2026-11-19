@@ -334,6 +334,26 @@ exhausted (issue #148). `deploy/user-unit-upgrade.sh` installs
 `deploy/systemd/user/sparrow.service.d/limits.conf` for it. Journal output is
 available through `journalctl -u sparrow.service`.
 
+The system unit filters system calls: `SystemCallFilter=@system-service`, then
+`~@privileged @resources`, then `sched_setscheduler setpriority`. systemd applies
+the entries in order, the first sets the default and each later one adds or
+removes calls, so the last entry returns exactly those two calls from the
+denied `@resources` group and leaves the rest of it denied. RocksDB's
+background threads call them: the store lowers the pool threads' CPU priority
+so flushes and compactions yield to foreground writes (this holds write stalls
+to 0.1 percent of the time, against 6.5 percent without it), and each thread
+makes `sched_setscheduler(SCHED_OTHER)` and `setpriority(PRIO_PROCESS, 19)` on
+its first job. A filter without the entry kills the daemon with SIGSYS and a
+core dump at the first flush or compaction, shortly after start, and the unit
+restarts into the same death. `RestrictRealtime=yes` is unaffected because
+`SCHED_OTHER` is not a real-time policy, and `ioprio_set`, also in
+`@resources`, stays denied because the store never lowers I/O priority.
+`deploy/install.sh` installs `deploy/systemd/sparrow.service` as
+`/etc/systemd/system/sparrow.service`; `deploy/test-instance.sh` renders the
+test unit from the same file, so both carry the entry. The old user unit has
+no filter. `sparrow-ship.service` runs no RocksDB and keeps the two-entry
+filter.
+
 After a release that changes the table options profile, the daemon rewrites
 older table files once in the background. `sparrow SOCKET status` reports it as
 `recompression`: `running`, `paused` with a `waiting` reason, or `complete`,
