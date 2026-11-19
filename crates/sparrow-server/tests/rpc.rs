@@ -7302,6 +7302,10 @@ struct EventRelayState {
     drop_first: std::cell::Cell<bool>,
     corrupt_receipt: std::cell::Cell<bool>,
     corrupt_publication: std::cell::Cell<bool>,
+    /// Answer `importPublish` with a daemon-style `RESOURCE_LIMIT` refusal instead of forwarding it.
+    refuse_publish: std::cell::Cell<bool>,
+    /// Fail `importCancel` as a lost connection would, instead of forwarding it.
+    fail_cancel: std::cell::Cell<bool>,
     /// Daemon-style refusals `(code, retryable)` answered, in order, to the next event batches
     /// instead of forwarding them.
     refusals: std::cell::RefCell<std::collections::VecDeque<(&'static str, bool)>>,
@@ -7456,11 +7460,33 @@ impl wire::sparrow::Server for EventRelay {
         let response = request.send().promise.await?;
         results.get().set_result(response.get()?.get_result()?)
     }
+    async fn import_cancel(
+        self: std::rc::Rc<Self>,
+        params: wire::sparrow::ImportCancelParams,
+        mut results: wire::sparrow::ImportCancelResults,
+    ) -> capnp::Result<()> {
+        if self.0.fail_cancel.get() {
+            return Err(capnp::Error::disconnected(
+                "injected lost connection".into(),
+            ));
+        }
+        let mut request = self.0.backend.borrow().import_cancel_request();
+        request.get().set_import(params.get()?.get_import()?)?;
+        let response = request.send().promise.await?;
+        results.get().set_result(response.get()?.get_result()?)
+    }
     async fn import_publish(
         self: std::rc::Rc<Self>,
         params: wire::sparrow::ImportPublishParams,
         mut results: wire::sparrow::ImportPublishResults,
     ) -> capnp::Result<()> {
+        if self.0.refuse_publish.get() {
+            let mut failure = results.get().init_result().init_error();
+            failure.set_code("RESOURCE_LIMIT");
+            failure.set_message("injected refusal");
+            failure.set_retryable(false);
+            return Ok(());
+        }
         let mut request = self.0.backend.borrow().import_publish_request();
         request.get().set_import(params.get()?.get_import()?)?;
         let response = request.send().promise.await?;
@@ -7586,6 +7612,99 @@ async fn cli_ingest_resumes_across_lost_connections_and_cancels_a_stalled_import
         .await;
 }
 
+/// Stage an unpublishable import above the inline bound through `client` and return the
+/// error it ends with. The relay refuses `importPublish`, as the daemon refuses a prepared import.
+async fn refused_large_ingest(
+    client: &sparrow_client::Client,
+    request_id: &str,
+) -> sparrow_client::Error {
+    let bytes = vec![b'x'; sparrow_core::INLINE_ARTIFACT_BYTES + 1];
+    client
+        .ingest(request_id, "large", wire::Format::Opaque, &bytes)
+        .await
+        .unwrap_err()
+}
+
+/// A refused import through `Client::ingest` above the inline bound cancels its staging
+/// journal, so the refusal does not hold an import slot until the retry window ends (#392).
+#[tokio::test(flavor = "current_thread")]
+async fn refused_large_ingest_over_a_connection_cancels_its_staging_journal() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let _daemon = start(&config, &socket).await;
+            let genuine = sparrow_client::Client::connect(&socket).await.unwrap();
+            let proxy_socket = dir.path().join("proxy.sock");
+            let (state, proxy) = relay(&proxy_socket, genuine.capability().clone());
+            state.refuse_publish.set(true);
+            let client = sparrow_client::Client::connect(&proxy_socket)
+                .await
+                .unwrap();
+            let error = refused_large_ingest(&client, "refused-large").await;
+            assert!(
+                matches!(&error, sparrow_client::Error::Domain { code, .. } if code == "RESOURCE_LIMIT"),
+                "{error}"
+            );
+            // A live journal would report its staging; a canceled one has ended its lease.
+            let status = sparrow_client::get_ingest_status(
+                genuine.capability(),
+                &genuine.discovery().store_id,
+                &sparrow_client::IngestSelector::Request("refused-large".into()),
+                Default::default(),
+            )
+            .await;
+            assert!(
+                matches!(&status, Err(sparrow_client::Error::Domain { code, .. })
+                    if code == "IMPORT_EXPIRED" || code == "NOT_FOUND"),
+                "refused import still holds its import slot: {:?}",
+                status.err()
+            );
+            proxy.abort();
+        })
+        .await;
+}
+
+/// A refused import whose cancel also fails returns `IMPORT_ABANDONED` naming the import,
+/// and leaves its journal staged for the retry window (#392).
+#[tokio::test(flavor = "current_thread")]
+async fn refused_large_ingest_whose_cancel_fails_reports_import_abandoned() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let _daemon = start(&config, &socket).await;
+            let genuine = sparrow_client::Client::connect(&socket).await.unwrap();
+            let proxy_socket = dir.path().join("proxy.sock");
+            let (state, proxy) = relay(&proxy_socket, genuine.capability().clone());
+            state.refuse_publish.set(true);
+            state.fail_cancel.set(true);
+            let client = sparrow_client::Client::connect(&proxy_socket)
+                .await
+                .unwrap();
+            let error = refused_large_ingest(&client, "abandoned-large").await;
+            assert!(
+                matches!(&error, sparrow_client::Error::Domain { code, message, retryable: false, .. }
+                    if code == "IMPORT_ABANDONED" && message.contains("RESOURCE_LIMIT")),
+                "{error}"
+            );
+            let status = sparrow_client::get_ingest_status(
+                genuine.capability(),
+                &genuine.discovery().store_id,
+                &sparrow_client::IngestSelector::Request("abandoned-large".into()),
+                Default::default(),
+            )
+            .await;
+            assert!(status.is_ok(), "uncancelled journal must stay staged: {:?}", status.err());
+            proxy.abort();
+        })
+        .await;
+}
+
 fn relay(
     socket: &Path,
     backend: wire::sparrow::Client,
@@ -7598,6 +7717,8 @@ fn relay(
         drop_first: std::cell::Cell::new(true),
         corrupt_receipt: std::cell::Cell::new(false),
         corrupt_publication: std::cell::Cell::new(false),
+        refuse_publish: std::cell::Cell::new(false),
+        fail_cancel: std::cell::Cell::new(false),
         refusals: std::cell::RefCell::new(std::collections::VecDeque::new()),
         connections: std::cell::Cell::new(0),
         mutate_file: std::cell::RefCell::new(None),
@@ -7782,17 +7903,17 @@ async fn producer_receipt_mismatch_never_certifies_or_retires_pending_input() {
             *state.mutate_file.borrow_mut() = None;
             std::fs::write(&input, b"initial").unwrap();
             state.corrupt_publication.set(true);
-            assert!(matches!(
-                client
-                    .import_file(
-                        "bad-publication-reply",
-                        "publication",
-                        wire::Format::Opaque,
-                        &input
-                    )
-                    .await,
-                Err(sparrow_client::Error::Protocol(_))
-            ));
+            // The publication committed but its reply is unusable: the cancel is answered
+            // CONFLICT, so the genuine receipt is retrieved instead of an error.
+            let retrieved = client
+                .import_file(
+                    "bad-publication-reply",
+                    "publication",
+                    wire::Format::Opaque,
+                    &input,
+                )
+                .await
+                .unwrap();
             assert_eq!(std::fs::read(&input).unwrap(), b"initial");
             let committed = genuine
                 .ingest(
@@ -7803,6 +7924,7 @@ async fn producer_receipt_mismatch_never_certifies_or_retires_pending_input() {
                 )
                 .await
                 .unwrap();
+            assert_eq!(committed.id, retrieved.id);
             assert_eq!(committed.durability, wire::Durability::Durable);
             state.corrupt_publication.set(false);
             *state.mutate_published_file.borrow_mut() = Some(input.clone());

@@ -4287,7 +4287,18 @@ nothing, cancels the staging journal with `importCancel`, so the daemon's bounde
 reclamation releases its import slot instead of holding it for the 48-hour retry
 window. Until then, retrying the canceled request ID fails with `IMPORT_EXPIRED`.
 If the cancellation also fails, the CLI reports `IMPORT_ABANDONED` with both
-causes. The SDK `import_file(endpoint, ...)` is this implementation.
+causes. A cancellation answered `CONFLICT` means the publication committed although
+its reply was lost, and the receipt is returned. The SDK `import_file(endpoint, ...)` is
+this implementation.
+
+The SDK upload paths over a held connection (`Client::ingest` and
+`ingest_with_durability` above the inline bound, `Client::import_file`,
+`Client::import_open_file` and the free `import_open_file`) share the cancellation
+rule but never reconnect or resume: any error ends the attempt. An attempt that
+fails after its journal began cancels the journal over the same connection, with the
+same `CONFLICT` and `IMPORT_ABANDONED` handling, so a refused import does not hold an
+import slot for the retry window. When the connection is lost, the cancellation fails
+and the caller receives `IMPORT_ABANDONED` naming the import.
 
 The binaries are `sparrowd` for the daemon and `sparrow` for its client.
 Every client invocation takes an optional `--secret-file PATH` and then an

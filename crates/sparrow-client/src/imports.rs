@@ -46,15 +46,35 @@ pub async fn import_file(
             Err(error) => break error,
         }
     };
-    let Some((store, id)) = checkpoint.import.clone() else {
+    settle(
+        error,
+        checkpoint.import.clone(),
+        async |store: &str, id: &str| cancel(endpoint, store, id).await,
+        async || attempt(&mut file, &mut checkpoint).await,
+    )
+    .await
+}
+
+/// Settle an upload that ended in `error`: cancel the staging journal `import` names, so an
+/// abandoned import never holds an import slot for the retry window.
+///
+/// A cancel answered `CONFLICT` means the publication committed although its reply was lost,
+/// so `retry` fetches the receipt. A cancel that itself fails returns `IMPORT_ABANDONED`
+/// naming the journal. An error before any journal existed is returned unchanged. This is the
+/// one implementation behind the free `import_file` and every `Client` upload path.
+async fn settle(
+    error: Error,
+    import: Option<(String, String)>,
+    cancel: impl AsyncFnOnce(&str, &str) -> Result<(), Error>,
+    retry: impl AsyncFnOnce() -> Result<ArtifactReceipt, Error>,
+) -> Result<ArtifactReceipt, Error> {
+    let Some((store, id)) = import else {
         return Err(error);
     };
-    match cancel(endpoint, &store, &id).await {
+    match cancel(&store, &id).await {
         Ok(()) => Err(error),
         // Publication committed although its reply was lost; retrieve the receipt.
-        Err(Error::Domain { code, .. }) if code == "CONFLICT" => {
-            attempt(&mut file, &mut checkpoint).await
-        }
+        Err(Error::Domain { code, .. }) if code == "CONFLICT" => retry().await,
         Err(cancel) => Err(Error::Domain {
             code: "IMPORT_ABANDONED".into(),
             message: format!(
@@ -64,6 +84,42 @@ pub async fn import_file(
             class: crate::FailureClass::Unclassified,
         }),
     }
+}
+
+/// Upload over one held connection and cancel the staging journal when the attempt fails.
+///
+/// A held connection cannot be replaced, so any error ends the attempt. The cancel uses the
+/// same connection; when that is lost too, the result is `IMPORT_ABANDONED`.
+pub(crate) async fn upload_or_cancel(
+    client: &wire::sparrow::Client,
+    discovery: &crate::Discovery,
+    request_id: &str,
+    source: &str,
+    format: wire::Format,
+    staged: &(impl StagedInput + ?Sized),
+    checkpoint: &mut Checkpoint,
+) -> Result<ArtifactReceipt, Error> {
+    let error = match upload(
+        client, discovery, request_id, source, format, staged, checkpoint,
+    )
+    .await
+    {
+        Ok(receipt) => return Ok(receipt),
+        Err(error) => error,
+    };
+    let import = checkpoint.import.clone();
+    settle(
+        error,
+        import,
+        async |store: &str, id: &str| cancel_on(client, store, id).await,
+        async || {
+            upload(
+                client, discovery, request_id, source, format, staged, checkpoint,
+            )
+            .await
+        },
+    )
+    .await
 }
 
 /// Highest durable import progress observed across attempts: received bytes,
@@ -128,7 +184,11 @@ async fn reconnect(endpoint: &Endpoint) -> Result<Client, Error> {
 
 pub(crate) async fn cancel(endpoint: &Endpoint, store: &str, id: &str) -> Result<(), Error> {
     let client = reconnect(endpoint).await?;
-    let mut request = client.capability().import_cancel_request();
+    cancel_on(client.capability(), store, id).await
+}
+
+async fn cancel_on(client: &wire::sparrow::Client, store: &str, id: &str) -> Result<(), Error> {
+    let mut request = client.import_cancel_request();
     import_reference(request.get().init_import(), store, id);
     let response = request.send().promise.await?;
     match response.get()?.get_result()?.which()? {
@@ -161,6 +221,8 @@ pub fn open_completed_file(path: &Path) -> Result<File, Error> {
 
 /// Upload an already opened completed regular file through the same resumable path.
 /// Reads positionally from byte zero, preserving the caller's cursor and path ownership.
+/// The caller's connection is not replaced; a failed attempt cancels its staging journal
+/// over it, and `IMPORT_ABANDONED` reports a cancel that also failed.
 pub async fn import_open_file(
     client: &wire::sparrow::Client,
     request_id: &str,
@@ -171,7 +233,7 @@ pub async fn import_open_file(
     // Discovery refuses an older daemon before allocating private staging.
     let discovery = crate::Discovery::fetch(client).await?;
     let mut checkpoint = Checkpoint::default();
-    upload(
+    upload_or_cancel(
         client,
         &discovery,
         request_id,
