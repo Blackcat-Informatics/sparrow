@@ -842,8 +842,9 @@ if used <= 0:
     sys.exit("du read 0 bytes for the store")
 st = os.statvfs(os.path.dirname(sys.argv[1]))
 free, need = st.f_bavail * st.f_frsize, 2 * (used + (10 << 30))
-print(f"free {free} store {used} two copies {need} margin {free - need}")
-sys.exit(0 if free >= need else "room rule fails: free space is below two copies")
+line = f"free {free} store {used} two copies {need} margin {free - need}"
+print(line)
+sys.exit(0 if free >= need else "room rule fails: free space is below two copies: " + line)
 ROOM
 cat "$RECORD/room-now.txt" )
 echo "EXIT=$?"
@@ -1401,9 +1402,16 @@ CHECK
      ```
 
      The script refuses to reuse `$RECORD/payload-sample-bytes`, so a repeat needs a new `RECORD` or
-     that directory removed by itself, one exact path. The sample's bytes (at most 50 MiB) stay under
-     `$RECORD` with `payload-sample.tsv`, which lists artifact, source, receipt time, length and
-     payload id.
+     that directory removed by itself, one exact path. The sample's bytes stay under `$RECORD` with
+     `payload-sample.tsv`, which lists artifact, source, receipt time, length and payload id. The 5
+     largest artifacts are kept whole, so the files total at most the ceiling (4 GiB by default, or
+     the fourth argument); `$RECORD` needs that much space. Each 1 MiB chunk file is removed right
+     after it is appended, so the peak extra space is one chunk beyond the sample files; a run that
+     fails during a read can leave that one chunk file. `$RECORD` is under the main checkout's `.stage/`
+     on the same filesystem `/` as the store, so its space adds to the room rule's two copies.
+     Arithmetic on the reading of 2026-11-19: 99,324,395,520 bytes for two copies plus 4,294,967,296
+     bytes (4 GiB) is 103,619,362,816 bytes, against 115,870,515,200 bytes free: a margin of
+     12,251,152,384 bytes (12.25 GB). Read it again with the room command before the window.
    - A stop of the scratch daemon is clean: SIGINT to the one process in the scope, then the journal
      line `sparrowd: closed store=` and an exit.
 
@@ -1806,9 +1814,10 @@ notice states this and gives the length only after the rehearsal has read `N`.
   `~/.local/libexec/sparrow/` with `Restart=always`. They read the local journal and write JSON
   Lines files under `~/.local/state/sparrow/katamari-journal/`; they never connect to Sparrow, so
   they keep writing from their own units while the daemon is down, and the shipper sends those files
-  after the start. Both units delete spool files older than three days when they start
-  (`ExecStartPre` runs `find ... -mtime +3 -delete`), so a restart of either unit in a window longer than
-  three days deletes files the shipper has not sent. The repository names no other owner and does not show whether the two units are
+  after the start. Each unit deletes its own spool files (`katamari-stored-*.jsonl` and `katamari-manager-*.jsonl`) when it
+  starts: `ExecStartPre` runs `find ... -mtime +3 -delete`, which matches files whose age, rounded down to
+  whole days, is more than 3, that is, last modified four or more full days ago. A restart of either unit
+  in a window that long deletes files the shipper has not sent. The repository names no other owner and does not show whether the two units are
   enabled and running on the live host; read that before the window with
   `systemctl --user is-active katamari-journal-spool.service katamari-manager-spool.service`
   (not run). A producer that rotates or deletes its own file in the window is outside Sparrow's reach.
