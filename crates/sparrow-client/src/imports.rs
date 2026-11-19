@@ -32,9 +32,9 @@ pub async fn import_file(
 /// connection the crate makes: the first, each replacement and the cancel's. A connection
 /// whose discovery reports another instance role or store id fails with the non-retryable
 /// `INSTANCE_MISMATCH` before any import call is made over it, so no further byte reaches
-/// that daemon. A journal staged on a daemon that later fails the check is left in place:
-/// the cancel would have to reach the refused daemon, and a cancel refused for the same
-/// reason ends as `IMPORT_ABANDONED` naming the import.
+/// that daemon. A journal staged on a daemon that later fails the check is left in place and named by the error:
+/// the cancel would have to reach the refused daemon. A cancel connection that fails the
+/// check ends as `IMPORT_ABANDONED` naming the import.
 pub async fn import_file_expecting(
     endpoint: &Endpoint,
     expect: &Expect,
@@ -77,9 +77,28 @@ async fn import_checked(
             Err(error) => break error,
         }
     };
-    // A refused daemon is not asked to cancel: the refusal is the result.
-    if expect::is_mismatch(&error) {
-        return Err(error);
+    // A refused daemon is not asked to cancel: the refusal is the result, naming the journal
+    // left staged so an operator can find the held import slot.
+    if let Error::Domain {
+        code,
+        message,
+        retryable,
+        class,
+    } = &error
+        && expect::is_mismatch(&error)
+    {
+        let message = match &checkpoint.import {
+            Some((store, id)) => {
+                format!("{message}; import {id} on store {store} stays staged and was not canceled")
+            }
+            None => message.clone(),
+        };
+        return Err(Error::Domain {
+            code: code.clone(),
+            message,
+            retryable: *retryable,
+            class: *class,
+        });
     }
     settle(
         error,

@@ -23,7 +23,9 @@ impl RequiredRole {
     }
 }
 
-fn role_label(role: InstanceRole) -> &'static str {
+/// The label of a discovered instance role: `unspecified`, `production` or `scratch`.
+#[must_use]
+pub fn instance_role_label(role: InstanceRole) -> &'static str {
     match role {
         InstanceRole::Unspecified => "unspecified",
         InstanceRole::Production => "production",
@@ -73,8 +75,8 @@ impl Expect {
             code: "INSTANCE_MISMATCH".into(),
             message: format!(
                 "required instance_role {} on store {required_store}, but the daemon reports instance_role {} on store {}; refusing before any import call",
-                role_label(self.role.wire()),
-                role_label(discovery.instance_role),
+                instance_role_label(self.role.wire()),
+                instance_role_label(discovery.instance_role),
                 discovery.store_id,
             ),
             retryable: false,

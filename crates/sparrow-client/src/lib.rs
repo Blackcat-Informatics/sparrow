@@ -38,7 +38,7 @@ mod receipt;
 pub use bytes::{decode_evidence, encode_evidence, read_bytes};
 pub use receipt::{ArtifactReceipt, Discovery, DurabilityWatermark, flush_through};
 mod expect;
-pub use expect::{Expect, RequiredRole};
+pub use expect::{Expect, RequiredRole, instance_role_label};
 mod imports;
 pub use imports::{
     CompletedFileIdentity, import_file, import_file_expecting, import_open_file,

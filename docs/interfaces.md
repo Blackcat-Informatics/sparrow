@@ -4321,13 +4321,14 @@ replacement connection and the cancellation connection of `import_file_expecting
 A daemon that reports another role, including a store with no role row (`unspecified`), or
 another store id fails closed with the non-retryable `INSTANCE_MISMATCH`, which names the
 required and the reported role and store id. The free `import_file(endpoint, ...)` and the
-CLI require nothing. A journal staged before a daemon fails the check stays staged: the
-cancellation would have to reach the refused daemon, and a cancellation refused for the same
-reason ends as `IMPORT_ABANDONED`. `Expect::require(&Discovery)` serves a caller that holds a
+CLI require nothing. A journal staged before a daemon fails the check stays staged, and the error names it: the
+cancellation would have to reach the refused daemon. In `import_file_expecting`, a
+cancellation connection that fails the check ends as `IMPORT_ABANDONED`; the part-set draft
+cancellation returns `INSTANCE_MISMATCH` itself. `Expect::require(&Discovery)` serves a caller that holds a
 bare `Connection`, which fetches no discovery itself.
 
-A request ID names one item for its whole life. The crate retries a retryable error itself
-while an attempt advances the checkpoint. After a terminal failure it cancels, and the same
+A request ID names one item for its whole life. The free `import_file` and `import_file_expecting` retry a retryable error themselves
+while an attempt advances the checkpoint; the held-connection paths return it without retrying. After a terminal failure it cancels, and the same
 ID answers `IMPORT_EXPIRED` until reclamation has removed the journal; the caller then
 begins again under the same ID, with bounded backoff. An input-bound refusal is not resent:
 `RESOURCE_LIMIT` for more than 32,768 records in one publication or for RDF write staging

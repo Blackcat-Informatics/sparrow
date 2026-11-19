@@ -172,7 +172,10 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         .with("recompression", recompression(value.get_recompression()?)?)
         .with("migrations", migrations(value.get_migrations()?)?)
         .with("query_only", value.get_query_only())
-        .with("instance_role", instance_role(value.get_instance_role()?))
+        .with(
+            "instance_role",
+            sparrow_client::instance_role_label(value.get_instance_role()?),
+        )
         .with(
             "stream_evidence_loss",
             stream_evidence_loss(value.get_stream_evidence_loss()?)?,
@@ -602,14 +605,9 @@ pub(super) fn discovery(discovery: &sparrow_client::Discovery) -> Value {
         .with("operation", "discover")
         .with("store_id", discovery.store_id.as_str())
         .with("schema_version", discovery.schema_version)
-        .with("instance_role", instance_role(discovery.instance_role))
+        .with(
+            "instance_role",
+            sparrow_client::instance_role_label(discovery.instance_role),
+        )
         .into()
-}
-
-fn instance_role(role: wire::InstanceRole) -> &'static str {
-    match role {
-        wire::InstanceRole::Unspecified => "unspecified",
-        wire::InstanceRole::Production => "production",
-        wire::InstanceRole::Scratch => "scratch",
-    }
 }

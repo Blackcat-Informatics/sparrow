@@ -14963,8 +14963,8 @@ async fn a_required_instance_role_and_store_refuse_a_mismatched_daemon_before_an
 
 /// INVARIANT (#399): a reconnect inside the free import re-checks the expectation. A daemon
 /// replaced by a production store after the first attempt's retryable refusal is refused with
-/// `INSTANCE_MISMATCH`, no import call reaches it, and the first store's journal is left staged
-/// rather than canceled through the refused connection.
+/// `INSTANCE_MISMATCH` naming the journal left on the first store, no import call reaches it,
+/// and no cancel is attempted: the first store's journal stays staged.
 #[tokio::test(flavor = "current_thread")]
 async fn a_reconnect_inside_the_import_refuses_a_daemon_swapped_to_another_role() {
     tokio::task::LocalSet::new()
@@ -14996,8 +14996,8 @@ async fn a_reconnect_inside_the_import_refuses_a_daemon_swapped_to_another_role(
             .await
             .unwrap_err();
             assert!(
-                matches!(&error, sparrow_client::Error::Domain { code, retryable: false, .. }
-                    if code == "INSTANCE_MISMATCH"),
+                matches!(&error, sparrow_client::Error::Domain { code, message, retryable: false, .. }
+                    if code == "INSTANCE_MISMATCH" && message.contains("stays staged")),
                 "{error}"
             );
             assert!(import_reached(&first, "swapped").await);
