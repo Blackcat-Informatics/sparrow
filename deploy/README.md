@@ -458,4 +458,5 @@ when `SCRATCH` holds no scratch-role configuration. A scratch store created
 before instance roles existed has no role row, so the daemon refuses to start
 on it once the configuration sets `instance_role`; `setup` detects it from its
 older configuration and refuses with this remedy: run `purge`, then `setup` for
-a fresh store.
+a fresh store. [evidence/test-load.md](evidence/test-load.md) records a run: setup, one
+artifact ingested over the ingest socket, found by `values_search`, teardown and purge.
