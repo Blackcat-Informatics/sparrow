@@ -306,8 +306,8 @@ fn record_ends<'a>(
         )
 }
 
-/// Typed failures from admission, evidence lifetime, and storage.
-#[derive(Debug)]
+/// Typed failures from admission, evidence lifetime, and storage. A copy keeps its retry class.
+#[derive(Clone, Debug)]
 pub struct Error {
     /// Stable machine-readable refusal code.
     pub code: &'static str,
@@ -337,6 +337,13 @@ impl Error {
         }
     }
 
+    /// This refusal with `context` appended to its message; the code and the retry class stay.
+    #[must_use]
+    pub(crate) fn with_context(self, context: &str) -> Self {
+        let message = format!("{self}; {context}");
+        Self { message, ..self }
+    }
+
     /// Whether a client may retry the same request and expect another outcome. The wire's
     /// `retryable` flag is this value and nothing else decides it.
     #[must_use]
@@ -362,7 +369,7 @@ impl purrdf_lex::json::record::ToJson for Error {
         Object::new()
             .with("code", self.code)
             .with("message", self.message.clone())
-            .with("retryable", self.code == "STORAGE_PRESSURE")
+            .with("retryable", self.is_retryable())
             .into()
     }
 }
@@ -2164,7 +2171,10 @@ impl Store {
         if record_count > writer.config.max_records {
             return Err(batch_bound(
                 origin,
-                "artifact exceeds configured record count",
+                format!(
+                    "artifact exceeds the configured max_records of {}",
+                    writer.config.max_records
+                ),
             ));
         }
         let mut source_time_profile = writer.time_profile(source)?;
@@ -2675,10 +2685,7 @@ impl Store {
     /// Read an exact bounded range of artifact, record, or complete retained file bytes.
     pub fn bytes(&self, id: &str, offset: u64, length: usize, now: u64) -> Result<Vec<u8>, Error> {
         if length > BYTE_READ_BYTES {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                "byte reads are bounded to 1 MiB",
-            ));
+            return Err(Error::input_bound("byte reads are bounded to 1 MiB"));
         }
         let writer = self.lock()?;
         if id.starts_with("file-generation:") {
@@ -2755,10 +2762,10 @@ impl Store {
             .with("days", days.to_string())
             .into();
         if targets.len() > writer.config.max_pin_members {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                "pin input exceeds configured membership limit",
-            ));
+            return Err(Error::input_bound(format!(
+                "pin input exceeds the configured max_pin_members of {}",
+                writer.config.max_pin_members
+            )));
         }
         if let Some(previous) = writer.retry(&retry_key, now)? {
             if field(&previous, "arguments")? != &arguments {
@@ -3312,7 +3319,7 @@ impl Store {
     ) -> Result<T, Error> {
         let _lease = self
             .rdf_read_lease(rdf_view::ReadSlot::Archive)
-            .map_err(|error| Error::new(error.code, error.message.clone()))?;
+            .map_err(|error| Error::clone(&error))?;
         Ok(operation())
     }
 

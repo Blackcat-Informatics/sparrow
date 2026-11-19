@@ -78,8 +78,8 @@ fn encode_durability(
     );
 }
 
-fn refusal(refusal: crate::admission::Refusal) -> Error {
-    Error::new(refusal.code, refusal.message)
+fn refusal(crate::admission::Refusal { code, message }: crate::admission::Refusal) -> Error {
+    Error::new(code, message)
 }
 
 /// Read the server's millisecond acceptance clock.
@@ -3018,7 +3018,7 @@ impl wire::sparrow::Server for Rpc {
         let input = params.get()?.get_query()?;
         let scope = scope(input.get_scope()?, &self)?;
         let fields = input.get_fields()?;
-        if fields.len() > 32 {
+        if fields.len() as usize > sparrow_core::RECORD_QUERY_FIELDS_MAX {
             failure(
                 results.get().init_result(),
                 Error::input_bound("at most 32 field constraints"),
@@ -3101,10 +3101,10 @@ impl wire::sparrow::Server for Rpc {
     ) -> capnp::Result<()> {
         let input = params.get()?.get_query()?;
         let scope = scope(input.get_scope()?, &self)?;
-        if input.get_text()?.len() > 65536 {
+        if input.get_text()?.len() > sparrow_core::RECORD_QUERY_TEXT_BYTES {
             failure(
                 results.get().init_result(),
-                Error::new("RESOURCE_LIMIT", "text query exceeds 64 KiB"),
+                Error::input_bound("text query exceeds 64 KiB"),
             );
             return Ok(());
         }
@@ -3549,7 +3549,10 @@ impl wire::sparrow::Server for Rpc {
         if targets.len() as usize > self.max_pin_members {
             failure(
                 results.get().init_result(),
-                Error::input_bound("pin input exceeds configured membership limit"),
+                Error::input_bound(format!(
+                    "pin input exceeds the configured max_pin_members of {}",
+                    self.max_pin_members
+                )),
             );
             return Ok(());
         }

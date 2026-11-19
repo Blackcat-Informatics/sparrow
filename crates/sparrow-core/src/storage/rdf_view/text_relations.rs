@@ -246,9 +246,10 @@ impl StoredRdfView<'_> {
                 .iter()
                 .map(|(id, document)| (id.as_str(), document.length)),
             || {
-                self.budget.checkpoint().0.map_or(Ok(()), |error| {
-                    Err(Error::new(error.code, error.message.clone()))
-                })
+                self.budget
+                    .checkpoint()
+                    .0
+                    .map_or(Ok(()), |error| Err(Error::clone(&error)))
             },
         )
         .map_err(|error| self.budget.fail(error))?;

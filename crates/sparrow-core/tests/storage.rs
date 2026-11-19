@@ -11318,7 +11318,7 @@ fn native_import_publishes_files_above_buffered_limit_without_a_whole_file_batch
             0,
         )
         .unwrap();
-    for (index, chunk) in input.chunks(sparrow_core::IMPORT_CHUNK_BYTES).enumerate() {
+    for (index, chunk) in input.chunks(IMPORT_CHUNK_BYTES).enumerate() {
         store
             .import_append(&journal.id, (index * IMPORT_CHUNK_BYTES) as u64, chunk, 0)
             .unwrap();
@@ -11434,11 +11434,7 @@ fn bounded_staging_ranges_preserve_exact_binary_bytes_and_committed_frontiers() 
         store.import_bytes(&journal.id, 100, 77, 0).unwrap(),
         input[100..177]
     );
-    for (index, chunk) in input
-        .chunks(sparrow_core::IMPORT_CHUNK_BYTES)
-        .enumerate()
-        .skip(1)
-    {
+    for (index, chunk) in input.chunks(IMPORT_CHUNK_BYTES).enumerate().skip(1) {
         store
             .import_append(&journal.id, (index * IMPORT_CHUNK_BYTES) as u64, chunk, 0)
             .unwrap();
@@ -11523,7 +11519,7 @@ fn streaming_layout_preserves_cross_chunk_delimiters_long_records_and_pages() {
             .code,
         "CONFLICT"
     );
-    for (index, chunk) in input.chunks(sparrow_core::IMPORT_CHUNK_BYTES).enumerate() {
+    for (index, chunk) in input.chunks(IMPORT_CHUNK_BYTES).enumerate() {
         store
             .import_append(&journal.id, (index * IMPORT_CHUNK_BYTES) as u64, chunk, 0)
             .unwrap();
@@ -17285,6 +17281,7 @@ fn producer_batch_over_the_whole_data_budget_is_refused_non_retryable() {
 /// stays retryable. The code is `RESOURCE_LIMIT` in both cases.
 #[test]
 fn an_input_bound_refusal_is_not_retryable_while_occupancy_stays_retryable() {
+    use sparrow_core::IMPORT_CHUNK_BYTES;
     let dir = tempfile::tempdir().unwrap();
     let mut limits = config();
     limits.max_records = 100_000;
@@ -17329,8 +17326,32 @@ fn an_input_bound_refusal_is_not_retryable_while_occupancy_stays_retryable() {
     let mut tight = config();
     tight.disk_budget = 2 * 1024 * 1024;
     tight.maintenance_reserve = 1024 * 1024;
-    let impossible = Store::open(small.path(), tight)
-        .unwrap()
+    let tight_store = Store::open(small.path(), tight).unwrap();
+    // A staged write whose estimate exceeds the whole data allowance can never fit.
+    let tiny = tempfile::tempdir().unwrap();
+    let mut room = config();
+    room.maintenance_reserve = 1024 * 1024;
+    room.disk_budget = room.maintenance_reserve + 200 * 1024;
+    let room = Store::open(tiny.path(), room).unwrap();
+    let chunk = vec![b'x'; IMPORT_CHUNK_BYTES];
+    let journal = room
+        .import_begin(
+            "ceiling",
+            "source",
+            "log",
+            chunk.len() as u64,
+            &digest(&chunk),
+            0,
+        )
+        .unwrap();
+    let ceiling = room.import_append(&journal.id, 0, &chunk, 0).unwrap_err();
+    assert_eq!(ceiling.code, "RESOURCE_LIMIT", "{ceiling}");
+    assert!(!ceiling.is_retryable(), "{ceiling}");
+    // A request-shape bound the same request can never pass.
+    let oversized = tight_store.bytes("any", 0, 2 * 1024 * 1024, 1).unwrap_err();
+    assert_eq!(oversized.code, "RESOURCE_LIMIT", "{oversized}");
+    assert!(!oversized.is_retryable(), "{oversized}");
+    let impossible = tight_store
         .ingest(
             "whole-budget",
             "source",

@@ -1511,7 +1511,7 @@ impl Store {
                                 .and_then(|_| {
                                     view.budget.reserve((maximum as u64).saturating_mul(64))
                                 })
-                                .map_err(|error| Error::new(error.code, error.message.clone()))
+                                .map_err(|error| Error::clone(&error))
                         },
                         Some(maximum),
                         None,

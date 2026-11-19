@@ -500,9 +500,10 @@ impl Writer {
             )));
         }
         if byte_length > self.config.disk_budget - self.config.maintenance_reserve {
-            return Err(Error::input_bound(
-                "declared input exceeds the entire available disk budget",
-            ));
+            return Err(Error::input_bound(format!(
+                "declared input exceeds the entire available disk budget of {} bytes",
+                self.config.disk_budget - self.config.maintenance_reserve
+            )));
         }
         Ok(())
     }
@@ -874,8 +875,7 @@ impl Store {
         now: u64,
     ) -> Result<Vec<u8>, Error> {
         if length > BYTE_READ_BYTES {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
+            return Err(Error::input_bound(
                 "staging byte reads are bounded to 1 MiB",
             ));
         }
@@ -1462,9 +1462,10 @@ impl Layout<'_> {
         payload_id: String,
     ) -> Result<(), Error> {
         if self.next_index >= self.writer.config.max_records as u64 {
-            return Err(Error::input_bound(
-                "import layout exceeds configured record count; raw staging remains available for cancellation",
-            ));
+            return Err(Error::input_bound(format!(
+                "import layout exceeds the configured max_records of {}; raw staging remains available for cancellation",
+                self.writer.config.max_records
+            )));
         }
         // The publication's atomic source-context update admits this many distinct records.
         // Refusing here costs the layout read, not the preparation of every record (#397).

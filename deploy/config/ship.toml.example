@@ -8,7 +8,7 @@
 intake_root = "/SPARROW/intake"
 state_dir = "/SPARROW/ship"
 max_chunk_bytes = 1048576      # line formats are split above 1 MiB ...
-max_chunk_lines = 50000        # ... or above 50,000 lines (max_records is 100,000);
+max_chunk_lines = 32768        # ... or above 32,768 lines (one publication holds at most 32,768 records);
                                # other formats ship whole, up to 7.93 GiB
 max_files_per_run = 64         # per source
 max_pending_bytes = 16777216   # all consume roots together

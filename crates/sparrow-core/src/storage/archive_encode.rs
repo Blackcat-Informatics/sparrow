@@ -167,6 +167,6 @@ pub(super) fn encode(
                 Ok::<_, Error>((builder.freeze().map_err(failure)?, absent.len() as u64))
             },
         )
-        .map_err(|error| Error::new(error.code, error.message.clone()))??;
+        .map_err(|error| Error::clone(&error))??;
     Ok((write_gts(&dataset, blobs)?, absent))
 }

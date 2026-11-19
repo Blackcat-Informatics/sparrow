@@ -16,7 +16,8 @@ pub use instant::{format_instant, parse_instant};
 pub use projection::json_profile as json_projection_profile;
 pub use query::{
     EventInterval, FieldConstraint, JSON_QUERY_PATH_BYTES, JsonPredicate, JsonQuery,
-    QueryAlternatives, QueryScope, QuerySelection, RecordQuery,
+    QueryAlternatives, QueryScope, QuerySelection, RECORD_QUERY_FIELDS_MAX,
+    RECORD_QUERY_TEXT_BYTES, RecordQuery,
 };
 pub use storage::archive::{
     ARCHIVE_MAX_SEGMENT_BYTES, ARCHIVE_MIN_SEGMENT_BYTES, ARCHIVE_SEGMENT_BYTES,

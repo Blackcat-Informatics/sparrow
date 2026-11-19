@@ -1213,12 +1213,14 @@ async fn run(shared: &Shared) -> Result<(), Error> {
 }
 
 /// Whether this batch can never be accepted, as opposed to the daemon being busy. The
-/// daemon marks a busy refusal (`RESOURCE_LIMIT`) retryable, and that batch is held. A full
+/// daemon marks a busy refusal (a retryable `RESOURCE_LIMIT`) retryable, and that batch is held.
+/// A `RESOURCE_LIMIT` the daemon marks non-retryable is a bound on the batch itself (#397), so
+/// it is quarantined like `INVALID_ARGUMENT`. A full
 /// producer registry is no longer a refusal: the daemon stores the batch and counts the lost
 /// gap evidence (#215), and a source past the 1024-mapping ceiling is stored without a time
 /// mapping (#227). An over-bound batch is answered `INVALID_ARGUMENT` and quarantined. Only an
 /// older daemon still answers these with a retryable `RESOURCE_LIMIT`, which stays held as
-/// before: the client cannot tell it from a busy daemon, and held bytes are never lost. A
+/// before: the flag is the only signal, and held bytes are never lost. A
 /// non-retryable `INVALID_ARGUMENT` or `CONFLICT` (for example producer sequences that overlap
 /// accepted positions, or a source time mapping that differs) is about this batch alone: its
 /// bytes go to a quarantine file and later events proceed. The client's own
@@ -1235,7 +1237,10 @@ fn permanent_refusal(error: &Error) -> bool {
             code,
             retryable: false,
             ..
-        } => code == "INVALID_ARGUMENT" || code == "CONFLICT",
+        } => matches!(
+            code.as_str(),
+            "INVALID_ARGUMENT" | "CONFLICT" | "RESOURCE_LIMIT"
+        ),
         Error::InvalidArgument(_) => true,
         _ => false,
     }

@@ -435,7 +435,7 @@ impl From<rocksdb::Error> for WriteRefusal {
 impl From<WriteRefusal> for Error {
     fn from(refusal: WriteRefusal) -> Self {
         match refusal {
-            WriteRefusal::Ceiling => Error::new("RESOURCE_LIMIT", WRITE_CEILING_MESSAGE),
+            WriteRefusal::Ceiling => Error::input_bound(WRITE_CEILING_MESSAGE),
             WriteRefusal::Other(error) => error,
         }
     }
@@ -658,7 +658,7 @@ impl Writer {
             // The caller's error replaces the status failure and the duty marks the forced
             // failure reported, so its own reason must ride in the error or it is lost.
             self.end_wait(state)
-                .map_err(|error| Error::new(error.code, format!("{error}; {forced}")))?;
+                .map_err(|error| error.with_context(forced))?;
         }
         Ok(failure)
     }
@@ -850,9 +850,7 @@ impl Writer {
             forced_failure,
         )
         .map_err(|error| match reason {
-            Some(forced) if !error.message.contains(&forced) => {
-                Error::new(error.code, format!("{error}; {forced}"))
-            }
+            Some(forced) if !error.message.contains(&forced) => error.with_context(&forced),
             _ => error,
         })
     }

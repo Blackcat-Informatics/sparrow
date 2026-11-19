@@ -589,8 +589,9 @@ pub enum PartWait {
 /// How part `part` waits after `error`, if it is a wait rather than an ordinary failure.
 ///
 /// `IMPORT_EXPIRED` is begin-again-after-reclaim and never permanent, although the daemon sends
-/// it with `retryable = false` (`sparrow-server/src/rpc.rs`, `failure()`, which marks only
-/// `RESOURCE_LIMIT`, `STORAGE_PRESSURE` and the like retryable). The daemon raises it when a
+/// it with `retryable = false` (`sparrow-server/src/rpc.rs`, `failure()`, which sends
+/// `Error::is_retryable`: only `STORAGE_PRESSURE`, `SHUTTING_DOWN` and occupancy
+/// `RESOURCE_LIMIT` are retryable). The daemon raises it when a
 /// part's lease ended (`ImportManifest::require_live`, `sparrow-core/src/storage/import.rs`);
 /// once reclamation deletes that row, a begin under the same request id starts afresh
 /// (`begin_import`, which finds no row and no live receipt). The caller keeps its ordinary

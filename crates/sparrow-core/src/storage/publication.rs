@@ -435,9 +435,10 @@ impl Store {
             ));
         }
         if manifest.layout_records > writer.config.max_records as u64 {
-            return Err(Error::input_bound(
-                "sealed layout exceeds the current configured record limit",
-            ));
+            return Err(Error::input_bound(format!(
+                "sealed layout exceeds the current configured max_records of {}",
+                writer.config.max_records
+            )));
         }
         let mut progress = match preparation(&writer, &manifest)? {
             Some(progress) => progress,
@@ -602,9 +603,10 @@ impl Store {
             ));
         }
         if manifest.layout_records > writer.config.max_records as u64 {
-            return Err(Error::input_bound(
-                "publication exceeds the current configured record limit",
-            ));
+            return Err(Error::input_bound(format!(
+                "publication exceeds the current configured max_records of {}",
+                writer.config.max_records
+            )));
         }
         let mut batch = WriteBatch::default();
         let mut record_ids = Vec::new();

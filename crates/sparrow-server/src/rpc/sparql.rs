@@ -162,7 +162,7 @@ pub(super) async fn query(
                 .query_work(None, move |store, now, cancellation| {
                     store
                         .sparql_read(&input.read(), now, &cancellation)
-                        .map_err(|e| Error::new(e.code, e.message.clone()))
+                        .map_err(|e| Error::clone(&e))
                 })
                 .await;
             deliver(out, reply);
@@ -172,7 +172,7 @@ pub(super) async fn query(
                 .query_work(None, move |store, now, cancellation| {
                     store
                         .sparql_explanation_read(&input.read(), now, &cancellation)
-                        .map_err(|e| Error::new(e.code, e.message.clone()))
+                        .map_err(|e| Error::clone(&e))
                 })
                 .await;
             match reply {

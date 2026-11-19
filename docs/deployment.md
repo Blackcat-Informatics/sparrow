@@ -429,8 +429,8 @@ before anything ships. The split matters for two reasons. The consume worker ret
 refused publication without limit, backing off from five seconds to one attempt
 every 15 minutes after consecutive failures, so a file over the record limit
 would be uploaded again and again. Deadline expiries back off too, even when the
-resumed claim advances, so a chunk that needs many attempts finishes later; keep `max_chunk_lines` below
-the server's `max_records`. And a consume publication has a 45-second deadline.
+resumed claim advances, so a chunk that needs many attempts finishes later; keep `max_chunk_lines` at or below
+32,768, the most records one publication holds, and below the server's `max_records`. And a consume publication has a 45-second deadline.
 Retries resume the durable upload and preparation, but each expiry spends the
 single consume worker. Ingest time grows faster than artifact size for deeply
 nested JSON: on 2026-10-27, under a host load average near 45, 17 KiB-per-line
