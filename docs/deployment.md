@@ -597,7 +597,7 @@ system unit's scripts refuse that unit. `deploy/user-unit-upgrade.sh` switches
 it from one kept image pair to another:
 
 ```bash
-deploy/user-unit-upgrade.sh --from sparrowd-schema71-fda2812 --to sparrowd-schema71-b420503 --keep-copy /SPARROW/store.before-b420503
+deploy/user-unit-upgrade.sh --from sparrowd-schema71-fda2812 --to sparrowd-schema71-a50820e --keep-copy /SPARROW/store.before-a50820e
 ```
 
 The live service runs `sparrowd-schema71-fda2812`. The next image keeps schema 71, so no CLI or
@@ -694,12 +694,16 @@ installed, which is the cutover of Sparrow issue 22, and it does not reach the u
 ### Switch 1: the payload index image, without an archive
 
 Switch 1 moves the live daemon from `sparrowd-schema71-fda2812` to the image built from `main`
-revision `b420503`, `sparrowd-schema71-b420503`. Two revisions are named separately. The image
-revision, `b420503`, names the `--to` pair in `SPARROW_BIN`, whose sums the pull request that
-merged this procedure records; the script requires that pair byte-identical to the kept copy in
-`~/.local/libexec/sparrow`. The checkout that runs `deploy/user-unit-upgrade.sh` is `main` at or
-after that merge, because only that script carries `--keep-copy`; its own revision has no bearing
-on the image.
+revision `a50820e`, `sparrowd-schema71-a50820e`. Two revisions are named separately. The image
+revision, `a50820e`, names the source the binaries were built from: the pair was built with
+`make install-bin` at that commit, which holds the shutdown cancel of #394 (`6b4d4b4`) and every
+change Switch 1 takes. A commit that changes only documentation after it does not change the
+binaries, so the image revision stays `a50820e` while `main` moves; `git diff a50820e..HEAD --stat`
+at a later head shows whether anything but documentation changed. The image revision names the
+`--to` pair in `SPARROW_BIN`, whose sums the pull request that merged this procedure records; the
+script requires that pair byte-identical to the kept copy in `~/.local/libexec/sparrow`. The
+checkout that runs `deploy/user-unit-upgrade.sh` is `main` at or after that merge, because only
+that script carries `--keep-copy`; its own revision has no bearing on the image.
 
 The schema number stays 71, so no client or producer needs a new build to keep working. The live
 store reads `sparrow.store/340` (status of 2026-11-19). The new image does not set `[archive]` in
@@ -736,14 +740,14 @@ Variables used below (set them in the shell that runs the steps):
 ```bash
 LIB=~/.local/libexec/sparrow
 OLD=sparrowd-schema71-fda2812;  OLD_CLI=sparrow-schema71-fda2812
-NEW=sparrowd-schema71-b420503;  NEW_CLI=sparrow-schema71-b420503
+NEW=sparrowd-schema71-a50820e;  NEW_CLI=sparrow-schema71-a50820e
 CONF=~/.config/sparrow/server.toml
 SOCK=$(sed -n 's/^socket_path *= *"\([^"]*\)".*/\1/p' "$CONF")
 STORE=$(sed -n 's/^data_dir *= *"\([^"]*\)".*/\1/p' "$CONF")      # /SPARROW/store
-COPY=/SPARROW/store.before-b420503     # a new sibling of $STORE (check: "$STORE" is /SPARROW/store)
-BIN=…/bin       # the directory holding the b420503 pair; the script reads it as SPARROW_BIN
+COPY=/SPARROW/store.before-a50820e     # a new sibling of $STORE (check: "$STORE" is /SPARROW/store)
+BIN=…/bin       # the directory holding the a50820e pair; the script reads it as SPARROW_BIN
 RECORD=…/.stage/image/switch-1   # under the main checkout's .stage/, never /tmp
-REH=/SPARROW/store.rehearsal-b420503   # the rehearsal copy, a new sibling of $STORE
+REH=/SPARROW/store.rehearsal-a50820e   # the rehearsal copy, a new sibling of $STORE
 REH_CONF=$RECORD/rehearsal.toml        # its configuration; its socket is $REH/rpc.sock
 ```
 
@@ -761,7 +765,7 @@ for f in "$OLD" "$OLD_CLI" sparrow-recovery-schema71-fda2812; do
 done
 ```
 
-`BIN` holds the new pair and its `sparrow-recovery-schema71-b420503` from `make install-bin`; check the
+`BIN` holds the new pair and its `sparrow-recovery-schema71-a50820e` from `make install-bin`; check the
 pair's `sha256sum` against the sums recorded with the pull request that merged this
 procedure.
 Install the new pair, never over a name that holds other bytes, then have a human with root
@@ -847,9 +851,9 @@ Three acts precede or accompany the script's stop, in this order.
    Switch 1 is the stop of the installed old image, `sparrowd-schema71-fda2812`, under the live
    user unit's `TimeoutStopSec=120` and `KillSignal=SIGINT`. A stop that outlasts the timeout ends
    in SIGKILL. The fix for the stop (#394, below) cannot reach that first stop, because it is in
-   the new image. The old image under the unit's limits stopped in 98.8 s, 82 percent of 120 s,
+   the new image; the stops of the new image measured below ran without it. The image `a50820e` differs from `b420503` in more than that fix (`git log b420503..a50820e` also lists, for example, the #392 upload cancellation changes and the instance role label), so the `b420503` figures below describe an image that is not the one switched to. The old image under the unit's limits stopped in 98.8 s, 82 percent of 120 s,
    on a store of 4.76 GB status `physical_bytes` at `/332` after six artifacts of 5,000 records
-   (`220-E-diag-old.log`; no kill). The new image under the same limits stopped in 50.5 s, 25.6 s
+   (`220-E-diag-old.log`; no kill). The new image built from `b420503` (before the fix), under the same limits, stopped in 50.5 s, 25.6 s
    and 13.1 s on a base of 3.46 GB (`210-D-diag-new.log`, `212-D-diag-new2.log`,
    `213-D-diag-quiesce.log`; the 13.1 s run waited first for the compaction threads to go idle).
 
@@ -958,7 +962,8 @@ Three acts precede or accompany the script's stop, in this order.
    the coordination session and wait. At `TimeoutStopSec` systemd sends SIGKILL, and the way back
    stands, because the script takes the kept copy only after the stop.
 
-   What a kill leaves. The live store is left as a SIGKILL leaves it. Measured on a store of 1.57 GB
+   What a kill leaves. The live store is left as a SIGKILL leaves it. Measured with the image
+   built from `b420503`, on a store of 1.57 GB
    at `/387` after three acknowledged ingests (15,000 records): the next open took 2,058 ms in the
    storage engine, against 23 to 65 ms for the new image's other opens of that store under the limits (clean
    opens 23, 27, 36 and 37 ms in logs `120`, `125`, `128` and `131`, and 65 ms in `150` before the
@@ -972,12 +977,27 @@ Three acts precede or accompany the script's stop, in this order.
    `stop sparrow.service` and `daemon stopped`; a gap equal to `TimeoutStopSec` means SIGKILL ended
    the stop.
 
-The stop of the new image after #394. Issue #394 is open. The proposed fix cancels background
-work after the shutdown flush (`Store::cancel_background_work()` called after `store.flush()`
-succeeds); it is not built and not on `main`, and no stop time with it is measured. The fix is to
-be measured with and without it on a store with a compaction backlog, with a check that every
-acknowledged record is present after a stop that cancelled a compaction. Until it exists, the
-stop of the new image has the times above.
+The stop of the new image after #394. The fix cancels background work after the shutdown flush
+(`Store::cancel_background_work()` called after `store.flush()` succeeds). It is on `main` as
+`6b4d4b4` (pull request 406) and the image `a50820e` holds it. Measured on a scratch store at
+`/387` with a base of 280,000 records (3.06 GB status `physical_bytes`), the live unit's limits and
+a SIGINT with a 600 s deadline, after six ingests of 5,000 records (30,000 records), with the same
+source built with and without the call, in the order with, without, without, with, with, without
+(`.stage/394/41-with-1.log` to `46-without-3.log`, `51-summary.log`):
+
+- With the call: 0.45 s, 0.97 s and 0.75 s (`41`, `44`, `45`).
+- Without it: 16.3 s, 33.3 s and 21.5 s (`42`, `43`, `46`). The RocksDB log shows a compaction
+  finishing 16.7 s, 33.0 s and 21.9 s after the SIGINT without the call, and 0.4 to 0.7 s after it
+  with the call, with jobs aborted by `Shutdown in progress` (`50-rocksdb-log-evidence.log`).
+- All six runs reopened with 310,000 live records, the 280,000 of the base plus the 30,000
+  acknowledged, and every acknowledged artifact was found once.
+
+Limits. The runs are on a store of 3.7 to 4.2 GB before the stop (status `physical_bytes`), not at the live size of about 39 GB. The stop under
+the unit's 120 s `TimeoutStopSec` is not measured with the call, nor is the 234.4 s stop. The
+mechanism by which the call shortens the stop is not established. The first stop of Switch 1 is the
+stop of `sparrowd-schema71-fda2812`, which lacks the call, so it has the times above and the 1800 s
+drop-in stands for it. Every later stop of the new image, including the way back's stop after an
+open, has the call.
 
 #### The window
 
@@ -1018,7 +1038,7 @@ qualification"). It is a selected-evidence probe, not a scrub of the whole engin
 the copy adds a WAL and manifest to it, so run it only on a second reflink copy
 (`deploy/copy-on-write.sh copy "$COPY" "$COPY.probe"`) whose configuration names that directory
 for `data_dir` and `socket_path`, and remove that one probe path afterwards. Neither the new daemon
-nor `sparrow-recovery-schema71-b420503` may open `COPY` or `COPY.probe`: either lifts the format and
+nor `sparrow-recovery-schema71-a50820e` may open `COPY` or `COPY.probe`: either lifts the format and
 spoils the copy as a way back.
 
 #### The rehearsal on a copy
@@ -1094,10 +1114,33 @@ with `echo proceed > FIFO`.
      kill -INT "$(cat /sys/fs/cgroup"$(systemctl --user show sparrow-rehearsal.scope -p ControlGroup --value)"/cgroup.procs)"
      ```
 
-5. Record the old image's refusal. Open `REH` once with the old image in the same form and write
-   the line it prints to `$RECORD/rehearsal-old-refusal.log`. The measured refusal on a store lifted
-   from `/332` is quoted above; this open observes the refusal on the live store's own lift. A
-   refusal changes nothing in the copy.
+5. Record the old image's refusal. The old image accepts `--no-intake`, so the log holds the
+   fence refusal, not an argument error. At `fda2812`, `arguments()` in
+   `crates/sparrow-server/src/main.rs` matches `"--no-intake"` (line 39) and its usage string lists
+   it (line 19). `main` then reads the configuration with `ServerConfig::read` (line 132; `config.rs` line 286),
+   which parses it with `toml::from_str` (`config.rs` line 298) and refuses a key that `fda2812`
+   does not know, because the struct is `deny_unknown_fields` (`config.rs` line 17). It then calls
+   `check_no_intake()` (line 145; `config.rs` lines 376-380, which delegates to `refuse_intake`,
+   line 402), which refuses a configured `consume`, `syslog`, `rpc_tcp_address`,
+   `ingest_socket_path` or `archive`. Both happen before the store opens. `open_store()` runs at line 191 and fails on a lifted store with the
+   fence refusal; the consume worker starts only at line 224, in the branch that `!intake` skips
+   (line 217). So the old image cannot start a consume worker on the live roots with `$REH_CONF`
+   through either path: the open fails first on a lifted copy, and the flag skips the worker on any
+   copy. This is read from the source, with `git show fda2812:...`. The old image with `--no-intake`
+   has not been run on any store: the measured refusals (below) ran it without the flag. What
+   remains unproven is the exact text and exit status of this open on the live store's own lift;
+   this step records them.
+
+   Run the step only when the configuration holds none of those keys, that is, when this command
+   prints nothing:
+
+   ```bash
+   grep -nE '^(\[\[consume|consume|\[\[syslog|syslog|rpc_tcp_address|ingest_socket_path|\[archive|archive)' "$REH_CONF"
+   ```
+
+   If it prints a line, do not run the old image. Read `$RECORD/rehearsal-old-refusal.log` after the
+   run: an argument error there (the usage line) means the installed old image does not accept the
+   flag, and the step proves nothing about the fence. A refusal changes nothing in the copy.
 
    ```bash
    systemd-run --user --scope --quiet --unit=sparrow-rehearsal-old -- \
@@ -1108,11 +1151,11 @@ with `echo proceed > FIFO`.
 6. Remove the rehearsal copy after listing it, as one command on one exact path:
 
    ```bash
-   ls -ld /SPARROW/store.rehearsal-b420503
+   ls -ld /SPARROW/store.rehearsal-a50820e
    ```
 
    ```bash
-   rm -r -- /SPARROW/store.rehearsal-b420503
+   rm -r -- /SPARROW/store.rehearsal-a50820e
    ```
 
 7. Answer the prompt: `proceed` only if every check passed, which switches the links and starts
@@ -1177,7 +1220,7 @@ Record `status > "$RECORD/after.json"` and compare with `before.json`:
 
 Every figure below was measured on a scratch store under a user scope with the live unit's
 limits (`MemoryHigh=2G`, `MemoryMax=4G`, `CPUQuota=100%`, `IOWeight=20`, `nice 10`, read back from
-the cgroup) with the image `sparrowd-schema71-b420503`, unless a line
+the cgroup) with the image `sparrowd-schema71-b420503`, built before the #394 fix and not the image `a50820e`, which differs from it in more than that fix, unless a line
 says otherwise. Logs are under `.stage/372-measure/logs/` in the main checkout. Nothing was
 measured at live size: the live store is about 39 GB and holds an unknown number of artifacts, and
 the pages of the migration number `ceil(artifacts / 1024)`, or more where 64 MiB cuts a page. The
@@ -1247,7 +1290,7 @@ The kept copy and the way back, on the 4.32 GB store (`23-keepcopy.log`, `24-int
   writer fence disagree" }` and exited with status 1, on the 4.32 GB store lifted to `/387`
   (`39-old-on-lifted-refusal.log`) and on the 8,160-artifact store lifted to `/387`
   (`170-A-old-refuses-lifted.log`). The rehearsal's step 5 runs the old image with `--no-intake`,
-  which was not measured.
+  which was not measured; the source evidence is in step 5.
 
 Stop time, SIGINT, on stores of 0.16 to 4.32 GB on disk after the same ingest, 6 artifacts of
 5,000 records. The runs of logs `104`, `124`, `133`, `143` and `163` (`stop_timed.sh`) had a
@@ -1358,16 +1401,19 @@ where the format fence commits.
   chain. Then check `status` against `before.json` and start `sparrow-ship.timer`. Remove `COPY` by the rule
   below once the old image has served a day.
 - Opened. The old image refuses the store, so the way back is the copy, which holds the store as it
-  was when the daemon stopped:
+  was when the daemon stopped. Write the runtime timeout drop-in again before the stop (the
+  commands under "Before the stop: the stop timeout, the quiesce and the watch"): the stop of the
+  new image runs under the unit's own `TimeoutStopSec=120` otherwise.
 
   ```bash
   systemctl --user stop sparrow-ship.timer sparrow.service     # SIGINT drain, up to TimeoutStopSec
-  systemctl --user show -p ActiveState --value sparrow.service  # inactive
-  ps -C sparrowd                                                # prints no process
-  mv -T -- /SPARROW/store /SPARROW/store.opened-by-b420503 \
-    && mv -T -- /SPARROW/store.before-b420503 /SPARROW/store \
+  test "$(systemctl --user show -p ActiveState --value sparrow.service)" = inactive \
+    && procs=$(ps -e -o comm=) \
+    && ! printf '%s\n' "$procs" | grep -q '^sparrowd' \
+    && mv -T -- /SPARROW/store /SPARROW/store.opened-by-a50820e \
+    && mv -T -- /SPARROW/store.before-a50820e /SPARROW/store \
     && test -d /SPARROW/store \
-    && test ! -e /SPARROW/store.before-b420503 \
+    && test ! -e /SPARROW/store.before-a50820e \
     && ln -sfn "$OLD" "$LIB/.sparrowd.next" \
     && mv -T -- "$LIB/.sparrowd.next" "$LIB/sparrowd" \
     && ln -sfn "$LIB/$OLD_CLI" ~/.local/bin/.sparrow.next \
@@ -1377,11 +1423,19 @@ where the format fence commits.
     && systemctl --user start sparrow.service
   ```
 
+  The chain begins with tests, and it stops there unless the unit's `ActiveState` is `inactive`,
+  the process list can be read, and no process whose name begins `sparrowd` is in it: a stop that is
+  still draining, a unit that never stopped, or a `ps` that fails moves nothing. The daemon runs as
+  the `sparrowd` link, so its name is `sparrowd`; a name cut to 15 characters from an image name
+  still begins `sparrowd`. If a test fails, wait for the stop to end, read `ActiveState` and
+  `ps -e -o pid,args`, and begin the chain again. A `sparrowd` process outside the unit that blocks
+  the guard is reported to the coordination session; the operator never kills it.
+
   The chain starts the daemon only when `/SPARROW/store` exists as the restored copy and both links
   name the old pair. A start on a missing store makes a new empty store with a new id, so when any
   command fails, start nothing. If the first `mv` fails, nothing moved: fix the cause and repeat. If
   the first succeeded and the second failed, `/SPARROW/store` is absent: put the opened store back
-  with `mv -T -- /SPARROW/store.opened-by-b420503 /SPARROW/store`, fix the cause, and begin the
+  with `mv -T -- /SPARROW/store.opened-by-a50820e /SPARROW/store`, fix the cause, and begin the
   chain again. If a link command failed after both moves, the store is in place: repeat the link
   commands from the chain, then the `reset-failed` and the start.
 
@@ -1390,7 +1444,7 @@ where the format fence commits.
   lacks everything the new image accepted between its start and the stop: the records and files it
   ingested, and the files its consume watches took and deleted. Count that loss before the
   swap (`live_records` in `after.json` less `before.json`, the start and stop times) and report it
-  with those figures; `/SPARROW/store.opened-by-b420503` still holds it, and the new image can open that
+  with those figures; `/SPARROW/store.opened-by-a50820e` still holds it, and the new image can open that
   directory later from a configuration that names it. Fixing forward on the new image is the
   other choice, and the way back is for a defect that forward cannot fix.
 
@@ -1401,22 +1455,28 @@ journal. The operator then removes it with one command on one exact path, typed 
 and after listing it:
 
 ```bash
-ls -ld /SPARROW/store.before-b420503
+ls -ld /SPARROW/store.before-a50820e
 ```
 
 ```bash
-rm -r -- /SPARROW/store.before-b420503
+rm -r -- /SPARROW/store.before-a50820e
 ```
 
 If the way back was taken, the copy is the store now, and the path to remove under the same rule,
 on the coordination session's word, is the new store the new image opened:
-`/SPARROW/store.opened-by-b420503`.
+`/SPARROW/store.opened-by-a50820e`.
 
 #### While the daemon is down
 
 The window runs from the unit stop to the first status answer: the drain (up to `TimeoutStopSec`), the copy,
 the rehearsal, the first open and its migrations' first page. The first status answer of the new image is not the
 end of the work; the index fills afterwards with the daemon serving.
+
+The window's length is unbounded until the rehearsal reads `N`. The hold waits with no timeout, so
+the daemon stays down for as long as the rehearsal and the answer take, and the migration at live
+size is not measured: the live artifact count `N` is unknown until the rehearsal reads it, and the
+only figures are scratch measurements at other sizes (see "What the measurement covers"). The
+notice states this and gives the length only after the rehearsal has read `N`.
 
 - Ingest socket (`ingest_socket_path`, the `sparrow-ingest` group) and the public TCP listener on port
   518 refuse connections. Every daemon that logs into Sparrow (`katamari-stored`, the Lillith daemons
@@ -1434,8 +1494,10 @@ end of the work; the index fills afterwards with the daemon serving.
 - No syslog listener is configured at the last recorded status, so no datagram is exposed; check
   `syslog_listeners` in `before.json`.
 
-Notice. Before: the window's start and its expected length (the parts listed under "What the measurement covers"; the live total is not measured), that the
-live daemon stops, that senders without a queue lose their output, that the switch is one-way once
+Notice. Before: the window's start; that its length is unbounded until the rehearsal reads `N`,
+because the hold has no timeout and the migration at live size is not measured (the parts listed
+under "What the measurement covers" are scratch figures, and the live total is not measured), with
+the length given when the rehearsal has read `N`; that the live daemon stops, that senders without a queue lose their output, that the switch is one-way once
 the store opens, and that a copy of the store is taken and kept. After: the first status answer's
 time, the image, `store_id`, that `payload` lookups read `pending` until the index migration
 completes (and `exact` after), that nothing needs a new client, and the day on which the copy goes.
