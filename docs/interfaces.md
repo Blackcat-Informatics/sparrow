@@ -76,6 +76,59 @@ source the producer names; the source is the item's lasting address in queries.
   split into parts of at most that many bytes, each imported as its own
   request, and then the manifest is imported.
 
+- the cost of the form sent (see below): an item sent as `jsonl` can be
+  refused above bounds that are not fixed byte limits, and it occupies ten to
+  fifty times its size.
+
+**What the store counts as disk use.** `linked_physical_bytes` counts the
+write-ahead log (WAL) files and the table files, not the memtables or caches.
+In-flight WAL, up to about 256 MiB, is part of it and falls after a memtable
+flush. Admission and the archive size trigger both use a figure that includes
+it, so a store can refuse ingest or start archiving on bytes that a flush
+returns. `status.physical_bytes` is the live figure and `pressure.linked_bytes`
+the figure of the last pressure pass. An empty store reads under 0.1 MB.
+
+**What an item costs.** The stored size depends on the record and the format,
+not on a fixed overhead. The table gives the settled figure after a restart,
+from one scratch measurement at main b420503 with a 20 GiB budget. The producers'
+own files, such as the mentation traces, are not measured. Read the factors as
+ranges to size from, not as the figure for any one producer.
+
+| Sent as | Input | Stored per raw byte |
+| --- | --- | --- |
+| `jsonl` | random base64 lines of about 3 KB | 9.9x to 13x |
+| `jsonl` | log-like records of about 170 B | 51x (about 8.7 KB per record) |
+| `opaque` | log text | 0.21x to 0.27x |
+| `opaque` | incompressible bytes | 1.03x to 1.08x |
+
+Right after an ingest the figure is higher because of the WAL: 2.7 MB of random
+`jsonl` read 44 times its size before the restart. Small records are the worst
+case for `jsonl`.
+
+**Refused ingests.** Two `jsonl` ingests ended `RESOURCE_LIMIT`. A single
+100 MB random-text file ended after 452 s with "atomic source context update
+exceeds metadata admission". A 10 MB file of 58,945 log-like records ended after
+635 s with "RDF write staging exceeds 64 MiB" and left about 817 MB on disk. The
+same bytes sent as `opaque` ingested 100 MB in 9 s. A refused ingest can leave
+bytes counted against the budget, so one refusal can raise the pressure that
+refuses the next. How long that residue stays and whether a flush and compaction
+reclaim it are not measured; issue #389 is open on it.
+
+**Choosing the form.** An item sent `opaque` costs about its size and is found
+by payload id only (`payloadLookup`); there is no search by value. An item sent
+as `jsonl` is searchable by value (`values_search`, `records`) and costs ten to
+fifty times its size. The measurements support this guidance and no more:
+
+- Send `jsonl` in bounded chunks of whole lines. Ten files of 10 MB with lines
+  of about 3 KB (112 MB in all) ingested. A single 100 MB file and a 10 MB file
+  of tiny records did not. No safe chunk size is measured for small records, and
+  100 MB of log-like `jsonl` was not run.
+- Send large files, and any file whose records need no search by value, as
+  `opaque`. A file above 16 MiB goes through the staged import as one artifact
+  with one payload id.
+- Back off on `STORAGE_PRESSURE` and `RESOURCE_LIMIT`; do not retry either at a
+  fixed interval.
+
 **Finding a sent item.** The one key for a file or an opaque item is its payload
 id: `blake3:` and 64 lower-case hex digits, the BLAKE3 hash of the artifact's exact
 bytes. A SHA-256 is not an index key. Sparrow computes the payload id of every
