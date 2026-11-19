@@ -839,21 +839,30 @@ Check what the window needs.
 - No scratch or rehearsal daemon from an earlier session runs. The script's check after the stop of
   `sparrow.service` (`deploy/user-unit-upgrade.sh`, the `ps -e -o comm=` list and the glob over it)
   stops the switch when any process whose name begins `sparrowd` is listed, and by then the live
-  daemon is already stopped. Only an `is-active` result of 3 (inactive) or 4 (unit not found) passes;
-  active (0), failed, or any other result stops here:
+  daemon is already stopped. The process list alone cannot be the gate before the stop, because the
+  live daemon runs and is listed. The gate here reads each unit's `ActiveState`, and only `inactive`
+  or `failed` passes: `active`, `activating`, `deactivating`, `reloading`, an empty value and a
+  failing `systemctl` all stop. `is-active` is not used, because its exit 3 also covers a failed
+  unit and, from systemd's source, a unit that is still activating or deactivating, whose `sparrowd`
+  may still run. `show` of a unit that does not exist prints `inactive` and exits 0 (seen on this
+  host with `LoadState=not-found`), so an absent unit passes, as it should:
 
   ```bash
-  idle=1
+  ok=1
   for u in sparrow-deploytest.service sparrow-rehearsal.scope sparrow-rehearsal-old.scope; do
-      systemctl --user is-active --quiet "$u"; rc=$?
-      [[ $rc == 3 || $rc == 4 ]] || { idle=0; printf '%s: is-active exit %s, stop\n' "$u" "$rc"; }
+      v=$(systemctl --user show -p ActiveState --value "$u") \
+          || { ok=0; printf '%s: systemctl show failed, stop\n' "$u"; continue; }
+      [[ $v == inactive || $v == failed ]] \
+          || { ok=0; printf '%s: ActiveState %s, stop\n' "$u" "${v:-empty}"; }
   done
-  ((idle))
+  ((ok))
   ```
 
-  The loop prints a line for each unit that is not inactive or absent, and the last line exits 0
-  only when all three pass. A `sparrowd` started outside a unit does not show here; read
-  `ps -e -ww -o pid,user,comm,args` and expect one `sparrowd` line, the live daemon.
+  The loop prints a line for each unit that does not pass, and the last line exits 0 only when all
+  three pass. It covers those three names. A `sparrowd` started outside them does not show there:
+  read `ps -e -ww -o pid,user,comm,args` and expect one `sparrowd` line, the live daemon, whose pid is
+  `MainPID` of `sparrow.service`. The listing is read by the operator; the script's own check after
+  the stop is the one that fails closed on a process.
 - The recorded `text_analyzer` and `rdf_profile` stay the same after the switch. The new image
   reads the lexicon bundle that `text_lexicon_dir` names; the PurRDF revision in
   `registry/compatibility.toml` is unchanged since `fda2812`, so the bundle built with the image
@@ -1559,10 +1568,10 @@ is retired once it is due and archived.
 Check the mount first. The worker refuses a directory that is on the root filesystem's device or
 on a local filesystem of the root's type, and never creates `dir`
 (`crates/sparrow-server/src/archive.rs`, `require_own_mount` and `archive_segment`). The share is
-`/net/synology/archives` (nfs4, source `192.168.1.1:/volume1/archives`); the directory `dir` names
+`/net/synology/archives` (nfs4, source `192.168.1.1:/volume1/archives`, mounted `hard`: `findmnt -no OPTIONS -T "$SHARE"` shows it, so a lost server hangs a call and the stall path applies rather than an error); the directory `dir` names
 lies inside it, so the share's mount point is never `dir` itself. Each command chain below ends in
 an exit status and stops at its first failure, and a lookup that errors stops the chain: no result
-is read from a pipe or from text that an error could leave empty. Run the chains in bash.
+is read from a pipe or from text that an error could leave empty. Run the chains in bash. The mount, directory and write blocks share `SHARE`, `ARCH` and `my_uid`, so run them in one shell.
 
 ```bash
 SHARE=/net/synology/archives
@@ -1596,8 +1605,8 @@ mkdir -m 0700 -- "$ARCH"
 The owner is the account that runs the daemon, so the command runs in that account's shell, not
 under `sudo`, and not as root (a root-squashed export would store it as `nobody`). The mode is 0700
 because the worker needs only its own account: it lists `dir`, creates `STORE_ID` and
-`<store_id>/` in it and writes below, and the code sets no mode or ownership anywhere
-(files take the account's umask, `write_synced`). The account must hold read, write and search on
+`<store_id>/` in it and writes below, and the archive code sets no mode or ownership
+(files take the account's umask, `write_synced`; the data directory's mode is set elsewhere, in `config.rs`). The account must hold read, write and search on
 the directory, which 0700 gives. `sparrow-archive verify` run by the same account reads it. Another
 account that must read the archive needs a mode and a group chosen for that reader, which the code does not
 require. `mkdir` without `-p` fails when the directory exists, so a second run changes nothing; no other change is made to the share.
@@ -1642,7 +1651,7 @@ The chain exits 0 only when the write, the flush to the server (`sync` of the on
 worker syncs each file it writes), the read-back and the owner comparison all succeed. A failure is
 one of these. `Permission denied` (EACCES) or `Operation not permitted` (EPERM) at the write: the
 mode or owner of `$ARCH` is wrong, or the export squashes this account. A file that is created and
-stored as `nobody` or uid 65534: root squash or all-squash on the export, or an identity mapping that
+stored as `nobody` or uid 65534: root squash or all-squash on the export (an all-squash export can map to another uid; the owner comparison catches any uid but this account's), or an identity mapping that
 does not map this account (`stat -c '%U %u'` shows the owner the server stored; the chain's
 comparison fails on it). A differing read-back: the client cache or the export. The server's export
 options are not visible from the client, and the exported `sync` option that
@@ -1730,8 +1739,10 @@ repeated inside the segment. Every failure leaves the watermark where it was
 journals `sparrowd: archive pass failed; the watermark did not move: ...`, and the
 worker tries again after `check_secs`. A call that hangs instead of failing blocks the worker's
 thread inside the system call: the watchdog journals `sparrowd: archive stalled step=...` every
-`stall_warn_secs`, and a step that ran `io_timeout_secs` makes the pass fail as `ARCHIVE_OVERRAN`
-without a commit once the call returns. The daemon keeps serving in each case. A segment file
+`stall_warn_secs`, and a step that ran `io_timeout_secs` marks the pass as overrun, which is checked only after the
+write and the read-back succeed (`archive_segment`). A slow call that returns an error fails the pass as `ARCHIVE_IO`, and a later
+failing step fails with its own code (`ARCHIVE_IO` or `ARCHIVE_VERIFY`); `ARCHIVE_OVERRAN` is the result only
+when every step succeeded. The segment is not committed in any of these cases. The daemon keeps serving in each case. A segment file
 that a failed pass left in `<store_id>/` is kept and read back on the next pass, never overwritten
 (`write_segment`); one that differs from what the worker prepared fails as
 `ARCHIVE_VERIFY` and the operator moves it aside.
@@ -1743,7 +1754,7 @@ watermark. Entries the watermark already covered stay retirable while the mount 
 path reads the mount, so an archived entry is retired when it is due. The code reading does not
 show these: whether a write that the kernel acknowledged before the mount vanished reached the NAS
 (the worker syncs each file and its directory, but the export's `sync` option is not visible
-from the client); what the kernel returns for a given mount option set (`hard` or `soft`); and any
+from the client); how long a `hard` mount holds a call before an error, if one ever comes (`timeo` and `retrans` are set, but no run was made); and any
 run of the worker against a lost mount on the live daemon, where the worker is not running.
 
 The way back. If the new unit failed before `sparrowd: store_open_ms`, restore `$CONF.before-archive`
