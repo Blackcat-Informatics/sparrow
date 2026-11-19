@@ -21,7 +21,7 @@ fn catalog_entry(
     admission.entry(bytes.len())?;
     budget
         .admit_bytes((id.len() + bytes.len()) as u64)
-        .map_err(|error| Error::new(error.code, error.message.clone()))
+        .map_err(|error| Error::clone(&error))
 }
 
 fn artifact_catalog(
@@ -50,12 +50,12 @@ fn artifact_catalog(
     })?;
     budget
         .admit_bytes((id.len() + bytes.len()) as u64)
-        .map_err(|error| Error::new(error.code, error.message.clone()))?;
+        .map_err(|error| Error::clone(&error))?;
     let header = artifact_rdf::catalog(&writer.db, id, &bytes, admission.remaining)?;
     if header.record_count == 0 {
         budget
             .request(row_bound("empty-time:"), false)
-            .map_err(|error| Error::new(error.code, error.message.clone()))?;
+            .map_err(|error| Error::clone(&error))?;
         if writer
             .db
             .get_pinned(crate::storage::recordless::key_parts(
@@ -478,7 +478,7 @@ impl Store {
                     budget
                         .request(pin_maximum as u64, true)
                         .and_then(|_| budget.reserve((pin_maximum as u64).saturating_mul(64)))
-                        .map_err(|error| Error::new(error.code, error.message.clone()))
+                        .map_err(|error| Error::clone(&error))
                 },
                 Some(pin_maximum),
                 Some(&mut remaining),

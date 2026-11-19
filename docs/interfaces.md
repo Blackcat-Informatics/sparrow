@@ -105,42 +105,38 @@ Right after an ingest the figure is higher because of the WAL: 2.7 MB of random
 case for `jsonl`. Every measured ingest used the CLI `ingest`, which always goes
 through the staged import; the inline path under 16 MiB is not measured.
 
-**Refused ingests.** Two measured ingests ended `RESOURCE_LIMIT`. A
-single 100 MB random-text file (33,015 lines) ended after 935 s with "atomic
-source context update exceeds metadata admission". A 10 MB file of 58,945
-log-like records ended after 635 s with "RDF write staging exceeds 64 MiB"; the
-store went from 138 MB to 817 MB, so the refusal added about 679 MB. Sent as
-`opaque`, 100 MB of random bytes ingested in 9 s; no log sends the refused files
-as `opaque`. The smallest triggers measured are 32,769 records of `{"a":N}` (382
-KB), refused after 125 s with the source-context message, and 60,000 such
-records (840 KB), refused after 204 s for RDF write staging.
+**Refused ingests.** Two bounds on a `jsonl` or `log` artifact refuse it with a
+non-retryable `RESOURCE_LIMIT` that names the bound: more than 32,768 records in one
+publication ("atomic source context update exceeds metadata admission" for an inline
+ingest, "import of more than 32768 records in one publication exceeds metadata
+admission" for a staged import), and RDF write staging over 64 MiB. A staged import
+refuses the record bound while its layout is prepared, before any record is prepared,
+so that refusal costs the layout read and leaves only the raw staging and layout pages
+that `importCancel` releases. An inline ingest, an event batch and the RDF staging
+bound refuse after the records are prepared. Sent as `opaque`, 100 MB of random bytes
+ingested in 9 s; no log sends the refused files as `opaque`.
 
-A refused file ingest leaves its prepared records. Preparation commits in
-checkpoints of at most 256 records or 256 KiB of source, each a synced write, so
-the 100 MB file with lines of about 3 KB commits about 85 records at a time.
-Both refusals come after every record is prepared, so all of the residue is
-preparation state. The CLI `ingest` cancels on the failure, and every measured
-ingest used it. A refused SDK `ingest` or `ingest_with_durability` above 16 MiB
-does not cancel: it keeps its prepared records and its journal slot until the
-2-day retry window ends. Reclaim removes one prepared record per pass, at
-between about 14 and 147 records per second in the logged idle windows. Reclaim is starved while an ingest runs: one 935 s refusal
-drained about 2,000 records. Space returns only after tombstone compaction.
+A 10 MB file of 58,945 log-like records ended after 635 s with "RDF write staging
+exceeds 64 MiB"; the store went from 138 MB to 817 MB, so the refusal added about 679
+MB. The smallest trigger measured for RDF write staging is 60,000 records of
+`{"a":N}` (840 KB), refused after 204 s.
 
-Repeated refusals can drive `physical_bytes` to `STORAGE_PRESSURE`. Five
-back-to-back refusals of 32,769 records took it to 152, 324, 535, 436 and 642
-MB. Refusals of two different 100 MB files took it from 713 MB to 2.54 GB, and
-the next ingest answered `STORAGE_PRESSURE` at 3.13 GB against a 3.22 GB budget.
-The lockout is temporary. A one-record ingest succeeded at 3.15 GB, 13 s after
-the last sample that read pressure phase `requested`; a sample in the same
-second read `ready`. A 2.7 MB file was then refused `STORAGE_PRESSURE`, and
-native compaction later brought physical bytes from 3.45 GB to 2.55 GB. Not
-measured: the 16-journal limit (`MAX_IMPORTS`), where an unreclaimed refusal
-holds its slot (no log counts the journals held), the exact staging threshold,
-and reclaim to zero after the 60,000-record refusal. At about 0.9 GB per 100 MB
-refusal, the live status of 2026-11-17 (38.94 GB used of a 53.69 GB budget,
-about 14.7 GB of headroom) would reach the ceiling after about 16 refusals (14.7
-GB divided by 0.9 GB, before the reserve and the batch estimate); that is an
-estimate, not a measurement. Issue #389 tracks the fault.
+A staged import refused after preparation leaves its prepared records. Preparation
+commits in checkpoints of at most 256 records or 256 KiB of source, each a synced
+write, so lines of about 3 KB commit about 85 records at a time. The CLI `ingest`
+cancels on the failure. A refused SDK `ingest` or `ingest_with_durability` above 16 MiB
+does not cancel: it keeps its prepared records and its journal slot until the 2-day
+retry window ends. Reclaim removes one prepared record per pass, at between about 14
+and 147 records per second in the logged idle windows, and is starved while an ingest
+runs. Space returns only after tombstone compaction.
+
+Repeated refusals that arrive after preparation, such as RDF write staging, leave
+prepared records until reclaim removes them and can drive `physical_bytes` to
+`STORAGE_PRESSURE`; the lockout clears when compaction returns space. No log measures a
+lockout from RDF staging refusals. Not measured: the 16-journal limit (`MAX_IMPORTS`),
+where an unreclaimed refusal holds its slot (no log counts the journals held), the exact
+staging threshold, and reclaim to zero after the 60,000-record refusal. Issue #389
+tracks the fault.
 
 **Choosing the form.** An item sent `opaque` costs at most about its size (0.21x to
 0.27x for log text, 1.03x to 1.08x for random bytes) and is found by payload id only
@@ -150,16 +146,17 @@ its size. The measurements support this guidance and no more:
 
 - Send `jsonl` in bounded chunks of whole lines, each of at most 32,768 records:
   one publication holds at most that many distinct records, and a larger
-  artifact is refused with `RESOURCE_LIMIT` (the RDF staging message may come
-  first, as at 60,000 records). Ten files of 10 MB with lines of about 3 KB (100
+  artifact is refused with the non-retryable `RESOURCE_LIMIT` (the RDF staging message
+  may come first, as at 60,000 records). Ten files of 10 MB with lines of about 3 KB (100
   MB; 112.7 MB with the two earlier files) ingested. A single 100 MB file and a
   10 MB file of tiny records did not. No safe chunk size is measured for small
   records, and 100 MB of log-like `jsonl` was not run.
 - Send large files, and any file whose records need no search by value, as
   `opaque`. A file between 16 MiB and the import bound goes through the staged
   import as one artifact with one payload id; a larger one is cut into parts.
-- Back off on `STORAGE_PRESSURE` and `RESOURCE_LIMIT`; do not retry either at a
-  fixed interval.
+- Back off on `STORAGE_PRESSURE` and on a `RESOURCE_LIMIT` marked retryable; do not
+  retry either at a fixed interval. A `RESOURCE_LIMIT` that is not retryable names a
+  bound on the input: cut the input, because the same bytes fail the same way.
 
 **Finding a sent item.** The one key for a file or an opaque item is its payload
 id: `blake3:` and 64 lower-case hex digits, the BLAKE3 hash of the artifact's exact
@@ -885,7 +882,7 @@ not split. A client learns the bound before it declares from
 schema version changes and no stored format changes; an older client reads the
 refusal as an ordinary non-retryable domain error. An artifact of many small
 records can still need more chunks or record identities than its size implies.
-Layout preparation then refuses it with `RESOURCE_LIMIT` when its row would
+Layout preparation then refuses it with a non-retryable `RESOURCE_LIMIT` when its row would
 exceed the retirement pass, and publication
 checks again for layouts prepared earlier and refuses record rows that would
 exceed the batch. An inline `ingest` is held to the same retirement check.
@@ -897,7 +894,7 @@ bound.
 An intake stages its RDF in memory before commit: at most 32 MiB of new dictionary
 terms and 64 MiB of anticipated writes per batch (the RDF index rows and manifest, plus
 the batch's other pending writes, so earlier records in the batch count). A graph that
-would pass either is refused with `RESOURCE_LIMIT` ("RDF dictionary staging exceeds 32
+would pass either is refused with the non-retryable `RESOURCE_LIMIT` ("RDF dictionary staging exceeds 32
 MiB", "RDF write staging exceeds 64 MiB"). The refusal is counted where the write
 raises it, so every intake path that stages through a counted write is covered:
 inline `ingest`, record batches and the import publication's artifact graph. A
@@ -1007,7 +1004,7 @@ additive, with no schema version change: `maxImportBytes @11`, `rawRecordBytes @
 (the longest record a layout keeps whole), and the joint retirement bound
 `retireRowBudget @13`, `retireChunkCharge @14` and `retireRecordCharge @15`. A staged
 artifact of `chunks` chunks (the sum over its records of the record length over
-65536, rounded up) and `records` records is refused `RESOURCE_LIMIT` at layout
+65536, rounded up) and `records` records is refused with the non-retryable `RESOURCE_LIMIT` at layout
 exactly when `retireChunkCharge * chunks + retireRecordCharge * records` exceeds
 `retireRowBudget`. Each value comes from the store's own properties
 (`max_raw_record_bytes`, `retire_row_budget`, `retire_chunk_charge`,
@@ -3798,7 +3795,7 @@ which is not retryable, and the client quarantines it; an operator who raises `m
 can replay the quarantine file. The size of the joined write, which includes source context
 and authority metadata, is judged at write time against the same whole data budget and
 answers the same non-retryable code. The `ingest` call answers an inline payload over 16 MiB
-with `INVALID_ARGUMENT` too. Other callers keep `RESOURCE_LIMIT`. An input-only refusal
+with `INVALID_ARGUMENT` too. Other callers keep the code `RESOURCE_LIMIT`, answered non-retryable (#397). An input-only refusal
 (record count, sequence count) is decided before the source mapping is bound, so a refused
 batch leaves no mapping behind. A batch refused after the mapping is bound (at the write-size
 checks, a record-level check, or when the write is applied) can still leave the mapping of its
@@ -4340,7 +4337,9 @@ while an attempt advances the checkpoint; the held-connection paths return it wi
 ID answers `IMPORT_EXPIRED` until reclamation has removed the journal; the caller then
 begins again under the same ID, with bounded backoff. An input-bound refusal is not resent:
 `RESOURCE_LIMIT` for more than 32,768 records in one publication or for RDF write staging
-over 64 MiB fails the same way on the same bytes, so the caller cuts the input.
+over 64 MiB fails the same way on the same bytes, so the daemon answers it non-retryable and the
+caller cuts the input. The 32,768-record bound is checked while the layout is prepared, before
+any record is prepared.
 
 `sparrow_client` is the producer interface. It depends on no `sparrow-core`, and a crate
 outside this workspace depends on it by git revision (`publish = false`). It builds with
@@ -4433,7 +4432,7 @@ or semantic engine. The public surface includes:
   every batch before it is sent, so the failure ends delivery and the batch is saved by the
   terminal save under the code `CLIENT_REFUSED`, not by the per-batch route above. The
   daemon storing a refused batch as a malformed record with its reason is the preferred form
-  and is not yet implemented (issue 216). A busy refusal (`RESOURCE_LIMIT`) is never quarantined:
+  and is not yet implemented (issue 216). A busy refusal (a retryable `RESOURCE_LIMIT`) is never quarantined:
   the client holds the batch, bounded by the queue limits, with overflow counted
   as `Full`. A full producer registry is not a refusal any more (#215): the daemon
   stores the batch and counts the lost gap evidence, so the client no longer holds
@@ -4629,7 +4628,7 @@ refusal and every refusal of an older daemon.
 | `CONFLICT` | Retry identity reuse, revision mismatch, or conflicting source generation. |
 | `EVIDENCE_INCOMPLETE` | A `require_complete_index` read selected evidence whose interpretation is permanently unknown or failed at ingest (a failed projection, unknown captured diagnostics, a recordless artifact under a diagnostic filter, a reclaimed parent's unknown origin). Not retryable; no online migration causes it. |
 | `RESULT_EXPIRED` | Bounded snapshot/result lease ended. |
-| `RESOURCE_LIMIT` / `RESULT_TOO_LARGE` | Host admission/output refusal. Native certified governor outcomes retain their read receipts. |
+| `RESOURCE_LIMIT` / `RESULT_TOO_LARGE` | Host admission/output refusal. `RESOURCE_LIMIT` is retryable when transient occupancy caused it (a full import journal table, a busy admission queue, a held read slot) and not retryable when a bound on the input itself caused it (more than 32,768 records in one publication, RDF write or dictionary staging over its cap, an input over the record, batch or whole-budget bound); the wire `retryable` flag says which and the message names the bound. Native certified governor outcomes retain their read receipts. |
 | `STORAGE_PRESSURE` | Insufficient safe write capacity, with retry state. |
 | `STORAGE_FAILURE` | Typed I/O, integrity, or commit failure; retryability follows the actual cause. |
 | `ARCHIVE_WATERMARK` | Publication at or behind the archive watermark. Not retryable as sent. |

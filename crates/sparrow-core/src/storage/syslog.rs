@@ -659,10 +659,7 @@ impl Packet<'_> {
 
 pub(super) fn capture(bytes: &[u8], start: u64) -> Result<SyslogSnapshot, Error> {
     if bytes.len() > SYSLOG_MESSAGE_BYTES {
-        return Err(Error::new(
-            "RESOURCE_LIMIT",
-            "syslog packet exceeds 65536 raw bytes",
-        ));
+        return Err(Error::input_bound("syslog packet exceeds 65536 raw bytes"));
     }
     let parsed = parse_packet(bytes, start);
     Ok(parsed.unwrap_or_else(|diagnostic| SyslogSnapshot {

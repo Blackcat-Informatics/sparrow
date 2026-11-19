@@ -34,7 +34,7 @@ pub(crate) use scope::{ReadSlot, ReadSlots};
 use sparse::RowCursor;
 pub use text_relations::{
     STORED_TEXT_CORPUS_PROFILE, STORED_TEXT_RELATION_PROFILE, SparqlTextCapture,
-    SparqlTextCoverage, SparqlTextRelations,
+    SparqlTextCoverage, SparqlTextRelations, TEXT_RELATION_IRI_BYTES,
 };
 
 /// Host source law: bounded borrowed index entries and admitted encoded catalog bodies.
@@ -227,8 +227,7 @@ fn global(ordinal: u64) -> Result<GlobalTermId, Error> {
 // Check the caller's borrowed allocation before its native conversion can clone it.
 fn input_capacity(value: &TermValue, depth: usize, remaining: &mut u64) -> Result<(), Error> {
     if depth > 16 {
-        return Err(Error::new(
-            "RESOURCE_LIMIT",
+        return Err(Error::input_bound(
             "RDF lookup input exceeds admitted depth",
         ));
     }
@@ -248,10 +247,7 @@ fn input_capacity(value: &TermValue, depth: usize, remaining: &mut u64) -> Resul
     };
     let bytes = (strings as u64).saturating_add(size_of::<TermValue>() as u64);
     *remaining = remaining.checked_sub(bytes).ok_or_else(|| {
-        Error::new(
-            "RESOURCE_LIMIT",
-            "RDF lookup input exceeds 64 KiB allocation admission",
-        )
+        Error::input_bound("RDF lookup input exceeds 64 KiB allocation admission")
     })?;
     if let TermValue::Triple { s, p, o } = value {
         for child in [&**s, &**p, &**o] {
@@ -1511,7 +1507,7 @@ impl Store {
                                 .and_then(|_| {
                                     view.budget.reserve((maximum as u64).saturating_mul(64))
                                 })
-                                .map_err(|error| Error::new(error.code, error.message.clone()))
+                                .map_err(|error| Error::clone(&error))
                         },
                         Some(maximum),
                         None,

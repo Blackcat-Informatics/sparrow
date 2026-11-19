@@ -62,7 +62,7 @@ pub(super) async fn query(
                     now,
                     &cancellation,
                 )
-                .map_err(|error| Error::new(error.code, error.message.clone()))
+                .map_err(|error| Error::clone(&error))
         })
         .await;
     sparql::deliver(results.get().init_result(), reply);

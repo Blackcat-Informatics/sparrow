@@ -280,7 +280,7 @@ pub struct DeliveryStats {
     /// Last transient failure, cleared when a batch is acknowledged.
     pub last_transient_failure: Option<Arc<Error>>,
     /// Admitted events whose batch the daemon permanently refused (a non-retryable
-    /// `INVALID_ARGUMENT` or `CONFLICT`, or a batch the client itself cannot send): an answer
+    /// `INVALID_ARGUMENT`, `CONFLICT` or `RESOURCE_LIMIT`, or a batch the client itself cannot send): an answer
     /// retrying the same batch can never change. Their bytes are in quarantine files, not
     /// lost. They kept their sequence; the daemon sees a gap only if it later accepts a
     /// higher sequence of an instance it already recorded, so this counter and the fence are
@@ -1213,12 +1213,14 @@ async fn run(shared: &Shared) -> Result<(), Error> {
 }
 
 /// Whether this batch can never be accepted, as opposed to the daemon being busy. The
-/// daemon marks a busy refusal (`RESOURCE_LIMIT`) retryable, and that batch is held. A full
+/// daemon marks a busy refusal (a retryable `RESOURCE_LIMIT`) retryable, and that batch is held.
+/// A `RESOURCE_LIMIT` the daemon marks non-retryable is a bound on the batch itself (#397), so
+/// it is quarantined like `INVALID_ARGUMENT`. A full
 /// producer registry is no longer a refusal: the daemon stores the batch and counts the lost
 /// gap evidence (#215), and a source past the 1024-mapping ceiling is stored without a time
 /// mapping (#227). An over-bound batch is answered `INVALID_ARGUMENT` and quarantined. Only an
 /// older daemon still answers these with a retryable `RESOURCE_LIMIT`, which stays held as
-/// before: the client cannot tell it from a busy daemon, and held bytes are never lost. A
+/// before: the flag is the only signal, and held bytes are never lost. A
 /// non-retryable `INVALID_ARGUMENT` or `CONFLICT` (for example producer sequences that overlap
 /// accepted positions, or a source time mapping that differs) is about this batch alone: its
 /// bytes go to a quarantine file and later events proceed. The client's own
@@ -1235,7 +1237,10 @@ fn permanent_refusal(error: &Error) -> bool {
             code,
             retryable: false,
             ..
-        } => code == "INVALID_ARGUMENT" || code == "CONFLICT",
+        } => matches!(
+            code.as_str(),
+            "INVALID_ARGUMENT" | "CONFLICT" | "RESOURCE_LIMIT"
+        ),
         Error::InvalidArgument(_) => true,
         _ => false,
     }
@@ -1806,6 +1811,22 @@ mod tests {
         assert_eq!(source.raw_os_error(), io.raw_os_error());
         assert!(io.raw_os_error().is_some());
         assert_eq!(shared.state.lock().unwrap().quarantine_failures, 1);
+    }
+
+    /// INVARIANT (#397): a `RESOURCE_LIMIT` the daemon marks non-retryable is a bound on this
+    /// batch and quarantines it; one it marks retryable is occupancy and is held, never
+    /// quarantined.
+    #[test]
+    fn a_resource_limit_quarantines_only_when_the_daemon_marks_it_non_retryable() {
+        for (retryable, quarantined) in [(false, true), (true, false)] {
+            let refusal = Error::Domain {
+                code: "RESOURCE_LIMIT".into(),
+                message: "bound".into(),
+                retryable,
+                class: crate::FailureClass::Unclassified,
+            };
+            assert_eq!(permanent_refusal(&refusal), quarantined, "{retryable}");
+        }
     }
 
     /// INVARIANT: the client's own refusal is classed permanent and `save` writes it under the

@@ -6,8 +6,10 @@
 /// Maximum UTF-8 path bytes admitted by JSON key/value discovery.
 pub const JSON_QUERY_PATH_BYTES: usize = 64 * 1024;
 
-pub(crate) const RECORD_QUERY_FIELDS_MAX: usize = 32;
-pub(crate) const RECORD_QUERY_TEXT_BYTES: usize = 65536;
+/// Most field constraints one record query carries.
+pub const RECORD_QUERY_FIELDS_MAX: usize = 32;
+/// Most UTF-8 bytes of text one record query carries.
+pub const RECORD_QUERY_TEXT_BYTES: usize = 65536;
 pub(crate) const RECORD_QUERY_FIELD_BYTES: usize = 256 * 1024;
 
 /// Explicit scope shared by JSON discovery operations.
@@ -373,8 +375,7 @@ impl RecordQuery {
                 .as_ref()
                 .is_some_and(|text| text.len() > RECORD_QUERY_TEXT_BYTES)
         {
-            return Err(crate::Error::new(
-                "RESOURCE_LIMIT",
+            return Err(crate::Error::input_bound(
                 "record query permits at most 32 field constraints and 64 KiB text",
             ));
         }
@@ -406,8 +407,7 @@ impl RecordQuery {
             }
         }
         if bytes > RECORD_QUERY_FIELD_BYTES {
-            return Err(crate::Error::new(
-                "RESOURCE_LIMIT",
+            return Err(crate::Error::input_bound(
                 "field query exceeds 256 KiB compiled input",
             ));
         }

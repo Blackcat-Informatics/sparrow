@@ -574,10 +574,8 @@ impl Store {
                         code = error.code,
                         "archive held: entry cannot be encoded; it is not archived and not deleted"
                     );
-                    return Err(Error::new(
-                        error.code,
-                        format!("archive cannot encode {first}: {}", error.message),
-                    ));
+                    let message = format!("archive cannot encode {first}: {}", error.message);
+                    return Err(error.with_message(message));
                 }
             }
         }

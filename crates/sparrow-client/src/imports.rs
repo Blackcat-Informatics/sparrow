@@ -186,8 +186,10 @@ fn resumable(cancel: &Error) -> bool {
 }
 
 /// Whether an upload error asks the caller to hold and retry: the free-space floor or a
-/// restart refusal, or a lost connection. `RESOURCE_LIMIT` is no hold: it is also how the
-/// daemon refuses an input bound.
+/// restart refusal, or a lost connection. The code decides only whether the staged journal
+/// is cancelled, which frees its import slot (the resource an occupancy refusal may concern);
+/// the caller receives the daemon's refusal unchanged, flag included, and retries from its
+/// own source.
 fn is_hold(error: &Error) -> bool {
     match error {
         Error::Domain { code, .. } => matches!(code.as_str(), "STORAGE_PRESSURE" | "SHUTTING_DOWN"),

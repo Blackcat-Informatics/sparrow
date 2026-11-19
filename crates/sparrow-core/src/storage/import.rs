@@ -500,10 +500,10 @@ impl Writer {
             )));
         }
         if byte_length > self.config.disk_budget - self.config.maintenance_reserve {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                "declared input exceeds the entire available disk budget",
-            ));
+            return Err(Error::input_bound(format!(
+                "declared input exceeds the entire available disk budget of {} bytes",
+                self.config.disk_budget - self.config.maintenance_reserve
+            )));
         }
         Ok(())
     }
@@ -515,12 +515,9 @@ impl Writer {
         if super::manifest_retire::envelope_charge(chunks, records, share.limits.max_payload_refs)
             > share.envelope_budget()
         {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                format!(
-                    "an artifact of {chunks} chunks and {records} records exceeds what one retirement pass can read; split the input and import the parts"
-                ),
-            ));
+            return Err(Error::input_bound(format!(
+                "an artifact of {chunks} chunks and {records} records exceeds what one retirement pass can read; split the input and import the parts"
+            )));
         }
         Ok(())
     }
@@ -878,8 +875,7 @@ impl Store {
         now: u64,
     ) -> Result<Vec<u8>, Error> {
         if length > BYTE_READ_BYTES {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
+            return Err(Error::input_bound(
                 "staging byte reads are bounded to 1 MiB",
             ));
         }
@@ -1466,10 +1462,18 @@ impl Layout<'_> {
         payload_id: String,
     ) -> Result<(), Error> {
         if self.next_index >= self.writer.config.max_records as u64 {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                "import layout exceeds configured record count; raw staging remains available for cancellation",
-            ));
+            return Err(Error::input_bound(format!(
+                "import layout exceeds the configured max_records of {}; raw staging remains available for cancellation",
+                self.writer.config.max_records
+            )));
+        }
+        // The publication's atomic source-context update admits this many distinct records.
+        // Refusing here costs the layout read, not the preparation of every record (#397).
+        if self.next_index >= super::source_context::MAX_CONTEXT_RECORDS as u64 {
+            return Err(Error::input_bound(format!(
+                "import of more than {} records in one publication exceeds metadata admission; split the input into parts of at most that many records",
+                super::source_context::MAX_CONTEXT_RECORDS
+            )));
         }
         let length = usize::try_from(byte_end - self.record_start)
             .map_err(|_| Error::new("RESOURCE_LIMIT", "import record length overflow"))?;

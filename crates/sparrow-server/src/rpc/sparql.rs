@@ -54,8 +54,8 @@ fn request(rpc: &Rpc, input: wire::sparql_query::Reader<'_>) -> Result<Request, 
         input.get_scope().map_err(invalid)?,
     )?;
     let text = input.get_query().map_err(invalid)?;
-    if text.len() > 65536 {
-        return Err(Error::new("RESOURCE_LIMIT", "SPARQL query exceeds 64 KiB"));
+    if text.len() > sparrow_core::RECORD_QUERY_TEXT_BYTES {
+        return Err(Error::input_bound("SPARQL query exceeds 64 KiB"));
     }
     let text = text.to_str().map_err(invalid)?.to_owned();
     let base = query_text(
@@ -72,8 +72,7 @@ fn request(rpc: &Rpc, input: wire::sparql_query::Reader<'_>) -> Result<Request, 
     };
     let entries = input.get_bindings().map_err(invalid)?;
     if entries.len() > 64 {
-        return Err(Error::new(
-            "RESOURCE_LIMIT",
+        return Err(Error::input_bound(
             "SPARQL admits at most 64 typed bindings",
         ));
     }
@@ -124,8 +123,7 @@ pub(super) fn query_limits(
         || limits.get_intermediate_cells() > 1000000
         || limits.get_scratch_bytes() > 33554432
     {
-        return Err(Error::new(
-            "RESOURCE_LIMIT",
+        return Err(Error::input_bound(
             "query limits exceed server ceilings; reduce source/engine budgets",
         ));
     }
@@ -162,7 +160,7 @@ pub(super) async fn query(
                 .query_work(None, move |store, now, cancellation| {
                     store
                         .sparql_read(&input.read(), now, &cancellation)
-                        .map_err(|e| Error::new(e.code, e.message.clone()))
+                        .map_err(|e| Error::clone(&e))
                 })
                 .await;
             deliver(out, reply);
@@ -172,7 +170,7 @@ pub(super) async fn query(
                 .query_work(None, move |store, now, cancellation| {
                     store
                         .sparql_explanation_read(&input.read(), now, &cancellation)
-                        .map_err(|e| Error::new(e.code, e.message.clone()))
+                        .map_err(|e| Error::clone(&e))
                 })
                 .await;
             match reply {

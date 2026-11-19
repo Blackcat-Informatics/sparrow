@@ -408,15 +408,16 @@ pub(super) fn data_batch_estimate(batch: &rocksdb::WriteBatch) -> u64 {
         .saturating_add(65536)
 }
 
-const WRITE_CEILING_MESSAGE: &str = "estimated atomic write cannot fit the configured data budget; increase the disk budget or reduce the operation";
-
 /// Why admission refused a data write. The one cause a caller acts on is a type, not a
 /// message: a write whose estimate exceeds the whole data allowance can never fit, whatever
 /// the store holds, so no retry of it can succeed. Every other refusal keeps its own error.
 #[derive(Debug)]
 pub(super) enum WriteRefusal {
     /// The estimate exceeds the whole data allowance (independent of the store's content).
-    Ceiling,
+    Ceiling {
+        estimate: u64,
+        allowance: u64,
+    },
     Other(Error),
 }
 
@@ -435,7 +436,12 @@ impl From<rocksdb::Error> for WriteRefusal {
 impl From<WriteRefusal> for Error {
     fn from(refusal: WriteRefusal) -> Self {
         match refusal {
-            WriteRefusal::Ceiling => Error::new("RESOURCE_LIMIT", WRITE_CEILING_MESSAGE),
+            WriteRefusal::Ceiling {
+                estimate,
+                allowance,
+            } => Error::input_bound(format!(
+                "estimated atomic write of {estimate} bytes cannot fit the configured data budget of {allowance} bytes; increase the disk budget or reduce the operation"
+            )),
             WriteRefusal::Other(error) => error,
         }
     }
@@ -460,7 +466,10 @@ pub(super) fn data_write_ceiling(
             "disk budget must exceed maintenance reserve",
         )
     })?;
-    limit.checked_sub(estimate).ok_or(WriteRefusal::Ceiling)
+    limit.checked_sub(estimate).ok_or(WriteRefusal::Ceiling {
+        estimate,
+        allowance: limit,
+    })
 }
 
 impl Writer {
@@ -622,12 +631,10 @@ impl Writer {
             self.reclaiming(|| self.commit(batch))
         };
         committed.map_err(|error| {
-            Error::new(
-                error.code,
-                format!(
-                    "the store cannot take a write, so the pressure wait could not be ended; intake stays refused until it can: {error}"
-                ),
-            )
+            let message = format!(
+                "the store cannot take a write, so the pressure wait could not be ended; intake stays refused until it can: {error}"
+            );
+            error.with_message(message)
         })?;
         state.end_wait();
         Ok(())
@@ -658,7 +665,7 @@ impl Writer {
             // The caller's error replaces the status failure and the duty marks the forced
             // failure reported, so its own reason must ride in the error or it is lost.
             self.end_wait(state)
-                .map_err(|error| Error::new(error.code, format!("{error}; {forced}")))?;
+                .map_err(|error| error.with_context(forced))?;
         }
         Ok(failure)
     }
@@ -850,9 +857,7 @@ impl Writer {
             forced_failure,
         )
         .map_err(|error| match reason {
-            Some(forced) if !error.message.contains(&forced) => {
-                Error::new(error.code, format!("{error}; {forced}"))
-            }
+            Some(forced) if !error.message.contains(&forced) => error.with_context(&forced),
             _ => error,
         })
     }

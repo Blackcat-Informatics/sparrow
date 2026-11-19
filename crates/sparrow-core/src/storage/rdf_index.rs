@@ -491,7 +491,7 @@ impl<'a> RdfWrite<'a> {
                 bytes: bytes as u64,
             });
         }
-        Error::new("RESOURCE_LIMIT", message)
+        Error::input_bound(message)
     }
 
     fn lookup(&mut self, bytes: &[u8]) -> Result<Option<u64>, Error> {
@@ -629,7 +629,7 @@ impl<'a> RdfWrite<'a> {
             ),
         ] {
             if rows.len().saturating_add(input.len()) > MAX_ROWS {
-                return Err(Error::new("RESOURCE_LIMIT", "RDF graph exceeds 32768 rows"));
+                return Err(Error::input_bound("RDF graph exceeds 32768 rows"));
             }
             for row in input {
                 let mut mapped = [0; 4];

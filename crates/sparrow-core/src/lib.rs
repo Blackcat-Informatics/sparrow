@@ -16,7 +16,8 @@ pub use instant::{format_instant, parse_instant};
 pub use projection::json_profile as json_projection_profile;
 pub use query::{
     EventInterval, FieldConstraint, JSON_QUERY_PATH_BYTES, JsonPredicate, JsonQuery,
-    QueryAlternatives, QueryScope, QuerySelection, RecordQuery,
+    QueryAlternatives, QueryScope, QuerySelection, RECORD_QUERY_FIELDS_MAX,
+    RECORD_QUERY_TEXT_BYTES, RecordQuery,
 };
 pub use storage::archive::{
     ARCHIVE_MAX_SEGMENT_BYTES, ARCHIVE_MIN_SEGMENT_BYTES, ARCHIVE_SEGMENT_BYTES,
@@ -88,7 +89,8 @@ pub use storage::rdf_view::{
     STORED_TEXT_RELATION_PROFILE, ScopedSparqlExplanation, ScopedSparqlResult,
     SparqlExplanationItem, SparqlExplanationPageBody, SparqlExplanationReadPage, SparqlGraphKind,
     SparqlItem, SparqlPageBody, SparqlRead, SparqlReadPage, SparqlTextCapture, SparqlTextCoverage,
-    SparqlTextRelations, StoredRdfView, sparql_term_node_bytes, sparql_term_wire_bytes,
+    SparqlTextRelations, StoredRdfView, TEXT_RELATION_IRI_BYTES, sparql_term_node_bytes,
+    sparql_term_wire_bytes,
 };
 pub use storage::receiver_stream::{
     MAX_RECEIVER_REGISTRY_BYTES, MAX_RECEIVER_WINDOWS, ReceiverDiscard, ReceiverPosition,

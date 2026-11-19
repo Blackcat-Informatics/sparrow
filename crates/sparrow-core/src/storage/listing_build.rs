@@ -212,7 +212,7 @@ impl<T: Clone> Waiter<T> {
             match &*state {
                 State::Done(Ok(result)) => return Ok(Some(Ok(result.clone()))),
                 State::Done(Err(error)) => {
-                    return Ok(Some(Err(Error::new(error.code, error.message.clone()))));
+                    return Ok(Some(Err(error.clone())));
                 }
                 State::Running => {}
             }

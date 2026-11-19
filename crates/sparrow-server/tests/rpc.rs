@@ -7622,6 +7622,57 @@ async fn cli_ingest_resumes_across_lost_connections_and_cancels_a_stalled_import
         .await;
 }
 
+/// INVARIANT (#397): a bound on the input itself reaches the SDK as a non-retryable refusal that
+/// names the bound. The free `import_file` does not resume or retry it: it returns the daemon's
+/// own error, not `IMPORT_RESUMABLE`, and cancels its journal once. The refusal arrives at
+/// layout, before any record is prepared.
+#[tokio::test(flavor = "current_thread")]
+async fn an_input_over_the_publication_record_bound_is_refused_non_retryable_and_cancelled() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let text = std::fs::read_to_string(&config).unwrap();
+            std::fs::write(&config, text.replace("max_records = 10000", "max_records = 100000"))
+                .unwrap();
+            let _daemon = start(&config, &socket).await;
+            let genuine = sparrow_client::Client::connect(&socket).await.unwrap();
+            let input = dir.path().join("bound.log");
+            std::fs::write(&input, b"a\n".repeat(32_769)).unwrap();
+            let error = sparrow_client::import_file(
+                &sparrow_client::Endpoint::Unix(socket.clone()),
+                "bound-input",
+                "bound",
+                wire::Format::Log,
+                &input,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(&error, sparrow_client::Error::Domain { code, message, retryable: false, .. }
+                    if code == "RESOURCE_LIMIT" && message.contains("32768")),
+                "{error}"
+            );
+            assert!(!error.retryable(), "{error}");
+            let status = sparrow_client::get_ingest_status(
+                genuine.capability(),
+                &genuine.discovery().store_id,
+                &sparrow_client::IngestSelector::Request("bound-input".into()),
+                Default::default(),
+            )
+            .await;
+            assert!(
+                matches!(&status, Err(sparrow_client::Error::Domain { code, .. })
+                    if code == "IMPORT_EXPIRED" || code == "NOT_FOUND"),
+                "the refused import still holds its journal: {:?}",
+                status.err()
+            );
+        })
+        .await;
+}
+
 /// Stage an unpublishable import above the inline bound through `client` and return the
 /// error it ends with. The relay refuses `importPublish`, as the daemon refuses a prepared import.
 async fn refused_large_ingest(

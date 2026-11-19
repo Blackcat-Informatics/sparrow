@@ -435,10 +435,10 @@ impl Store {
             ));
         }
         if manifest.layout_records > writer.config.max_records as u64 {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                "sealed layout exceeds the current configured record limit",
-            ));
+            return Err(Error::input_bound(format!(
+                "sealed layout exceeds the current configured max_records of {}",
+                writer.config.max_records
+            )));
         }
         let mut progress = match preparation(&writer, &manifest)? {
             Some(progress) => progress,
@@ -564,8 +564,7 @@ impl Store {
         progress.prepared_records = index;
         put(&mut batch, &preparation_key(id), &progress);
         if batch.size_in_bytes() > PUBLICATION_BYTES {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
+            return Err(Error::input_bound(
                 "prepared record dependencies exceed 128 MiB",
             ));
         }
@@ -604,10 +603,10 @@ impl Store {
             ));
         }
         if manifest.layout_records > writer.config.max_records as u64 {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
-                "publication exceeds the current configured record limit",
-            ));
+            return Err(Error::input_bound(format!(
+                "publication exceeds the current configured max_records of {}",
+                writer.config.max_records
+            )));
         }
         let mut batch = WriteBatch::default();
         let mut record_ids = Vec::new();
@@ -684,8 +683,7 @@ impl Store {
             );
             record_ids.push(record.id);
             if batch.size_in_bytes() > PUBLICATION_BYTES {
-                return Err(Error::new(
-                    "RESOURCE_LIMIT",
+                return Err(Error::input_bound(
                     "complete publication metadata exceeds 128 MiB",
                 ));
             }
@@ -747,8 +745,7 @@ impl Store {
             now,
         )?;
         if batch.size_in_bytes() > PUBLICATION_BYTES {
-            return Err(Error::new(
-                "RESOURCE_LIMIT",
+            return Err(Error::input_bound(
                 "complete publication and receipt exceed 128 MiB",
             ));
         }
