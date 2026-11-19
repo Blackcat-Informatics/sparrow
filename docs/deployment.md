@@ -1243,8 +1243,29 @@ if len(listed) > counted:
     fail(f"the listing holds {len(listed)} artifacts, sources reports {counted}")
 omitted = counted - len(listed)
 unlisted_sources = len([s for s, c in held.items() if c and not per_source.get(s)])
-
+# The gap per source, for the operator to read. An omitted artifact has no live bytes and no live record, so
+# its receipt is before the cutoff, now minus retention_seconds (nothing retires without an archive). The
+# oldest listed receipt of a source is printed beside its gap; the omitted ones lie before it in that source.
 now = datetime.datetime.now(datetime.timezone.utc)
+cutoff = now - datetime.timedelta(seconds=int(status["retention_seconds"]))
+oldest, newest, live_records = {}, {}, {}
+for r in listed.values():
+    at = r["origin"]["received_at"] if r["origin"] is not None else None
+    if at is not None:
+        oldest[r["source"]] = min(oldest.get(r["source"], at), at)
+        newest[r["source"]] = max(newest.get(r["source"], at), at)
+    live_records[r["source"]] = live_records.get(r["source"], 0) + int(r["retained_records"])
+gap_lines = [f"cutoff {cutoff.strftime('%Y-%m-%dT%H:%M:%SZ')} (now minus retention_seconds {status['retention_seconds']})",
+             "source\tcounted\tlisted\tomitted\toldest listed\tnewest listed\trecords counted\trecords live in listed"]
+for r in sorted(sources, key=lambda r: r["source_id"]):
+    name = r["source_id"]
+    gap_lines.append(f"{name}\t{held[name]}\t{per_source.get(name, 0)}\t{held[name] - per_source.get(name, 0)}\t"
+                     f"{oldest.get(name, '-')}\t{newest.get(name, '-')}\t{r['retained_records']}\t{live_records.get(name, 0)}")
+gap_lines.append(f"total\t{counted}\t{len(listed)}\t{omitted}\t\t\t\t")
+(record / "listing-gap.tsv").write_text("\n".join(gap_lines) + "\n")
+(record / "listing-ids.txt").write_text("".join(i + "\n" for i in sorted(listed)))
+print("\n".join(gap_lines), flush=True)
+
 edges = [now - datetime.timedelta(days=d) for d in AGE_DAYS]
 
 
@@ -1450,10 +1471,39 @@ CHECK
      field of `before.json` counts them, so their number on the copy is not known until the check prints it. The
      check therefore does not require equality. It fails when a source's listed rows exceed that
      source's `complete_artifacts` plus `fragment_parents`, or the listed total exceeds the sum of
-     those counts, which the code excludes, and it prints the counted, listed and omitted numbers, the
-     sources that list none, and the gap between the `artifacts` counter and the `sources` sum (which
-     evicted artifacts and parents whose entry is gone also move). A smaller listing means artifacts
-     without live bytes or live records, the rehearsal reads the printed gap and does not fail on it. The 5 largest artifacts by
+     those counts, which the code excludes. It prints, and writes to `$RECORD/listing-gap.tsv`, for each
+     source and in total the counted artifacts, the listed ones, the omitted ones, the oldest and
+     newest listed receipt, the counted records and the live records of the listed artifacts, with the
+     cutoff (now minus `retention_seconds`); it writes the listed ids to `$RECORD/listing-ids.txt`. It
+     prints the gap between the `artifacts` counter and the `sources` sum too (evicted artifacts and
+     parents whose entry is gone also move it). A smaller listing means artifacts without live bytes
+     or live records, and the rehearsal does not fail on it.
+
+     What gap to expect. An omitted artifact is past its deadline, so its receipt is before the cutoff
+     (30 days before the run; 2026-10-20 for a run on 2026-11-19, arithmetic), and the omitted ones
+     of a source lie at its head. The live store has held records since 2026-10-17: it reported 217
+     `live_records` under the same `store_id` on 2026-10-17 and 2026-10-18 (file times of
+     `.stage/native-graph-integration/runtime-recovery-final-status.json` and
+     `schema52-live-before-status.json`), so artifacts received from then until the cutoff are
+     expected in the gap, and no later one is. The reading in `.stage/image/switch-1/before.json`
+     cannot size it: status `live_records` is the retained-records counter, not a count by deadline
+     (`status_report` in `storage.rs`), and the file holds no receipt times, no per-source counts and
+     no count of expired artifacts. It bounds the gap above only by the counted artifacts, 39,061
+     (3,020,515 minus 2,981,454, arithmetic on its `source-summary` and `source-context` totals).
+     Under an assumed uniform ingest over the 33 days from 2026-10-17 to 2026-11-19, the 3 days before
+     the cutoff would hold about 3,550 artifacts (arithmetic on that assumption; the real rate is not
+     known). Sizing it needs the number of artifacts received before the cutoff, which no CLI call
+     exposes: an expired artifact is not a listing row, so its id and receipt cannot be read.
+
+     A real loss is not separable from an expected gap by the table alone, because the omitted
+     artifacts are invisible to the CLI: a live artifact lost from the index looks like an expired
+     one. The separating evidence is an independent listing of the live daemon taken before the stop,
+     with the same walk, compared by id with `listing-ids.txt` for every id received at or after the
+     cutoff: an id in the live listing and absent from the copy's listing is a loss, and a gap with
+     no such id is the expected one. That live listing takes the writer lock for each page, about
+     5,055 pages (arithmetic from the walk above), so it needs the coordination session's go and has
+     not been run. Without it, read a gap only as expected where the source received artifacts before
+     the cutoff, and treat any gap in a source that began after it as a loss to investigate. The 5 largest artifacts by
      `byte_length` come from the whole walk, and the spread is drawn from the same rows by source and
      by age window (the last 1, 1 to 3, 3 to 7, 7 to 14 and 14 to 21 days, and everything older;
      source `j` takes window `(lap + j) mod 6` in each lap, so ages mix across sources). Only rows that report
