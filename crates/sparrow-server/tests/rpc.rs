@@ -14589,6 +14589,34 @@ async fn discover_and_status_report_the_configured_instance_role() {
         .await;
 }
 
+/// Value (#377): `discover` answers on the ingest socket with the store id and the instance role,
+/// the one guard a sender has against sending test cruft to the live store. A store created with
+/// `instance_role = "scratch"` reads `scratch` there; a store with no role reads `unspecified`,
+/// which a sender refuses like `production`.
+#[tokio::test(flavor = "current_thread")]
+async fn the_ingest_socket_discover_reports_the_instance_role_and_store() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for (configured, expected) in [(Some("scratch"), "scratch"), (None, "unspecified")] {
+                let dir = tempfile::tempdir().unwrap();
+                let data = dir.path().join("store");
+                let socket = data.join("rpc.sock");
+                let config = write_server_config(dir.path(), &data, &socket);
+                let (ingest, _) = configure_ingest_socket(dir.path(), &config, 4);
+                if let Some(role) = configured {
+                    let base = std::fs::read_to_string(&config).unwrap();
+                    std::fs::write(&config, format!("instance_role = \"{role}\"\n{base}")).unwrap();
+                }
+                let _daemon = start_with_ingest(&config, &socket, &ingest).await;
+                let store = cli(&socket, &["status"])["store_id"].clone();
+                let discovered = cli(&ingest, &["discover"]);
+                assert_eq!(discovered["instance_role"].as_str(), Some(expected));
+                assert_eq!(discovered["store_id"], store);
+            }
+        })
+        .await;
+}
+
 /// INVARIANT (#280): a declaration above the import bound answers a non-retryable
 /// INVALID_ARGUMENT that names the bound and the remedy, Discovery advertises that same bound
 /// before any declaration, status counts the refusal, and an in-bound import begins unchanged.

@@ -869,7 +869,11 @@ encoding changes. `Discovery.instanceRole` (field 16) and `Status.instanceRole`
 (1) and `scratch` (2). Both fields are additive; a reader that does not know
 them sees no change. A store with no row reports `unspecified` and behaves as
 before. The Rust client decodes the discovery field as `Discovery.instance_role`,
-and CLI and MCP status render the status field as `instance_role`.
+and CLI and MCP status render the status field as `instance_role`. The ingest socket
+admits `discover`, so a sender reads the role there: `sparrow SOCKET discover` prints
+the connection's `store_id`, `schema_version` and `instance_role`. A sender that must
+not reach the live store sends only when the role reads `scratch` and refuses
+`production` and `unspecified`.
 
 The server configuration key `instance_role` (`"production"` or `"scratch"`)
 names the role. A store created while the key is set records the role in its

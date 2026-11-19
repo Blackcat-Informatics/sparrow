@@ -595,6 +595,17 @@ fn admission(status: wire::admission_status::Reader<'_>) -> capnp::Result<Value>
         .into())
 }
 
+/// The identity the connection learned when it opened, which the ingest socket admits: the store
+/// and its role, so a sender can refuse a store that is not `scratch` before it sends anything.
+pub(super) fn discovery(discovery: &sparrow_client::Discovery) -> Value {
+    Object::new()
+        .with("operation", "discover")
+        .with("store_id", discovery.store_id.as_str())
+        .with("schema_version", discovery.schema_version)
+        .with("instance_role", instance_role(discovery.instance_role))
+        .into()
+}
+
 fn instance_role(role: wire::InstanceRole) -> &'static str {
     match role {
         wire::InstanceRole::Unspecified => "unspecified",
