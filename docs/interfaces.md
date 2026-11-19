@@ -105,7 +105,7 @@ Right after an ingest the figure is higher because of the WAL: 2.7 MB of random
 case for `jsonl`. Every measured ingest used the CLI `ingest`, which always goes
 through the staged import; the inline path under 16 MiB is not measured.
 
-**Refused ingests.** Two ingests of the sizing series ended `RESOURCE_LIMIT`. A
+**Refused ingests.** Two measured ingests ended `RESOURCE_LIMIT`. A
 single 100 MB random-text file (33,015 lines) ended after 935 s with "atomic
 source context update exceeds metadata admission". A 10 MB file of 58,945
 log-like records ended after 635 s with "RDF write staging exceeds 64 MiB"; the
@@ -142,8 +142,8 @@ about 14.7 GB of headroom) would reach the ceiling after about 16 refusals (14.7
 GB divided by 0.9 GB, before the reserve and the batch estimate); that is an
 estimate, not a measurement. Issue #389 tracks the fault.
 
-**Choosing the form.** An item sent `opaque` costs at most about its size (0.21x
-for log text, 1.08x for random bytes) and is found by payload id only
+**Choosing the form.** An item sent `opaque` costs at most about its size (0.21x to
+0.27x for log text, 1.03x to 1.08x for random bytes) and is found by payload id only
 (`payloadLookup`); there is no search by value. An item sent as `jsonl` is
 searchable by value (`values_search`, `records`) and costs about 10 to 51 times
 its size. The measurements support this guidance and no more:
