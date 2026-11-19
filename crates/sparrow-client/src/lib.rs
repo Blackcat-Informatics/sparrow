@@ -321,10 +321,13 @@ impl Client {
     /// publication committed although its reply was lost, or the daemon's file watcher owns
     /// the staging; the upload is retried once, returning the receipt or that attempt's
     /// error, and a watcher-owned journal is left intact. When the connection is lost before
-    /// the cancel arrives, the journal is intact and the error is the retryable
-    /// `IMPORT_RESUMABLE`: a retry under the same request ID resumes it. When the daemon
-    /// answers the cancel with an error, the error is `IMPORT_ABANDONED` naming the import,
-    /// whose slot stays occupied until the retry window ends.
+    /// the cancel arrives, or the daemon refuses the cancel with a retryable hold (free-space
+    /// floor, restart, busy admission), the error is the retryable `IMPORT_RESUMABLE`
+    /// naming the import and keeping the refusal's class: a retry under the same request ID
+    /// resumes the journal if it is still staged, or starts a fresh import if the cancel
+    /// committed and its reply was lost. When the cancel fails for good, for example
+    /// `PERMISSION_DENIED`, the error is `IMPORT_ABANDONED` naming the import, whose slot
+    /// stays occupied until the retry window ends.
     pub async fn import_file(
         &self,
         request_id: &str,

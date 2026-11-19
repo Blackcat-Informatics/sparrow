@@ -72,9 +72,10 @@ enum Session {
 /// the publication committed although its reply was lost, so the retry fetches the receipt.
 /// It also answers it for staging the daemon's own file watcher owns; there the journal stays
 /// intact and the retry resumes it, returning that attempt's result. A cancel that cannot
-/// reach the daemon on a [`Session::Held`] connection leaves the journal and checkpoint
-/// intact, so the result is the retryable `IMPORT_RESUMABLE`: a retry under the same request
-/// ID resumes. Any other failed cancel returns `IMPORT_ABANDONED` naming the journal. An
+/// reach the daemon on a [`Session::Held`] connection, or that the daemon refuses with a
+/// retryable hold, leaves the journal and checkpoint intact, so the result is the retryable
+/// `IMPORT_RESUMABLE` keeping the refusal's class: a retry under the same request ID resumes.
+/// Any other failed cancel returns `IMPORT_ABANDONED` naming the journal. An
 /// error before any journal existed is returned unchanged. This is the one implementation
 /// behind the free `import_file` and every `Client` upload path.
 async fn settle(
@@ -90,16 +91,22 @@ async fn settle(
     match cancel(&store, &id).await {
         Ok(()) => Err(error),
         Err(Error::Domain { code, .. }) if code == "CONFLICT" => retry().await,
-        Err(Error::Transport(lost))
-            if matches!(session, Session::Held) && lost.kind == capnp::ErrorKind::Disconnected =>
-        {
+        // On a held connection the cancel never reached the daemon, or the daemon refused it
+        // with a hold (free-space floor, restart, busy admission): the journal is intact
+        // unless a committed cancel's reply was lost, so a retry resumes it, or finds it
+        // canceled and starts a fresh one under the same ID. The refusal's class is kept.
+        Err(cancel) if matches!(session, Session::Held) && resumable(&cancel) => {
+            let class = match &cancel {
+                Error::Domain { class, .. } => *class,
+                _ => crate::FailureClass::Unclassified,
+            };
             Err(Error::Domain {
                 code: "IMPORT_RESUMABLE".into(),
                 message: format!(
-                    "{error}; the connection was lost before import {id} could be canceled ({lost}); its journal is intact, so retrying under the same request ID resumes it"
+                    "{error}; canceling import {id} did not complete ({cancel}); retrying under the same request ID resumes its journal if it is still staged, or starts a fresh import if the cancel committed"
                 ),
                 retryable: true,
-                class: crate::FailureClass::Unclassified,
+                class,
             })
         }
         Err(cancel) => Err(Error::Domain {
@@ -110,6 +117,16 @@ async fn settle(
             retryable: false,
             class: crate::FailureClass::Unclassified,
         }),
+    }
+}
+
+/// Whether a failed cancel leaves the journal for a retry: the connection was lost, or the
+/// daemon refused the cancel with a retryable hold.
+fn resumable(cancel: &Error) -> bool {
+    match cancel {
+        Error::Transport(lost) => lost.kind == capnp::ErrorKind::Disconnected,
+        Error::Domain { retryable, .. } => *retryable,
+        _ => false,
     }
 }
 

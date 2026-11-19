@@ -7304,8 +7304,8 @@ struct EventRelayState {
     corrupt_publication: std::cell::Cell<bool>,
     /// Answer `importPublish` with a daemon-style `RESOURCE_LIMIT` refusal instead of forwarding it.
     refuse_publish: std::cell::Cell<bool>,
-    /// Answer `importCancel` with a daemon `PERMISSION_DENIED` refusal instead of forwarding it.
-    refuse_cancel: std::cell::Cell<bool>,
+    /// Answer `importCancel` with this daemon refusal `(code, retryable)` instead of forwarding it.
+    refuse_cancel: std::cell::Cell<Option<(&'static str, bool)>>,
     /// Daemon-style refusals `(code, retryable)` answered, in order, to the next event batches
     /// instead of forwarding them.
     refusals: std::cell::RefCell<std::collections::VecDeque<(&'static str, bool)>>,
@@ -7465,11 +7465,14 @@ impl wire::sparrow::Server for EventRelay {
         params: wire::sparrow::ImportCancelParams,
         mut results: wire::sparrow::ImportCancelResults,
     ) -> capnp::Result<()> {
-        if self.0.refuse_cancel.get() {
+        if let Some((code, retryable)) = self.0.refuse_cancel.get() {
             let mut failure = results.get().init_result().init_error();
-            failure.set_code("PERMISSION_DENIED");
+            failure.set_code(code);
             failure.set_message("injected refusal");
-            failure.set_retryable(false);
+            failure.set_retryable(retryable);
+            if code == "STORAGE_PRESSURE" {
+                failure.set_class(wire::FailureClass::FreeSpaceFloor);
+            }
             return Ok(());
         }
         let mut request = self.0.backend.borrow().import_cancel_request();
@@ -7684,7 +7687,7 @@ async fn refused_large_ingest_whose_cancel_is_refused_reports_import_abandoned()
             let proxy_socket = dir.path().join("proxy.sock");
             let (state, proxy) = relay(&proxy_socket, genuine.capability().clone());
             state.refuse_publish.set(true);
-            state.refuse_cancel.set(true);
+            state.refuse_cancel.set(Some(("PERMISSION_DENIED", false)));
             let client = sparrow_client::Client::connect(&proxy_socket)
                 .await
                 .unwrap();
@@ -7750,6 +7753,45 @@ async fn large_ingest_over_a_lost_connection_is_retryable_and_resumes_under_its_
         .await;
 }
 
+/// A cancel the daemon refuses with a retryable hold (the free-space floor) leaves the journal
+/// intact: the error stays retryable, names the import and keeps its class, and the same
+/// request ID then completes on a fresh connection (#392).
+#[tokio::test(flavor = "current_thread")]
+async fn large_ingest_whose_cancel_is_held_by_the_floor_is_retryable_and_resumes() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store_path = dir.path().join("store");
+            let socket = store_path.join("rpc.sock");
+            let config = write_server_config(dir.path(), &store_path, &socket);
+            let _daemon = start(&config, &socket).await;
+            let genuine = sparrow_client::Client::connect(&socket).await.unwrap();
+            let proxy_socket = dir.path().join("proxy.sock");
+            let (state, proxy) = relay(&proxy_socket, genuine.capability().clone());
+            state.refuse_publish.set(true);
+            state.refuse_cancel.set(Some(("STORAGE_PRESSURE", true)));
+            let client = sparrow_client::Client::connect(&proxy_socket)
+                .await
+                .unwrap();
+            let error = refused_large_ingest(&client, "held-large").await;
+            assert!(error.retryable(), "{error}");
+            assert!(error.is_free_space_floor(), "{error}");
+            assert!(
+                matches!(&error, sparrow_client::Error::Domain { code, message, .. }
+                    if code == "IMPORT_RESUMABLE" && message.contains("import:")),
+                "{error}"
+            );
+            let bytes = vec![b'x'; sparrow_core::INLINE_ARTIFACT_BYTES + 1];
+            let receipt = genuine
+                .ingest("held-large", "large", wire::Format::Opaque, &bytes)
+                .await
+                .unwrap();
+            assert_eq!(receipt.byte_length, bytes.len() as u64);
+            proxy.abort();
+        })
+        .await;
+}
+
 fn relay(
     socket: &Path,
     backend: wire::sparrow::Client,
@@ -7763,7 +7805,7 @@ fn relay(
         corrupt_receipt: std::cell::Cell::new(false),
         corrupt_publication: std::cell::Cell::new(false),
         refuse_publish: std::cell::Cell::new(false),
-        refuse_cancel: std::cell::Cell::new(false),
+        refuse_cancel: std::cell::Cell::new(None),
         refusals: std::cell::RefCell::new(std::collections::VecDeque::new()),
         connections: std::cell::Cell::new(0),
         mutate_file: std::cell::RefCell::new(None),
