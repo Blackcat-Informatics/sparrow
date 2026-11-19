@@ -76,28 +76,52 @@ source the producer names; the source is the item's lasting address in queries.
   split into parts of at most that many bytes, each imported as its own
   request, and then the manifest is imported.
 
-**Finding one item's fate.** While the item is live, three reads find it:
+**Finding a sent item.** The one key for a file or an opaque item is its payload
+id: `blake3:` and 64 lower-case hex digits, the BLAKE3 hash of the artifact's exact
+bytes. A SHA-256 is not an index key. Sparrow computes the payload id of every
+complete artifact, so the sender needs no companion record: it hashes the bytes
+it holds and asks.
 
-- `payloadLookup` (CLI `payload`, MCP `payload_lookup`) takes an artifact
-  item's payload id, the BLAKE3 hash of its bytes as `blake3:` and 64 hex
-  digits (not another hash such as a SHA-256), and returns the artifacts that
-  hold those bytes. It covers whole artifacts only. The
-  answer is exact once the payload-index migration completes; before that,
-  every listed artifact is held and an unlisted one is unknown (see
-  [Payload id index](#payload-id-index-store-format));
-- `records` over the item's source lists its records;
-- `values_search` over the item's source finds a record by an exact JSON field
-  value.
+- **Live.** `payloadLookup` (CLI `payload`, MCP `payload_lookup`) returns the
+  artifacts that hold those bytes, in pages, with `complete` (CLI and MCP
+  `answer_certainty` `exact` or `pending`). Repeated bytes make several
+  artifacts, possibly under several sources, and the lookup returns every one,
+  so the caller counts rows. One artifact read gives each hit's source. See
+  [Payload id index](#payload-id-index-store-format).
+- **Archive.** `sparrow-archive list DIR` prints one JSON line per segment with an
+  `entries` array; each entry gives the artifact `id`, `source`, `received_at`,
+  `byte_length` and `payload_id` (`blake3:` form, the same string `payloadLookup`
+  takes). The reader matches the payload id, or the artifact id from the ingest
+  receipt as the second route, then runs `sparrow-archive extract DIR ARTIFACT_ID`,
+  which writes the artifact's verified bytes to stdout. The reader hashes the
+  output and compares it with the payload id, since `extract` checks each record
+  and the total length, not the whole-file hash. `sparrow-archive verify DIR`
+  checks every segment. All three are offline and read-only. An artifact of
+  several records still lists the payload id of its whole bytes. A segment that
+  lacks it is refused by `list`, `verify` and `extract`.
+- **Not held.** Live: a first page (no cursor) that is empty with `complete = true`.
+  Archive: no payload id in the listing of any segment, from a `list` that exits 0
+  (`list` prints the segments it decoded before it fails on a bad one, so a
+  failed run proves nothing). Not held anywhere means
+  both, with the archive read after the archive worker has run on that data.
+- **Limits.** Whole artifacts only: a line inside a JSONL record has no payload
+  id. Live holding differs from archive holding: the live index lists an artifact
+  only while the store holds all its bytes, so an expired or evicted artifact is
+  not listed live though the archive may hold it, and not held live is not not
+  held. Until the `payload-index` migration completes (`complete = false`), a
+  listed artifact is held and an empty list means unknown, never not held. A
+  file that is cut into parts is found by its parts, each under its own payload
+  id, and the whole file's hash is no artifact's payload id. A file is cut only
+  where one artifact cannot hold it (the import bound, the record limit or the
+  joint retirement bound; see [Part sets for consume roots](#part-sets-for-consume-roots-280)),
+  and a syslog file over the packet limit is cut too. A file below those limits,
+  including a staged import above the 16 MiB inline bound, is one artifact found by
+  the hash of all its bytes. A tail checkpoint's payload id is the hash of
+  its checkpointed range. The `payload` lookup is not scoped to a source.
 
-Once the item has aged out, the archive holds it, if the archive is running (see
-[Archive status](archive-format.md#archive-status)). `sparrow-archive list DIR`
-prints one JSON line per segment with an `entries` array; each entry gives the
-artifact `id`, `source`, `received_at` and `byte_length`. It does not print
-payload ids. The reader matches the item by source, receipt time and length
-(or by the artifact id noted while the item was live), then runs
-`sparrow-archive extract DIR ARTIFACT_ID`, which writes the artifact's verified
-bytes to stdout. `sparrow-archive verify DIR` checks every segment. All three
-are offline and read-only.
+As a convenience for records, `values_search` over a source finds a JSONL record by an
+exact JSON field value, such as a `digest` the sender put in it; that is not the
+contract. `records` over a source lists its records.
 
 **Retention Sparrow guarantees.** Nothing is deleted that has not been archived:
 the deletion gate, the archive watermark and the store fence enforce it (see

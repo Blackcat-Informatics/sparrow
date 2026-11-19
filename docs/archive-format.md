@@ -211,7 +211,8 @@ belongs to one of its records, and a recordless artifact has no bytes. A reader
 rebuilds an artifact by joining its records' blobs in source order. `sparrow-archive`
 hashes each record's bytes against the `payloadBlake3` digest its link quad names, checks that the
 records are contiguous in byte order from zero, and checks that their total equals the
-artifact's `byteLength`. It does not compare the whole artifact with its BLAKE3 `payload`.
+artifact's `byteLength`. It does not compare the whole artifact with its BLAKE3
+`payload`, which `list` prints as `payload_id`.
 
 An entry already retired before the store was fenced still has its catalog row
 until ordinary cleanup removes it. A record evicted or retired before the fence has no
@@ -370,8 +371,8 @@ Crash recovery follows from the intent:
 The archive writes no manifest. A segment's contents are its GTS file: the graphs of its
 records and artifacts, the link quads and the record blobs. The per-segment facts that
 other tools need are in that file or are derived from it: `sparrow-archive list` prints each
-segment's record, artifact and blob counts and its artifacts' `id`, `source`, `received_at`
-and `byte_length`. The store's own progress is in its catalog, not in the archive
+segment's record, artifact and blob counts and its artifacts' `id`, `source`, `received_at`,
+`byte_length` and `payload_id`. The store's own progress is in its catalog, not in the archive
 (section 7).
 
 ## 10. Readers
@@ -393,7 +394,8 @@ opens a live store and writes nothing.
 
 To take one artifact out of the archive with only the NAS directory and the binary:
 `sparrow-archive list DIR` prints one JSON line per segment, whose `entries` array gives
-each artifact's `id`, `source`, `received_at` (Unix milliseconds) and `byte_length`;
+each artifact's `id`, `source`, `received_at` (Unix milliseconds), `byte_length` and
+`payload_id` (the BLAKE3 hash of the artifact's whole bytes, `blake3:` and 64 hex digits, read from the artifact's graph);
 `sparrow-archive verify DIR` checks every segment; and
 `sparrow-archive extract DIR ARTIFACT_ID > file` joins the artifact's records from every
 segment under `DIR` in byte order, wherever they were archived, and writes them to stdout

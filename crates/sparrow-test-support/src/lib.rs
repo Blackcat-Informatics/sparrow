@@ -361,6 +361,19 @@ pub fn forged_segment(claimed: &[u8], actual: &[u8]) -> Vec<u8> {
     builder
         .push_quad(record, artifact_link, artifact, None)
         .expect("fixture quad");
+    // The artifact graph names the artifact's payload id as an IRI, as the store writes it.
+    let payload_link = builder
+        .intern_iri(&format!("{NS}payload"))
+        .expect("fixture link");
+    let payload = builder
+        .intern_iri(&format!(
+            "urn:sparrow:payload:{}",
+            digest_string(actual).trim_start_matches("blake3:")
+        ))
+        .expect("fixture payload");
+    builder
+        .push_quad(artifact, payload_link, payload, None)
+        .expect("fixture quad");
     let dataset = builder.freeze().expect("fixture dataset");
     let mut writer =
         to_writer(&dataset, &RdfLookaside::default(), "sparrow-archive").expect("fixture writer");

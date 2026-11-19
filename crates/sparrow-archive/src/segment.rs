@@ -39,6 +39,9 @@ pub struct ArchivedArtifact {
     pub received_at: u64,
     /// Full original byte count.
     pub byte_length: u64,
+    /// The BLAKE3 hash of all the artifact's own bytes, `blake3:` and 64 lower-case hex
+    /// digits: the key `payloadLookup` uses on the live store.
+    pub payload_id: String,
 }
 
 /// What `verify` reports for a segment that decoded.
