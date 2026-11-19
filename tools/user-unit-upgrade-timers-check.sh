@@ -2,15 +2,18 @@
 # SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 #
-# Recorded check for deploy/user-unit-upgrade.sh (issue #175): a successful switch starts
-# sparrow-ship.timer again, and on its early-abort path the script starts again only the timer
-# that was active before it stopped it, changing nothing else.
+# Recorded check for deploy/user-unit-upgrade.sh: a successful switch starts sparrow-ship.timer
+# again (issue #175), and on its early-abort path the script starts again only the timer that was
+# active before it stopped it, changing nothing else; --keep-copy copies the closed store between
+# the stop and the link switch; --hold-after-copy (issue #403) pauses there, and proceed switches,
+# abort or a hangup with dead output restarts the old image and restores the timer, and the option
+# is refused without --keep-copy.
 #
 # It runs the real script end to end in a scratch world: a fake HOME with kept images, links,
-# configuration and a status-answering CLI, and stub systemctl, getcap, lsattr, ps and sleep first
+# configuration and a status-answering CLI, and stub systemctl, getcap, lsattr, logger, ps and sleep first
 # on PATH. The stub systemctl keeps timer state in files and logs every call, so the assertions read
 # what the script asked of the user manager. Nothing here reaches a real unit, timer, store or
-# daemon. It stays out of `make check` (it needs python3 and runs the whole script four times); run
+# daemon. It stays out of `make check` (it needs python3 and runs the whole script several times); run
 # it after any change to the script's timer handling.
 #
 # Usage: tools/user-unit-upgrade-timers-check.sh SCRATCH_DIR   (absolute; created if absent, never emptied)
@@ -60,6 +63,8 @@ STUB
 for a; do :; done
 echo "---------------C------ $a"
 STUB
+    # shellcheck disable=SC2016 # the stub expands its own variables
+    printf '#!/bin/sh\necho "$*" >>"$STATE/logger"\n' >"$w/stubs/logger"
     printf '#!/bin/sh\nexit 0\n' >"$w/stubs/ps"
     printf '#!/bin/sh\nexit 0\n' >"$w/stubs/sleep"
     cat >"$w/stubs/systemctl" <<'SYSTEMCTL'
@@ -80,7 +85,10 @@ case $1 in
                 elif [[ -e $STATE/$5.active ]]; then echo active; else echo inactive; fi ;;
             LimitNOFILESoft) echo 65536 ;;
         esac ;;
-    start) shift; for u; do touch "$STATE/$u.active"; done ;;
+    start) shift
+        # STUB_HUP_ON_START=1: the login shell's SIGHUP reaches the script as it starts the service.
+        [[ ${STUB_HUP_ON_START:-0} == 1 && $1 == sparrow.service ]] && kill -HUP "$PPID"
+        for u; do touch "$STATE/$u.active"; done ;;
     stop) shift; for u; do rm -f -- "$STATE/$u.active"; done ;;
 esac
 exit 0
@@ -171,5 +179,119 @@ grep -q 'already exists' <<<"$out" || fail "keep-copy refusal did not say the na
 [[ ! -e $w/state/calls ]] || ! grep -Eq '^(stop|start) ' "$w/state/calls" || fail "keep-copy-exists path touched a unit"
 extra=()
 echo "ok   keep-copy name exists: refused before any change"
+
+# 7. --hold-after-copy pauses after the copy and before the link switch; "proceed" continues to the
+#    switch and the start, as without the hold. The answer comes through a named pipe.
+w=$(world hold-proceed)
+chattr +C -- "$w/store"
+mkfifo -- "$w/answer"
+touch "$w/state/sparrow-ship.timer.active"
+extra=(--keep-copy "$w/store.before" --hold-after-copy --hold-answer "$w/answer")
+echo proceed >"$w/answer" &
+writer=$!
+run "$w"
+kill "$writer" 2>/dev/null || true
+((rc == 0)) || { echo "$out" >&2; fail "hold-proceed path exited $rc"; }
+copied=$(grep -n 'kept a reflink copy' <<<"$out" | cut -d: -f1)
+held=$(grep -n 'HOLD:' <<<"$out" | head -1 | cut -d: -f1)
+switched=$(grep -n 'switch links' <<<"$out" | cut -d: -f1)
+((copied < held && held < switched)) || fail "the hold did not fall between the copy and the link switch: $out"
+[[ $(readlink "$w/home/.local/libexec/sparrow/sparrowd") == sparrowd-schema71-bbb ]] || fail "hold-proceed path did not switch the link"
+[[ -e $w/state/sparrow-ship.timer.active ]] || fail "hold-proceed path left the shipper timer stopped"
+echo "ok   hold + proceed: held between the copy and the link switch, then switched"
+
+# 8. "abort" at the hold starts the old image again on the unchanged store, switches nothing, restores
+#    the timer and exits non-zero.
+w=$(world hold-abort)
+chattr +C -- "$w/store"
+mkfifo -- "$w/answer"
+touch "$w/state/sparrow-ship.timer.active"
+extra=(--keep-copy "$w/store.before" --hold-after-copy --hold-answer "$w/answer")
+echo abort >"$w/answer" &
+writer=$!
+run "$w"
+kill "$writer" 2>/dev/null || true
+((rc != 0)) || fail "hold-abort path exited 0"
+[[ $(readlink "$w/home/.local/libexec/sparrow/sparrowd") == sparrowd-schema68-aaa ]] || fail "hold-abort path moved the daemon link"
+[[ $(readlink "$w/home/.local/bin/sparrow") == "$w/home/.local/libexec/sparrow/sparrow-schema68-aaa" ]] || fail "hold-abort path moved the CLI link"
+! grep -q 'switch links' <<<"$out" || fail "hold-abort path switched links"
+[[ ! -e $w/home/.config/systemd/user/sparrow.service.d/limits.conf ]] || fail "hold-abort path installed the drop-in"
+[[ -e $w/state/sparrow.service.active ]] || fail "hold-abort path left sparrow.service stopped"
+[[ -e $w/state/sparrow-ship.timer.active ]] || fail "hold-abort path did not restore the timer"
+[[ $(grep -En '^(stop|start) sparrow\.service' "$w/state/calls" | cut -d: -f2 | tr '\n' ';') == 'stop sparrow.service;start sparrow.service;' ]] \
+    || fail "hold-abort path did not stop then start sparrow.service once"
+[[ -d $w/store.before ]] || fail "hold-abort path lost the kept copy"
+echo "ok   hold + abort: old image started again, nothing switched, exit $rc"
+
+# 9. --hold-after-copy without --keep-copy is refused before anything is touched.
+w=$(world hold-no-copy)
+touch "$w/state/sparrow-ship.timer.active"
+extra=(--hold-after-copy)
+run "$w"
+((rc != 0)) || fail "hold-no-copy path exited 0"
+grep -q 'needs --keep-copy' <<<"$out" || fail "hold refusal did not name --keep-copy: $out"
+[[ ! -e $w/state/calls ]] || fail "hold-no-copy path called systemctl"
+extra=()
+echo "ok   hold without keep-copy: refused before any change"
+
+# 10. The terminal hangs up during the hold (SSH drop) and every write fails (the output pipe's reader has gone): the abort
+#     still starts the old image first and restores the timer, swaps nothing, and leaves its
+#     message in DIR.abort.log and the journal (logger) for the operator to find.
+w=$(world hold-hangup)
+chattr +C -- "$w/store"
+mkfifo -- "$w/answer" "$w/output"
+touch "$w/state/sparrow-ship.timer.active"
+set +e
+# The reader leaves once the hold has begun, so the script's later writes hit a closed pipe.
+{ while IFS= read -r line; do [[ $line == *HOLD:* ]] && break; done; } <"$w/output" &
+env -i PATH="$w/stubs:/usr/bin:/bin" HOME="$w/home" STATE="$w/state" SPARROW_BIN="$w/kept" \
+    "$script" --from sparrowd-schema68-aaa --to sparrowd-schema71-bbb \
+    --keep-copy "$w/store.before" --hold-after-copy --hold-answer "$w/answer" >"$w/output" 2>&1 &
+pid=$!
+# Opening the pipe for writing returns only when the script is reading it, that is, in the hold.
+exec 4>"$w/answer"
+kill -HUP "$pid"
+wait "$pid"
+rc=$?
+exec 4>&-
+set -e
+((rc != 0)) || fail "hold-hangup path exited 0"
+[[ -e $w/state/sparrow.service.active ]] || fail "hold-hangup path left sparrow.service stopped"
+[[ -e $w/state/sparrow-ship.timer.active ]] || fail "hold-hangup path did not restore the timer"
+[[ $(readlink "$w/home/.local/libexec/sparrow/sparrowd") == sparrowd-schema68-aaa ]] || fail "hold-hangup path moved the daemon link"
+grep -q 'hold aborted (SIGHUP)' "$w/store.before.abort.log" || fail "hold-hangup path wrote no durable abort message"
+grep -q 'hold aborted (SIGHUP)' "$w/state/logger" || fail "hold-hangup path wrote no journal message"
+echo "ok   hold + hangup with dead output: old image restarted, message in ${w##*/}/store.before.abort.log"
+
+# 11. An answer without a trailing newline is accepted.
+w=$(world hold-nonewline)
+chattr +C -- "$w/store"
+mkfifo -- "$w/answer"
+extra=(--keep-copy "$w/store.before" --hold-after-copy --hold-answer "$w/answer")
+printf proceed >"$w/answer" &
+writer=$!
+run "$w"
+kill "$writer" 2>/dev/null || true
+extra=()
+((rc == 0)) || { echo "$out" >&2; fail "hold answer without newline exited $rc"; }
+echo "ok   hold answer without a trailing newline: accepted"
+
+# 12. A hangup that arrives while the abort restores (the login shell's SIGHUP after the terminal
+#     read ended) does not stop the restore: the service and timer come back and the abort is recorded.
+w=$(world hold-hangup-in-abort)
+chattr +C -- "$w/store"
+mkfifo -- "$w/answer"
+touch "$w/state/sparrow-ship.timer.active"
+extra=(--keep-copy "$w/store.before" --hold-after-copy --hold-answer "$w/answer")
+echo abort >"$w/answer" &
+writer=$!
+run "$w" STUB_HUP_ON_START=1
+kill "$writer" 2>/dev/null || true
+extra=()
+((rc != 0)) || fail "hangup-in-abort path exited 0"
+[[ -e $w/state/sparrow.service.active ]] || fail "hangup-in-abort path left sparrow.service stopped"
+[[ -e $w/state/sparrow-ship.timer.active ]] || fail "hangup-in-abort path did not restore the timer"
+grep -q 'hold aborted (operator)' "$w/store.before.abort.log" || fail "hangup-in-abort path wrote no abort record"
+echo "ok   hangup during the abort: restore completed and recorded"
 
 echo PASS
