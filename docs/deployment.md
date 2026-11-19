@@ -1120,10 +1120,11 @@ read-only client of the rehearsal daemon's socket:
 
 ```bash
 cat > "$RECORD/payload-check.py" <<'CHECK'
-import datetime, json, pathlib, subprocess, sys
+import datetime, json, os, pathlib, subprocess, sys
 
 cli, sock, record = sys.argv[1], sys.argv[2], pathlib.Path(sys.argv[3])
-TARGET, MAX_READ, MAX_PAGES = 50, 1 << 20, 100000
+CEILING = int(sys.argv[4]) if len(sys.argv) > 4 else 4 << 30   # most bytes the check reads
+TARGET, LARGEST, CHUNK, MAX_PAGES, SCAN_PAGES = 50, 5, 1 << 20, 100000, 5
 AGE_DAYS = [0, 1, 3, 7, 14, 21]   # window edges, days before now; the last window is open-ended
 
 
@@ -1142,15 +1143,23 @@ def call(*args):
     return json.loads(run([cli, sock, *args]))
 
 
-def pages(*args):
+def pages(*args, limit=MAX_PAGES):
     cursor = []
-    for _ in range(MAX_PAGES):
+    for _ in range(limit):
         page = call(*args, *cursor)
         yield page
         if page.get("next_cursor") is None:
             return
         cursor = ["--cursor", page["next_cursor"]]
-    fail("page limit reached: " + " ".join(args[:2]))
+    if limit == MAX_PAGES:
+        fail("page limit reached: " + " ".join(args[:2]))
+
+
+def length_of(row):
+    origin = row["origin"]
+    if origin is None or origin.get("byte_length") is None:
+        fail(f"{row['artifact_id']}: the catalog row has no byte_length")
+    return int(origin["byte_length"])
 
 
 status = call("status")
@@ -1175,38 +1184,70 @@ edges = [now - datetime.timedelta(days=d) for d in AGE_DAYS]
 epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 windows = [(edges[i + 1], edges[i]) for i in range(len(edges) - 1)] + [(epoch, edges[-1])]
 
+# Candidates: the first SCAN_PAGES pages of every source and age window. Nothing sorts by size.
+cells = {}
+for j, source in enumerate(sources):
+    for w, (lo, hi) in enumerate(windows):
+        found = [r for p in pages("artifacts", store, "--source", source["source_id"], "--received-from", stamp(lo),
+                                  "--received-before", stamp(hi), "--page-size", "31", limit=SCAN_PAGES)
+                 for r in p["rows"] if r["origin"] is not None and r["complete_bytes_available"]]
+        cells[(j, w)] = [(r, source["source_id"]) for r in found if length_of(r) > 0]
+
 
 def select():
-    chosen, seen = [], set()
+    pool = [c for rows in cells.values() for c in rows]
+    chosen = sorted(pool, key=lambda c: -length_of(c[0]))[:LARGEST]
+    seen = {c[0]["artifact_id"] for c in chosen}
+    spent = sum(length_of(c[0]) for c in chosen)
+    if chosen and length_of(chosen[0][0]) > CEILING:
+        fail(f"the largest artifact seen, {chosen[0][0]['artifact_id']} of {length_of(chosen[0][0])} bytes, exceeds the "
+             f"ceiling of {CEILING} bytes; raise the ceiling (fourth argument)")
+    if spent > CEILING:
+        fail(f"the {LARGEST} largest artifacts total {spent} bytes, over the ceiling of {CEILING}; raise the ceiling")
     while True:
         before = len(chosen)
         for lap in range(len(windows)):
-            for j, source in enumerate(sources):
-                lo, hi = windows[(lap + j) % len(windows)]
-                for page in pages("artifacts", store, "--source", source["source_id"], "--received-from", stamp(lo),
-                                  "--received-before", stamp(hi), "--page-size", "31"):
-                    hit = next((r for r in page["rows"] if r["artifact_id"] not in seen and r["origin"] is not None
-                                and r["complete_bytes_available"] and 0 < int(r["origin"]["byte_length"]) <= MAX_READ), None)
-                    if hit:
-                        seen.add(hit["artifact_id"])
-                        chosen.append((hit, source["source_id"]))
-                        break
+            for j in range(len(sources)):
+                fits = next((c for c in cells[(j, (lap + j) % len(windows))] if c[0]["artifact_id"] not in seen
+                             and spent + length_of(c[0]) <= CEILING), None)
+                if fits:
+                    seen.add(fits[0]["artifact_id"])
+                    chosen.append(fits)
+                    spent += length_of(fits[0])
                 if len(chosen) >= TARGET:
                     return chosen
         if len(chosen) == before:
-            fail(f"only {len(chosen)} readable artifacts of at most 1 MiB found, need {TARGET}")
+            fail(f"only {len(chosen)} artifacts found within the ceiling of {CEILING} bytes, need {TARGET}; "
+                 "raise the ceiling or find why the copy has so few")
+
+
+def read_whole(artifact, length, path):
+    # successive reads of at most CHUNK bytes, appended to one file that is hashed as one stream
+    piece = path.with_suffix(".chunk")
+    offset = 0
+    with open(path, "xb") as whole:
+        while offset < length:
+            want = min(CHUNK, length - offset)
+            call("bytes", store, artifact, str(offset), str(want), str(piece))
+            data = piece.read_bytes()
+            os.unlink(piece)
+            if len(data) != want:
+                fail(f"{artifact}: read at offset {offset} returned {len(data)} bytes, asked for {want}")
+            whole.write(data)
+            offset += want
+    if path.stat().st_size != length:
+        fail(f"{artifact}: chunks total {path.stat().st_size} bytes, the catalog says {length}")
 
 
 chosen = select()
 out = record / "payload-sample-bytes"
 out.mkdir()
-report = []
+report, read = [], 0
 for n, (hit, source) in enumerate(chosen):
-    artifact, length = hit["artifact_id"], int(hit["origin"]["byte_length"])
+    artifact, length = hit["artifact_id"], length_of(hit)
     path = out / f"{n:04d}.bin"
-    call("bytes", store, artifact, "0", str(length), str(path))
-    if path.stat().st_size != length:
-        fail(f"{artifact}: read {path.stat().st_size} bytes, the catalog says {length}")
+    read_whole(artifact, length, path)
+    read += length
     payload_id = "blake3:" + run(["b3sum", "--no-names", str(path)]).strip()
     answers = list(pages("payload", store, payload_id, "--page-size", "1000"))
     exact = all(p["answer_certainty"] == "exact" for p in answers)
@@ -1215,7 +1256,9 @@ for n, (hit, source) in enumerate(chosen):
         fail(f"{artifact}: payload {payload_id} exact={exact}, lists the artifact={listed}")
     report.append(f"{artifact}\t{source}\t{hit['origin']['received_at']}\t{length}\t{payload_id}")
 (record / "payload-sample.tsv").write_text("\n".join(report) + "\n")
-print(f"payload check passed: {len(report)} artifacts from {len({r.split(chr(9))[1] for r in report})} sources; "
+sizes = [length_of(h) for h, _ in chosen]
+print(f"payload check passed: {len(report)} artifacts from {len({s for _, s in chosen})} sources; "
+      f"sizes {min(sizes)} to {max(sizes)} bytes, {read} bytes read of the {CEILING} ceiling; "
       f"payload-index done=total={total}; sources count {complete} complete + {parents} fragment parents")
 CHECK
 python3 -I "$RECORD/payload-check.py" "$LIB/$NEW_CLI" "$REH/rpc.sock" "$RECORD" > "$RECORD/payload-check.log" 2>&1
@@ -1271,22 +1314,39 @@ cat "$RECORD/payload-check.log"
      the completion line appears. The lookup check below needs the completion line, so completion
    gates `proceed`.
    - A sample of payload lookups is exact, and the counts agree. After the completion line, the
-     check below chooses at least 50 artifacts from the rehearsal copy, spread over its sources and
-     over its ages. It reads `sources` for the source list, and for each source takes one artifact
-     per age window from `artifacts STORE_ID --source S --received-from T --received-before U`.
-     Source `j` takes window `(lap + j) mod 6` in each lap, so ages mix across sources. The
-     windows are the last 1, 1 to 3, 3 to 7, 7 to 14 and 14 to 21 days, and everything older.
-     Only artifacts that report `complete_bytes_available` and a `byte_length` from 1 byte to
-     1 MiB are taken, because `bytes` reads at most 1 MiB per call. For each, it fetches the exact
-     bytes from the rehearsal daemon with `bytes STORE_ID ARTIFACT_ID 0 LENGTH FILE`, compares the
-     byte count with the catalog's `byte_length`, hashes the file outside the daemon with
-     `b3sum --no-names`, and asks `payload STORE_ID blake3:HASH`. The hash comes from the bytes read
-     back, not from the index. Each lookup must answer `answer_certainty` `exact` on every page and
-     list that artifact. A lookup that lists none, or answers `pending` after the completion line,
-     fails the rehearsal. It also requires the `payload-index` migration `done` to equal its
+     check below chooses at least 50 artifacts from the rehearsal copy: the 5 largest it finds, and
+     a spread over the copy's sources and ages. No call lists artifacts by size. The nearest is
+     `artifacts STORE_ID --source S --received-from T --received-before U`, which orders rows by
+     source, then receipt time, and gives each row's `byte_length`. The check reads `sources` for the
+     source list and scans the first 5 pages of 31 rows of every source and age window (the last 1,
+     1 to 3, 3 to 7, 7 to 14 and 14 to 21 days, and everything older), takes the 5 largest
+     `byte_length` among the rows it scanned, and fills the spread one artifact per window
+     (source `j` takes window `(lap + j) mod 6` in each lap, so ages mix across sources). The largest
+     artifacts are the largest of that scan, not of the whole copy. Only rows that report
+     `complete_bytes_available` and a `byte_length` are taken; a row without `byte_length` fails the
+     check. For each artifact it fetches the exact bytes from the rehearsal daemon with
+     `bytes STORE_ID ARTIFACT_ID OFFSET LENGTH FILE`, in successive reads of at most 1 MiB
+     (the call's limit), appended in order to one file under `$RECORD`, and hashes that file with
+     `b3sum --no-names` outside the daemon, so an artifact over 1 MiB is hashed as one stream. It
+     then asks `payload STORE_ID blake3:HASH`. The hash comes from the bytes read back, not from the
+     index. Each lookup must answer `answer_certainty` `exact` on every page and list that artifact.
+     A lookup that lists none, or answers `pending` after the completion line, fails the rehearsal.
+     The check fails when any read returns fewer bytes than asked (a short read, a truncated last
+     chunk, an empty last chunk), when the chunks total other than the catalog's `byte_length`, and,
+     through the hash, when a read returns bytes from the wrong offset. The server refuses a range
+     that passes the artifact's end with `INVALID_ARGUMENT` ("byte range is outside evidence";
+     `in_range` in `crates/sparrow-core/src/storage.rs`) and never truncates it.
+     The check also requires the `payload-index` migration `done` to equal its
      `total` with `failure` and `watermark` null, and `total` (the `artifacts` counter) to equal
      the artifact count the copy reports: the sum of `complete_artifacts` and `fragment_parents`
-     over every `sources` row; `status` itself reports no artifact count. Any failure exits
+     over every `sources` row; `status` itself reports no artifact count.
+     The total bytes read are capped by a ceiling, 4 GiB by default (a choice; the optional fourth
+     argument, in bytes, changes it). If the largest artifact seen alone exceeds the ceiling, or the
+     5 largest together do, the check fails and says to raise it; it never skips them silently. No
+     read rate has been measured, so no duration is stated; at an assumed 100 MiB/s, which is an
+     assumption and not a measurement, 4 GiB is about 41 s of reading (arithmetic) before hashing
+     and the lookups. The check prints the artifact count, the source count, the smallest and the
+     largest artifact in bytes and the total bytes read. Any failure exits
      nonzero and names the artifact. `bytes` is a read call that the `--no-intake` daemon serves
      (only `--query-only` refuses writes, and `bytes` writes nothing in the store); this is read
      from `bytes_read` in `crates/sparrow-server/src/rpc.rs` and `Store::bytes` in
