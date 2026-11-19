@@ -714,14 +714,17 @@ switch 1, so no archive worker runs, and the switch crosses only the payload ind
   to `/395` (the payload index family, #323), deletes any stale `payload-id:` keys and seeds the
   `payload-index-upgrade` checkpoint and two zero counter rows. The batch is atomic: a kill leaves
   `/340` untouched or the whole of `/395`. It is the point of no return: `sparrowd-schema71-fda2812`
-  refuses a lifted store at its open and exits with status 1. The refusal observed on a lifted
-  store is `Error: Error { code: "STORAGE_FAILURE", message: "log time interpretation law and writer
-  fence disagree" }` (below, "What the measurement covers"). The code is `STORAGE_FAILURE`, not
+  refuses a lifted store at its open and exits with status 1. The refusal observed on stores
+  lifted from `/332` to `/387` is `Error: Error { code: "STORAGE_FAILURE", message: "log time
+  interpretation law and writer fence disagree" }` (below, "What the measurement covers"); it is not
+  observed on a store lifted from `/340`. The code is `STORAGE_FAILURE`, not
   `UNSUPPORTED`. The downgrade check in `deploy/lib.sh` compares schema numbers only, so it cannot
   see this fence (Sparrow issue 385); the rules below, not the script, keep the old image off the
   store.
 - The online `payload-index` migration then runs in the maintenance worker, with the daemon
-  serving throughout. Pages of 1,024 artifacts or 64 MiB each commit atomically with their
+  serving throughout. Each page examines up to 1,024 artifact entries, and ends sooner when the
+  stored bytes of the entries it has read reach 64 MiB (the catalog rows, not payload;
+  `crates/sparrow-core/src/storage/payload_index.rs`, `PAGE_BYTES` and `page_of`). A page commits atomically with its
   checkpoint, the migration resumes after a kill or power loss without redoing or skipping a
   page, and it waits below the free-space floor. The format stays `/395`. Until it completes,
   `payload` answers `pending`.
@@ -1128,11 +1131,11 @@ read-only client of the rehearsal daemon's socket:
 
 ```bash
 cat > "$RECORD/payload-check.py" <<'CHECK'
-import datetime, json, os, pathlib, subprocess, sys
+import datetime, json, os, pathlib, subprocess, sys, time
 
 cli, sock, record = sys.argv[1], sys.argv[2], pathlib.Path(sys.argv[3])
 CEILING = int(sys.argv[4]) if len(sys.argv) > 4 else 4 << 30   # most bytes the check reads
-TARGET, LARGEST, CHUNK, PAGE_ROWS = 50, 5, 1 << 20, 31          # the server returns at most 31 artifact rows a page
+TARGET, LARGEST, CHUNK, REPORT_EVERY = 50, 5, 1 << 20, 1000
 AGE_DAYS = [0, 1, 3, 7, 14, 21]   # window edges, days before now; the last window is open-ended
 
 
@@ -1184,13 +1187,35 @@ held = {r["source_id"]: int(r["complete_artifacts"]) + int(r["fragment_parents"]
 if total != sum(held.values()):
     fail(f"migration total {total} != sources complete_artifacts + fragment_parents {sum(held.values())}")
 
-# One full walk of the artifact listing: no call sorts by size or filters by it, and a page holds at most 31 rows.
-walk_calls, listed, last = 0, {}, None
-for page in pages(2 * (total // PAGE_ROWS) + 1000, "artifacts", store, "--page-size", "1000"):
+# One full walk of the artifact listing: no call sorts by size or filters by it. A page holds at most 31
+# rows and fewer when its charged catalog bytes run out first, so a page can hold none; every page that
+# ends before the last has consumed at least one catalog entry (an artifact or one of its records), and
+# the store-counters migration `total` counts every such entry, so it bounds the calls.
+counters = [m for m in status["migrations"] if m["name"] == "store-counters"]
+if len(counters) != 1 or counters[0]["watermark"] is not None or counters[0]["done"] != counters[0]["total"]:
+    fail(f"status has no complete store-counters migration row: {counters}")
+call_limit = int(counters[0]["total"]) + 1
+walk_calls, listed, last, cursors, started = 0, {}, None, set(), time.monotonic()
+cursor = []
+while True:
+    if walk_calls >= call_limit:
+        fail(f"the listing walk made {walk_calls} calls, the bound of {call_limit} catalog entries, and is not finished")
+    page = call("artifacts", store, "--page-size", "1000", *cursor)
     walk_calls += 1
     last = page
     for r in page["rows"]:
+        if r["artifact_id"] in listed:
+            fail(f"the listing returned {r['artifact_id']} twice")
         listed[r["artifact_id"]] = r
+    if walk_calls % REPORT_EVERY == 0:
+        print(f"listing walk: {walk_calls} calls, {len(listed)} artifacts, {time.monotonic() - started:.0f} s", flush=True)
+    if page.get("next_cursor") is None:
+        break
+    if page["next_cursor"] in cursors:
+        fail(f"the listing repeated the cursor {page['next_cursor']}")
+    cursors.add(page["next_cursor"])
+    cursor = ["--cursor", page["next_cursor"]]
+walk_seconds = time.monotonic() - started
 if last is None or last["answer_certainty"] != "exact" or int(last["matching_artifacts"]) != len(listed):
     fail(f"the listing walk is not complete and exact: {len(listed)} rows after {walk_calls} calls, "
          f"last page answers {last and last['answer_certainty']}, {last and last['matching_artifacts']} matching")
@@ -1289,7 +1314,7 @@ print(f"payload check passed: {len(report)} artifacts; sources holding artifacts
       f"with readable artifacts {len(names)}, sampled {len({h['source'] for h in chosen})}; "
       f"age windows covered {len({window_of(h) for h in chosen})} of {len(edges)}; "
       f"sizes {min(sizes)} to {max(sizes)} bytes, {read} bytes read of the {CEILING} ceiling; "
-      f"listing walk of {walk_calls} calls, {len(listed)} artifacts; "
+      f"listing walk of {walk_calls} calls and {walk_seconds:.0f} s, {len(listed)} artifacts; "
       f"payload-index done=total={total}")
 CHECK
 ```
@@ -1323,6 +1348,7 @@ CHECK
    unit's `limits.conf` does for the live daemon (the store refuses to open below 2048):
 
    ```bash
+   date +%s.%N > "$RECORD/rehearsal-t0.txt"
    systemd-run --user --scope --quiet --unit=sparrow-rehearsal \
        -p MemoryHigh=2G -p MemoryMax=4G -p CPUQuota=100% -p IOWeight=20 -- \
        bash -c 'ulimit -n 65536; exec nice -n 10 "$0" --config "$1" --no-intake' \
@@ -1332,27 +1358,52 @@ CHECK
    Run it in the background and read `$RECORD/rehearsal-daemon.log`, which gains the `store_open_ms`
    line (with `migration_fence=`), the `migration payload-index start` line and the
    `migration payload-index complete pages=P done=N elapsed_seconds=S` line. `N` is the live
-   artifact count and `P` its page count, `ceil(N / 1024)` or more when 64 MiB cuts a page.
+   artifact count and `P` its page count, `ceil(N / 1024)` or more when the entries a page reads reach
+   64 MiB. The lines carry no timestamps. Take the time before the start, in the same shell, so the
+   wall time is known: `date +%s.%N > "$RECORD/rehearsal-t0.txt"` before the `systemd-run`, and
+   `date +%s.%N` before and after each `status` read in step 4. The open's own time is `total=` in the
+   `store_open_ms` line (milliseconds), and the migration's is `elapsed_seconds`.
 
 4. Check. Proceed to the live open only if all of these hold.
    - The copy lifts to the new format: `"$LIB/$NEW_CLI" "$REH/rpc.sock" status` shows
-     `store_format` `sparrow.store/395` and the recorded `store_id`.
-   - The payload-index migration is seen advancing page by page: successive `status`
-     reads show `migrations[]` `payload-index` `done` rising toward `total` with `failure` null, and
-     the completion line appears. The lookup check below needs the completion line, so completion
-   gates `proceed`.
+     `store_format` `sparrow.store/395` and the recorded `store_id`. (A `/340` store lifts to `/395`,
+     read from the code; the dry run's `/332` scratch store lifted to `/387`.)
+   - The payload-index migration completes: the log holds the `start` line and a `complete` line
+     with `pages=P`, `done=N` and `N` equal to `total`, and `status` shows `migrations[]`
+     `payload-index` with `done` equal to `total` and `failure` null. A migration of one page, or of
+     pages quicker than a `status` call, is first seen complete (the dry run's 308 artifacts went in
+     one page in 1.636 s, and the first `status` read already showed it done), so the `complete`
+     line, not a rising `done`, is the check. The lookup check below needs it, so completion gates
+     `proceed`.
    - A sample of payload lookups is exact, and the counts agree. After the completion line, the
      check below chooses at least 50 artifacts from the rehearsal copy: the 5 largest in the copy,
      and a spread over its sources and ages. No call lists artifacts by size or filters by it. The
      check therefore walks the whole `artifacts STORE_ID` listing once, without a source or an
      interval; the listing orders rows by source, then receipt time, and gives each row's source,
-     `received_at` and `byte_length`. The server returns at most 31 rows a page whatever
-     `--page-size` asks (`PAGE_ITEMS` in `crates/sparrow-core/src/storage/artifact_read.rs`), so the
-     walk takes about the artifact count divided by 31 calls, plus any pages that carry no rows
-     (about 1,260 calls for the 39,061 artifacts that `before.json` implies, which is arithmetic on
-     the source-summary and source-context totals). The check's page limit is twice that count plus 1,000
-     calls; a walk that passes it, or that ends without an exact final page, or whose rows differ from
-     the listing's own `matching_artifacts` count or from the migration `total`, fails. It also
+     `received_at` and `byte_length`. A page holds at most 31 rows (`PAGE_ITEMS` in
+     `crates/sparrow-core/src/storage/artifact_read.rs`) and often fewer, because the server cuts a
+     page by the catalog bytes it charges, not by rows. Reading an artifact folds each of its
+     records (`fold_index_record`), charges 64 times each record entry's stored bytes against a
+     32 MiB admission (`charge_catalog` in `storage.rs`, `SCAN_BYTES` in `catalog_lease.rs`), and a
+     page ends when that is spent, in the middle of an artifact when need be (`artifact_index_page`).
+     The CLI's `--scan-budget` (at most 100,000 entries, default 10,000) does not lower the call
+     count: 32 MiB divided by 64 is 524,288 bytes of record entries, so a record entry of 53 bytes or
+     more exhausts the bytes before 10,000 entries, and the check leaves the default. Every page
+     that ends before the last consumes at least one catalog entry, an artifact or one of its
+     records, or the call fails with `RESOURCE_LIMIT`. The walk therefore ends within the
+     `store-counters` migration `total` plus 1 calls, which counts every catalog entry; the check
+     takes that as its call limit and fails when the walk passes it. It also fails when a cursor
+     repeats, when the listing returns an artifact twice, when the walk ends without an exact final
+     page, or when its rows differ from the listing's own `matching_artifacts` count or from the
+     migration `total`. The call limit is a bound, not an expectation. The dry run's scratch store,
+     308 artifacts of about 1,330 records (409,300 records, arithmetic), took 694 calls: 424 pages
+     held no row, 232 one and 38 two, at 27.9 calls per second (`.stage/372-dryrun/logs/12-walk-rate.log`),
+     about 590 records per call (arithmetic). Scaling the calls by records to the live
+     2,981,454 `live_records` (`before.json`) gives about 5,055 calls and, at 27.9 calls per second,
+     about 181 s (arithmetic; the rate came from a scratch store while other builds ran on the
+     host, the load was not logged, and live record entries may differ in size, which moves the call
+     count). The check prints a progress line every 1,000 calls and the walk's calls and seconds
+     at the end. It also
      fails when a source that `sources` reports as holding `complete_artifacts` plus
      `fragment_parents` artifacts returns fewer rows than that. The 5 largest artifacts by
      `byte_length` come from the whole walk, and the spread is drawn from the same rows by source and
@@ -1383,9 +1434,11 @@ CHECK
      The total bytes read are capped by a ceiling, 4 GiB by default (a choice; the optional fourth
      argument, in bytes, changes it). If the largest artifact alone exceeds the ceiling, or the
      5 largest together do, the check fails and says to raise it; it never skips them silently. No
-     read rate has been measured, so no duration is stated; at an assumed 100 MiB/s, which is an
-     assumption and not a measurement, 4 GiB is about 41 s of reading (arithmetic) before hashing,
-     the lookups and the listing walk. The check prints the artifact count, how many sources hold
+     read rate of the live copy has been measured, so no duration is stated for it; at an assumed
+     100 MiB/s, which is an assumption and not a measurement, 4 GiB is about 41 s of reading
+     (arithmetic) before hashing, the lookups and the listing walk. The dry run's whole check took
+     90.5 s on the scratch store, with 879 CLI calls and 108,120,791 bytes read in 133 `bytes` calls
+     (`.stage/372-dryrun/logs/11-rehearsal-4b-checker.log`, `13-checker-call-count.log`). The check prints the artifact count, how many sources hold
      artifacts, how many hold readable ones and how many were sampled, how many of the 6 age windows
      the sample covers, the smallest and the largest artifact in bytes, the total bytes read and the
      walk's call count. Any failure exits nonzero and names the artifact. `bytes` is a read call that the `--no-intake` daemon serves
@@ -1412,8 +1465,9 @@ CHECK
      Arithmetic on the reading of 2026-11-19: 99,324,395,520 bytes for two copies plus 4,294,967,296
      bytes (4 GiB) is 103,619,362,816 bytes, against 115,870,515,200 bytes free: a margin of
      12,251,152,384 bytes (12.25 GB). Read it again with the room command before the window.
-   - A stop of the scratch daemon is clean: SIGINT to the one process in the scope, then the journal
-     line `sparrowd: closed store=` and an exit.
+   - A stop of the scratch daemon is clean: SIGINT to the one process in the scope, then the line
+     `sparrowd: closed store=` in `$RECORD/rehearsal-daemon.log` (the scratch scope's output goes
+     there, not to a unit's journal) and an exit; the dry run exited 0.236 s after the signal.
 
      ```bash
      kill -INT "$(cat /sys/fs/cgroup"$(systemctl --user show sparrow-rehearsal.scope -p ControlGroup --value)"/cgroup.procs)"
@@ -1431,10 +1485,11 @@ CHECK
    fence refusal; the consume worker starts only at line 224, in the branch that `!intake` skips
    (line 217). So the old image cannot start a consume worker on the live roots with `$REH_CONF`
    through either path: the open fails first on a lifted copy, and the flag skips the worker on any
-   copy. This is read from the source, with `git show fda2812:...`. The old image with `--no-intake`
-   has not been run on any store: the measured refusals (below) ran it without the flag. What
-   remains unproven is the exact text and exit status of this open on the live store's own lift;
-   this step records them.
+   copy. This is read from the source, with `git show fda2812:...`. Observed with this command on a
+   `/332`-derived scratch store lifted to `/387` by the `a50820e` image: exit status 1 and the line
+   `Error: Error { code: "STORAGE_FAILURE", message: "log time interpretation law and writer fence
+   disagree" }` (`.stage/372-dryrun/logs/15-rehearsal-5-old-refusal.log`). The text and status on a
+   store lifted from `/340` are not observed; this step records them.
 
    Run the step only when the configuration holds none of those keys, that is, when this command
    prints nothing:
@@ -1495,7 +1550,10 @@ from the script, not run).
 What the rehearsal adds to the downtime, all arithmetic. The copy of `COPY` costs the copy time
 below. The migration costs `P` pages times the per-page time, 0.108 s median at 1,024 artifacts of
 3 records, 0.159 s at most there, and 0.263 to 0.602 s for the single page of 101 larger artifacts
-(figures and logs under "What the measurement covers"). An illustration with an assumed count, not
+(figures and logs under "What the measurement covers"); the dry run's single page of 308 artifacts of
+about 1,330 records took 1.636 s, so the per-page time follows the size of the entries, and its open
+(`total=417` ms in `store_open_ms`) and scratch stop (0.236 s) on a 4.24 GB copy are in
+`.stage/372-dryrun/logs/14-rehearsal-4d-stop.log`. An illustration with an assumed count, not
 the live one: 1,000,000 artifacts is 977 pages, 106 s at 0.108 s per page and 588 s at 0.602 s. Add
 the open and the scratch stop (0.015 to 0.025 s idle at a store of 164 MB, 1.85 to 3.47 s at
 4.3 GB; logs `76`, `85`, `92`, `38`, `47`), and the lookups. The rehearsal reads `N` itself, so
@@ -1539,7 +1597,8 @@ limits (`MemoryHigh=2G`, `MemoryMax=4G`, `CPUQuota=100%`, `IOWeight=20`, `nice 1
 the cgroup) with the image `sparrowd-schema71-b420503`, built before the #394 fix and not the image `a50820e`, which differs from it in more than that fix, unless a line
 says otherwise. Logs are under `.stage/372-measure/logs/` in the main checkout. Nothing was
 measured at live size: the live store is about 39 GB and holds an unknown number of artifacts, and
-the pages of the migration number `ceil(artifacts / 1024)`, or more where 64 MiB cuts a page. The
+the pages of the migration number `ceil(artifacts / 1024)`, or more where the artifact entries
+of a page reach 64 MiB. The
 live artifact count is read at the rehearsal. The host load was not logged, so no figure carries
 one.
 
@@ -1605,8 +1664,9 @@ The kept copy and the way back, on the 4.32 GB store (`23-keepcopy.log`, `24-int
   It printed `Error: Error { code: "STORAGE_FAILURE", message: "log time interpretation law and
   writer fence disagree" }` and exited with status 1, on the 4.32 GB store lifted to `/387`
   (`39-old-on-lifted-refusal.log`) and on the 8,160-artifact store lifted to `/387`
-  (`170-A-old-refuses-lifted.log`). The rehearsal's step 5 runs the old image with `--no-intake`,
-  which was not measured; the source evidence is in step 5.
+  (`170-A-old-refuses-lifted.log`). The rehearsal's step 5 command, which runs the old image with
+  `--no-intake`, gave the same text and exit status 1 on a `/332`-derived store lifted to `/387`
+  (`.stage/372-dryrun/logs/15-rehearsal-5-old-refusal.log`).
 
 Stop time, SIGINT, on stores of 0.16 to 4.32 GB on disk after the same ingest, 6 artifacts of
 5,000 records. The runs of logs `104`, `124`, `133`, `143` and `163` (`stop_timed.sh`) had a
