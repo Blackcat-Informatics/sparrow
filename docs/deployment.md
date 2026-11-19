@@ -929,8 +929,9 @@ Three acts precede or accompany the script's stop, in this order.
    the three `rocksdb:low` (compaction) threads ran, used about 30 CPU-seconds, and the cgroup
    wrote 343 MB in 44 s, the last thread leaving at +44 s (`211-D-diag-derived.log`). In the
    13.1 s run nothing was computing: threads were in IO wait at `IOWeight=20` (`213-D-diag-quiesce.log`).
-   The exact RocksDB call is inferred: gdb and the other stack samplers are refused without
-   root (`ptrace: Operation not permitted` under `ptrace_scope=1`, `210-D-diag-new.log`). The 234 s stop of an earlier run did not reproduce and is unexplained.
+   The exact RocksDB call is inferred: gdb is refused without root (`ptrace: Operation not
+   permitted` under `ptrace_scope=1`, `210-D-diag-new.log`), and so is `eu-stack`
+   (`124-C-bigNew-stop-timed.log`); no stack was taken. The 234 s stop of an earlier run did not reproduce and is unexplained.
 
    While the script waits in `stop sparrow.service`, read these from a second shell, none of which
    needs root. A long stop is waited out, never ended by hand.
@@ -1273,13 +1274,19 @@ kill (`220-E-diag-old.log`). In every run the `closed store` journal line came 0
 SIGINT; the rest was teardown. The slow stop is not particular to the new image. In the 50.5 s run
 the compaction threads ran (about 30 CPU-seconds, 343 MB written in 44 s;
 `211-D-diag-derived.log`); in the 13.1 s run threads were in IO wait. The exact call is inferred
-(no stack sampler ran without root), and the 234.4 s stop above did not reproduce. At the older
+(gdb and `eu-stack` were refused without root; no stack was taken), and the 234.4 s stop above did not reproduce. At the older
 1.57 GB series the process wrote about 351 MB in 18 s during a 25 s stop (`133-C-bigNew-d-stop-timed.log`,
 `write_bytes` 7,523,508,224 at 2 s and 7,874,908,160 at 20 s).
 
-The stop does not order by store size across these runs: 61.4 s and 25.0 s at 1.57 GB, 13.1 s to 50.5 s
-at 3.46 GB, 98.8 s at 4.76 GB with the old image, 234.4 s at 4.32 GB on disk before the ingest (7.38 GB status `physical_bytes`, `33-post-ingest-status.log`). The `TimeoutStopSec` above
-scales one of them by size and is arithmetic.
+The stop does not order by store size across these runs. On-disk size before the ingest, then status
+`physical_bytes` at the SIGINT where a log has it:
+
+- New image: 61.4 s on 1.57 GB on disk (2.38 GB status, `122-C-bigNew-status.log`); 25.0 s on the
+  same base (no status read); 13.1 s to 50.5 s on 3.46 GB on disk (5.11 to 5.38 GB status).
+- Old image: 98.8 s on the 3.46 GB base on disk (4.76 GB status).
+- New image, round 1: 234.4 s on 4.32 GB on disk (7.38 GB status, `33-post-ingest-status.log`).
+
+The `TimeoutStopSec` above scales one of these by status size and is arithmetic.
 
 `--no-intake`, on a scratch store at `/387` (`300-F-setup.log` to `311-F-control-stop.log`). A store
 with one consume watch, bootstrapped from a `[[consume]]` block into the catalog, and three files
