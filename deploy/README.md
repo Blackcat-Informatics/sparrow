@@ -513,7 +513,7 @@ and `purge` falls back to the unit's journal line for this socket. When the id
 is unknown or differs, `purge` removes nothing and names the cause; delete
 `SCRATCH/archive-dir` to leave that archive in place and purge the rest. A
 `setup` without `SPARROW_TEST_ARCHIVE_DIR` drops the stale record and leaves the
-directory alone; it refuses while the unit exists or runs, and
+directory alone. `purge` refuses while the unit exists or runs, and
 when `SCRATCH` holds no configuration written by this script (it checks the script's header line, which every version wrote). A scratch store created
 before instance roles existed has no role row, so the daemon refuses to start
 on it once the configuration sets `instance_role`; `setup` detects it from its

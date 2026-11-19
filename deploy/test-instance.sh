@@ -72,7 +72,7 @@ own_store_id() {
         id=$(<"$STORE_RECORD")
     else
         id=$(journalctl --user -u "$UNIT" -o cat --no-pager 2>/dev/null \
-            | grep -F "capnp=$DATA/store/rpc.sock" | tail -n 1 \
+            | grep -F "capnp=$DATA/store/rpc.sock data=" | tail -n 1 \
             | sed -nE 's/.*store=(store:[0-9a-f]{32}) .*/\1/p' || true)
     fi
     [[ $id =~ ^store:[0-9a-f]{32}$ ]] && printf '%s\n' "$id"
