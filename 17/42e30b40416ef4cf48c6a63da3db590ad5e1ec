@@ -1,0 +1,19 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 1742e30b40416ef4cf48c6a63da3db590ad5e1ec
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 414
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/414
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 4c660a0288729c23d6e506fd55963e1ce2e5f9e5
+GhpRsq-Head-Ref: paudley/412-rebuild-the-a50820e-pair-lost-with-the
+GhpRsq-Head-OID: 1742e30b40416ef4cf48c6a63da3db590ad5e1ec
+GhpRsq-Result-Tree: 35baced4658d1e2b087a9de6d4ca8bd7d85487af
+GhpRsq-Result-Commit: 11426cf32e29ad0d381ffeec5ec2f83e05093608
+GhpRsq-Parent-Hashes: 1742e30b40416ef4cf48c6a63da3db590ad5e1ec
+GhpRsq-Squash-Notes-SHA256: 9168576c7f712b0cdaa3237333ec200a4ce4d4cd72ccc8e7ecfafaf90b016a02
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
