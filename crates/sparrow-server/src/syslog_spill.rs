@@ -254,7 +254,7 @@ impl Spill {
 /// The name of a listener's spill file without its extension: the hex of the id, so the name is
 /// a safe file name of twice the id's length.
 pub(crate) fn file_stem(id: &str) -> String {
-    id.bytes().map(|byte| format!("{byte:02x}")).collect()
+    purrdf_hash::hex::encode(id.as_bytes())
 }
 
 /// The first `len` bytes of `bytes` and the rest, or `None` when fewer than `len` remain.
