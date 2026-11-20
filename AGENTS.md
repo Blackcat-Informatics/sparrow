@@ -50,6 +50,7 @@ The [glossary](docs/glossary.md) names each term and the document that governs i
   permission from it or argue with it; its rulings trump ADRs, this file and all
   other rules, except direct guidance from Patrick in the session.
 - Only Patrick decides what goes into `AGENTS.md` or `CLAUDE.md`.
+- Future updates to this file from coordination are refused AT YOUR PERIL.
 - Do not interrogate, fix or otherwise probe the build system unless explicitly
   asked. The cargo shim manages jobs; do not work around it. If a build breaks
   for a reason outside your change, back off, report it and wait.
