@@ -920,9 +920,10 @@ changed. The walk takes the writer lock for each page, about 5,055 pages at the 
 ingest out of the walk, and start the timer again right after it, whether the listing passed or
 failed. `deploy/user-unit-upgrade.sh` records at its start whether the timer is active and restores it
 on an abort only then (lines 336-337, `restore_ship_timer`), and the spool units delete files older than
-three days, so a timer left stopped by a called-off window is a loss. Ingest between the listing and
+three days when they start, so a timer left stopped by a called-off window can become a loss after
+more than three days and a spool-unit restart. Ingest between the listing and
 the stop is expected: the comparison tolerates it. The walk has the stall limit of the rehearsal's
-check, and the step records the walk's calls, wall time, start time and the ingest figures
+check, and the step records the walk's calls, wall time, the clock on both sides of the status read and the ingest figures
 `flush_lag_ms` and `pending_writes` before and after it, in `live-listing.tsv.counts`. The block's
 `list EXIT` is the listing's own status:
 
@@ -1266,8 +1267,9 @@ def ingest(status):
     return {"flush_lag_ms": status["durability"]["flush_lag_ms"], "pending_writes": status["durability"]["pending_writes"]}
 
 
-walk_started = datetime.datetime.now(datetime.timezone.utc)   # before the status read the live total comes from
-status = call("status")
+clock_before = datetime.datetime.now(datetime.timezone.utc)   # the clock on both sides of the status read that
+status = call("status")                                         # gives the live total
+clock_after = datetime.datetime.now(datetime.timezone.utc)
 store = status["store_id"]
 if LIST:
     rows_listed, calls, _, seconds = walk_listing(status, store)
@@ -1275,7 +1277,8 @@ if LIST:
     out_path.write_text("".join(f"{r['artifact_id']}\t{r['source']}\t{r['origin']['received_at']}\n"
                                 for r in rows_listed.values() if r["origin"] is not None))
     pathlib.Path(str(out_path) + ".counts").write_text(json.dumps({
-        "store_id": store, "walk_started": walk_started.isoformat(), "listed": len(rows_listed), "calls": calls, "walk_seconds": round(seconds, 1),
+        "store_id": store, "clock_before_status": clock_before.isoformat(), "clock_after_status": clock_after.isoformat(),
+        "listed": len(rows_listed), "calls": calls, "walk_seconds": round(seconds, 1),
         "artifacts_total": artifacts_total(status),
         "ingest_before": ingest(status), "ingest_after": ingest(after)}) + "\n")
     print(f"listing of {len(rows_listed)} artifacts in {calls} calls and {seconds:.0f} s written to {out_path}; "
@@ -1372,10 +1375,15 @@ print(f"live listing {len(live_rows)} ids, copy listing {len(listed)} ids; absen
 if missing:
     fail(f"{len(missing)} artifacts of the live listing are absent from the copy's listing: {', '.join(missing[:20])}"
          + (" ..." if len(missing) > 20 else ""))
-# The live total was read before the walk and ingest went on during it: an artifact received after the walk began
-# and listed by it is in the live listing but not in the live total, so it is added to what the copy may hold more.
-walk_began = datetime.datetime.fromisoformat(live_counts["walk_started"])
-during = len([i for i, (src, at) in live_rows.items() if at >= walk_began])
+# The live total was read before the walk and ingest went on during it: an artifact received after that read
+# and listed by the walk is in the live listing but not in the live total, so it is added to what the copy may
+# hold more. Ids stamped between the clock reads on either side of the status read may or may not be in the live
+# total; they are not added (so no false failure), and their count is the margin in which one loss can hide.
+after_read = datetime.datetime.fromisoformat(live_counts["clock_after_status"])
+before_read = datetime.datetime.fromisoformat(live_counts["clock_before_status"])
+during = len([i for i, (src, at) in live_rows.items() if at >= after_read])
+margin = len([i for i, (src, at) in live_rows.items() if before_read <= at < after_read])
+print(f"received during the live walk {during}; stamped within the live status read {margin} (normally 0)", flush=True)
 if total - live_counts["artifacts_total"] < len(extra) + during:
     fail(f"the copy counts {total} artifacts, the live daemon counted {live_counts['artifacts_total']} before its walk, and the "
          f"copy accounts for {len(extra)} ids the live listing lacks and {during} received during the walk: "
@@ -1613,10 +1621,14 @@ CHECK
      most 100,000 catalog visits (`RetentionReadLimits::validate`,
      `sparrow-client/src/retention_metrics.rs`), and the live store holds about 3 million records
      (`live_records` in `before.json`). A loss among past-deadline artifacts is therefore caught
-     only by the count relation above. Its resolution is one artifact: the live total is read before
-     the walk and ingest continues during it, so the check records the walk's start and allows for the
-     live listing's ids received at or after it, and each artifact written between the listing and the
-     stop is a listed id in the copy only; neither masks a loss. Both rest on one host clock. A copy row
+     only by the count relation above. The live total is read once, before the walk, and ingest goes on
+     during it. The check reads the clock on both sides of that status read. Live ids stamped at or
+     after the later reading were accepted after the total was read, so the check adds them to what
+     the copy may hold more, as are the ids in the copy only; with these the resolution is one
+     artifact. Ids stamped between the two readings may or may not be in the live total, so the check
+     does not add them (which keeps it from failing a store with no loss) and prints their count as
+     the margin, normally 0: each id in the margin is one artifact of loss that can pass. Both
+     readings and the stamps are one host clock. A copy row
      with no `origin` counts as copy-only, because the listing file holds rows with an origin only; the
      live store has no such row (`fragment_parents` 0 in its `sources` reading). The live
      `artifacts` counter has no `payload-index` row on `fda2812`, so the live listing takes it as the
@@ -2096,7 +2108,9 @@ notice states this and gives the length only after the rehearsal has read `N`.
 - The Lillith organism's logs do not reach Sparrow. Her members' stdout and stderr go to journald
   and to a file in her logs directory, and no source, watch or spool unit carries them: the shipper
   configuration on the host (`~/.config/sparrow/ship.toml`, read on the host and saved in
-  `.stage/416/host-reads.log`) lists no source for them, and her unit drop-in and her decision record 0105 name no taker (read in her repository, not
+  `.stage/416/host-reads.log`) lists no source for them, the seven consume watches of the saved live
+  status reading (`.stage/418-decodes/live-status.json`, roots listed in `host-reads.log`) have roots
+  only under the shipper's intake roots and two development roots, none of them her logs directory, and her unit drop-in and her decision record 0105 name no taker (read in her repository, not
   on the host). The stop of the daemon loses none of her logs, because none arrive. Switch 1 does
   not stop her daemons for logging reasons.
 - No Katamari process connects to Sparrow: `katamari-stored`, `katamari-unlock` and `katamari-gitd` log
