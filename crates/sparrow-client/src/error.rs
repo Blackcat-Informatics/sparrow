@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
-/// The machine-readable reason of a retryable refusal, additive to its code.
+/// The machine-readable reason of a refusal, additive to its code: what the daemon sent, or
+/// `Local` for a refusal the client built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FailureClass {
-    /// No class: every refusal of an older daemon, and any the daemon does not classify.
+    /// No class: every refusal of an older daemon, any the daemon does not classify, and the
+    /// refusals the client builds with codes that no daemon refusal carries. A client-built
+    /// refusal that uses a code a daemon sends for the input (`INVALID_ARGUMENT`,
+    /// `RESOURCE_LIMIT`) must be `Local` instead.
     #[default]
     Unclassified,
     /// The free-space floor paused writes. The producer holds until space returns; the code is

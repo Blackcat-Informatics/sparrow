@@ -132,8 +132,10 @@ impl Refusal {
     #[must_use]
     pub(crate) fn of(error: &Error) -> Option<Self> {
         match error {
-            // A refusal the client built itself is never `Unclassified`: the daemon sends
-            // that class, a client-built one carries `Local` and says its claim is pending.
+            // A refusal the daemon sent is `Unclassified` (an older daemon sends no class). A
+            // client-built refusal with one of these two codes must carry `Local`, or it would
+            // read as the daemon's refusal of the input; the client's other refusals are
+            // `Unclassified` but use codes this match does not take.
             Error::Upload(sparrow_client::Error::Domain {
                 code,
                 message,
@@ -854,6 +856,22 @@ impl ClaimRoot {
             return Err(Error::State(
                 "quarantine directory must be owned by the daemon",
             ));
+        }
+        // The names above are lexical. Compare identity too, so a configured root that reaches
+        // this directory by another route (a bind mount) is never given quarantined sources.
+        for root in roots {
+            let other = open(
+                fs::CWD,
+                root,
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                ResolveFlags::NO_SYMLINKS,
+            )?
+            .metadata()?;
+            if other.dev() == metadata.dev() && other.ino() == metadata.ino() {
+                return Err(Error::State(
+                    "the quarantine directory is the same directory as a configured consume root; the refused source stays in its private claim directory",
+                ));
+            }
         }
         Ok((directory, dirname))
     }

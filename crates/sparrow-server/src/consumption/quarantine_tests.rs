@@ -208,3 +208,29 @@ fn quarantine_refuses_a_duplicated_source_and_a_configured_root() {
     assert!(f.producer.join(".sparrow-inflight").join(&f.id).exists());
     assert_eq!(f.store.consumption_pending().unwrap().len(), 1);
 }
+
+/// INVARIANT (#417): a configured root that reaches the quarantine directory through `..` is
+/// found by identity, which the lexical name check cannot see; no source is written into it.
+/// A bind-mount alias is checked by the same device and inode comparison and is not tested.
+#[test]
+fn a_root_reaching_the_quarantine_through_dotdot_is_refused_by_identity() {
+    let f = claimed();
+    let parent = f.producer.parent().unwrap();
+    let quarantine = parent.join("watch.sparrow-quarantine");
+    std::fs::create_dir(&quarantine).unwrap();
+    std::fs::set_permissions(&quarantine, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let alias = parent
+        .join("watch")
+        .join("..")
+        .join("watch.sparrow-quarantine");
+    let result = f.root.quarantine(
+        &f.producer,
+        &[alias],
+        &f.id,
+        &refusal(),
+        crate::now().unwrap(),
+    );
+    assert!(result.is_err());
+    assert!(!quarantine.join(&f.id).exists());
+    assert!(f.producer.join(".sparrow-inflight").join(&f.id).exists());
+}

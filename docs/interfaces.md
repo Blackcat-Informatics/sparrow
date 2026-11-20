@@ -4228,10 +4228,12 @@ What shows it:
 
 The move is a rename on one filesystem, so the source has one name at every
 instant and is never copied or deleted. Configuration validation and `watch put`
-refuse a root, `data_dir`, archive root or other path the daemon writes that is,
-contains or lies inside another root's quarantine directory, whichever of the two
-is configured first, and the worker refuses to move a source into a directory
-that is a configured root. So the daemon never reads a quarantine as input. A
+refuse a watch root containing `..`, and refuse a root, `data_dir`, archive root
+or other path the daemon writes that is, contains or lies inside another root's
+quarantine directory, whichever of the two is configured first. The worker also
+refuses to move a source into a directory that is, by device and inode, the same
+directory as any configured root, which covers a bind mount. So the daemon never
+reads a quarantine as input. A
 stop between the move and the retirement is finished from the refusal file on the
 next failed attempt of that claim. A stop after the refusal file is written and
 before the move leaves that `CLAIM_ID.refusal` in the quarantine directory with
@@ -4256,8 +4258,10 @@ change that. `status` reports `retired_claim_count` and `max_retired_claims`
 (`Status.retiredClaimCount` and `Status.maxRetiredClaims`, schema 71, additive),
 and the daemon logs once per start when the count reaches three quarters of the
 bound (768, which leaves 256 retirements to act in) and once at the bound, saying
-what follows. No supported step frees the rows. Issue #420 tracks ageing retired
-claims out, which needs a stored-format change.
+what follows. No supported step frees the rows; issue #420 tracks ageing retired claims
+out, which needs a stored-format change. A parked claim that a configured limit
+refused (such as `max_records`) clears when the setting is raised and the daemon
+restarts, because its one upload after the restart then publishes.
 
 To recover a quarantined source, read the refusal in `retired_claims` or the
 refusal file, fix the cause (for example split the file below the record bound),
