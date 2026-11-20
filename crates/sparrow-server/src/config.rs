@@ -316,6 +316,17 @@ fn default_ingest_connections() -> usize {
 }
 
 impl ServerConfig {
+    /// The directory of the syslog TCP spill files: `syslog-spill` beside the data directory, so a
+    /// frame the listener could not store at a stop is kept outside the store that refused it.
+    /// A configuration with a syslog listener and a data directory with no parent is refused at read.
+    #[must_use]
+    pub fn syslog_spill_dir(&self) -> PathBuf {
+        self.data_dir.components().as_path().parent().map_or_else(
+            || PathBuf::from("syslog-spill"),
+            |parent| parent.join("syslog-spill"),
+        )
+    }
+
     /// Read and validate the same typed configuration used by the production daemon.
     pub fn read(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let text = std::fs::read_to_string(path)?;
@@ -352,6 +363,9 @@ impl ServerConfig {
         }
         if config.socket_path.parent() != Some(config.data_dir.as_path()) {
             return Err("socket_path must be directly inside the private data_dir".into());
+        }
+        if !config.syslog.is_empty() && config.data_dir.components().as_path().parent().is_none() {
+            return Err("syslog listeners keep their spill directory beside data_dir, so data_dir needs a parent directory".into());
         }
         config.validate_ingest_socket()?;
         if !config.consume.is_empty() && config.max_concurrent_requests < 2 {

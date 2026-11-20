@@ -14,6 +14,7 @@ pub mod journal_log;
 mod source_file;
 pub mod staging_refusal;
 pub mod syslog_listener;
+mod syslog_spill;
 mod syslog_wire;
 mod tail_wire;
 mod tailing;
