@@ -5,84 +5,14 @@ SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 # Sparrow implementation plan
 
-Status: implementation and finite acceptance checks complete. Helper-census tooling, a RocksDB storage
-foundation, the Cap'n Proto daemon, bounded JSON occurrence discovery and persistent
-native full-text retrieval and bounded acceptance-time record context through
-shared CLI and stdio MCP clients are present. Native JSON/Markdown content and
-record metadata now persist through a canonical RDF dictionary and six physical
-quad permutations; typed inspection exposes projection state and stream counts.
-The native stored view now supports bounded lazy reads and governed
-SELECT, ASK, CONSTRUCT and DESCRIBE through the Rust core API, with native typed
-substitutions, retained outcomes and scoped membership/coverage. The CLI/MCP and
-typed RPC graph surface is implemented and deployed. Recordless
-artifact RDF and independent artifact coverage are deployed in schema 52;
-native correlation is deployed in schema 58 through the same governed
-query and retained-result owners. Public explanations are deployed in schema 61;
-schema 62 deploys the borrowed stored-text rank/span relations with corpus,
-coverage and original-byte evidence. The
-integration state is recorded in
-[PurRDF integration gaps](purrdf-integration-gaps.md).
-Independent Artifact-class metadata for populated artifacts and persisted
-Source/Stream class declarations are implemented and deployed in schema 57.
-Deployed schema 59 adds occurrence-owned tracing relationships from the existing
-native JSON facts, including lifecycle observations, producer-scoped span IDs,
-ordered context, declared parent/follows-from evidence and exact context spans.
-Its bounded metadata backfill preserves existing authority families and retention.
-Runtime adoption and source qualification remain separate evidence surfaces.
-The requested implementation and finite acceptance checks are complete. Production
-capacity remains unqualified beyond the measured envelope. Current executable surfaces
-and verification are recorded in [Development runtime](development-runtime.md).
-Stable-ID pin renewal is implemented through the core, typed daemon, CLI and MCP,
-including durable retry receipts and optional revision guards. Pin discovery
-and member retrieval now use finite immutable catalog pages shared by the typed
-daemon, CLI and MCP. Artifact and source discovery share the catalog lease owner;
-source inventory includes exact intake keys, mapping IDs, retained occurrence
-counts and configured watch bindings. Producer continuity remains explicitly
-unknown. Source discovery includes finite producer windows and active/recent
-terminal file-generation checkpoint IDs, including empty inputs; checkpoint/gap
-evidence does not imply complete history.
-Artifact discovery now admits live, explicit evidence and revision-guarded pin
-membership through the same reference owner as record queries, including
-recordless artifacts and frozen pages after pin release. Artifact source-array
-and diagnostic filters use the shared record matcher, with frozen coverage,
-unknown counts and strict refusal. Record queries, including same-record fields
-and native ranked text, now use immutable result pages with frozen receipts and
-ranking corpus evidence. Standalone text search shares those captures, native
-ranking, operation-bound cursors and aggregate handle admission. Key/value discovery now shares those leases and captures complete native occurrence
-rows or key counts before paging. Cursor-only result_next resumes all existing typed page families through their
-shared lease and canonical renderers.
-Optional artifact grouping uses the same captured record matcher and native
-ranking, with frozen per-artifact counts and page-local row references across
-typed RPC, CLI and MCP. Its schema-43 live and copied-corpus evidence is recorded
-in [Development runtime](development-runtime.md#frozen-artifact-match-groups).
-Existing paged query receipts now freeze
-capture identity, native profiles and effective host admission ceilings while
-preserving original coverage and certainty. Native graph captures retain the
-engine's certified governor outcomes. Frozen logical scope receipts are deployed
-for record/text/key/value queries in schema 56 and graph/context in schema 57.
-Production-scale indexed-selection and resource acceptance remain required.
-Key discovery now supports exact native RFC 6901 path restriction through the
-same occurrence matcher, typed client, CLI and MCP; paths and complete counts
-remain frozen across continuations.
-Context now reports single-capture identity and effective directional, catalog
-and response admission; byte exhaustion refuses without a successful prefix.
-The standalone producer client and schema-11 typed event batch operation are
-present. Native event JSONL enters the same occurrence/field/text/time indexes;
-the bounded producer queue now reconnects with immutable pending batches and
-provides durable admitted-input flush/shutdown fences. The tracing layer, typed
-span/context capture, explicit buffered-WAL acknowledgements and flush-through,
-and finite producer sequence windows are implemented. Public TCP shares the
-generated service and bounded Rust logging worker with Unix. Bounded syslog
-listeners and packet interpretation, active-log generations, durable tail
-checkpoints, observed rotation/gaps, producer-finish completion and explicit
-completed-tail handoff are implemented. Production operational qualification
-remains milestone-4 work; source/runtime evidence is recorded separately in
-Development runtime.
+Current executable surfaces, deployed schemas and verification are recorded in
+[Development runtime](development-runtime.md); native integration and its gaps
+are in [PurRDF integration gaps](purrdf-integration-gaps.md). This plan states
+the query priorities, sample discovery and delivery slices.
 
 This plan builds on [Architecture](architecture.md) and [Interfaces](interfaces.md).
-It records the initial query priorities and sample discovery supplied on
-2026-10-06. The existing milestone dependencies remain: qualify storage and
-lifetime first, then import, then query surfaces, then continuous producers.
+The milestone dependencies are: qualify storage and lifetime first, then
+import, then query surfaces, then continuous producers.
 
 ## Current acceptance boundary
 
@@ -94,7 +24,7 @@ production capacity.
 | Required area | Evidence already present | Qualification boundary |
 | --- | --- | --- |
 | Graph queries | Deployed schema 62 supplies SELECT/ASK/CONSTRUCT/DESCRIBE, measured EXPLAIN and borrowed stored-text rank/span relations through typed RPC/CLI/MCP. Production-image private/live checks return 2,990 triples in 43 pages; native scores/corpus identity and nine record-local spans match the preceding ordinary-search oracle. | Qualified under unchanged limits. The separate 8,320-record load store refuses whole-store graph COUNT at catalog admission; selected COUNT/ranking/EXPLAIN pass. [Native integration](purrdf-integration-gaps.md), [load](load-qualification.md#schema-62-native-graph-and-text-follow-up). |
-| Reclamation | Native tombstone-compaction policy; real-pressure regression with measured decrease, successful retry, protected shared bytes and reopen; all three current-source 60-day turnover profiles pass. The full gate passes at bee07bc and the installed daemon adopts that policy. | Finite physical recovery and turnover are qualified. Closed files remain after zero logical ownership; no hard quota is configured and no new upstream API is required. [Native reclamation](native-reclamation.md), [turnover](turnover-qualification.md#schema-62-retention-and-native-compaction-policy). |
+| Reclamation | Native tombstone-compaction policy; real-pressure regression with measured decrease, successful retry, protected shared bytes and reopen; all three current-source 60-day turnover profiles pass. | Finite physical recovery and turnover are qualified. Closed files remain after zero logical ownership; no hard quota is configured and no new upstream API is required. [Native reclamation](native-reclamation.md), [turnover](turnover-qualification.md#schema-62-retention-and-native-compaction-policy). |
 | Agent contracts | Live schema 62 advertises 38 shared typed tools, including text corpus/profile/coverage receipts and native relation descriptors. TCP/Unix CLI/MCP agree; frozen continuations, profiles/generations, 217 records and all 253 byte targets are preserved with zero leftover handles/bytes. | Qualified through default images and load follow-up with exact independent counts/scores. Effective limits and typed refusals remain part of the contract. [Interfaces](interfaces.md), [load](load-qualification.md). |
 | Final qualification | Release gate; twelve completed-file SIGKILL windows; real owned-kernel queue overflow and configured directory-limit recovery; writable/read-only closes, multiple writers, moved-in files and stale events; current-source turnover and concurrent mixed-format load. | Declared finite workloads pass with measured resources and latencies. Historical representative-corpus/burst evidence retains its source identity. Production rate/density targets and strict quota acceptance are not established. [Crash/watch checks](interfaces.md#completed-file-process-crash-qualification), [turnover](turnover-qualification.md), [performance](performance-baseline.md). |
 
@@ -103,7 +33,8 @@ directory-budget exhaustion is independent of exhausting the shared kernel
 watch quota. The SIGKILL matrix starts from durable reservation and does not
 prove power-loss persistence at arbitrary filesystem boundaries. The finite
 turnover corpus is 65,642,380 raw bytes per pin mode. None of these results closes
-production capacity acceptance. Host reboot and power-loss trials
+production capacity acceptance. Production-scale indexed-selection and resource
+acceptance remain required. Host reboot and power-loss trials
 are not additional first-version gates: the architecture's crash scenarios and
 the durability claims actually made determine the required checks.
 
@@ -112,29 +43,10 @@ hypothetical dependency request. The remaining deployment inputs below determine
 future capacity claims; no numerical SLA, strict quota or production consume
 root has been inferred. Inaccessible corpus samples remain a coverage limit.
 
-The initial upstream readback on 2026-10-18 found #600, #601 and #605 open.
-Later main landed actual-payload materialization (PR #609, closing #605) and
-governed request EXPLAIN (PR #611, closing #600). The preceding source selected
-`9b2bf3b71325154137bc1aa817b46356daadfe3a` for both runtime dependencies and
-census discovery. Three focused release consumer regressions and release Clippy
-pass, covering retained complete materialization and request/governor EXPLAIN
-parity, including host refusals. Signed `126248c` passed the full gate for that
-adoption. Source schema 61 adds the public EXPLAIN adapters, with three additional
-release consumer regressions, release Clippy and pinned census passing. The
-normal full gate passed at signed `ffdfbbf`, and production-feature images now
-pass private-copy and live adoption with exact-byte, profile and generation
-continuity. A later upstream refresh finds #601 completed by PR #615 at
-`a47940e1f130bf3739c6d59aaf89643209905ea4`, an ancestor of observed main
-`25de0d0de0856c7b88288d0ee65777bd1e95b34b`. Its scoped registry/cursor API is
-available. Source dependencies and the census reference now select that exact
-landed commit. Source qualification and stored-text consumer implementation
-were separate from the preceding installed schema-61 image, which used `9b2bf3b`.
-The schema-62 adoption now selects `a47940e1` in the production images too.
-The selected rust-rocksdb upstream remains
-`46d7e4f10dd9f8dbb219893592a1cab9bdc109c6`. The earlier inference that Sparrow
-required a new file-compaction API was unproven and is withdrawn. Existing native
-policy and measured pressure recovery must be evaluated before declaring an
-external dependency blocker.
+The RocksDB binding is the `rocksdb` crate that `Cargo.toml` declares and
+`Cargo.lock` resolves. Evaluate the existing native
+compaction policy and measured pressure recovery before declaring an external
+dependency blocker.
 
 ## First useful outcome
 
@@ -277,12 +189,11 @@ complete stream history. Multi-source temporal correlation uses the explicit
 ## PurRDF integration and ownership
 
 Inspect and compile against an exact selected native dependency revision before
-runtime implementation. The current runtime dependencies and census reference
-both select `9b2bf3b71325154137bc1aa817b46356daadfe3a`, as recorded separately in
-`Cargo.toml`, `Cargo.lock` and `registry/compatibility.toml`. The table below
-preserves the original seam audit at
-`e58974e504b9681597faea1490002ce8ddaf7448`; later native integration and its
-remaining gaps are recorded in [PurRDF integration gaps](purrdf-integration-gaps.md).
+runtime implementation. The runtime dependencies are declared in `Cargo.toml` and
+locked in `Cargo.lock`; the census reference revision is in
+`registry/compatibility.toml`. The table below records the seam audit; native
+integration and its remaining gaps are recorded in
+[PurRDF integration gaps](purrdf-integration-gaps.md).
 
 | Concern | Native owner / inspected surface | Sparrow work |
 | --- | --- | --- |
@@ -363,7 +274,7 @@ in a time interval, verifies the matching original bytes, and pins selected
 evidence. Native/resident comparisons cover duplicate keys, array-parent binding,
 unknown timestamps, lexical versus logical values, expiry, and partial coverage.
 
-### 4. Full-text investigation and context — next milestone 3 slice
+### 4. Full-text investigation and context — milestone 3 slice
 
 - Persist native-analyzed text postings and corpus statistics; declare ranking
   scope, resolve analyzer artifacts, and bind prepared scoring to stored reads.
@@ -399,9 +310,8 @@ These do not prevent foundation work or synthetic query fixtures:
 
 - Deployment host, filesystem/quota, RAM ceiling, disk budget, and maintenance
   reserve. Establish numerical targets after initial whole-store measurement.
-- Public Cap'n Proto TCP at `0.0.0.0:518` is authorized, with no ingestion
-  authentication requirement (2026-10-08). Other TCP operations require a
-  shared-secret CHAP session (2026-10-27); qualify remote agent access through
+- Public Cap'n Proto TCP at `0.0.0.0:518` carries no ingestion authentication
+  requirement. Other TCP operations require a shared-secret CHAP session; qualify remote agent access through
   the same typed operations.
 - Explicit production watch roots and each producer's completed-file, append,
   rotation, or truncation handoff contract. Sample paths authorize read-only

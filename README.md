@@ -56,8 +56,7 @@ present commands, verified behavior and limits.
 
 The production deployment is the system unit in [`deploy/`](deploy/README.md),
 serving typed Cap'n Proto on `0.0.0.0:518` and a private Unix socket at
-`/SPARROW/store/rpc.sock`; the live host runs the earlier user service until its
-cutover. Anonymous TCP peers may only discover,
+`/SPARROW/store/rpc.sock`. Anonymous TCP peers may only discover,
 ingest and import; other TCP operations require `--secret-file` CHAP authentication. The client is `~/.local/bin/sparrow`.
 Graph queries use PurRDF's native semantics and governors over bounded stored
 views, with explicit admission refusals; see
@@ -75,8 +74,7 @@ An unpinned item is due at `received_at + 30 days` (server acceptance) and is
 retired then once the archive holds it. Source timestamps remain queryable but
 do not determine expiry. Disk pressure can retire archived, unpinned items
 earlier. A pin keeps an item until the pin ends. The deletion gate keeps every
-unarchived item past its deadline, so with no archive running (the live daemon
-today) nothing retires and ingest is refused with `STORAGE_PRESSURE` at the
+unarchived item past its deadline, so with no archive running nothing retires and ingest is refused with `STORAGE_PRESSURE` at the
 budget less the reserve or below the free-space floor. When protected data or unreclaimed storage prevents another write,
 ingestion applies backpressure.
 
@@ -189,10 +187,9 @@ from unindexed or missing evidence.
 
 Each milestone has acceptance criteria in the architecture document. Performance
 measurements must include graph indexes and maintenance, as well as raw payloads.
-Initial read-only sample discovery covers local `/var/log`, Lillith Soul's
-`inner-core`, and Brainstem evidence. It is bounded structural inspection, not a
-qualified benchmark corpus; sample-based benchmarking remains an implementation
-prerequisite for performance claims.
+Sample discovery (local `/var/log`, Lillith Soul's `inner-core` and Brainstem
+evidence) is bounded structural inspection, not a qualified benchmark corpus;
+performance claims require sample-based benchmarking.
 
 Per-class retention, clustering, embeddings, and a human dashboard are later
 extensions. The initial service focuses on agent access to disposable operational
