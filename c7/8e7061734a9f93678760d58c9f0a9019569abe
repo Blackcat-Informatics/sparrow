@@ -1,0 +1,19 @@
+ghprsq source head backlink metadata
+
+parent_hashes: c78e7061734a9f93678760d58c9f0a9019569abe
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 433
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/433
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: b622d6dd8a60c1feb2644f9bfcbfd204776459d3
+GhpRsq-Head-Ref: paudley/427-syslog-udp-datagrams-lost-under-storage
+GhpRsq-Head-OID: c78e7061734a9f93678760d58c9f0a9019569abe
+GhpRsq-Result-Tree: 172e431204b7bb430947970e516f13c19ebc2e89
+GhpRsq-Result-Commit: 4363a939f26c53e28854ea51b4a433055a81663a
+GhpRsq-Parent-Hashes: c78e7061734a9f93678760d58c9f0a9019569abe
+GhpRsq-Squash-Notes-SHA256: c8f84803ba36086fbdeff6621d4f0e7c509e878377e65bfe82aacad4b3826953
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
