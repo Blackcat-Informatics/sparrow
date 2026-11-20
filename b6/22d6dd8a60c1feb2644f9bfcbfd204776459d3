@@ -1,0 +1,19 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 23d1e19d27025f60c57a089d737cc191f2b0e425
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 434
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/434
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 7e922f9c4259bab1fae6b566a7cbaa0e4745f44d
+GhpRsq-Head-Ref: paudley/428-syslog-tcp-a-held-frame-is-discarded
+GhpRsq-Head-OID: 23d1e19d27025f60c57a089d737cc191f2b0e425
+GhpRsq-Result-Tree: e83f95ff0a20b2a1b65fba430a6bd85db9d94282
+GhpRsq-Result-Commit: b622d6dd8a60c1feb2644f9bfcbfd204776459d3
+GhpRsq-Parent-Hashes: 23d1e19d27025f60c57a089d737cc191f2b0e425
+GhpRsq-Squash-Notes-SHA256: d7a06208f9ec9808260cb15eef4604ca643c25ba33c85f05ff98ff21232753fc
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
