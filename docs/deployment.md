@@ -912,21 +912,35 @@ Check what the window needs.
   directory differs from the one the store was built with ("Refused open" in `deploy/RECOVERY.md`).
 
 Take the live daemon's listing, which the rehearsal's check compares with the copy's ("The rehearsal on
-a copy", step 4). Write `payload-check.py` first (the block under that heading). The walk takes the
-writer lock for each page, about 5,055 pages at the live record count (arithmetic from the walk's
-rate, below), so stop the shipper timer before it, which keeps the shipper's ingest out of the
-walk; the script stops the same timer at its start, and a stop of an already stopped timer is not run.
-The check has the walk's stall limit, and records the walk's calls and wall time and the ingest
-figures `flush_lag_ms` and `pending_writes` before and after it, in `live-listing.tsv.counts`:
+a copy", step 4). Write `payload-check.py` first (the block under that heading). `--list` runs `$NEW_CLI`
+against the live `fda2812` daemon: the wire delta is additive status fields and the listing path is the
+same paged code, but no log shows this pairing working, and a failure stops this step with nothing
+changed. The walk takes the writer lock for each page, about 5,055 pages at the live record count
+(arithmetic from the walk's rate, below), so stop the shipper timer before it to keep the shipper's
+ingest out of the walk, and start the timer again right after it, whether the listing passed or
+failed. `deploy/user-unit-upgrade.sh` records at its start whether the timer is active and restores it
+on an abort only then (lines 336-337, `restore_ship_timer`), and the spool units delete files older than
+three days, so a timer left stopped by a called-off window is a loss. Ingest between the listing and
+the stop is expected: the comparison tolerates it. The walk has the stall limit of the rehearsal's
+check, and the step records the walk's calls, wall time, start time and the ingest figures
+`flush_lag_ms` and `pending_writes` before and after it, in `live-listing.tsv.counts`. The block's
+`list EXIT` is the listing's own status:
 
 ```bash
 systemctl --user stop sparrow-ship.timer
 python3 -I "$RECORD/payload-check.py" --list "$LIB/$NEW_CLI" "$SOCK" "$RECORD/live-listing.tsv" > "$RECORD/live-listing.log" 2>&1
-echo "EXIT=$?"
+list_exit=$?
+systemctl --user start sparrow-ship.timer
+echo "list EXIT=$list_exit timer $(systemctl --user is-active sparrow-ship.timer)"
 cat "$RECORD/live-listing.log"
 ```
 
-Take it as late as the window allows, and compare the ingest figures with `before.json`.
+A nonzero `list EXIT` ends the step. Take the listing as late as the window allows. No threshold for
+abandoning a walk that slows ingest can be derived: `before.json` holds `flush_lag_ms` and
+`pending_writes` at 0 and no figure for the walk's effect. As a choice, read `status` in another shell
+during the walk and stop the listing command (Ctrl-C, which changes nothing in the store) when
+`flush_lag_ms` stays above `buffered_flush_interval_ms` of the configuration or `pending_writes`
+keeps rising; then run the timer line of the block by hand.
 
 Give the notice (below) and wait for the go.
 
@@ -1252,16 +1266,16 @@ def ingest(status):
     return {"flush_lag_ms": status["durability"]["flush_lag_ms"], "pending_writes": status["durability"]["pending_writes"]}
 
 
+walk_started = datetime.datetime.now(datetime.timezone.utc)   # before the status read the live total comes from
 status = call("status")
 store = status["store_id"]
 if LIST:
-    began = time.monotonic()
     rows_listed, calls, _, seconds = walk_listing(status, store)
     after = call("status")
     out_path.write_text("".join(f"{r['artifact_id']}\t{r['source']}\t{r['origin']['received_at']}\n"
                                 for r in rows_listed.values() if r["origin"] is not None))
     pathlib.Path(str(out_path) + ".counts").write_text(json.dumps({
-        "store_id": store, "listed": len(rows_listed), "calls": calls, "walk_seconds": round(seconds, 1),
+        "store_id": store, "walk_started": walk_started.isoformat(), "listed": len(rows_listed), "calls": calls, "walk_seconds": round(seconds, 1),
         "artifacts_total": artifacts_total(status),
         "ingest_before": ingest(status), "ingest_after": ingest(after)}) + "\n")
     print(f"listing of {len(rows_listed)} artifacts in {calls} calls and {seconds:.0f} s written to {out_path}; "
@@ -1336,9 +1350,9 @@ print("\n".join(gap_lines), flush=True)
 
 # The live daemon's listing, taken before the stop, against this copy's. Every artifact that listing returned
 # and that is still within retention must be here; the copy may hold more, written between the listing and the
-# stop. Past-deadline artifacts are in no listing, so a loss among them shows only in the counts: no read-only
-# call returns their ids (every listing, record and text read filters on deadline) or counts them at this size
-# (retention-metrics admits at most 100,000 catalog visits).
+# stop. Past-deadline artifacts are in no listing, so a loss among them shows only in the counts: no call
+# enumerates them (every listing, record and text read filters on deadline; `payload` returns them only for a
+# known digest) or counts them at this size (retention-metrics admits at most 100,000 catalog visits).
 live_rows = {}
 for line in LIVE.read_text().splitlines():
     i, src, at = line.split("\t")
@@ -1358,9 +1372,14 @@ print(f"live listing {len(live_rows)} ids, copy listing {len(listed)} ids; absen
 if missing:
     fail(f"{len(missing)} artifacts of the live listing are absent from the copy's listing: {', '.join(missing[:20])}"
          + (" ..." if len(missing) > 20 else ""))
-if total - live_counts["artifacts_total"] < len(extra):
-    fail(f"the copy counts {total} artifacts, the live daemon counted {live_counts['artifacts_total']}, and the copy lists "
-         f"{len(extra)} ids the live listing lacks: counted artifacts are missing")
+# The live total was read before the walk and ingest went on during it: an artifact received after the walk began
+# and listed by it is in the live listing but not in the live total, so it is added to what the copy may hold more.
+walk_began = datetime.datetime.fromisoformat(live_counts["walk_started"])
+during = len([i for i, (src, at) in live_rows.items() if at >= walk_began])
+if total - live_counts["artifacts_total"] < len(extra) + during:
+    fail(f"the copy counts {total} artifacts, the live daemon counted {live_counts['artifacts_total']} before its walk, and the "
+         f"copy accounts for {len(extra)} ids the live listing lacks and {during} received during the walk: "
+         "counted artifacts are missing")
 
 edges = [now - datetime.timedelta(days=d) for d in AGE_DAYS]
 
@@ -1587,14 +1606,20 @@ CHECK
 
      Residual. Past-deadline artifacts are in no listing: every call that lists or reads artifacts or
      records filters on the deadline (`live_artifact` and `live_record`: `artifact_read.rs`,
-     `query_membership.rs`, `context.rs`, `text_index.rs`, `rdf_view.rs`), and a read by id
-     (`Store::artifact`) needs an id that nothing lists. No call counts them at live size:
-     `retention-metrics` admits at most 100,000 catalog visits (`RetentionReadLimits::validate`,
+     `query_membership.rs`, `context.rs`, `text_index.rs`, `rdf_view.rs`), so no call enumerates
+     them. `payload STORE_ID blake3:HASH` returns them with no deadline filter (`payload_index.rs`, the
+     module contract and `payload_lookup`), but only for a known digest, and a read by id
+     (`Store::artifact`) needs an id. No call counts them at live size: `retention-metrics` admits at
+     most 100,000 catalog visits (`RetentionReadLimits::validate`,
      `sparrow-client/src/retention_metrics.rs`), and the live store holds about 3 million records
      (`live_records` in `before.json`). A loss among past-deadline artifacts is therefore caught
-     only by the count relation above, to the resolution of one artifact, because each artifact written
-     between the live listing and the stop is a listed id in the copy only and does not mask a loss. The
-     live `artifacts` counter has no `payload-index` row on `fda2812`, so the live listing takes it as the
+     only by the count relation above. Its resolution is one artifact: the live total is read before
+     the walk and ingest continues during it, so the check records the walk's start and allows for the
+     live listing's ids received at or after it, and each artifact written between the listing and the
+     stop is a listed id in the copy only; neither masks a loss. Both rest on one host clock. A copy row
+     with no `origin` counts as copy-only, because the listing file holds rows with an origin only; the
+     live store has no such row (`fragment_parents` 0 in its `sources` reading). The live
+     `artifacts` counter has no `payload-index` row on `fda2812`, so the live listing takes it as the
      `source-summary` total minus the `source-context` total (an inference from their definitions).
 
      What gap to expect, as an inference. An omitted artifact is past its deadline, so its receipt is
@@ -1737,7 +1762,8 @@ process test, so a leftover `sparrowd` blocks it: confirm that no scratch daemon
 answering.
 
 An `abort` starts the old image again on the unchanged store, waits for its first status answer
-(up to 600 s), starts `sparrow-ship.timer` again only if the old image answered, writes the outcome
+(up to 600 s), starts `sparrow-ship.timer` again only if it was active when the script began (the live listing
+step above restarts it) and the old image answered, writes the outcome
 to `COPY.abort.log` beside the kept copy, to the journal and to the terminal, and exits 1. End of
 input, a removed answer pipe, Ctrl-C, SIGTERM and SIGHUP abort the same way. The new image never
 opens the live store after an abort, so the "Not opened" way back below is not needed; read
@@ -2063,13 +2089,14 @@ notice states this and gives the length only after the rehearsal has read `N`.
 - Ingest socket (`ingest_socket_path`, the `sparrow-ingest` group) and the public TCP listener on port
   518 refuse connections. A client that holds and retries, such as the Rust client with its queue,
   delivers after the start; a sender without a queue loses what it emits meanwhile and the store
-  cannot count that loss ("A floor refusal requests reclamation"). The coordination session holds
-  which senders connect and queue, so the notice goes to it before the stop. `lillith_memetics`' cruft
+  cannot count that loss ("A floor refusal requests reclamation"). Which senders connect to the
+  socket and the port, and which of them queue, is not established here; the notice goes to the
+  coordination channel before the stop. `lillith_memetics`' cruft
   sender is named by [Cruft](interfaces.md#cruft); whether it queues is not read.
 - The Lillith organism's logs do not reach Sparrow. Her members' stdout and stderr go to journald
   and to a file in her logs directory, and no source, watch or spool unit carries them: the shipper
-  configuration on the host (`~/.config/sparrow/ship.toml`, read on the host) lists no source for
-  them, and her unit drop-in and her decision record 0105 name no taker (read in her repository, not
+  configuration on the host (`~/.config/sparrow/ship.toml`, read on the host and saved in
+  `.stage/416/host-reads.log`) lists no source for them, and her unit drop-in and her decision record 0105 name no taker (read in her repository, not
   on the host). The stop of the daemon loses none of her logs, because none arrive. Switch 1 does
   not stop her daemons for logging reasons.
 - No Katamari process connects to Sparrow: `katamari-stored`, `katamari-unlock` and `katamari-gitd` log
@@ -2095,10 +2122,10 @@ notice states this and gives the length only after the rehearsal has read `N`.
     keep writing from their own units while the daemon is down, and the shipper sends those files
     after the start. Each unit deletes its own spool files (`katamari-stored-*.jsonl` and
     `katamari-manager-*.jsonl`) when it starts: `ExecStartPre` runs `find ... -mtime +3 -delete`
-    (`systemctl --user cat` of both units, read on the host), which matches files last modified four
+    (`systemctl --user cat` of both units, read on the host and saved in `.stage/416/host-reads.log`), which matches files last modified four
     or more full days ago. A restart of either unit after an outage that long deletes the oldest files
     the shipper has not sent. Both units and `sparrow-ship.timer` read `active` on the host
-    (`systemctl --user is-active`).
+    (`systemctl --user is-active`, saved in `.stage/416/host-reads.log`).
   A producer that rotates or deletes its own file in the window is outside Sparrow's reach.
 - Her CLI and MCP tools (`lillith_decodes`) and every other client of the CLI and the MCP tools get
   connection refused until the first status answer. Which of her operations use them is not read.
