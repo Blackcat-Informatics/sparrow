@@ -212,6 +212,24 @@ store files stay owner-only under the unit's `UMask=0077`. Only the operator
 belongs to that group, for the CLI and administration. Fleet producers ingest
 through the ingest-only group socket below, not this socket.
 
+### Syslog TCP listener install steps
+
+A `[[syslog]]` listener with `transport = "tcp"` keeps the frames it holds at a stop in
+`/SPARROW/syslog-spill`, beside the store: a frame the store still refuses for pressure when the
+daemon stops is written there and published at the next start (`docs/interfaces.md`, syslog TCP).
+The shipped unit, profile and tmpfiles entry do not grant that directory, so the host needs these
+steps before the first such listener is configured, and the daemon refuses to start with an error
+naming the directory when it cannot write there:
+
+1. Add `d /SPARROW/syslog-spill 0700 sparrow sparrow -` to `/etc/tmpfiles.d/sparrow.conf` and run
+   `systemd-tmpfiles --create sparrow.conf`.
+2. Add `/SPARROW/syslog-spill` to the unit's `ReadWritePaths=` and run `systemctl daemon-reload`.
+3. Add `/SPARROW/syslog-spill/ rw,` and `/SPARROW/syslog-spill/** rwk,` to
+   `/etc/apparmor.d/sparrow` and reload the profile with `apparmor_parser -r`.
+4. Restart the daemon on the new unit.
+
+A configuration with only UDP listeners needs none of this.
+
 ### Ingest-only group socket
 
 Daemons that run as other accounts, such as `katamari-stored`, log into Sparrow

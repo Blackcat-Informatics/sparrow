@@ -23,8 +23,7 @@ than the plain log files it replaces.
   projections, SPARQL and text search over them. An unpinned item is due at
   `received_at + 30 days` and is retired then once the archive holds it; a pin
   keeps an item until the pin ends, and nothing is deleted that has not been
-  archived. The archive is implemented and is not yet running on the live
-  daemon, so nothing retires there today; see
+  archived; the archive's rollout state is in
   [Archive status](docs/archive-format.md#archive-status).
 - **Consumers.** Every daemon sends its operational log to Sparrow.
   `lillith_memetics` sends cruft (see [Cruft](docs/interfaces.md#cruft)).
@@ -139,7 +138,7 @@ Optimize for reading, maintenance and compile-time guarantees.
   is input-bound (the request itself exceeds a bound, so a retry of the same
   request cannot succeed), and every other code is not. Preserve the cause; never
   swallow an error or turn it into a default. No `.unwrap()` or `.expect()` in
-  production paths (there are none today; keep it so). A missing requirement or
+  production paths. A missing requirement or
   a broken invariant fails loudly with an actionable message.
 - **Diagnostics.** No `dbg!`, and no ad hoc printing left behind. The daemon's
   operator lines go to stderr as whole single lines for the journal, and the

@@ -2670,6 +2670,7 @@ async fn syslog_connection_failure_stops_siblings_and_reopens_exact_durable_pack
                 operations.clone(),
                 registry.clone(),
                 Default::default(),
+                &config.syslog_spill_dir(),
             )
             .await
             .unwrap();

@@ -91,6 +91,7 @@ btrfs checksums and compression; its own digests and compression cover both.
 | `/SPARROW` | root:sparrow, 0750 | The service's tree. |
 | `/SPARROW/store` | sparrow, 0710, no copy-on-write (`C`) | The store and `rpc.sock` (0660). |
 | `/SPARROW/intake/NAME` | the operator who made it (plain `mkdir`; the cutover gives existing roots to `sparrow`), 0770, ACL `group:sparrow:rwx` | One consume root per watch. |
+| `/SPARROW/syslog-spill` | sparrow, 0700; only for a TCP syslog listener, see [the install steps](../docs/deployment.md#syslog-tcp-listener-install-steps) | The frames a TCP syslog listener held at a stop. |
 | `/SPARROW/ship` | paudley:sparrow, 2700 | The shipper's queue, staging, ledgers and lock. |
 | `/net/synology/archives/sparrow-archive` | on the NAS (NFSv4), 0700; create it once, owned by the daemon's user | The archive worker's per-store directories and the `STORE_ID` file. |
 | `/etc/systemd/system/sparrow*.{service,timer}` | root, 0644 | The units, from `systemd/`. |
