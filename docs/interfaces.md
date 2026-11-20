@@ -4094,8 +4094,9 @@ Reserving a source now refuses a journal that would leave less than 448
 bytes of its 8 KiB for this history.
 
 A claim is `pending` while it is in the active recovery set, `complete` once
-its publication and source removal are recorded, and `abandoned` once an
-administrator retired it unrecoverable. The listing returns every pending
+its publication and source removal are recorded, and `abandoned` once it was
+retired unrecoverable, by an administrator or by the consume worker when it
+quarantined a source the daemon refused permanently. The listing returns every pending
 claim, and every complete or abandoned claim whose pending span overlaps the
 window. The span runs from `first_seen` to `last_pending_at`, the only times the
 journal keeps for pending attempts, so a claim with any pending attempt in the
@@ -4182,11 +4183,13 @@ and watch listing reads all retired rows through one iterator and sends them on
 the wire. A row is at most 8 KiB stored, so the bound is 8 MiB of rows. On the
 wire a row is at most about 3.2 KiB (2048 path bytes, 512 caller, 512 reason and
 the claim ID), so 1024 rows are about 3.2 MiB against the 64 MiB message limit,
-and about 5.5 MiB as MCP JSON, where the path is hex. Reaching the bound takes
-1024 operator retirements. A retirement past it is refused with
-`RESOURCE_LIMIT` and leaves the claim pending; no retired row is dropped. The
-count of retired claims is the length of `retired_claims` in `status` and
-`watch list`. Folding the oldest rows into a summary, which would remove the
+and about 5.5 MiB as MCP JSON, where the path is hex. Both an administrator's
+retirement and the consume worker's quarantine of a refused source add a row
+(see below), so the bound fills without anyone acting. A retirement past it is
+refused with `RESOURCE_LIMIT` and leaves the claim pending; no retired row is
+dropped, and issue #420 tracks ageing them out. The store-wide count and the
+bound are `Status.retiredClaimCount` and `Status.maxRetiredClaims`; each watch's
+rows are its `retired_claims`. Folding the oldest rows into a summary, which would remove the
 refusal, needs a stored-format change and is not part of this bound.
 
 ### Quarantining a permanently refused source
@@ -4194,10 +4197,13 @@ refusal, needs a stored-format change and is not part of this bound.
 The consume worker retries every failed publication with backoff except one: the
 daemon's refusal of the input itself, a non-retryable `INVALID_ARGUMENT` or
 `RESOURCE_LIMIT` (a bound on the input, such as more records than one
-publication holds). Retrying identical bytes cannot change that answer, so the
-worker stops uploading the claim. Occupancy, the free-space floor, transport
-failures, deadline expiry and a non-retryable `STORAGE_FAILURE` keep retrying.
-Only a claim with no recorded publication is quarantined.
+publication holds). The client class decides: a refusal the daemon sent has class
+`Unclassified`, and one the client built to say a claim is pending has class
+`Local` and is never permanent. Retrying identical bytes cannot change the
+daemon's answer, so the worker stops uploading the claim. Occupancy, the
+free-space floor, transport failures, deadline expiry, a refusal the client built
+and a non-retryable `STORAGE_FAILURE` keep retrying. Only a claim with no
+recorded publication is quarantined.
 
 The worker renames the claim's private source into `ROOT.sparrow-quarantine/`,
 a directory of mode 0700 beside the watch root, created on first use, as
@@ -4205,25 +4211,63 @@ a directory of mode 0700 beside the watch root, created on first use, as
 original relative path. It then retires the claim with caller
 `sparrowd consume worker` and the reason `non-retryable CODE: MESSAGE; source
 kept as ROOT.sparrow-quarantine/CLAIM_ID`, cut to the 512-byte reason bound. The
-claim leaves `pending_claims` and its journal slot is freed; `status`, `watch
-list` and `watch claims` show it under `retired_claims`. The daemon logs one
-line, `sparrowd: watch=W claim=ID quarantined caller=… reason=… path=…`. The
-move is a rename on one filesystem, so the source has one name at every instant
-and is never copied or deleted. Consume roots never overlap, so no root contains
-a quarantine directory and the daemon never reads it as input. A stop between the
-move and the retirement is finished from the refusal file on the next failed
-attempt of that claim.
+claim leaves `pending_claims` and its journal slot is freed. The retirement is
+the same record an administrator's retirement writes, and it counts toward the
+same 1024-row bound. The daemon logs one line, `sparrowd: watch=W claim=ID
+quarantined caller=… reason=… path=…`.
+
+What shows it:
+
+- `status` and `watch list` list the claim under the watch's `retired_claims`,
+  with state `retired-unrecoverable`, the caller, the reason (the refusal) and the
+  original path in hex.
+- `watch claims` lists it in `claims` with state `abandoned` and the time it
+  finished. That listing carries the journal's history, including
+  `last_pending_reason` from the last attempt, and not the retirement caller or
+  reason; read those in `status` or `watch list`.
+
+The move is a rename on one filesystem, so the source has one name at every
+instant and is never copied or deleted. Configuration validation and `watch put`
+refuse a root, `data_dir`, archive root or other path the daemon writes that is,
+contains or lies inside another root's quarantine directory, whichever of the two
+is configured first, and the worker refuses to move a source into a directory
+that is a configured root. So the daemon never reads a quarantine as input. A
+stop between the move and the retirement is finished from the refusal file on the
+next failed attempt of that claim. A stop after the refusal file is written and
+before the move leaves that `CLAIM_ID.refusal` in the quarantine directory with
+no source beside it; the claim is uploaded again, and if it then publishes, the
+file stays. It is a note, never read as input, and an operator may remove it.
+A source found in both the quarantine and the private claim directory is never
+retired: the claim stays pending and the watch `failure` names it, until an
+operator reconciles the two.
 
 When the quarantine cannot be written (a read-only or unwritable parent, no
 space, a root that is a mount point) or the retired record is full, the source
 stays in `.sparrow-inflight/`, the claim stays pending, and the watch `failure`
-reads `claim ID: non-retryable CODE: MESSAGE; quarantine failed: CAUSE`. The
-worker repeats only the move on the ordinary backoff and uploads nothing.
+reads `claim ID: non-retryable CODE: MESSAGE; quarantine failed: CAUSE`. Within one
+daemon run the worker repeats only the move on the ordinary backoff and uploads
+nothing. The refusal is held in memory, so after a restart a parked claim is
+uploaded once more, refused once more and parked again.
+
+At the 1024-row bound no claim can be retired, by the worker or by an
+administrator. Each refused claim parks in place and holds one of the 16 journal
+slots; with 16 parked claims no watch claims a new file, and a restart does not
+change that. `status` reports `retired_claim_count` and `max_retired_claims`
+(`Status.retiredClaimCount` and `Status.maxRetiredClaims`, schema 71, additive),
+and the daemon logs once per start when the count reaches three quarters of the
+bound (768, which leaves 256 retirements to act in) and once at the bound, saying
+what follows. No supported step frees the rows. Issue #420 tracks ageing retired
+claims out, which needs a stored-format change.
 
 To recover a quarantined source, read the refusal in `retired_claims` or the
-refusal file, fix the cause (for example split the file below the record
-bound), and move the fixed file into the watch root, where it is consumed as a
-new file. Sparrow never removes anything from the quarantine directory.
+refusal file, fix the cause (for example split the file below the record bound),
+and move the fixed file into the watch root, where it is consumed as a new file
+with its own claim. Parts of a split file that the daemon accepted before the
+refusal stay stored: a claim's part request IDs derive from a hash of its watch,
+path, file generation and directories, and a moved or changed file has a new
+generation (its change time differs), so the new claim sends every part again and
+the earlier parts are duplicated. Sparrow never removes anything from the
+quarantine directory.
 
 The default scan budget is 10,000 (maximum 100,000) records and pin collections;
 aggregate native catalog construction defaults to and is capped at 32 MiB.

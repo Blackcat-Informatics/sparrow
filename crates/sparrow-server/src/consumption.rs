@@ -98,6 +98,24 @@ const RETIRE_CALLER: &str = "sparrowd consume worker";
 /// Longest retirement reason the store keeps.
 const REASON_BYTES: usize = 512;
 
+/// The quarantine directory of the consume root at `root`: a sibling named by appending
+/// [`QUARANTINE_SUFFIX`] to the root's final component. Configuration validation, `watch put` and
+/// the worker all name it through this one function. None for a root with no parent or name.
+#[must_use]
+pub(crate) fn quarantine_path(root: &Path) -> Option<std::path::PathBuf> {
+    let mut name = root.file_name()?.to_owned();
+    name.push(QUARANTINE_SUFFIX);
+    Some(root.parent()?.join(name))
+}
+
+/// Whether `other` is, contains or lies inside the quarantine directory of `root`: the daemon
+/// would read the quarantined sources as input, or write them into a path it owns.
+#[must_use]
+pub(crate) fn overlaps_quarantine(root: &Path, other: &Path) -> bool {
+    quarantine_path(root)
+        .is_some_and(|quarantine| quarantine.starts_with(other) || other.starts_with(&quarantine))
+}
+
 /// A permanent refusal of a claim's input by the daemon: a code and message that retrying the
 /// same bytes can never change.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,11 +132,13 @@ impl Refusal {
     #[must_use]
     pub(crate) fn of(error: &Error) -> Option<Self> {
         match error {
+            // A refusal the client built itself is never `Unclassified`: the daemon sends
+            // that class, a client-built one carries `Local` and says its claim is pending.
             Error::Upload(sparrow_client::Error::Domain {
                 code,
                 message,
                 retryable: false,
-                ..
+                class: sparrow_client::FailureClass::Unclassified,
             }) if matches!(code.as_str(), "INVALID_ARGUMENT" | "RESOURCE_LIMIT") => Some(Self {
                 code: code.clone(),
                 message: message.clone(),
@@ -775,11 +795,24 @@ impl ClaimRoot {
     fn quarantine_dir(
         &self,
         root_path: &Path,
+        roots: &[std::path::PathBuf],
         create: bool,
     ) -> Result<(File, std::ffi::OsString), Error> {
-        let (Some(parent), Some(name)) = (root_path.parent(), root_path.file_name()) else {
+        let (Some(parent), Some(name), Some(quarantine)) = (
+            root_path.parent(),
+            root_path.file_name(),
+            quarantine_path(root_path),
+        ) else {
             return Err(Error::State("consume root has no parent directory"));
         };
+        if roots
+            .iter()
+            .any(|root| quarantine.starts_with(root.as_path()) || root.starts_with(&quarantine))
+        {
+            return Err(Error::State(
+                "the quarantine directory is a configured consume root or lies inside one; the refused source stays in its private claim directory",
+            ));
+        }
         let parent = open(
             fs::CWD,
             parent,
@@ -799,8 +832,10 @@ impl ClaimRoot {
                 "configured consume root changed; no quarantine directory is created for it",
             ));
         }
-        let mut dirname = name.to_owned();
-        dirname.push(QUARANTINE_SUFFIX);
+        let dirname = quarantine
+            .file_name()
+            .ok_or(Error::State("quarantine path has no name"))?
+            .to_owned();
         if create {
             match fs::mkdirat(&parent, dirname.as_os_str(), Mode::from_raw_mode(0o700)) {
                 Ok(()) => parent.sync_all()?,
@@ -832,6 +867,7 @@ impl ClaimRoot {
     pub(crate) fn quarantine(
         &self,
         root_path: &Path,
+        roots: &[std::path::PathBuf],
         id: &str,
         refusal: &Refusal,
         now: u64,
@@ -851,12 +887,25 @@ impl ClaimRoot {
         }
         if self.store.consumption_retired()?.len() >= sparrow_core::MAX_RETIRED_CONSUMPTION_CLAIMS {
             return Err(Error::State(
-                "the retired claim record is full; the refused source stays in its private claim directory",
+                "the retired claim record is full (1024 rows): the refused source stays in its private claim directory and the claim stays pending, holding one of 16 journal slots; at 16 such claims no watch claims a new file",
             ));
         }
-        let (directory, dirname) = self.quarantine_dir(root_path, true)?;
+        let (directory, dirname) = self.quarantine_dir(root_path, roots, true)?;
         let moved = match open(&directory, Path::new(id), OFlags::RDONLY, BENEATH) {
-            Ok(_) => true,
+            Ok(_) => {
+                // A source in both places is never retired: the claim stays pending and
+                // the private entry would refuse the next open of the root.
+                match open(&self.inflight, Path::new(id), OFlags::RDONLY, BENEATH) {
+                    Ok(_) => {
+                        return Err(Error::State(
+                            "the refused source is in both the quarantine and the private claim directory; reconcile them by hand before the claim retires",
+                        ));
+                    }
+                    Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                true
+            }
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => return Err(error),
         };
@@ -886,6 +935,7 @@ impl ClaimRoot {
     pub(crate) fn interrupted_quarantine(
         &self,
         root_path: &Path,
+        roots: &[std::path::PathBuf],
         id: &str,
     ) -> Result<Option<Refusal>, Error> {
         match open(&self.inflight, Path::new(id), OFlags::RDONLY, BENEATH) {
@@ -893,7 +943,7 @@ impl ClaimRoot {
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let (directory, _) = match self.quarantine_dir(root_path, false) {
+        let (directory, _) = match self.quarantine_dir(root_path, roots, false) {
             Ok(found) => found,
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(None);

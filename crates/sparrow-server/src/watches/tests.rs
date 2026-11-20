@@ -247,6 +247,22 @@ fn kernel_overflow_and_directory_exhaustion_require_fresh_coverage() {
     );
 }
 
+/// INVARIANT (#417): the retired-claim record warns at three quarters of its bound and again
+/// at the bound, and not before.
+#[test]
+fn the_retired_record_warns_at_three_quarters_and_at_the_bound() {
+    let table = [
+        (0, RetiredFill::Below),
+        (767, RetiredFill::Below),
+        (768, RetiredFill::Warn),
+        (1023, RetiredFill::Warn),
+        (1024, RetiredFill::Full),
+    ];
+    for (count, fill) in table {
+        assert_eq!(RetiredFill::of(count, 1024), fill, "{count}");
+    }
+}
+
 #[test]
 fn failing_claim_retries_back_off_to_a_bounded_ceiling() {
     // INVARIANT: a claim that keeps failing slows to one attempt per 15 minutes

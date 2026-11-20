@@ -10,6 +10,10 @@ pub enum FailureClass {
     /// The free-space floor paused writes. The producer holds until space returns; the code is
     /// still `STORAGE_PRESSURE` and the refusal still retryable.
     FreeSpaceFloor,
+    /// The client built this refusal itself; no daemon sent it. It reports a wait that the
+    /// claim's own retry ends (a limit the daemon has not advertised), so it is never a
+    /// permanent refusal of the input, whatever its code and retry flag say.
+    Local,
 }
 
 /// An explicit transport, daemon, compatibility, input, or local file failure.

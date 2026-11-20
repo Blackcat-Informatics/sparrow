@@ -27,6 +27,15 @@ fn only_a_non_retryable_input_refusal_is_permanent() {
         (domain("RESOURCE_LIMIT", true), false),
         (domain("STORAGE_PRESSURE", true), false),
         (domain("STORAGE_FAILURE", false), false),
+        (
+            Error::Upload(sparrow_client::Error::Domain {
+                code: "RESOURCE_LIMIT".into(),
+                message: "the claim is pending".into(),
+                retryable: false,
+                class: sparrow_client::FailureClass::Local,
+            }),
+            false,
+        ),
         (Error::State("consume publication deadline expired"), false),
         (
             Error::Storage(sparrow_core::Error::new("RESOURCE_LIMIT", "advertise")),
@@ -89,7 +98,7 @@ fn a_refused_source_is_quarantined_and_its_claim_retired_with_the_refusal() {
     let now = crate::now().unwrap();
     let retired = f
         .root
-        .quarantine(&f.producer, &f.id, &refusal(), now)
+        .quarantine(&f.producer, &[], &f.id, &refusal(), now)
         .unwrap();
     let quarantine = f
         .producer
@@ -117,7 +126,9 @@ fn a_move_interrupted_before_the_retirement_is_finished_from_its_refusal_file() 
     let f = claimed();
     let now = crate::now().unwrap();
     assert_eq!(
-        f.root.interrupted_quarantine(&f.producer, &f.id).unwrap(),
+        f.root
+            .interrupted_quarantine(&f.producer, &[], &f.id)
+            .unwrap(),
         None
     );
     let quarantine = f
@@ -139,11 +150,13 @@ fn a_move_interrupted_before_the_retirement_is_finished_from_its_refusal_file() 
     .unwrap();
     let found = f
         .root
-        .interrupted_quarantine(&f.producer, &f.id)
+        .interrupted_quarantine(&f.producer, &[], &f.id)
         .unwrap()
         .unwrap();
     assert_eq!(found, refusal());
-    f.root.quarantine(&f.producer, &f.id, &found, now).unwrap();
+    f.root
+        .quarantine(&f.producer, &[], &f.id, &found, now)
+        .unwrap();
     assert_eq!(std::fs::read(quarantine.join(&f.id)).unwrap(), b"{}\n");
     assert!(f.store.consumption_pending().unwrap().is_empty());
 }
@@ -157,10 +170,41 @@ fn an_unwritable_quarantine_leaves_the_source_and_the_claim_in_place() {
     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o500)).unwrap();
     let result = f
         .root
-        .quarantine(&f.producer, &f.id, &refusal(), crate::now().unwrap());
+        .quarantine(&f.producer, &[], &f.id, &refusal(), crate::now().unwrap());
     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(result.is_err());
     assert!(f.producer.join(".sparrow-inflight").join(&f.id).exists());
     assert_eq!(f.store.consumption_pending().unwrap().len(), 1);
     assert!(f.store.consumption_retired().unwrap().is_empty());
+}
+
+/// INVARIANT (#417): a source found in both the quarantine and the private claim directory is
+/// never retired, and a quarantine that is a configured root is never written; each leaves the
+/// claim pending and the source where it was.
+#[test]
+fn quarantine_refuses_a_duplicated_source_and_a_configured_root() {
+    let f = claimed();
+    let quarantine = f
+        .producer
+        .parent()
+        .unwrap()
+        .join("watch.sparrow-quarantine");
+    let now = crate::now().unwrap();
+    let as_root = [quarantine.clone()];
+    assert!(
+        f.root
+            .quarantine(&f.producer, &as_root, &f.id, &refusal(), now)
+            .is_err()
+    );
+    assert!(!quarantine.exists());
+    std::fs::create_dir(&quarantine).unwrap();
+    std::fs::set_permissions(&quarantine, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(quarantine.join(&f.id), b"{}\n").unwrap();
+    assert!(
+        f.root
+            .quarantine(&f.producer, &[], &f.id, &refusal(), now)
+            .is_err()
+    );
+    assert!(f.producer.join(".sparrow-inflight").join(&f.id).exists());
+    assert_eq!(f.store.consumption_pending().unwrap().len(), 1);
 }

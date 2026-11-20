@@ -1646,6 +1646,9 @@ async fn run(
     // Next attempt, consecutive failures, best progress and shared parts per pending claim.
     let mut retry = BTreeMap::<String, ClaimRetry>::new();
     let mut connect_after = Instant::now();
+    // How far the retired-claim record's fill was last logged this run (`note_retired`).
+    let mut retired_logged = RetiredFill::Below;
+    note_retired(&store, &mut retired_logged)?;
     // A command or a permit the last wait received, for this pass.
     let mut received = None;
     let mut permit = None;
@@ -1748,6 +1751,7 @@ async fn run(
                     let result = retire_claim(&mut detectors, &retirement);
                     if result.is_ok() {
                         retry.remove(&retirement.claim);
+                        note_retired(&store, &mut retired_logged)?;
                     }
                     acknowledge(reply, result, &store, &registry, &detectors)?;
                 }
@@ -1917,6 +1921,10 @@ async fn run(
             }
         }
         if let Some((watch, id, is_tail)) = work {
+            let roots = detectors
+                .iter()
+                .map(|detector| detector.config.root.clone())
+                .collect::<Vec<_>>();
             // The entry exists before the first attempt, so the attempt has a cache and a mark.
             let attempt = Arc::clone(
                 &retry
@@ -1936,7 +1944,8 @@ async fn run(
                     .get(&id)
                     .and_then(|entry| entry.refusal.clone())
                     .ok_or(Error::State("refused claim lost its refusal"))?;
-                if quarantine_claim(detector, &id, &refusal)? {
+                if quarantine_claim(detector, &roots, &id, &refusal)? {
+                    note_retired(&store, &mut retired_logged)?;
                     retry.remove(&id);
                 } else {
                     retry
@@ -2066,11 +2075,11 @@ async fn run(
                         Some(refusal) => Some(refusal),
                         // An earlier run may have moved the source and stopped before it
                         // retired the claim; its refusal is on file beside the source.
-                        None => match detector
-                            .owner
-                            .claim()?
-                            .interrupted_quarantine(&detector.config.root, &id)
-                        {
+                        None => match detector.owner.claim()?.interrupted_quarantine(
+                            &detector.config.root,
+                            &roots,
+                            &id,
+                        ) {
                             Ok(found) => found,
                             Err(error) => {
                                 eprintln!(
@@ -2117,15 +2126,65 @@ async fn run(
     Ok(())
 }
 
+/// How full the store's retired-claim record is, as the worker logs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RetiredFill {
+    Below,
+    /// Three quarters of the bound or more. Both the worker and an operator retire claims, and
+    /// no row is ever removed, so the record only fills; three quarters leaves a quarter of the
+    /// bound (256 retirements) to act in after the warning.
+    Warn,
+    /// The bound: no further claim can be retired.
+    Full,
+}
+
+impl RetiredFill {
+    #[must_use]
+    fn of(count: usize, max: usize) -> Self {
+        if count >= max {
+            Self::Full
+        } else if count.saturating_mul(4) >= max.saturating_mul(3) {
+            Self::Warn
+        } else {
+            Self::Below
+        }
+    }
+}
+
+/// Log the retired-claim record's fill once for each level it reaches in this run, with what
+/// happens next. Called at start and after each retirement.
+fn note_retired(store: &Store, logged: &mut RetiredFill) -> Result<(), Error> {
+    let max = sparrow_core::MAX_RETIRED_CONSUMPTION_CLAIMS;
+    let count = store.consumption_retired()?.len();
+    let fill = RetiredFill::of(count, max);
+    if fill > *logged {
+        let next = if fill == RetiredFill::Full {
+            "no claim can be retired now: a refused claim parks in place holding one of the 16 journal slots"
+        } else {
+            "at the bound a refused claim parks in place holding one of the 16 journal slots"
+        };
+        eprintln!(
+            "sparrowd: WARNING retired claims {count} of {max}: {next}, and with 16 parked claims no watch claims a new file; see docs/interfaces.md, Quarantining a permanently refused source"
+        );
+    }
+    *logged = fill.max(*logged);
+    Ok(())
+}
+
 /// Move the refused source of claim `id` into quarantine and retire the claim. True when the
 /// claim is retired. A failure that is not fatal to the store stays on the claim and the watch's
 /// status, is logged once per change of its text, and leaves the source where it is.
-fn quarantine_claim(detector: &mut Detector, id: &str, refusal: &Refusal) -> Result<bool, Error> {
+fn quarantine_claim(
+    detector: &mut Detector,
+    roots: &[PathBuf],
+    id: &str,
+    refusal: &Refusal,
+) -> Result<bool, Error> {
     let now = crate::now()?;
     let outcome = detector
         .owner
         .claim()
-        .and_then(|claim| claim.quarantine(&detector.config.root, id, refusal, now));
+        .and_then(|claim| claim.quarantine(&detector.config.root, roots, id, refusal, now));
     match outcome {
         Ok(retired) => {
             detector.held_move_failures.remove(id);

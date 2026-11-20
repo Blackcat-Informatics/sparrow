@@ -108,6 +108,18 @@ impl OutputPaths {
     ) -> Result<(), Box<dyn std::error::Error>> {
         for watch in watches {
             for (key, path) in &self.0 {
+                if crate::consumption::overlaps_quarantine(&watch.root, path) {
+                    return Err(format!(
+                        "watch `{}` root {} has its quarantine directory at {}, which overlaps {key} {}: a refused source is moved there, so no path Sparrow writes may share it; move one of them",
+                        watch.id,
+                        watch.root.display(),
+                        crate::consumption::quarantine_path(&watch.root)
+                            .unwrap_or_default()
+                            .display(),
+                        path.display()
+                    )
+                    .into());
+                }
                 if path.starts_with(&watch.root) || watch.root.starts_with(path) {
                     return Err(format!(
                         "watch `{}` root {} overlaps {key} {}: a watch root must neither contain nor lie inside a path Sparrow writes itself; move one of them",
@@ -570,6 +582,12 @@ impl ConsumeWatch {
             }) {
                 return Err("consume roots must not overlap".into());
             }
+            if roots.iter().any(|other: &PathBuf| {
+                crate::consumption::overlaps_quarantine(&watch.root, other)
+                    || crate::consumption::overlaps_quarantine(other, &watch.root)
+            }) {
+                return Err("a consume root must not be, contain or lie inside another root's quarantine directory (ROOT.sparrow-quarantine beside it); the daemon would read refused sources as input".into());
+            }
             roots.push(watch.root.clone());
         }
         Ok(())
@@ -739,5 +757,55 @@ mod tests {
             watch(&dir.path().join("intake/app"))
         ))
         .unwrap();
+    }
+    fn root(id: &str, path: &str) -> super::ConsumeWatch {
+        super::ConsumeWatch {
+            id: id.into(),
+            root: path.into(),
+            producer_contract: super::ProducerContract::FinishedFiles,
+            source: id.into(),
+            format: "jsonl".into(),
+            quiet_ms: 1000,
+            max_directories: 1,
+            max_candidates: 1,
+            publish_hold: false,
+        }
+    }
+
+    /// INVARIANT (#417): no root and no path Sparrow writes may be a root's quarantine
+    /// directory (`ROOT.sparrow-quarantine` beside it), whichever is configured first, because
+    /// the daemon would read refused sources as input or write into them. `watch put` runs
+    /// `validate_fields` (through `validate`) and `refuse_overlap` on the whole next catalog,
+    /// so the same two checks guard it.
+    #[test]
+    fn a_quarantine_directory_is_never_another_root_or_a_daemon_output() {
+        let roots = [
+            ("/p/x", "/p/x.sparrow-quarantine", false),
+            ("/p/x.sparrow-quarantine", "/p/x", false),
+            ("/p/x", "/p/x.sparrow-quarantine/inner", false),
+            ("/p/x", "/p/x.other", true),
+            ("/p/x", "/p/y.sparrow-quarantine", true),
+        ];
+        for (first, second, accepted) in roots {
+            let watches = [root("a", first), root("b", second)];
+            assert_eq!(
+                super::ConsumeWatch::validate_fields(&watches).is_ok(),
+                accepted,
+                "{first} then {second}"
+            );
+        }
+        let outputs = [
+            ("/p/x.sparrow-quarantine", false),
+            ("/p/x.sparrow-quarantine/archive", false),
+            ("/p/z", true),
+        ];
+        for (output, accepted) in outputs {
+            let paths = super::OutputPaths(vec![("archive.root", output.into())]);
+            assert_eq!(
+                paths.refuse_overlap(&[root("a", "/p/x")]).is_ok(),
+                accepted,
+                "{output}"
+            );
+        }
     }
 }

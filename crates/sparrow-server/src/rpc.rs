@@ -3280,6 +3280,8 @@ impl wire::sparrow::Server for Rpc {
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
                 out.set_query_only(self.query_only);
                 out.set_instance_role(instance_role(self.store.instance_role()));
+                out.set_retired_claim_count(retired.len() as u32);
+                out.set_max_retired_claims(sparrow_core::MAX_RETIRED_CONSUMPTION_CLAIMS as u32);
                 encode_stream_evidence_loss(
                     out.reborrow().init_stream_evidence_loss(),
                     &self.store.stream_evidence_loss(),
