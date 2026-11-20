@@ -1,0 +1,19 @@
+ghprsq source head backlink metadata
+
+parent_hashes: a27d965d1f1c906d9c5d18e859a3d2c0af672d61
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 423
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/423
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 57b8130a7e5c0ff8edae06b26bd421aa1ee8f469
+GhpRsq-Head-Ref: paudley/370-size-mentation-intake-against-the-live
+GhpRsq-Head-OID: a27d965d1f1c906d9c5d18e859a3d2c0af672d61
+GhpRsq-Result-Tree: cfae092e3410c56d30c6a751a11bc8ecaa4e0f16
+GhpRsq-Result-Commit: 69b37bf9ce736a171340ef6155014605e08fd6ce
+GhpRsq-Parent-Hashes: a27d965d1f1c906d9c5d18e859a3d2c0af672d61
+GhpRsq-Squash-Notes-SHA256: 1b76dcb60a882803f41dc392ee1ff1c0ba7c473a6bec717ffe8c48d1daa3971a
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
