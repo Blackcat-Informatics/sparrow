@@ -718,8 +718,8 @@ switch 1, so no archive worker runs, and the switch crosses only the payload ind
   `/340` untouched or the whole of `/395`. It is the point of no return: `sparrowd-schema71-fda2812`
   refuses a lifted store at its open and exits with status 1. The refusal observed on stores
   lifted from `/332` to `/387` is `Error: Error { code: "STORAGE_FAILURE", message: "log time
-  interpretation law and writer fence disagree" }` (below, "What the measurement covers"); it has not
-  been observed on a store lifted from `/340`. The code is `STORAGE_FAILURE`, not
+  interpretation law and writer fence disagree" }` (below, "What the measurement covers"). On the live store's own copy lifted from `/340` to `/395`
+  it was the same text with exit status 1 (`.stage/image/switch-1/rehearsal-old-refusal.log`). The code is `STORAGE_FAILURE`, not
   `UNSUPPORTED`. The downgrade check in `deploy/lib.sh` compares schema numbers only, so it cannot
   see this fence (Sparrow issue 385); the rules below, not the script, keep the old image off the
   store.
@@ -1104,6 +1104,12 @@ drop-in stands for it. Every later stop of the new image, including the way back
 open, has the call.
 
 #### The window
+
+Do not start the window's stop between minute 55 and minute 10 of any hour. In that part of the hour
+the live daemon has expired the 45 s consume publication deadline (`PUBLICATION_DEADLINE` in
+`crates/sparrow-server/src/watches.rs`) for the `katamari-stored` watch, twice in the readings of
+issue 421; the cause is not known. The stop of the old image is the step whose length matters most
+(the stop timeout above).
 
 ```bash
 cd MAIN_CHECKOUT       # main at or after the merge of this procedure; the script finds lib.sh beside itself
@@ -1507,7 +1513,8 @@ CHECK
 
    `text_lexicon_dir` must equal the live one, so the analyzer is the live analyzer. The
    mode was measured on a scratch store ("What the measurement covers", the `--no-intake`
-   paragraph); it was not run on a lifted copy of the live store.
+   paragraph). It then ran on the copy of the live store (`intake=false` and the payload-index
+   migration in `.stage/image/switch-1/rehearsal-daemon.log`).
 
 3. Open. Start the new image on the copy in a scratch scope with the live unit's limits, never the
    live unit and never the live socket. The descriptor limit is raised in the scope's shell, as the
@@ -1587,7 +1594,11 @@ CHECK
      2,981,454 `live_records` (`.stage/image/switch-1/before.json`) gives about 5,055 calls and, at
      27.9 calls per second, about 181 s (arithmetic; the rate came from one scratch store, the host
      load was not logged, and live record entries may differ in size, which
-     moves the call count). The check prints a progress line every 1,000 calls and the walk's calls and seconds
+     moves the call count). The call rate varies: on one lifted copy of 291 artifacts, a walk of 249
+     calls took 51 s, 4.9 calls per second, and a later walk of the same copy took 5 s, about 50 calls
+     per second (arithmetic on the calls and seconds in `.stage/372-dryrun2/logs/10-checker.log` and
+     `11-guards.log`), a spread of about tenfold whose cause is not isolated. A live duration planned
+     from one measurement can be off by that factor. The check prints a progress line every 1,000 calls and the walk's calls and seconds
      at the end. The `sources` rows and the per-source index count an artifact until it is retired,
      whatever its deadline (`source_summary.rs`, module header), and the listing omits an artifact with
      no live bytes and no live record (`finish_row` in `artifact_read.rs`). Nothing retires on the live
@@ -1744,8 +1755,11 @@ CHECK
    copy. This is read from the source, with `git show fda2812:...`. Observed with this command on a
    `/332`-derived scratch store lifted to `/387` by the `a50820e` image: exit status 1 and the line
    `Error: Error { code: "STORAGE_FAILURE", message: "log time interpretation law and writer fence
-   disagree" }` (`.stage/372-dryrun/logs/15-rehearsal-5-old-refusal.log`). The text and status on a
-   store lifted from `/340` are not observed; this step records them.
+   disagree" }` (`.stage/372-dryrun/logs/15-rehearsal-5-old-refusal.log`). A second dry run gave the
+   same exit status and text on a `/332` store lifted to `/387`
+   (`.stage/372-dryrun2/logs/13-old-refusal.log`). On the copy of the live store lifted from `/340`
+   to `/395`, the same text and exit status 1 were observed
+   (`.stage/image/switch-1/rehearsal-old-refusal.log`).
 
    Run the step only when the configuration holds none of those keys, that is, when this command
    prints nothing:
@@ -1872,7 +1886,10 @@ from the code, not run from `/340`), so `/340` lifts to `/395`. The core test
 `/340` intake-manifest store, built synthetically from the legacy fixture, is lifted to `/395` at
 open and stays there. It does not prove what the live store holds: no older writer is in the tree,
 and what retirement left in the live store cannot be built. The rehearsal on the live store's own
-copy covers that, and the refusal text on a lifted `/340` store is not yet observed.
+copy covers that: the copy at `/340` lifted to `/395` with the `a50820e` image, the payload-index
+migration ran 39 pages over 39,080 artifacts in 6.154 s, and the old image refused the lifted copy with
+the text above (`.stage/image/switch-1/rehearsal-daemon.log`, `rehearsal-status.json`,
+`rehearsal-old-refusal.log`).
 
 Lift at a store of 4.32 GB on disk, 101 artifacts, 392,095 live records, `/332` to `/387`
 (`21-pre-lift-old-status.log`, `31-lift-measure.log`):
