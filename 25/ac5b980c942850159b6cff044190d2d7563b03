@@ -1,0 +1,19 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: f27c4fdd5b17b30ea55e61979bbf24bfcfdc8401
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 435
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/435
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 4363a939f26c53e28854ea51b4a433055a81663a
+GhpRsq-Head-Ref: paudley/397-resource-limit-is-always-retryable
+GhpRsq-Head-OID: f27c4fdd5b17b30ea55e61979bbf24bfcfdc8401
+GhpRsq-Result-Tree: 716412acb2cd36afdbf596282f20f3ac727ddafd
+GhpRsq-Result-Commit: 25ac5b980c942850159b6cff044190d2d7563b03
+GhpRsq-Parent-Hashes: f27c4fdd5b17b30ea55e61979bbf24bfcfdc8401
+GhpRsq-Squash-Notes-SHA256: 42d4f22abebec55823d6c7c68c3a6752c9ceb2c53f74a9d5f0ab133009998a50
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
