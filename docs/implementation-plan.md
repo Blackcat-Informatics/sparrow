@@ -42,8 +42,8 @@ hypothetical dependency request. The remaining deployment inputs below determine
 future capacity claims; no numerical SLA, strict quota or production consume
 root has been inferred. Inaccessible corpus samples remain a coverage limit.
 
-The selected rust-rocksdb upstream is
-`46d7e4f10dd9f8dbb219893592a1cab9bdc109c6`. Evaluate the existing native
+The RocksDB binding is the `rocksdb` crate that `Cargo.toml` declares and
+`Cargo.lock` resolves. Evaluate the existing native
 compaction policy and measured pressure recovery before declaring an external
 dependency blocker.
 
