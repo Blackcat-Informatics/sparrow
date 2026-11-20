@@ -230,7 +230,30 @@ fn a_root_reaching_the_quarantine_through_dotdot_is_refused_by_identity() {
         &refusal(),
         crate::now().unwrap(),
     );
-    assert!(result.is_err());
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.contains("same directory as a configured consume root"),
+        "{error}"
+    );
     assert!(!quarantine.join(&f.id).exists());
     assert!(f.producer.join(".sparrow-inflight").join(&f.id).exists());
+}
+
+/// INVARIANT (#417): a configured root that does not exist cannot be the quarantine, so it
+/// neither parks the move nor hides an interrupted one; other open errors stay fatal.
+#[test]
+fn a_missing_configured_root_does_not_stop_the_quarantine() {
+    let f = claimed();
+    let missing = f.producer.parent().unwrap().join("gone");
+    let roots = [missing, f.producer.clone()];
+    f.root
+        .quarantine(
+            &f.producer,
+            &roots,
+            &f.id,
+            &refusal(),
+            crate::now().unwrap(),
+        )
+        .unwrap();
+    assert!(f.store.consumption_pending().unwrap().is_empty());
 }

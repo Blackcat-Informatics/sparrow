@@ -860,13 +860,19 @@ impl ClaimRoot {
         // The names above are lexical. Compare identity too, so a configured root that reaches
         // this directory by another route (a bind mount) is never given quarantined sources.
         for root in roots {
-            let other = open(
+            // A root that does not exist cannot be this directory.
+            let other = match open(
                 fs::CWD,
                 root,
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 ResolveFlags::NO_SYMLINKS,
-            )?
-            .metadata()?;
+            ) {
+                Ok(other) => other.metadata()?,
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if other.dev() == metadata.dev() && other.ino() == metadata.ino() {
                 return Err(Error::State(
                     "the quarantine directory is the same directory as a configured consume root; the refused source stays in its private claim directory",
