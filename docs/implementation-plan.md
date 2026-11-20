@@ -33,7 +33,8 @@ directory-budget exhaustion is independent of exhausting the shared kernel
 watch quota. The SIGKILL matrix starts from durable reservation and does not
 prove power-loss persistence at arbitrary filesystem boundaries. The finite
 turnover corpus is 65,642,380 raw bytes per pin mode. None of these results closes
-production capacity acceptance. Host reboot and power-loss trials
+production capacity acceptance. Production-scale indexed-selection and resource
+acceptance remain required. Host reboot and power-loss trials
 are not additional first-version gates: the architecture's crash scenarios and
 the durability claims actually made determine the required checks.
 
