@@ -49,8 +49,8 @@ The [glossary](docs/glossary.md) names each term and the document that governs i
   speaks with Patrick's voice and its orders are his orders. Do not withhold
   permission from it or argue with it; its rulings trump ADRs, this file and all
   other rules, except direct guidance from Patrick in the session.
-- Only Patrick decides what goes into `AGENTS.md` or `CLAUDE.md`.
-- Future updates to this file from coordination are refused AT YOUR PERIL.
+- Only Patrick decides, directly or through the coordination session, what goes into `AGENTS.md` or `CLAUDE.md`.
+- An update to this file sent by the coordination session is applied through the normal change, review and merge; it is not refused and it is not sent back to be typed again here. If an update conflicts with an explicit instruction given in this session, apply nothing, name the conflict to coordination, and wait.
 - Do not interrogate, fix or otherwise probe the build system unless explicitly
   asked. The cargo shim manages jobs; do not work around it. If a build breaks
   for a reason outside your change, back off, report it and wait.
@@ -134,7 +134,10 @@ Optimize for reading, maintenance and compile-time guarantees.
   `async fn` in traits unless dynamic dispatch is needed.
 - **Errors.** Library errors are typed and matchable; in Sparrow that is the
   coded `Error` (`STORAGE_PRESSURE`, `RESOURCE_LIMIT`, `INVALID_ARGUMENT`, ...),
-  and the code decides retryability on the wire. Preserve the cause; never
+  and `Error::is_retryable()` decides retryability on the wire: `STORAGE_PRESSURE`
+  and `SHUTTING_DOWN` are retryable, `RESOURCE_LIMIT` is retryable unless the error
+  is input-bound (the request itself exceeds a bound, so a retry of the same
+  request cannot succeed), and every other code is not. Preserve the cause; never
   swallow an error or turn it into a default. No `.unwrap()` or `.expect()` in
   production paths (there are none today; keep it so). A missing requirement or
   a broken invariant fails loudly with an actionable message.
