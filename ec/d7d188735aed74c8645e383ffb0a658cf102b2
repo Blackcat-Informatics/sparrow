@@ -1,0 +1,19 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: f90969154fbb279a962701077d8b8df885a8d9b0
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 430
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/430
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: e8467bc049c21fa80c675660c71e72234fd27631
+GhpRsq-Head-Ref: paudley/429-agents-md-retryability-wording-and
+GhpRsq-Head-OID: f90969154fbb279a962701077d8b8df885a8d9b0
+GhpRsq-Result-Tree: 79f0f23679e3706d4cfb4f7b3691163664d6257d
+GhpRsq-Result-Commit: ecd7d188735aed74c8645e383ffb0a658cf102b2
+GhpRsq-Parent-Hashes: f90969154fbb279a962701077d8b8df885a8d9b0
+GhpRsq-Squash-Notes-SHA256: b4909bb88f8a0f5a7a70644603353d3715fe114c8e47226689b5a292941347d9
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
