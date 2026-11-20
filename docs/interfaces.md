@@ -158,6 +158,36 @@ its size. The measurements support this guidance and no more:
   retry either at a fixed interval. A `RESOURCE_LIMIT` that is not retryable names a
   bound on the input: cut the input, because the same bytes fail the same way.
 
+**Mentation intake against the budget.** Two carriers bring `lillith_decodes`
+mentation to Sparrow. Neither is the retired shipped `lillith-mentation` source
+(see [the retired watch](development-runtime.md)); the artifacts it stored
+remain and are not part of either.
+
+- The backlog, 186 files and 6.78 GB, is sent once as `opaque` files through the
+  client crate by the `lillith_memetics` import. The route is proved on synthetic
+  files up to 520,880,974 bytes on a scratch instance; the largest real file is
+  521 MB and goes through the staged import as one artifact.
+- The traces written from now on, other than tool calls, which stay in the
+  producer's own vault, are sent by a sender that is not built. Its rate of about
+  64 MB a day is a planning figure from the backlog's 106 days, not a measured
+  intake.
+
+The arithmetic, in raw bytes before any stored factor: 64 MB a day for 90 days is
+5.76 GB; with the 6.78 GB backlog the total is about 12.5 GB. The live store held
+38.94 GB of a 53.69 GB budget, which leaves about 14.7 GB, so the intake fits with
+about 2.2 GB to spare when the stored size equals the raw size, and does not fit
+above a factor of about 1.2. Sent as `opaque`, the measured factors are 0.21x to
+0.27x for log text and 1.03x to 1.08x for incompressible bytes (the table above),
+which fit; add up to about 256 MiB of in-flight WAL. Sent as `jsonl`, the measured
+factors of 9.9x to 51x put the same intake at about 125 GB or more, over the
+budget, so the intake is sent as `opaque`. Nothing retires for 30 days after
+receipt, and with no archive worker running nothing retires at all, so a full
+budget refuses all ingest with `STORAGE_PRESSURE`. Sources: the 18 and 19 November
+comments on #370 and the table above.
+
+Not measured: the stored factor of the real mentation files in either form, and
+the cost of one small `jsonl` record sent alone as its own artifact.
+
 **Finding a sent item.** The one key for a file or an opaque item is its payload
 id: `blake3:` and 64 lower-case hex digits, the BLAKE3 hash of the artifact's exact
 bytes. A SHA-256 is not an index key. Sparrow computes the payload id of every
