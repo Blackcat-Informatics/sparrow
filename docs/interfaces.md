@@ -581,8 +581,8 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
   spool would append to the filesystem the floor protects, so it would need its own
   higher floor or a separate filesystem. What remains: Syslog UDP datagrams are held in the
   daemon up to `hold_bytes` and then in the kernel buffer, and are lost past the kernel
-  buffer, at a stop or listener failure while the store still refuses them, and on an
-  unclean daemon exit (see the UDP hold section); every other source holds at the producer (client queue, ship queue, source
+  buffer, at a stop while the store still refuses them, on a listener failure (a store
+  error or a reader error), and on an unclean daemon exit (see the UDP hold section); every other source holds at the producer (client queue, ship queue, source
   file, sender socket).
 
 ### A floor refusal requests reclamation (#267)
