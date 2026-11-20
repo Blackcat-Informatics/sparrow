@@ -138,40 +138,44 @@ where an unreclaimed refusal holds its slot (no log counts the journals held), t
 staging threshold, and reclaim to zero after the 60,000-record refusal. Issue #389
 tracks the fault.
 
-**The staging bound and senders.** The daemon refuses a publication when its
+**The staging bound and senders.** The daemon refuses an RDF write when its
 anticipated staged writes exceed 64 MiB. The anticipated size is the sum of the
-batch's pending writes, the compact JSON manifest of each graph (owner, terms,
-graphs and rows), 576 bytes for each row of the graph being written, 128 bytes for
-each new dictionary term in the batch, and the bytes already staged by earlier records
-of the same publication. The 576 and 128 figures are fixed reservations in the code,
-not measured output, and the sum is an upper bound on reserved writes, not disk growth.
+batch's pending writes, the compact JSON manifest of the graph (owner, terms, graphs
+and rows), 576 bytes for each row of the graph being written, 128 bytes for each new
+dictionary term in the batch, and the encoded bytes of those new dictionary terms. The
+576 and 128 figures are fixed reservations in the code, not measured output, and the sum
+is not the disk growth. A staged import starts a fresh write for each preparation
+checkpoint and another for the artifact graph at publication, so earlier records count
+through the batch's pending writes only. A record whose own projection graph crosses
+the bound is not refused: it is stored without that graph (see
+[RDF staging refusals are counted and named](#rdf-staging-refusals-are-counted-and-named-340)).
 A sender cannot compute the sum in advance: the rows and new terms come from the
-daemon's derivation of each record, and the pending and staged bytes depend on the
-other records of the publication. A sender therefore sets no size from this bound and
-does not predict the refusal.
+daemon's derivation of each record, and the pending writes depend on the other records
+of the batch. A sender therefore sets no size from this bound and does not predict the
+refusal.
 
-A non-retryable `RESOURCE_LIMIT` with the input-bound flag is answered for one
-publication. The daemon stores nothing for the refused publication, and the request is
-not retried at the same size. A sender that publishes several records in one import
-then:
+A sender sees a refusal for this bound, or for the 32,768-record bound, as
+`RESOURCE_LIMIT` with `retryable` false; the wire carries no other mark of an input
+bound. The refused publication publishes nothing, and the same request at the same size
+fails the same way. A refusal after preparation keeps its prepared records and its
+journal slot until reclaim. A sender that publishes several records in one import then:
 
-1. Cancels the refused import under its request ID with `importCancel`. A refusal
-   after preparation keeps its prepared records and its journal slot until reclaim.
+1. Cancels the refused import under its request ID with `importCancel`.
 2. Splits the publication in half and sends each half as a new import under a new
    request ID.
 3. Repeats step 2 for any half refused the same way, down to one record.
 
-A sender that publishes one record per import has nothing to split. When that
-record is refused with the same `RESOURCE_LIMIT`, the daemon stores nothing for it and
-the refusal is final for that publication. The sender may then resend the record as one
-`opaque` document under a new request ID, recording the refusal's code, input-bound flag
-and message as the item's fate, so that no item is dropped and the import does not stop
-because of the bound. This is permitted sender behaviour, not a daemon rule. An accepted
-opaque resend stores the record whole, as its bytes, found by payload ID only: its
-content is not queryable as RDF rows or by value. The opaque record still writes an RDF
-metadata graph, so the resend is not exempt from the bound, and whether it clears the
-bound is not measured. An opaque resend that is refused too is recorded with its own
-refusal as the item's fate.
+A sender that publishes one record per import has nothing to split. When that record
+is refused with the same non-retryable `RESOURCE_LIMIT`, its publication publishes
+nothing and the refusal is final for that publication. The sender may then resend the
+record as one `opaque` document under a new request ID, recording the refusal's code,
+`retryable` flag and message as the item's fate, so that no item is dropped and the
+import does not stop because of the bound. This is permitted sender behaviour, not a
+daemon rule. An accepted opaque resend stores the record whole, as its bytes, found by
+payload ID only: its content is not queryable as RDF rows or by value. The opaque record
+still writes an RDF metadata graph, so the resend is not exempt from the bound, and
+whether it clears the bound is not measured. An opaque resend that is refused too is
+recorded with its own refusal as the item's fate.
 
 **Choosing the form.** An item sent `opaque` costs at most about its size (0.21x to
 0.27x for log text, 1.03x to 1.08x for random bytes) and is found by payload id only
@@ -4498,7 +4502,9 @@ ID answers `IMPORT_EXPIRED` until reclamation has removed the journal; the calle
 begins again under the same ID, with bounded backoff. An input-bound refusal is not resent:
 `RESOURCE_LIMIT` for more than 32,768 records in one publication or for RDF write staging
 over 64 MiB fails the same way on the same bytes, so the daemon answers it non-retryable and the
-caller cuts the input. The 32,768-record bound is checked while the layout is prepared, before
+caller cuts the input (see
+"The staging bound and senders" under [Cruft](#cruft) for the split and the permitted opaque
+resend). The 32,768-record bound is checked while the layout is prepared, before
 any record is prepared.
 
 `sparrow_client` is the producer interface. It depends on no `sparrow-core`, and a crate
