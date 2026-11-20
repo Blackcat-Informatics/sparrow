@@ -163,11 +163,15 @@ then:
 
 A sender that publishes one record per import has nothing to split. When that
 record is refused with the same `RESOURCE_LIMIT`, the daemon stores nothing for it and
-the refusal is final for that publication. Resending the record as one `opaque`
-document is a new publication, not a retry, and the daemon does not measure whether it
-clears the bound. An opaque record also writes an RDF metadata graph, so it is not
-exempt from this bound. Whether a sender sends such a record as `opaque` is the
-sender's decision, and this document does not state it as a daemon rule.
+the refusal is final for that publication. The sender may then resend the record as one
+`opaque` document under a new request ID, recording the refusal's code, input-bound flag
+and message as the item's fate, so that no item is dropped and the import does not stop
+because of the bound. This is permitted sender behaviour, not a daemon rule. An accepted
+opaque resend stores the record whole, as its bytes, found by payload ID only: its
+content is not queryable as RDF rows or by value. The opaque record still writes an RDF
+metadata graph, so the resend is not exempt from the bound, and whether it clears the
+bound is not measured. An opaque resend that is refused too is recorded with its own
+refusal as the item's fate.
 
 **Choosing the form.** An item sent `opaque` costs at most about its size (0.21x to
 0.27x for log text, 1.03x to 1.08x for random bytes) and is found by payload id only
