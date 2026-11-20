@@ -1378,7 +1378,10 @@ if missing:
 # The live total was read before the walk and ingest went on during it: an artifact received after that read
 # and listed by the walk is in the live listing but not in the live total, so it is added to what the copy may
 # hold more. Ids stamped between the clock reads on either side of the status read may or may not be in the live
-# total; they are not added (so no false failure), and their count is the margin in which one loss can hide.
+# total; they are not added (so no false failure), and their count is printed as the margin. The server stamps an
+# artifact's receipt before it takes the writer lock, so an artifact stamped before the first clock read and saved
+# after the status snapshot is in neither the total, nor `during`, nor the margin: each artifact in flight across
+# the status read can hide one lost artifact unreported. That is the stated limit; no lease allowance is added.
 after_read = datetime.datetime.fromisoformat(live_counts["clock_after_status"])
 before_read = datetime.datetime.fromisoformat(live_counts["clock_before_status"])
 during = len([i for i, (src, at) in live_rows.items() if at >= after_read])
@@ -1604,7 +1607,8 @@ CHECK
      (`--list`, taken before the stop, "Before the window") as its last argument and requires:
      every id of it received at or after the cutoff is in this copy's listing, or the check fails and
      names the ids (the first 20); the `artifacts` counter of the copy is not below the live one plus
-     the number of ids in the copy only. Ids in the copy only were written between the live listing
+     the number of ids in the copy only and the number of live ids received at or after the later
+     clock reading of the live status read (`during`). Ids in the copy only were written between the live listing
      and the stop: they are printed as a count and do not fail. Ids of the live listing received before
      the cutoff and absent here are printed as a count (they can have expired since). A source with
      no listed row is covered the same way: every id the live listing holds for it, received at or
@@ -1623,12 +1627,21 @@ CHECK
      (`live_records` in `before.json`). A loss among past-deadline artifacts is therefore caught
      only by the count relation above. The live total is read once, before the walk, and ingest goes on
      during it. The check reads the clock on both sides of that status read. Live ids stamped at or
-     after the later reading were accepted after the total was read, so the check adds them to what
-     the copy may hold more, as are the ids in the copy only; with these the resolution is one
-     artifact. Ids stamped between the two readings may or may not be in the live total, so the check
-     does not add them (which keeps it from failing a store with no loss) and prints their count as
-     the margin, normally 0: each id in the margin is one artifact of loss that can pass. Both
-     readings and the stamps are one host clock. A copy row
+     after the later reading were accepted after the total was read, so the check adds them (`during`)
+     to what the copy may hold more, as are the ids in the copy only. Ids stamped between the two
+     readings may or may not be in the live total, so the check does not add them (which keeps it
+     from failing a store with no loss) and prints their count as the margin, normally 0; each id in
+     the margin is one artifact of loss that can pass. The server stamps an artifact's receipt before
+     it takes the writer lock (`rpc.rs`, `now()` before the operation; `storage.rs`, `self.lock()` in
+     ingest), so an artifact stamped before the first clock reading and saved after the status
+     snapshot is in neither the live total, nor `during`, nor the margin: each artifact in flight
+     across the status read can hide one lost artifact unreported. That is the stated limit, and the
+     check adds no allowance for it. The expected count is near 0: the artifacts counter is 39,061
+     (3,020,515 minus 2,981,454 in `.stage/image/switch-1/before.json`) over the store's age of
+     2,821,860 s (from 2026-10-17 22:06, the file time of the earliest status file, to the
+     2026-11-19 13:57 reading), about 0.014 artifacts per second (arithmetic, an inference from
+     those two readings), so each second between stamp and save expects about 0.014 artifacts; the
+     interval itself is not measured. The clock readings and the stamps are one host clock. A copy row
      with no `origin` counts as copy-only, because the listing file holds rows with an origin only; the
      live store has no such row (`fragment_parents` 0 in its `sources` reading). The live
      `artifacts` counter has no `payload-index` row on `fda2812`, so the live listing takes it as the
