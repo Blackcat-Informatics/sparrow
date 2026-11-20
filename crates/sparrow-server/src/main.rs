@@ -266,6 +266,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let syslog_registry = sparrow_server::syslog_listener::SyslogRegistry::default();
     let pressure_wake = sparrow_server::pressure_wake::PressureWake::default();
+    if let Err(error) = sparrow_server::syslog_listener::check_spill_owners(
+        &config.syslog_spill_dir(),
+        &config.syslog,
+    ) {
+        return shutdown::finish(
+            Err(error.into()),
+            shutdown::Workers {
+                consumer: consumer.take(),
+                ..Default::default()
+            },
+            &store,
+            &endpoints,
+            &admission,
+            operation_slots,
+        )
+        .await;
+    }
     let mut syslog = if config.syslog.is_empty() {
         None
     } else {
@@ -275,6 +292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             operations.clone(),
             syslog_registry.clone(),
             pressure_wake.clone(),
+            &config.syslog_spill_dir(),
         )
         .await
         {

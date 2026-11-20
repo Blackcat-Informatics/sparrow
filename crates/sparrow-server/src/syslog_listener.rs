@@ -6,6 +6,7 @@
 mod udp_hold;
 
 use crate::pressure_wake::{PressureWake, Waiter};
+use crate::syslog_spill::Spill;
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -100,7 +101,7 @@ pub(crate) fn validate(listeners: &[SyslogListener]) -> io::Result<()> {
     }
     for listener in listeners {
         if listener.id.is_empty()
-            || listener.id.len() > 128
+            || listener.id.len() > 64
             || !ids.insert(&listener.id)
             || listener.source.is_empty()
             || listener.source.len() > 512
@@ -585,6 +586,7 @@ impl SyslogWorker {
         operations: Arc<Semaphore>,
         registry: SyslogRegistry,
         wake: PressureWake,
+        spill_dir: &std::path::Path,
     ) -> io::Result<Self> {
         validate(definitions)?;
         let mut sockets = Vec::new();
@@ -656,7 +658,8 @@ impl SyslogWorker {
             );
             status.kernel = kernel;
             let metric = Metrics(Arc::new(Mutex::new(status)));
-            sockets.push((socket, metric.clone()));
+            let spill = Arc::new(Spill::new(spill_dir, &definition.id));
+            sockets.push((socket, metric.clone(), spill));
             metrics.push(metric);
         }
         *registry
@@ -669,7 +672,7 @@ impl SyslogWorker {
         let task = tokio::spawn(async move {
             let _alive = alive;
             let mut listeners = JoinSet::new();
-            for (socket, metrics) in sockets {
+            for (socket, metrics, spill) in sockets {
                 listeners.spawn(listen(
                     socket,
                     metrics,
@@ -677,7 +680,7 @@ impl SyslogWorker {
                     operations.clone(),
                     receiver.clone(),
                     shutdown.clone(),
-                    wake.clone(),
+                    PressureHold::new(wake.clone(), spill),
                 ));
             }
             finish_tasks(Ok(()), &mut listeners, &shutdown).await
@@ -774,16 +777,155 @@ struct Packet {
     intake: Intake,
 }
 
-/// Offer one packet to the store. With `keep_on_pressure` a `STORAGE_PRESSURE` answer leaves
-/// the packet with the caller instead of being counted as a refused discard. A packet with a
-/// `stamp` that the store refuses as behind the archive watermark is offered once more with the
-/// commit instant and counted restamped: a log is never refused for its stamp.
+/// Publish the frames an earlier stop spilled, in order, before this listener accepts a
+/// connection. A frame the store refuses for pressure is held as a live frame is, until the
+/// store takes it or the listener stops. Returns `true` once the file is empty, and `false` when
+/// a stop ended the drain: every frame the store has not taken is then rewritten to the file.
+/// A frame the store refuses otherwise fails the listener and keeps its file.
+async fn publish_spilled(
+    store: &sparrow_core::Store,
+    spill: &Spill,
+    metrics: &Metrics,
+    operations: &Arc<Semaphore>,
+    stop: &mut watch::Receiver<bool>,
+    wake: &mut Waiter,
+) -> io::Result<bool> {
+    let spilled = spill.read()?;
+    let definition = metrics.snapshot()?.definition;
+    if spilled.torn_bytes != 0 {
+        journal(&format!(
+            "sparrowd: syslog listener {}: spill {} ends in {} bytes of a record cut off by a crash; that frame was never synced and is dropped",
+            definition.id,
+            spill.path().display(),
+            spilled.torn_bytes,
+        ));
+    }
+    let frames = spilled.frames;
+    let mut next = 0;
+    let mut outcome = Ok(true);
+    while let Some(frame) = frames.get(next) {
+        let packet = Packet {
+            bytes: frame.bytes.clone(),
+            intake: Intake::Tcp,
+        };
+        match publish_held(
+            store,
+            &frame.source,
+            packet,
+            metrics,
+            operations,
+            stop,
+            wake,
+        )
+        .await
+        {
+            Ok(Published::Stored) => next += 1,
+            Ok(Published::Pressured) => {
+                outcome = Ok(false);
+                break;
+            }
+            Ok(Published::Refused) => {
+                outcome = Err(io::Error::other(format!(
+                    "syslog spill {}: frame {} of {} was refused by the store; the file keeps it and the listener does not accept connections",
+                    spill.path().display(),
+                    next + 1,
+                    frames.len(),
+                )));
+                break;
+            }
+            Err(error) => {
+                outcome = Err(error);
+                break;
+            }
+        }
+    }
+    spill.replace(&frames[next..])?;
+    outcome
+}
+
+/// What ends a held frame's wait and what keeps it past a stop: the daemon's pressure wake and the
+/// listener's spill file. A listener hands both to each connection together.
+struct PressureHold {
+    wake: PressureWake,
+    spill: Arc<Spill>,
+}
+
+impl PressureHold {
+    fn new(wake: PressureWake, spill: Arc<Spill>) -> Self {
+        Self { wake, spill }
+    }
+}
+
+/// Refuse to start while a configured TCP listener has no writable spill directory, or while the
+/// directory holds a file that no configured TCP listener owns: its frames would never be
+/// published. Without a TCP listener nothing is checked.
+pub fn check_spill_owners(dir: &std::path::Path, listeners: &[SyslogListener]) -> io::Result<()> {
+    if !listeners
+        .iter()
+        .any(|listener| listener.transport == SyslogTransport::Tcp)
+    {
+        return Ok(());
+    }
+    require_writable(dir)?;
+    let owned: std::collections::BTreeSet<std::ffi::OsString> = listeners
+        .iter()
+        .filter(|listener| listener.transport == SyslogTransport::Tcp)
+        .flat_map(|listener| {
+            let spill = Spill::new(dir, &listener.id);
+            [spill.path().to_owned(), spill.partial_path()]
+        })
+        .filter_map(|path| path.file_name().map(std::ffi::OsStr::to_owned))
+        .collect();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("syslog spill directory {}: {error}", dir.display()),
+            ));
+        }
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !owned.contains(&entry.file_name()) {
+            return Err(io::Error::other(format!(
+                "syslog spill {} is not owned by any configured TCP syslog listener, so its frames would never be published; restore the listener or move the file aside by hand",
+                entry.path().display(),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Create the spill directory if it is missing and prove the daemon can write in it, so a stop
+/// under pressure never finds out that the spill cannot be kept. The failure names the directory
+/// and the host steps that make it writable.
+fn require_writable(dir: &std::path::Path) -> io::Result<()> {
+    let refuse = |action: &str, error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "syslog spill directory {}: cannot {action}: {error}; a TCP syslog listener needs a directory the daemon can write (docs/deployment.md, \"Syslog TCP listener install steps\")",
+                dir.display()
+            ),
+        )
+    };
+    std::fs::create_dir_all(dir).map_err(|error| refuse("create it", error))?;
+    let probe = dir.join(".write-probe");
+    std::fs::File::create(&probe).map_err(|error| refuse("write in it", error))?;
+    std::fs::remove_file(&probe).map_err(|error| refuse("remove its write probe", error))
+}
+
+/// Offer one packet to the store. A `STORAGE_PRESSURE` answer always leaves the packet with the
+/// caller, which holds it, spills it or counts it, so no packet is discarded here for pressure.
+/// A packet with a `stamp` that the store refuses as behind the archive watermark is offered
+/// once more with the commit instant and counted restamped: a log is never refused for its stamp.
 async fn publish(
     store: sparrow_core::Store,
     source: String,
     bytes: Arc<[u8]>,
     metrics: &Metrics,
-    keep_on_pressure: bool,
     stamp: Option<u64>,
 ) -> io::Result<Published> {
     enum Attempt {
@@ -832,12 +974,12 @@ async fn publish(
             }
         } {
             Ok(artifact) => artifact,
-            Err(error) if keep_on_pressure && error.code == "STORAGE_PRESSURE" => {
+            Err(error) if error.code == "STORAGE_PRESSURE" => {
                 return Ok(Attempt::Pressured);
             }
             // A full receiver-window registry no longer refuses (#215): the packet is stored
             // without a window and the store counts the lost evidence.
-            Err(error) if matches!(error.code, "RESOURCE_LIMIT" | "STORAGE_PRESSURE") => {
+            Err(error) if error.code == "RESOURCE_LIMIT" => {
                 return record_discard(
                     &store,
                     &source,
@@ -923,14 +1065,14 @@ async fn publish(
 /// blocks on `wake`, the stop and nothing else, and its same bytes are offered again at each
 /// wake; it owns no timer. The daemon sends the wake at every ending it can see, and the
 /// maintenance worker's one observation wakes every held frame at its one-second cadence
-/// for the endings it cannot (see `crate::pressure_wake`). A stop ends the hold: the frame
-/// gets one last attempt and, if refused, is counted exactly as before. A frame waiting for a
-/// permit blocks on the permit and, so the journal can announce its wait once the report
-/// interval has passed, on the same observer tick; it never retries on a clock.
+/// for the endings it cannot (see `crate::pressure_wake`). A stop ends the hold: the frame gets
+/// one last attempt and, if refused for pressure, is returned as `Pressured` for the caller to
+/// spill (TCP) or count (UDP) instead of being held. A frame waiting for a permit blocks on the
+/// permit and, so the journal can announce its wait once the report interval has passed, on the
+/// same observer tick; it never retries on a clock.
 ///
-/// A UDP datagram is stamped with its read instant. On a stop it gets one last attempt as well,
-/// but a refusal is returned as `Pressured` for the caller to count with the rest of its queue
-/// instead of being counted here as one refused discard.
+/// A UDP datagram is stamped with its read instant. A stop leaves it the same way, so the
+/// caller counts the rest of its queue as lost.
 async fn publish_held(
     store: &sparrow_core::Store,
     source: &str,
@@ -976,12 +1118,11 @@ async fn publish_held(
             source.to_owned(),
             bytes.clone(),
             metrics,
-            !stopping || matches!(intake, Intake::Udp { .. }),
             intake.stamp(),
         )
         .await?;
         drop(permit);
-        if published != Published::Pressured || (stopping && matches!(intake, Intake::Udp { .. })) {
+        if published != Published::Pressured || stopping {
             hold.leave()?;
             return Ok(published);
         }
@@ -1060,11 +1201,25 @@ async fn listen(
     operations: Arc<Semaphore>,
     mut stop: watch::Receiver<bool>,
     shutdown: watch::Sender<bool>,
-    wake: PressureWake,
+    hold: PressureHold,
 ) -> io::Result<()> {
+    let PressureHold { wake, spill } = hold;
     let definition = metrics.snapshot()?.definition;
     match socket {
         Socket::Tcp(listener) => {
+            let mut waiter = wake.subscribe();
+            if !publish_spilled(
+                &store,
+                &spill,
+                &metrics,
+                &operations,
+                &mut stop,
+                &mut waiter,
+            )
+            .await?
+            {
+                return Ok(());
+            }
             let connections = Arc::new(Semaphore::new(definition.max_connections));
             let roster = Arc::new(Roster::default());
             let mut tasks = JoinSet::new();
@@ -1091,10 +1246,10 @@ async fn listen(
                         let Some(stream) = pending.take() else { continue; };
                         let lease = roster.enroll()?;
                         metrics.update(|status| { status.active_connections += 1; Ok(()) })?;
-                        let metrics = metrics.clone(); let store = store.clone(); let operations = operations.clone(); let stop = stop.clone(); let wake = wake.clone();
+                        let metrics = metrics.clone(); let store = store.clone(); let operations = operations.clone(); let stop = stop.clone(); let wake = wake.clone(); let spill = spill.clone();
                         tasks.spawn(async move {
                             let _permit = permit;
-                            let result = receive_tcp(BufReader::with_capacity(4096, stream), &metrics, store, operations, stop, lease, wake).await;
+                            let result = receive_tcp(BufReader::with_capacity(4096, stream), &metrics, store, operations, stop, lease, PressureHold::new(wake, spill)).await;
                             metrics.update(|status| { status.active_connections = status.active_connections.checked_sub(1).ok_or_else(|| io::Error::other("syslog connection counter underflow"))?; Ok(()) })?;
                             result
                         });
@@ -1282,8 +1437,9 @@ async fn receive_tcp<R: AsyncRead + Unpin>(
     operations: Arc<Semaphore>,
     mut stop: watch::Receiver<bool>,
     mut lease: Lease,
-    wake: PressureWake,
+    hold: PressureHold,
 ) -> io::Result<()> {
+    let PressureHold { wake, spill } = hold;
     let mut wake = wake.subscribe();
     let definition = &metrics.snapshot()?.definition;
     let framing = definition
@@ -1335,12 +1491,15 @@ async fn receive_tcp<R: AsyncRead + Unpin>(
             None => (End::Stopped, true),
         };
         let frame = partial.into_frame(end);
-        // The frame is held here, unread past, until the store takes it.
-        let accepted = publish_held(
+        // The frame is held here, unread past, until the store takes it. The listener has taken it
+        // off the wire, so the sender cannot resend it: a stop that still finds the store under
+        // pressure spills it beside the store, and a spill that cannot be written fails the stop.
+        let bytes: Arc<[u8]> = Arc::from(frame.bytes);
+        let published = publish_held(
             &store,
             &definition.source,
             Packet {
-                bytes: Arc::from(frame.bytes),
+                bytes: bytes.clone(),
                 intake: Intake::Tcp,
             },
             metrics,
@@ -1348,8 +1507,17 @@ async fn receive_tcp<R: AsyncRead + Unpin>(
             &mut stop,
             &mut wake,
         )
-        .await?
-            == Published::Stored;
+        .await?;
+        if published == Published::Pressured {
+            spill.append(&definition.source, &bytes)?;
+            journal(&format!(
+                "sparrowd: syslog listener {}: stop spilled a held TCP frame of {} bytes to {}; it is published at the next start",
+                definition.id,
+                bytes.len(),
+                spill.path().display(),
+            ));
+        }
+        let accepted = published == Published::Stored;
         if frame.truncated {
             discard(
                 &store,
@@ -1717,8 +1885,8 @@ mod tests {
             .await;
     }
 
-    /// INVARIANT: below the free-space floor a packet is refused and counted in
-    /// memory; refusing its durable discard count does not fail the intake worker.
+    /// INVARIANT: below the free-space floor a packet is answered `Pressured`, not refused, so
+    /// nothing is counted refused or discarded here and the intake worker does not fail.
     #[tokio::test]
     async fn packet_refused_below_the_free_space_floor_keeps_intake_running() {
         let dir = tempfile::tempdir().unwrap();
@@ -1758,15 +1926,14 @@ mod tests {
             "source".into(),
             Arc::from(&b"<34>refused"[..]),
             &metrics,
-            false,
             None,
         )
         .await
         .unwrap();
-        assert_eq!(published, Published::Refused);
+        assert_eq!(published, Published::Pressured);
         let status = metrics.snapshot().unwrap();
-        assert_eq!(status.counts.refused, 1);
-        assert_eq!(status.failure.as_deref(), Some(NOT_DURABLE));
+        assert_eq!(status.counts.refused, 0);
+        assert_eq!(status.failure, None);
         assert_eq!(store.durability_status().unwrap().failure, None);
     }
 
@@ -1992,6 +2159,7 @@ mod tests {
         let lease = roster.enroll().unwrap();
         let metrics = fixture.metrics.clone();
         let store = fixture.store.clone();
+        let spill = fixture.spill.clone();
         let reading = tokio::spawn(async move {
             receive_tcp(
                 receiver,
@@ -2000,7 +2168,7 @@ mod tests {
                 Arc::new(Semaphore::new(4)),
                 stopped,
                 lease,
-                Default::default(),
+                PressureHold::new(Default::default(), spill),
             )
             .await
         });
@@ -2041,6 +2209,7 @@ mod tests {
         pub(super) metrics: Metrics,
         pub(super) wake: PressureWake,
         pub(super) operations: Arc<Semaphore>,
+        pub(super) spill: Arc<Spill>,
         /// Keeps the floor's resume edge wired to `wake`, as the daemon wires it.
         pub(super) resumes: std::cell::RefCell<Vec<sparrow_core::ResumeSubscription>>,
     }
@@ -2107,12 +2276,14 @@ mod tests {
             definition.clone(),
             definition.address,
         ))));
+        let spill = Arc::new(Spill::new(&dir.path().join("spill"), "listener"));
         Listener {
             _dir: dir,
             store,
             metrics,
             wake: PressureWake::default(),
             operations: Arc::new(Semaphore::new(4)),
+            spill,
             resumes: std::cell::RefCell::default(),
         }
     }
@@ -2139,7 +2310,7 @@ mod tests {
             fixture.operations.clone(),
             stopped,
             stop.clone(),
-            fixture.wake.clone(),
+            PressureHold::new(fixture.wake.clone(), fixture.spill.clone()),
         ));
         (stop, task)
     }
@@ -2163,7 +2334,7 @@ mod tests {
             Arc::new(Semaphore::new(4)),
             stopped,
             lease,
-            Default::default(),
+            PressureHold::new(Default::default(), fixture.spill.clone()),
         )
         .await
         .unwrap();
@@ -2183,6 +2354,7 @@ mod tests {
         let lease = Arc::new(Roster::default()).enroll().unwrap();
         let metrics = fixture.metrics.clone();
         let store = fixture.store.clone();
+        let spill = fixture.spill.clone();
         let reading = tokio::spawn(async move {
             receive_tcp(
                 receiver,
@@ -2191,7 +2363,7 @@ mod tests {
                 Arc::new(Semaphore::new(4)),
                 stopped,
                 lease,
-                Default::default(),
+                PressureHold::new(Default::default(), spill),
             )
             .await
         });
@@ -2294,8 +2466,18 @@ mod tests {
         let lease = Arc::new(Roster::default()).enroll().unwrap();
         let wake = fixture.wake.clone();
         let operations = fixture.operations.clone();
+        let spill = fixture.spill.clone();
         tokio::spawn(async move {
-            receive_tcp(receiver, &metrics, store, operations, stopped, lease, wake).await
+            receive_tcp(
+                receiver,
+                &metrics,
+                store,
+                operations,
+                stopped,
+                lease,
+                PressureHold::new(wake, spill),
+            )
+            .await
         })
     }
 
@@ -2346,6 +2528,181 @@ mod tests {
         assert_eq!(stored_lengths(&fixture.store), [5, 20]);
         drop(sender);
         reading.await.unwrap().unwrap();
+    }
+
+    /// Value (#428): a frame the listener took off the wire, which the store still refuses when
+    /// the daemon stops, is spilled beside the store and is not counted refused. The next start
+    /// publishes it, and the spill file is removed once the store has taken it.
+    #[tokio::test]
+    async fn a_frame_held_at_a_stop_under_pressure_is_spilled_and_published_at_the_next_start() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        fixture.store.space_floor().refuse_writes_for_tests(true);
+        let (mut sender, receiver) = tokio::io::duplex(16);
+        let (stop, stopped) = watch::channel(false);
+        let reading = connection(&fixture, receiver, stopped);
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>a")
+            .await
+            .unwrap();
+        until(&fixture.metrics, frame_taken).await;
+        stop.send_replace(true);
+        reading.await.unwrap().unwrap();
+        let counts = fixture.metrics.snapshot().unwrap().counts;
+        assert_eq!((counts.refused, counts.accepted), (0, 0));
+        let spilled = fixture.spill.read().unwrap();
+        assert_eq!(spilled.frames.len(), 1);
+        assert_eq!(spilled.frames[0].source, "source");
+        assert!(stored_lengths(&fixture.store).is_empty());
+        relieve(&fixture);
+        assert!(drain(&fixture, false).await.unwrap());
+        assert_eq!(stored_lengths(&fixture.store), [5]);
+        assert!(!fixture.spill.path().exists());
+        drop(sender);
+    }
+
+    /// Value (#428): a stop that cannot write the spill fails, so the loss is reported as a
+    /// failure of the stop and not as a count. The frame is not kept anywhere else.
+    #[tokio::test]
+    async fn a_spill_that_cannot_be_written_fails_the_stop() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        fixture.store.space_floor().refuse_writes_for_tests(true);
+        // A regular file where the spill directory must be makes every spill write fail.
+        let blocked = fixture._dir.path().join("blocked");
+        std::fs::write(&blocked, b"").unwrap();
+        let spill = Arc::new(Spill::new(&blocked, "listener"));
+        let (mut sender, receiver) = tokio::io::duplex(16);
+        let (stop, stopped) = watch::channel(false);
+        let lease = Arc::new(Roster::default()).enroll().unwrap();
+        let metrics = fixture.metrics.clone();
+        let store = fixture.store.clone();
+        let operations = fixture.operations.clone();
+        let wake = fixture.wake.clone();
+        let reading = tokio::spawn(async move {
+            receive_tcp(
+                receiver,
+                &metrics,
+                store,
+                operations,
+                stopped,
+                lease,
+                PressureHold::new(wake, spill),
+            )
+            .await
+        });
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>a")
+            .await
+            .unwrap();
+        until(&fixture.metrics, frame_taken).await;
+        stop.send_replace(true);
+        let error = reading.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("syslog spill"), "{error}");
+        assert_eq!(fixture.metrics.snapshot().unwrap().counts.refused, 0);
+        drop(sender);
+    }
+
+    /// Run the start-time drain of the fixture's spill, with a stop requested or not.
+    async fn drain(fixture: &Listener, stopped: bool) -> io::Result<bool> {
+        let (_stop_sender, mut stop) = watch::channel(stopped);
+        let mut waiter = fixture.wake.subscribe();
+        publish_spilled(
+            &fixture.store,
+            &fixture.spill,
+            &fixture.metrics,
+            &fixture.operations,
+            &mut stop,
+            &mut waiter,
+        )
+        .await
+    }
+
+    /// Value (#428): a stop that ends the start-time drain under pressure keeps every frame the
+    /// store has not taken, in order, in the file; the next drain publishes them all.
+    #[tokio::test]
+    async fn a_drain_stopped_by_pressure_keeps_every_untaken_frame_in_order() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        fixture.spill.append("source", b"<34>a").unwrap();
+        fixture.spill.append("source", b"<34>bb").unwrap();
+        fixture.store.space_floor().refuse_writes_for_tests(true);
+        assert!(!drain(&fixture, true).await.unwrap());
+        assert_eq!(fixture.spill.read().unwrap().frames.len(), 2);
+        relieve(&fixture);
+        assert!(drain(&fixture, false).await.unwrap());
+        assert_eq!(stored_lengths(&fixture.store), [5, 6]);
+        assert!(!fixture.spill.path().exists());
+    }
+
+    /// Value (#428): a spilled frame the store refuses, not for pressure, fails the listener and
+    /// keeps its file, so the frame is neither accepted behind nor lost.
+    #[tokio::test]
+    async fn a_spilled_frame_the_store_refuses_keeps_the_file_and_fails_the_listener() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        fixture.spill.append("source", b"<34>a").unwrap();
+        fixture
+            .store
+            .space_floor()
+            .refuse_next_write_for_tests("RESOURCE_LIMIT");
+        let error = drain(&fixture, false).await.unwrap_err();
+        assert!(
+            error.to_string().contains("was refused by the store"),
+            "{error}"
+        );
+        assert_eq!(fixture.spill.read().unwrap().frames.len(), 1);
+    }
+
+    /// Value (#428): a record cut off at the end of a spill file, as a crash leaves it, is
+    /// dropped and counted in the bytes it cost; the frames before it are kept.
+    #[tokio::test]
+    async fn a_record_cut_off_at_the_end_of_a_spill_file_is_dropped_and_the_frames_before_it_kept()
+    {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        fixture.spill.append("source", b"<34>a").unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(fixture.spill.path())
+            .unwrap();
+        std::io::Write::write_all(&mut file, &[5, 0, 0, 0, b'x']).unwrap();
+        let spilled = fixture.spill.read().unwrap();
+        assert_eq!(spilled.frames.len(), 1);
+        assert_eq!(spilled.torn_bytes, 5);
+    }
+
+    /// Value (#428): a scratch file an interrupted rewrite left beside a spill file is not a file
+    /// no listener owns, so it does not fail the start check, and the drain removes it, because
+    /// the spill file still holds every frame the scratch file copied.
+    #[tokio::test]
+    async fn an_interrupted_rewrite_leaves_a_scratch_file_that_neither_fails_the_start_nor_survives_the_drain()
+     {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        fixture.spill.append("source", b"<34>a").unwrap();
+        std::fs::write(fixture.spill.partial_path(), b"stale").unwrap();
+        let definition = fixture.metrics.snapshot().unwrap().definition;
+        let dir = fixture.spill.path().parent().unwrap();
+        check_spill_owners(dir, &[definition]).unwrap();
+        assert!(drain(&fixture, false).await.unwrap());
+        assert_eq!(stored_lengths(&fixture.store), [5]);
+        assert!(!fixture.spill.partial_path().exists());
+    }
+
+    /// Value (#428): a TCP listener whose spill directory cannot be written fails the start with
+    /// the directory and the install steps named, so a stop under pressure never discovers the
+    /// missing precondition; a configuration without a TCP listener is not checked.
+    #[tokio::test]
+    async fn a_tcp_listener_without_a_writable_spill_directory_fails_the_start() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        let definition = fixture.metrics.snapshot().unwrap().definition;
+        let blocker = fixture
+            .spill
+            .path()
+            .parent()
+            .unwrap()
+            .join("not-a-directory");
+        std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+        std::fs::write(&blocker, b"file").unwrap();
+        let dir = blocker.join("syslog-spill");
+        let error = check_spill_owners(&dir, std::slice::from_ref(&definition)).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains(&dir.display().to_string()), "{text}");
+        assert!(text.contains("Syslog TCP listener install steps"), "{text}");
+        check_spill_owners(&dir, &[]).unwrap();
     }
 
     /// Value (#243): a hold is visible while it lasts, which an operator needs to tell a
@@ -2952,8 +3309,9 @@ mod tests {
         assert!(status.release(third.unwrap(), at(102)).is_none());
     }
 
-    /// Value (#243): shutdown interrupts a hold and the frame in hand is still accounted as
-    /// before: stored when the store takes it by then, counted refused when pressure persists.
+    /// Value (#243, #428): shutdown interrupts a hold and the frame in hand is accounted once:
+    /// stored when the store takes it by then, and spilled beside the store, not counted
+    /// refused, when pressure persists.
     #[tokio::test]
     async fn stopping_during_a_hold_publishes_the_frame_or_counts_it() {
         for cleared in [false, true] {
@@ -2974,7 +3332,11 @@ mod tests {
             let counts = fixture.metrics.snapshot().unwrap().counts;
             assert_eq!(
                 (counts.accepted, counts.refused),
-                if cleared { (1, 0) } else { (0, 1) }
+                (if cleared { 1 } else { 0 }, 0)
+            );
+            assert_eq!(
+                fixture.spill.read().unwrap().frames.len(),
+                usize::from(!cleared)
             );
         }
     }

@@ -3339,7 +3339,18 @@ stream or discards a frame:
   accept wait in the kernel backlog only at the connection ceiling; the free-space
   floor no longer stops the listener accepting (#257), and a held frame does not
   depend on accepting. On shutdown a hold ends: the frame gets one last
-  attempt and, if the store still refuses it, is counted `refused` as before.
+  attempt and, if the store still refuses it for pressure, is spilled to
+  `syslog-spill/` beside `data_dir`, one file per TCP listener, and is
+  not counted. The next start publishes the spilled frames, in order, before the
+  listener accepts a connection; the file is removed once the store has taken
+  every frame, so delivery after a crash during that publication is at least
+  once. A frame the store refuses for pressure during that publication waits as
+  a held frame does, so the listener accepts no connection behind it. A refusal
+  other than pressure fails the listener and keeps the file. A spill that cannot
+  be written fails the stop with the error naming the file. A spill file that no
+  configured TCP listener owns fails the start, naming the file, and so does a
+  spill directory the daemon cannot write. A spill cut off
+  at its end by a crash drops that record, counted in the journal line in bytes.
   A wait for an operation permit is not cut short by a stop: the frame must
   still be published, which takes a permit from the budget shutdown waits on
   anyway. Each new offer is a refused write attempt, so the store-wide refusal
@@ -3669,7 +3680,7 @@ Resolve each reference with typed `syslogListenerGet`, CLI
 store and source are required: a matching listener ID under another source
 cannot satisfy the query. Older schemas refuse with `UNSUPPORTED`; a different
 store refuses with `STORE_MISMATCH`; an absent or rebound listener refuses with
-`NOT_FOUND`. Current source labels are 1..512 bytes and listener IDs 1..128 bytes.
+`NOT_FOUND`. Current source labels are 1..512 bytes and listener IDs 1..64 bytes.
 The runtime registry has at most four entries and is read through its existing
 fallible snapshot owner. Both source discovery and listener lookup return registry
 failures as typed `STORAGE_FAILURE`, rather than a successful empty result or a
