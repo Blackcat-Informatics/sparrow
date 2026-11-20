@@ -138,6 +138,37 @@ where an unreclaimed refusal holds its slot (no log counts the journals held), t
 staging threshold, and reclaim to zero after the 60,000-record refusal. Issue #389
 tracks the fault.
 
+**The staging bound and senders.** The daemon refuses a publication when its
+anticipated staged writes exceed 64 MiB. The anticipated size is the sum of the
+batch's pending writes, the compact JSON manifest of each graph (owner, terms,
+graphs and rows), 576 bytes for each row of the graph being written, 128 bytes for
+each new dictionary term in the batch, and the bytes already staged by earlier records
+of the same publication. The 576 and 128 figures are fixed reservations in the code,
+not measured output, and the sum is an upper bound on reserved writes, not disk growth.
+A sender cannot compute the sum in advance: the rows and new terms come from the
+daemon's derivation of each record, and the pending and staged bytes depend on the
+other records of the publication. A sender therefore sets no size from this bound and
+does not predict the refusal.
+
+A non-retryable `RESOURCE_LIMIT` with the input-bound flag is answered for one
+publication. The daemon stores nothing for the refused publication, and the request is
+not retried at the same size. A sender that publishes several records in one import
+then:
+
+1. Cancels the refused import under its request ID with `importCancel`. A refusal
+   after preparation keeps its prepared records and its journal slot until reclaim.
+2. Splits the publication in half and sends each half as a new import under a new
+   request ID.
+3. Repeats step 2 for any half refused the same way, down to one record.
+
+A sender that publishes one record per import has nothing to split. When that
+record is refused with the same `RESOURCE_LIMIT`, the daemon stores nothing for it and
+the refusal is final for that publication. Resending the record as one `opaque`
+document is a new publication, not a retry, and the daemon does not measure whether it
+clears the bound. An opaque record also writes an RDF metadata graph, so it is not
+exempt from this bound. Whether a sender sends such a record as `opaque` is the
+sender's decision, and this document does not state it as a daemon rule.
+
 **Choosing the form.** An item sent `opaque` costs at most about its size (0.21x to
 0.27x for log text, 1.03x to 1.08x for random bytes) and is found by payload id only
 (`payloadLookup`); there is no search by value. An item sent as `jsonl` is
