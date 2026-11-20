@@ -580,8 +580,9 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
 - Spool. A daemon-side file spool is not built for UDP. A
   spool would append to the filesystem the floor protects, so it would need its own
   higher floor or a separate filesystem. What remains: Syslog UDP datagrams are held in the
-  daemon up to `hold_bytes` and then in the kernel buffer, and are lost only past the
-  kernel buffer or on an unclean daemon exit (see the UDP hold section); every other source holds at the producer (client queue, ship queue, source
+  daemon up to `hold_bytes` and then in the kernel buffer, and are lost past the kernel
+  buffer, at a stop or listener failure while the store still refuses them, and on an
+  unclean daemon exit (see the UDP hold section); every other source holds at the producer (client queue, ship queue, source
   file, sender socket).
 
 ### A floor refusal requests reclamation (#267)
@@ -3492,10 +3493,10 @@ UDP syslog is lossy by its nature; loss is counted where it can be (the kernel's
 drops, a clean shutdown) and stated plainly where it cannot (a crash, an exit on a
 full disk). The shutdown count is the final kernel drop count and `lost_at_shutdown`.
 Under storage pressure a UDP listener queues datagrams up to `hold_bytes` and the kernel
-buffer takes the rest, so a datagram that arrives while both are full is lost without a
-reply to its sender. Four counters show it: `kernel_drops` for the datagrams the kernel
+buffer takes the rest, so a datagram that arrives while both are full is lost, and its
+sender keeps no copy. Four counters show it: `kernel_drops` for the datagrams the kernel
 dropped, `reader_full_waits` for the times the queue was full, and `lost_at_shutdown` with
-`lost_at_shutdown_bytes` for the datagrams a stop could not publish. A sender that cannot
+`lost_at_shutdown_bytes` for the datagrams a stop or a listener failure could not publish. A sender that cannot
 lose a record does not use UDP syslog: it sends over syslog TCP, which holds the sender
 instead of dropping, or through the ingest socket. No configured sender uses a UDP
 listener, so no sender moves.
