@@ -911,6 +911,23 @@ Check what the window needs.
   (`bin/lexicons-PURRDF_REV`) is the same tree. A changed `text_analyzer` after the open means the
   directory differs from the one the store was built with ("Refused open" in `deploy/RECOVERY.md`).
 
+Take the live daemon's listing, which the rehearsal's check compares with the copy's ("The rehearsal on
+a copy", step 4). Write `payload-check.py` first (the block under that heading). The walk takes the
+writer lock for each page, about 5,055 pages at the live record count (arithmetic from the walk's
+rate, below), so stop the shipper timer before it, which keeps the shipper's ingest out of the
+walk; the script stops the same timer at its start, and a stop of an already stopped timer is not run.
+The check has the walk's stall limit, and records the walk's calls and wall time and the ingest
+figures `flush_lag_ms` and `pending_writes` before and after it, in `live-listing.tsv.counts`:
+
+```bash
+systemctl --user stop sparrow-ship.timer
+python3 -I "$RECORD/payload-check.py" --list "$LIB/$NEW_CLI" "$SOCK" "$RECORD/live-listing.tsv" > "$RECORD/live-listing.log" 2>&1
+echo "EXIT=$?"
+cat "$RECORD/live-listing.log"
+```
+
+Take it as late as the window allows, and compare the ingest figures with `before.json`.
+
 Give the notice (below) and wait for the go.
 
 #### Before the stop: the stop timeout, the quiesce and the watch
@@ -1133,8 +1150,18 @@ read-only client of the rehearsal daemon's socket:
 cat > "$RECORD/payload-check.py" <<'CHECK'
 import datetime, json, os, pathlib, subprocess, sys, time
 
-cli, sock, record = sys.argv[1], sys.argv[2], pathlib.Path(sys.argv[3])
-CEILING = int(sys.argv[4]) if len(sys.argv) > 4 else 4 << 30   # most bytes the check reads
+# check:  CLI SOCKET RECORD_DIR CEILING_BYTES LIVE_LISTING
+# list:   --list CLI SOCKET OUTPUT_FILE     writes the listing of a daemon as id, source and receipt lines, and its counts
+#                                           to OUTPUT_FILE.counts, with the ingest figures before and after the walk
+LIST = sys.argv[1] == "--list"
+args = sys.argv[2:] if LIST else sys.argv[1:]
+cli, sock = args[0], args[1]
+out_path = pathlib.Path(args[2])
+record = out_path
+CEILING = int(args[3]) if len(args) > 3 else 4 << 30   # most bytes the check reads
+LIVE = pathlib.Path(args[4]) if len(args) > 4 else None  # the live daemon's listing, from --list
+if not LIST and LIVE is None:
+    sys.exit("usage: payload-check.py CLI SOCKET RECORD_DIR CEILING_BYTES LIVE_LISTING (the live daemon's --list output)")
 TARGET, LARGEST, CHUNK, REPORT_EVERY = 50, 5, 1 << 20, 1000
 AGE_DAYS = [0, 1, 3, 7, 14, 21]   # window edges, days before now; the last window is open-ended
 
@@ -1172,8 +1199,75 @@ def length_of(row):
     return int(origin["byte_length"])
 
 
+def walk_listing(status, store):
+    counters = [m for m in status["migrations"] if m["name"] == "store-counters"]
+    if len(counters) != 1 or counters[0]["watermark"] is not None or counters[0]["done"] != counters[0]["total"]:
+        fail(f"status has no complete store-counters migration row: {counters}")
+    sources_done = [m for m in status["migrations"] if m["name"] == "source-summary"]
+    if len(sources_done) != 1 or sources_done[0]["watermark"] is not None or sources_done[0]["done"] != sources_done[0]["total"]:
+        fail(f"status has no complete source-summary migration row: {sources_done}")
+    call_limit = int(counters[0]["total"]) + 1
+    stall_limit = int(status["max_records_per_artifact"]) + 1
+    walk_calls, listed, last, stalled, started = 0, {}, None, 0, time.monotonic()
+    cursor = []
+    while True:
+        if walk_calls >= call_limit:
+            fail(f"the listing walk made {walk_calls} calls, the bound of {call_limit} catalog entries, and is not finished")
+        page = call("artifacts", store, "--page-size", "1000", *cursor)
+        walk_calls += 1
+        last = page
+        for r in page["rows"]:
+            if r["artifact_id"] in listed:
+                fail(f"the listing returned {r['artifact_id']} twice")
+            listed[r["artifact_id"]] = r
+        stalled = 0 if page["rows"] else stalled + 1
+        if stalled > stall_limit:
+            fail(f"the listing walk made {stalled} consecutive calls without a new row after {len(listed)} artifacts; "
+                 f"one artifact needs at most {stall_limit} (max_records_per_artifact plus 1)")
+        if walk_calls % REPORT_EVERY == 0:
+            print(f"listing walk: {walk_calls} calls, {len(listed)} artifacts, {time.monotonic() - started:.0f} s", flush=True)
+        if page.get("next_cursor") is None:
+            break
+        cursor = ["--cursor", page["next_cursor"]]
+    walk_seconds = time.monotonic() - started
+    return listed, walk_calls, last, walk_seconds
+
+
+def migration(status, name):
+    rows = [m for m in status["migrations"] if m["name"] == name]
+    if len(rows) != 1:
+        fail(f"status has no single {name} migration row")
+    return rows[0]
+
+
+def artifacts_total(status):
+    # The artifacts counter: the payload-index migration total where there is one, otherwise the source-summary
+    # total (artifacts plus records) minus the source-context total (records): an inference, not a reading.
+    if any(m["name"] == "payload-index" for m in status["migrations"]):
+        return int(migration(status, "payload-index")["total"])
+    return int(migration(status, "source-summary")["total"]) - int(migration(status, "source-context")["total"])
+
+
+def ingest(status):
+    return {"flush_lag_ms": status["durability"]["flush_lag_ms"], "pending_writes": status["durability"]["pending_writes"]}
+
+
 status = call("status")
 store = status["store_id"]
+if LIST:
+    began = time.monotonic()
+    rows_listed, calls, _, seconds = walk_listing(status, store)
+    after = call("status")
+    out_path.write_text("".join(f"{r['artifact_id']}\t{r['source']}\t{r['origin']['received_at']}\n"
+                                for r in rows_listed.values() if r["origin"] is not None))
+    pathlib.Path(str(out_path) + ".counts").write_text(json.dumps({
+        "store_id": store, "listed": len(rows_listed), "calls": calls, "walk_seconds": round(seconds, 1),
+        "artifacts_total": artifacts_total(status),
+        "ingest_before": ingest(status), "ingest_after": ingest(after)}) + "\n")
+    print(f"listing of {len(rows_listed)} artifacts in {calls} calls and {seconds:.0f} s written to {out_path}; "
+          f"artifacts counted {artifacts_total(status)}; "
+          f"ingest before {ingest(status)}, after {ingest(after)}")
+    sys.exit(0)
 rows = [m for m in status["migrations"] if m["name"] == "payload-index"]
 if len(rows) != 1:
     fail("status has no single payload-index migration row")
@@ -1185,6 +1279,9 @@ total = int(row["total"])
 sources = [r for p in pages(100000, "sources", store) for r in p["rows"]]
 held = {r["source_id"]: int(r["complete_artifacts"]) + int(r["fragment_parents"]) for r in sources}
 counted = sum(held.values())
+if total != counted:
+    fail(f"the artifacts counter {total} differs from the sources sum {counted}: an artifact was evicted or lost, "
+         "which nothing does on a store without an archive")
 
 # One full walk of the artifact listing: no call sorts by size or filters by it. A page holds at most 31
 # rows and fewer when its charged catalog bytes run out first, so a page can hold none. A page that ends
@@ -1197,36 +1294,7 @@ counted = sum(held.values())
 # stall limit is a size-based heuristic that fails a stalled walk early: one artifact's records plus 1. The
 # store-counters total counts every catalog entry and is the backstop on the calls that the code guarantees.
 # Cursors carry a new snapshot id on every page, so a repeated cursor is not a stall signal and is not checked.
-counters = [m for m in status["migrations"] if m["name"] == "store-counters"]
-if len(counters) != 1 or counters[0]["watermark"] is not None or counters[0]["done"] != counters[0]["total"]:
-    fail(f"status has no complete store-counters migration row: {counters}")
-sources_done = [m for m in status["migrations"] if m["name"] == "source-summary"]
-if len(sources_done) != 1 or sources_done[0]["watermark"] is not None or sources_done[0]["done"] != sources_done[0]["total"]:
-    fail(f"status has no complete source-summary migration row: {sources_done}")
-call_limit = int(counters[0]["total"]) + 1
-stall_limit = int(status["max_records_per_artifact"]) + 1
-walk_calls, listed, last, stalled, started = 0, {}, None, 0, time.monotonic()
-cursor = []
-while True:
-    if walk_calls >= call_limit:
-        fail(f"the listing walk made {walk_calls} calls, the bound of {call_limit} catalog entries, and is not finished")
-    page = call("artifacts", store, "--page-size", "1000", *cursor)
-    walk_calls += 1
-    last = page
-    for r in page["rows"]:
-        if r["artifact_id"] in listed:
-            fail(f"the listing returned {r['artifact_id']} twice")
-        listed[r["artifact_id"]] = r
-    stalled = 0 if page["rows"] else stalled + 1
-    if stalled > stall_limit:
-        fail(f"the listing walk made {stalled} consecutive calls without a new row after {len(listed)} artifacts; "
-             f"one artifact needs at most {stall_limit} (max_records_per_artifact plus 1)")
-    if walk_calls % REPORT_EVERY == 0:
-        print(f"listing walk: {walk_calls} calls, {len(listed)} artifacts, {time.monotonic() - started:.0f} s", flush=True)
-    if page.get("next_cursor") is None:
-        break
-    cursor = ["--cursor", page["next_cursor"]]
-walk_seconds = time.monotonic() - started
+listed, walk_calls, last, walk_seconds = walk_listing(status, store)
 if last is None or last["answer_certainty"] != "exact" or int(last["matching_artifacts"]) != len(listed):
     fail(f"the listing walk is not complete and exact: {len(listed)} rows after {walk_calls} calls, "
          f"last page answers {last and last['answer_certainty']}, {last and last['matching_artifacts']} matching")
@@ -1265,6 +1333,34 @@ gap_lines.append(f"total\t{counted}\t{len(listed)}\t{omitted}\t\t\t\t")
 (record / "listing-gap.tsv").write_text("\n".join(gap_lines) + "\n")
 (record / "listing-ids.txt").write_text("".join(i + "\n" for i in sorted(listed)))
 print("\n".join(gap_lines), flush=True)
+
+# The live daemon's listing, taken before the stop, against this copy's. Every artifact that listing returned
+# and that is still within retention must be here; the copy may hold more, written between the listing and the
+# stop. Past-deadline artifacts are in no listing, so a loss among them shows only in the counts: no read-only
+# call returns their ids (every listing, record and text read filters on deadline) or counts them at this size
+# (retention-metrics admits at most 100,000 catalog visits).
+live_rows = {}
+for line in LIVE.read_text().splitlines():
+    i, src, at = line.split("\t")
+    live_rows[i] = (src, datetime.datetime.fromisoformat(at))
+live_counts = json.loads(pathlib.Path(str(LIVE) + ".counts").read_text())
+if live_counts["store_id"] != store:
+    fail(f"the live listing is of {live_counts['store_id']}, this copy is {store}")
+missing = sorted(i for i, (src, at) in live_rows.items() if i not in listed and at >= cutoff)
+expired_since = len([i for i, (src, at) in live_rows.items() if i not in listed and at < cutoff])
+extra = sorted(i for i in listed if i not in live_rows)
+unlisted_live = live_counts["artifacts_total"] - live_counts["listed"]
+unlisted_copy = total - len(listed)
+print(f"live listing {len(live_rows)} ids, copy listing {len(listed)} ids; absent from the copy {len(missing)} within retention "
+      f"and {expired_since} past the cutoff; in the copy only {len(extra)} (written after the live listing, expected); "
+      f"artifacts counted live {live_counts['artifacts_total']} and copy {total}; not listed live {unlisted_live}, "
+      f"copy {unlisted_copy}, difference {unlisted_copy - unlisted_live}", flush=True)
+if missing:
+    fail(f"{len(missing)} artifacts of the live listing are absent from the copy's listing: {', '.join(missing[:20])}"
+         + (" ..." if len(missing) > 20 else ""))
+if total - live_counts["artifacts_total"] < len(extra):
+    fail(f"the copy counts {total} artifacts, the live daemon counted {live_counts['artifacts_total']}, and the copy lists "
+         f"{len(extra)} ids the live listing lacks: counted artifacts are missing")
 
 edges = [now - datetime.timedelta(days=d) for d in AGE_DAYS]
 
@@ -1351,8 +1447,8 @@ print(f"payload check passed: {len(report)} artifacts; sources holding artifacts
       f"age windows covered {len({window_of(h) for h in chosen})} of {len(edges)}; "
       f"sizes {min(sizes)} to {max(sizes)} bytes, {read} bytes read of the {CEILING} ceiling; "
       f"listing walk of {walk_calls} calls and {walk_seconds:.0f} s, {len(listed)} artifacts; "
-      f"payload-index done=total={total}; artifacts counted by sources {counted}, listed {len(listed)}, "
-      f"omitted from the listing {omitted} (counts expired or without live bytes and records; {unlisted_sources} "
+      f"payload-index done=total={total}; live ids absent 0, copy-only ids {len(extra)}; artifacts counted by sources {counted}, listed {len(listed)}, "
+      f"not listed {omitted} (expired, or lost; the check cannot tell, the live listing comparison decides; {unlisted_sources} "
       f"sources list none); artifacts counter {total}, gap to sources {total - counted}")
 CHECK
 ```
@@ -1442,12 +1538,9 @@ CHECK
      of them, not one artifact. The code gives no bound on such a run shorter than the walk. The stall
      limit is therefore a size-based heuristic that fails a stalled walk early, not a code guarantee:
      it fails a walk with more than `max_records_per_artifact` (100,000 in that `before.json`)
-     plus 1 consecutive pages without a new row. Sizing the worst case (arithmetic): `physical_bytes`
-     38,896,138,877 over 2,981,454 `live_records` is at most 13,046 bytes per record, so a page reads at
-     least 40 records (524,288 bytes divided by 13,046), and even if every record were in one run of
-     omitted artifacts the run is at most 74,200 pages, under the limit of 100,001; records past their
-     deadline may not be in `live_records`, so their number is unknown and this holds only while it is
-     small. Every page carries a new random snapshot id in its
+     plus 1 consecutive pages without a new row. The limit is sized on the dry run's record density,
+     where the whole walk is about 5,055 pages (arithmetic below), and is not a code guarantee. Every
+     page carries a new random snapshot id in its
      cursor, so a repeated cursor does not signal a stall and is not checked. At 27.9 calls per
      second that bound is 100,001 calls, about 3,584 s (arithmetic). The walk also ends within the
      `store-counters` migration `total` plus 1 calls, which counts every catalog entry; the check
@@ -1471,39 +1564,56 @@ CHECK
      field of `before.json` counts them, so their number on the copy is not known until the check prints it. The
      check therefore does not require equality. It fails when a source's listed rows exceed that
      source's `complete_artifacts` plus `fragment_parents`, or the listed total exceeds the sum of
-     those counts, which the code excludes. It prints, and writes to `$RECORD/listing-gap.tsv`, for each
-     source and in total the counted artifacts, the listed ones, the omitted ones, the oldest and
+     those counts, which the code excludes, and when the `artifacts` counter differs from the `sources`
+     sum, which nothing changes on a store without an archive (eviction and retirement are gated by
+     `archived` in `archive.rs`). It prints, and writes to `$RECORD/listing-gap.tsv`, for each
+     source and in total the counted artifacts, the listed ones, the not listed ones, the oldest and
      newest listed receipt, the counted records and the live records of the listed artifacts, with the
-     cutoff (now minus `retention_seconds`); it writes the listed ids to `$RECORD/listing-ids.txt`. It
-     prints the gap between the `artifacts` counter and the `sources` sum too (evicted artifacts and
-     parents whose entry is gone also move it). A smaller listing means artifacts without live bytes
-     or live records, and the rehearsal does not fail on it.
+     cutoff (now minus `retention_seconds`); it writes the listed ids to `$RECORD/listing-ids.txt`. A
+     smaller listing means artifacts that are expired, or lost: the check cannot tell which from the
+     listing alone, and without the live listing comparison below a loss smaller than the gap passes.
 
-     What gap to expect. An omitted artifact is past its deadline, so its receipt is before the cutoff
-     (30 days before the run; 2026-10-20 for a run on 2026-11-19, arithmetic), and the omitted ones
-     of a source lie at its head. The live store has held records since 2026-10-17: it reported 217
-     `live_records` under the same `store_id` on 2026-10-17 and 2026-10-18 (file times of
+     The live listing comparison is a condition of `proceed`. The check takes the live daemon's listing
+     (`--list`, taken before the stop, "Before the window") as its last argument and requires:
+     every id of it received at or after the cutoff is in this copy's listing, or the check fails and
+     names the ids (the first 20); the `artifacts` counter of the copy is not below the live one plus
+     the number of ids in the copy only. Ids in the copy only were written between the live listing
+     and the stop: they are printed as a count and do not fail. Ids of the live listing received before
+     the cutoff and absent here are printed as a count (they can have expired since). A source with
+     no listed row is covered the same way: every id the live listing holds for it, received at or
+     after the cutoff, must be here; a source that lists nothing on both sides holds only artifacts
+     past their deadline. The check prints the not listed counts of the live daemon and the copy and
+     their difference.
+
+     Residual. Past-deadline artifacts are in no listing: every call that lists or reads artifacts or
+     records filters on the deadline (`live_artifact` and `live_record`: `artifact_read.rs`,
+     `query_membership.rs`, `context.rs`, `text_index.rs`, `rdf_view.rs`), and a read by id
+     (`Store::artifact`) needs an id that nothing lists. No call counts them at live size:
+     `retention-metrics` admits at most 100,000 catalog visits (`RetentionReadLimits::validate`,
+     `sparrow-client/src/retention_metrics.rs`), and the live store holds about 3 million records
+     (`live_records` in `before.json`). A loss among past-deadline artifacts is therefore caught
+     only by the count relation above, to the resolution of one artifact, because each artifact written
+     between the live listing and the stop is a listed id in the copy only and does not mask a loss. The
+     live `artifacts` counter has no `payload-index` row on `fda2812`, so the live listing takes it as the
+     `source-summary` total minus the `source-context` total (an inference from their definitions).
+
+     What gap to expect, as an inference. An omitted artifact is past its deadline, so its receipt is
+     before the cutoff (30 days before the run; 2026-10-20 for a run on 2026-11-19, arithmetic),
+     assuming artifacts were stored with a deadline of receipt plus retention, which is unverified for
+     the store's earliest era (`sparrow.store/37`). The live store held records on or before 2026-10-17:
+     it reported 217 `live_records` under the same `store_id` in two status files whose modification
+     times are 2026-10-17 and 2026-10-18 (the only time evidence they carry;
      `.stage/native-graph-integration/runtime-recovery-final-status.json` and
      `schema52-live-before-status.json`), so artifacts received from then until the cutoff are
-     expected in the gap, and no later one is. The reading in `.stage/image/switch-1/before.json`
-     cannot size it: status `live_records` is the retained-records counter, not a count by deadline
-     (`status_report` in `storage.rs`), and the file holds no receipt times, no per-source counts and
-     no count of expired artifacts. It bounds the gap above only by the counted artifacts, 39,061
-     (3,020,515 minus 2,981,454, arithmetic on its `source-summary` and `source-context` totals).
-     Under an assumed uniform ingest over the 33 days from 2026-10-17 to 2026-11-19, the 3 days before
-     the cutoff would hold about 3,550 artifacts (arithmetic on that assumption; the real rate is not
-     known). Sizing it needs the number of artifacts received before the cutoff, which no CLI call
-     exposes: an expired artifact is not a listing row, so its id and receipt cannot be read.
-
-     A real loss is not separable from an expected gap by the table alone, because the omitted
-     artifacts are invisible to the CLI: a live artifact lost from the index looks like an expired
-     one. The separating evidence is an independent listing of the live daemon taken before the stop,
-     with the same walk, compared by id with `listing-ids.txt` for every id received at or after the
-     cutoff: an id in the live listing and absent from the copy's listing is a loss, and a gap with
-     no such id is the expected one. That live listing takes the writer lock for each page, about
-     5,055 pages (arithmetic from the walk above), so it needs the coordination session's go and has
-     not been run. Without it, read a gap only as expected where the source received artifacts before
-     the cutoff, and treat any gap in a source that began after it as a loss to investigate. The 5 largest artifacts by
+     expected in the gap. `.stage/image/switch-1/before.json` cannot size it: status `live_records` is
+     the retained-records counter, which counts every record entry not evicted or retired, so it
+     includes records past their deadline (`status_report` in `storage.rs`, `store_counters.rs`), and the
+     file holds no receipt times and no per-source counts. It bounds the gap above only by the
+     `artifacts` counter, 39,061 (3,020,515 minus 2,981,454, arithmetic on its `source-summary` and
+     `source-context` totals). Under an assumed uniform ingest over the 33 days from 2026-10-17 to
+     2026-11-19, the 3 days before the cutoff would hold about 3,550 artifacts (arithmetic on that
+     assumption; the real rate is not known). The `artifacts` and `sources` calls expose no receipt
+     time of an unlisted artifact, so the gap is read from the not listed counts, not sized in advance. The 5 largest artifacts by
      `byte_length` come from the whole walk, and the spread is drawn from the same rows by source and
      by age window (the last 1, 1 to 3, 3 to 7, 7 to 14 and 14 to 21 days, and everything older;
      source `j` takes window `(lap + j) mod 6` in each lap, so ages mix across sources). Only rows that report
@@ -1525,8 +1635,8 @@ CHECK
      `in_range` in `crates/sparrow-core/src/storage.rs`) and never truncates it.
      The check also requires the `payload-index` migration `done` to equal its
      `total` with `failure` and `watermark` null.
-     The total bytes read are capped by a ceiling, 4 GiB by default (a choice; the optional fourth
-     argument, in bytes, changes it). If the largest artifact alone exceeds the ceiling, or the
+     The total bytes read are capped by a ceiling, 4 GiB (a choice; the fourth argument, in
+     bytes, sets it). If the largest artifact alone exceeds the ceiling, or the
      5 largest together do, the check fails and says to raise it; it never skips them silently. No
      read rate of the live copy has been measured, so no duration is stated for it; at an assumed
      100 MiB/s, which is an assumption and not a measurement, 4 GiB is about 41 s of reading
@@ -1543,7 +1653,7 @@ CHECK
      Run it once the completion line has appeared; `EXIT=0` is the pass:
 
      ```bash
-     python3 -I "$RECORD/payload-check.py" "$LIB/$NEW_CLI" "$REH/rpc.sock" "$RECORD" > "$RECORD/payload-check.log" 2>&1
+     python3 -I "$RECORD/payload-check.py" "$LIB/$NEW_CLI" "$REH/rpc.sock" "$RECORD" 4294967296 "$RECORD/live-listing.tsv" > "$RECORD/payload-check.log" 2>&1
      echo "EXIT=$?"
      cat "$RECORD/payload-check.log"
      ```
@@ -1612,7 +1722,7 @@ CHECK
    rm -r -- /SPARROW/store.rehearsal-a50820e
    ```
 
-7. Answer the prompt: `proceed` only if every check passed, which switches the links and starts
+7. Answer the prompt: `proceed` only if every check passed, the live listing comparison of step 4 included, which switches the links and starts
    the new image on the live store. Otherwise answer `abort`.
 
 The script's check for a remaining `sparrowd` runs once, after the stop of `sparrow.service` and
@@ -1951,32 +2061,47 @@ only figures are scratch measurements at other sizes (see "What the measurement 
 notice states this and gives the length only after the rehearsal has read `N`.
 
 - Ingest socket (`ingest_socket_path`, the `sparrow-ingest` group) and the public TCP listener on port
-  518 refuse connections. Every daemon that logs into Sparrow (the Lillith daemons and
-  `lillith_memetics`' cruft sender) is affected. No Katamari process connects to Sparrow:
-  `katamari-stored`, `katamari-unlock` and `katamari-gitd` log only to the local journal, the
-  console and an optional file (Katamari issue 83; Sparrow issue 372, comment 19354), so the window
-  changes nothing for them. A client that holds and retries, such as the
-  Rust client with its queue, delivers after the start; a sender without a queue loses what it emits
-  meanwhile and the store cannot count that loss ("A floor refusal requests reclamation"). The
-  coordination session holds which senders queue, so the notice goes to it before the stop, and
-  asks it to say whether the organism runs in the window: her logs are the logs of those daemons.
-- The consume and tail roots under `~/.local/state/sparrow` stay on disk: a file that arrives waits and
-  the watches read it after the start. The script stops `sparrow-ship.timer` first and starts it
-  again at the end; the shipper reads only the producers' files and writes only into the roots.
-  `katamari-journal-spool` and `katamari-manager-spool` are interim user units on the operator's
-  host: this repository holds their scripts (`deploy/libexec/`) and unit files
-  (`deploy/systemd/user/`), and the operator's user manager runs the copies under
-  `~/.local/libexec/sparrow/` with `Restart=always`. They read the local journal and write JSON
-  Lines files under `~/.local/state/sparrow/katamari-journal/`; they never connect to Sparrow, so
-  they keep writing from their own units while the daemon is down, and the shipper sends those files
-  after the start. Each unit deletes its own spool files (`katamari-stored-*.jsonl` and `katamari-manager-*.jsonl`) when it
-  starts: `ExecStartPre` runs `find ... -mtime +3 -delete`, which matches files whose age, rounded down to
-  whole days, is more than 3, that is, last modified four or more full days ago. A restart of either unit
-  in a window that long deletes files the shipper has not sent. The repository names no other owner and does not show whether the two units are
-  enabled and running on the live host; read that before the window with
-  `systemctl --user is-active katamari-journal-spool.service katamari-manager-spool.service`
-  (not run). A producer that rotates or deletes its own file in the window is outside Sparrow's reach.
-- `lillith_decodes`, the CLI and the MCP tools get connection refused until the first status answer.
+  518 refuse connections. A client that holds and retries, such as the Rust client with its queue,
+  delivers after the start; a sender without a queue loses what it emits meanwhile and the store
+  cannot count that loss ("A floor refusal requests reclamation"). The coordination session holds
+  which senders connect and queue, so the notice goes to it before the stop. `lillith_memetics`' cruft
+  sender is named by [Cruft](interfaces.md#cruft); whether it queues is not read.
+- The Lillith organism's logs do not reach Sparrow. Her members' stdout and stderr go to journald
+  and to a file in her logs directory, and no source, watch or spool unit carries them: the shipper
+  configuration on the host (`~/.config/sparrow/ship.toml`, read on the host) lists no source for
+  them, and her unit drop-in and her decision record 0105 name no taker (read in her repository, not
+  on the host). The stop of the daemon loses none of her logs, because none arrive. Switch 1 does
+  not stop her daemons for logging reasons.
+- No Katamari process connects to Sparrow: `katamari-stored`, `katamari-unlock` and `katamari-gitd` log
+  only to the local journal, the console and an optional file (Katamari issue 83; Sparrow issue 372,
+  comment 19354), so the window changes nothing for them.
+- Shipped kinds ride through the window. The consume and tail roots under `~/.local/state/sparrow` stay
+  on disk: a file that arrives waits and the watches read it after the start. The script stops
+  `sparrow-ship.timer` first and starts it again at the end; the shipper reads only the producers'
+  files and writes only into the roots.
+  - Four Lillith sources, `lillith-corrections`, `lillith-coordinator-corrections`,
+    `lillith-discards` and `lillith-refusals`, read the `corrections`, `coordinator-corrections`,
+    `discards` and `refusal-evidence` directories under her `lillith_soul/inner-core` (the host's
+    `ship.toml`). Their files wait in the producer directories and in the shipper queue, which holds
+    1 GiB (`max_queue_bytes`), stops adding at that bound and drops nothing, takes at most 64 files a
+    run, and runs from a timer 5 minutes after each run, with an fsynced ledger
+    (`deploy/libexec/sparrow-ship`, lines 317-331; `deploy/systemd/sparrow-ship.timer`, read in the
+    repository). The daemon reads them after the restart. How long an outage they survive is bounded
+    by the producer directories' retention, which is not determined.
+  - `katamari.stored` is spooled from the journal into files by the interim user units
+    `katamari-journal-spool` and `katamari-manager-spool`. This repository holds their scripts
+    (`deploy/libexec/`) and unit files (`deploy/systemd/user/`); the user manager runs the copies
+    under `~/.local/libexec/sparrow/` with `Restart=always`. They never connect to Sparrow, so they
+    keep writing from their own units while the daemon is down, and the shipper sends those files
+    after the start. Each unit deletes its own spool files (`katamari-stored-*.jsonl` and
+    `katamari-manager-*.jsonl`) when it starts: `ExecStartPre` runs `find ... -mtime +3 -delete`
+    (`systemctl --user cat` of both units, read on the host), which matches files last modified four
+    or more full days ago. A restart of either unit after an outage that long deletes the oldest files
+    the shipper has not sent. Both units and `sparrow-ship.timer` read `active` on the host
+    (`systemctl --user is-active`).
+  A producer that rotates or deletes its own file in the window is outside Sparrow's reach.
+- Her CLI and MCP tools (`lillith_decodes`) and every other client of the CLI and the MCP tools get
+  connection refused until the first status answer. Which of her operations use them is not read.
 - No syslog listener is configured at the last recorded status, so no datagram is exposed; check
   `syslog_listeners` in `before.json`.
 
