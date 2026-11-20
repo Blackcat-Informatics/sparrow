@@ -858,15 +858,15 @@ impl PressureHold {
 
 /// Refuse to start while a configured TCP listener has no writable spill directory, or while the
 /// directory holds a file that no configured TCP listener owns: its frames would never be
-/// published. Without a TCP listener nothing is checked.
+/// published, so the scan runs for every configuration, including one without a TCP listener.
+/// Only a TCP listener requires the directory to exist and be writable.
 pub fn check_spill_owners(dir: &std::path::Path, listeners: &[SyslogListener]) -> io::Result<()> {
-    if !listeners
+    if listeners
         .iter()
         .any(|listener| listener.transport == SyslogTransport::Tcp)
     {
-        return Ok(());
+        require_writable(dir)?;
     }
-    require_writable(dir)?;
     let owned: std::collections::BTreeSet<std::ffi::OsString> = listeners
         .iter()
         .filter(|listener| listener.transport == SyslogTransport::Tcp)
@@ -878,7 +878,15 @@ pub fn check_spill_owners(dir: &std::path::Path, listeners: &[SyslogListener]) -
         .collect();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        // A path that is missing or runs through a file holds no spill file.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(());
+        }
         Err(error) => {
             return Err(io::Error::new(
                 error.kind(),
@@ -2684,9 +2692,12 @@ mod tests {
 
     /// Value (#428): a TCP listener whose spill directory cannot be written fails the start with
     /// the directory and the install steps named, so a stop under pressure never discovers the
-    /// missing precondition; a configuration without a TCP listener is not checked.
+    /// missing precondition; a configuration without a TCP listener needs no directory. A spill
+    /// file left behind by a removed listener fails the start whatever the configuration holds,
+    /// so its frames are never stranded unreported.
     #[tokio::test]
-    async fn a_tcp_listener_without_a_writable_spill_directory_fails_the_start() {
+    async fn the_start_check_requires_a_writable_spill_directory_only_for_tcp_and_refuses_unowned_files_always()
+     {
         let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
         let definition = fixture.metrics.snapshot().unwrap().definition;
         let blocker = fixture
@@ -2703,6 +2714,14 @@ mod tests {
         assert!(text.contains(&dir.display().to_string()), "{text}");
         assert!(text.contains("Syslog TCP listener install steps"), "{text}");
         check_spill_owners(&dir, &[]).unwrap();
+        // A spill file survives its listener's removal: the start fails instead of stranding it.
+        let kept = listener(SyslogTransport::Tcp, 1, 60_000);
+        kept.spill.append("source", b"<34>a").unwrap();
+        let owner = kept.metrics.snapshot().unwrap().definition;
+        let spill_dir = kept.spill.path().parent().unwrap();
+        check_spill_owners(spill_dir, &[owner]).unwrap();
+        let error = check_spill_owners(spill_dir, &[]).unwrap_err();
+        assert!(error.to_string().contains("not owned"), "{error}");
     }
 
     /// Value (#243): a hold is visible while it lasts, which an operator needs to tell a
