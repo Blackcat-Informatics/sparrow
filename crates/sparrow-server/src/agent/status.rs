@@ -176,6 +176,8 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
             "instance_role",
             sparrow_client::instance_role_label(value.get_instance_role()?),
         )
+        .with("retired_claim_count", value.get_retired_claim_count())
+        .with("max_retired_claims", value.get_max_retired_claims())
         .with(
             "stream_evidence_loss",
             stream_evidence_loss(value.get_stream_evidence_loss()?)?,

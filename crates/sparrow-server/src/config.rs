@@ -92,6 +92,15 @@ where
         .transpose()
 }
 
+/// Whether `path` has no `..` component. A path with one names a directory the lexical
+/// overlap checks cannot see, so every configured path whose position those checks guard
+/// (archive directory, ingest socket, watch roots) must pass this.
+#[must_use]
+pub(crate) fn without_parent_dir(path: &Path) -> bool {
+    path.components()
+        .all(|part| !matches!(part, std::path::Component::ParentDir))
+}
+
 /// Paths the daemon writes, by configuration key. `server.toml` names no log file, so these are
 /// the paths a watch root could swallow. Checks are lexical, like the other configuration
 /// checks; the runtime root open also compares canonical paths with the store.
@@ -108,6 +117,26 @@ impl OutputPaths {
     ) -> Result<(), Box<dyn std::error::Error>> {
         for watch in watches {
             for (key, path) in &self.0 {
+                if !without_parent_dir(path) {
+                    return Err(format!(
+                        "{key} {} contains '..', which the overlap checks against watch `{}` cannot see; write the path without it",
+                        path.display(),
+                        watch.id
+                    )
+                    .into());
+                }
+                if crate::consumption::overlaps_quarantine(&watch.root, path) {
+                    return Err(format!(
+                        "watch `{}` root {} has its quarantine directory at {}, which overlaps {key} {}: a refused source is moved there, so no path Sparrow writes may share it; move one of them",
+                        watch.id,
+                        watch.root.display(),
+                        crate::consumption::quarantine_path(&watch.root)
+                            .unwrap_or_default()
+                            .display(),
+                        path.display()
+                    )
+                    .into());
+                }
                 if path.starts_with(&watch.root) || watch.root.starts_with(path) {
                     return Err(format!(
                         "watch `{}` root {} overlaps {key} {}: a watch root must neither contain nor lie inside a path Sparrow writes itself; move one of them",
@@ -193,12 +222,7 @@ impl ArchiveConfig {
 
     /// Lexical checks only: probing the archive device may block, so it is not done here.
     fn validate(&self, data_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        let normal = |path: &Path| {
-            path.is_absolute()
-                && path
-                    .components()
-                    .all(|part| !matches!(part, std::path::Component::ParentDir))
-        };
+        let normal = |path: &Path| path.is_absolute() && without_parent_dir(path);
         if !normal(&self.dir) || self.dir.as_os_str().len() > 2048 {
             return Err(
                 "archive dir must be an absolute path of at most 2048 bytes without '..'".into(),
@@ -427,11 +451,7 @@ impl ServerConfig {
             return Ok(());
         };
         let parent = path.parent().filter(|_| {
-            path.is_absolute()
-                && path.file_name().is_some()
-                && path
-                    .components()
-                    .all(|part| !matches!(part, std::path::Component::ParentDir))
+            path.is_absolute() && path.file_name().is_some() && without_parent_dir(path)
         });
         let Some(parent) = parent else {
             return Err(
@@ -540,6 +560,7 @@ impl ConsumeWatch {
                 || watch.id.len() > 128
                 || !ids.insert(&watch.id)
                 || !watch.root.is_absolute()
+                || !without_parent_dir(&watch.root)
                 || watch.root.as_os_str().len() > 2048
                 || watch.source.is_empty()
                 || watch.source.len() > 512
@@ -547,7 +568,7 @@ impl ConsumeWatch {
                 || !(1..=4096).contains(&watch.max_directories)
                 || !(1..=16384).contains(&watch.max_candidates)
             {
-                return Err("consume requires unique bounded identities, absolute roots, quiet_ms <= 600000, max_directories 1..4096 and max_candidates 1..16384".into());
+                return Err("consume requires unique bounded identities, absolute roots without '..', quiet_ms <= 600000, max_directories 1..4096 and max_candidates 1..16384".into());
             }
             if watch.producer_contract == ProducerContract::ActiveFilesRetain
                 && (!["log", "jsonl"].contains(&watch.format.as_str())
@@ -569,6 +590,12 @@ impl ConsumeWatch {
                 watch.root.starts_with(other) || other.starts_with(&watch.root)
             }) {
                 return Err("consume roots must not overlap".into());
+            }
+            if roots.iter().any(|other: &PathBuf| {
+                crate::consumption::overlaps_quarantine(&watch.root, other)
+                    || crate::consumption::overlaps_quarantine(other, &watch.root)
+            }) {
+                return Err("a consume root must not be, contain or lie inside another root's quarantine directory (ROOT.sparrow-quarantine beside it); the daemon would read refused sources as input".into());
             }
             roots.push(watch.root.clone());
         }
@@ -739,5 +766,60 @@ mod tests {
             watch(&dir.path().join("intake/app"))
         ))
         .unwrap();
+    }
+    fn root(id: &str, path: &str) -> super::ConsumeWatch {
+        super::ConsumeWatch {
+            id: id.into(),
+            root: path.into(),
+            producer_contract: super::ProducerContract::FinishedFiles,
+            source: id.into(),
+            format: "jsonl".into(),
+            quiet_ms: 1000,
+            max_directories: 1,
+            max_candidates: 1,
+            publish_hold: false,
+        }
+    }
+
+    /// INVARIANT (#417): no root and no path Sparrow writes may be a root's quarantine
+    /// directory (`ROOT.sparrow-quarantine` beside it), whichever is configured first, because
+    /// the daemon would read refused sources as input or write into them. `watch put` runs
+    /// `validate_fields` (through `validate`) and `refuse_overlap` on the whole next catalog,
+    /// so the same two checks guard it.
+    #[test]
+    fn a_quarantine_directory_is_never_another_root_or_a_daemon_output() {
+        let roots = [
+            ("/p/x", "/p/x.sparrow-quarantine", false),
+            ("/p/x.sparrow-quarantine", "/p/x", false),
+            ("/p/x", "/p/x.sparrow-quarantine/inner", false),
+            ("/p/x", "/p/q/../x.sparrow-quarantine", false),
+            ("/p/q/../x.sparrow-quarantine", "/p/x", false),
+            ("/p/q/../x", "/p/x.sparrow-quarantine", false),
+            ("/p/x.sparrow-quarantine", "/p/q/../x", false),
+            ("/p/x", "/p/x.other", true),
+            ("/p/x", "/p/y.sparrow-quarantine", true),
+        ];
+        for (first, second, accepted) in roots {
+            let watches = [root("a", first), root("b", second)];
+            assert_eq!(
+                super::ConsumeWatch::validate_fields(&watches).is_ok(),
+                accepted,
+                "{first} then {second}"
+            );
+        }
+        let outputs = [
+            ("/p/x.sparrow-quarantine", false),
+            ("/p/x.sparrow-quarantine/archive", false),
+            ("/p/q/../x.sparrow-quarantine", false),
+            ("/p/z", true),
+        ];
+        for (output, accepted) in outputs {
+            let paths = super::OutputPaths(vec![("archive.root", output.into())]);
+            assert_eq!(
+                paths.refuse_overlap(&[root("a", "/p/x")]).is_ok(),
+                accepted,
+                "{output}"
+            );
+        }
     }
 }

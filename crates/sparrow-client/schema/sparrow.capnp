@@ -328,6 +328,11 @@ struct Status {
   # Additive (#371): the role fixed when the store was created; `unspecified` for a store with
   # no role row. A reader that does not know this field sees no change.
   instanceRole @65 :InstanceRole;
+  # Additive (#417): retired claims recorded store-wide and the bound on them. A retirement,
+  # by an administrator or by the consume worker quarantining a refused source, adds one row
+  # and no row is removed; at the bound no claim can be retired. A reader that does not know
+  # these fields sees no change.
+  retiredClaimCount @66 :UInt32; maxRetiredClaims @67 :UInt32;
 }
 # What a store is for, fixed at creation from the `instance_role` configuration key. A sender
 # that must refuse the live store reads it from `Discovery`. `unspecified` is a store with no

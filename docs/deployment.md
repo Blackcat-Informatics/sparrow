@@ -425,10 +425,12 @@ above `max_chunk_bytes` or `max_chunk_lines` are split on line boundaries into
 shipped whole up to Sparrow's 7.93 GiB import bound; a larger file is reported
 as a failed file on every run and never queued. The removed `max_whole_bytes` key must be deleted
 from the shipper configuration; a configuration that still sets it is refused
-before anything ships. The split matters for two reasons. The consume worker retries a
-refused publication without limit, backing off from five seconds to one attempt
-every 15 minutes after consecutive failures, so a file over the record limit
-would be uploaded again and again. Deadline expiries back off too, even when the
+before anything ships. The split matters for two reasons. The consume worker moves a file
+the daemon refuses at an input bound, such as one over the record limit, into a quarantine
+directory beside the watch root and retires its claim; it is never published (see
+[Quarantining a permanently refused source](interfaces.md#quarantining-a-permanently-refused-source)).
+Every other failed publication retries without limit, backing off from five seconds to one
+attempt every 15 minutes after consecutive failures. Deadline expiries back off too, even when the
 resumed claim advances, so a chunk that needs many attempts finishes later; keep `max_chunk_lines` at or below
 32,768, the most records one publication holds, and below the server's `max_records`. And a consume publication has a 45-second deadline.
 Retries resume the durable upload and preparation, but each expiry spends the

@@ -201,7 +201,7 @@ fn unplannable(index: u32, limits: &PartLimits) -> Error {
             failing.join(" and ")
         ),
         retryable: false,
-        class: crate::FailureClass::Unclassified,
+        class: crate::FailureClass::Local,
     }
 }
 
@@ -214,7 +214,7 @@ fn missing_pending(index: u32, missing: MissingLimits) -> Error {
             missing.names()
         ),
         retryable: false,
-        class: crate::FailureClass::Unclassified,
+        class: crate::FailureClass::Local,
     }
 }
 
