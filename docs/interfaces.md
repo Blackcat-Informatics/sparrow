@@ -157,8 +157,8 @@ refusal.
 A sender sees a refusal for this bound, or for the 32,768-record bound, as
 `RESOURCE_LIMIT` with `retryable` false; the wire carries no other mark of an input
 bound. The refused publication publishes nothing, and the same request at the same size
-fails the same way. A refusal after preparation keeps its prepared records and its
-journal slot until reclaim. A sender that publishes several records in one import then:
+fails the same way. A staged import refused after preparation keeps its prepared
+records and its journal slot until reclaim. A sender that publishes several records in one import then:
 
 1. Cancels the refused import under its request ID with `importCancel`.
 2. Splits the publication in half and sends each half as a new import under a new
