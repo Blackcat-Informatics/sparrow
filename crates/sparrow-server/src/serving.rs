@@ -55,26 +55,14 @@ impl AcceptFaults {
     }
 }
 
-/// Accept on the private or ingest Unix socket; under test a counted number of accepts fail first.
-async fn accept_unix(
-    listener: &tokio::net::UnixListener,
-) -> std::io::Result<(tokio::net::UnixStream, tokio::net::unix::SocketAddr)> {
+/// Await one accept; under test a counted number of accepts fail first, as a descriptor
+/// shortage does.
+async fn accepted<T>(accept: impl Future<Output = std::io::Result<T>>) -> std::io::Result<T> {
     #[cfg(test)]
     if let Some(error) = tests::injected_accept_error() {
         return Err(error);
     }
-    listener.accept().await
-}
-
-/// Accept on public TCP, as [`accept_unix`] does.
-async fn accept_tcp(
-    listener: &tokio::net::TcpListener,
-) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
-    #[cfg(test)]
-    if let Some(error) = tests::injected_accept_error() {
-        return Err(error);
-    }
-    listener.accept().await
+    accept.await
 }
 
 /// The listeners the loop accepts on.
@@ -170,7 +158,7 @@ pub async fn serve(
                     }
                 }
             }
-            accepted = accept_unix(sockets.private), if rpc_slot.is_some() && !paused => {
+            accepted = accepted(sockets.private.accept()), if rpc_slot.is_some() && !paused => {
                 let stream = match accepted {
                     Ok((stream, _)) => { faults.succeeded(); stream }
                     Err(error) => {
@@ -189,7 +177,7 @@ pub async fn serve(
                     Err(error) => eprintln!("sparrowd: private socket peer unreadable: {error}"),
                 }
             }
-            accepted = async { accept_unix(ingest.expect("enabled ingest branch").0).await }, if ingest.is_some() && ingest_slot.is_some() && !paused => {
+            accepted = async { accepted(ingest.expect("enabled ingest branch").0.accept()).await }, if ingest.is_some() && ingest_slot.is_some() && !paused => {
                 let stream = match accepted {
                     Ok((stream, _)) => { faults.succeeded(); stream }
                     Err(error) => {
@@ -204,7 +192,7 @@ pub async fn serve(
                 rpc.floor_pause().connection_accepted();
                 let _ = ingest.expect("enabled ingest branch").1.admit(stream, rpc.clone(), slot);
             }
-            accepted = async { accept_tcp(sockets.tcp.as_ref().expect("enabled TCP branch").0).await }, if sockets.tcp.is_some() && rpc_slot.is_some() && !paused => {
+            accepted = async { accepted(sockets.tcp.as_ref().expect("enabled TCP branch").0.accept()).await }, if sockets.tcp.is_some() && rpc_slot.is_some() && !paused => {
                 let (stream, peer) = match accepted {
                     Ok(accepted) => { faults.succeeded(); accepted }
                     Err(error) => {
