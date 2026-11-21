@@ -3,7 +3,9 @@
 
 //! Bounded tracing capture feeding the single producer delivery path.
 
-use crate::{Delivery, EventField, EventKind, EventLevel, EventSpan, FieldValue, ProducerEvent};
+use crate::{
+    Console, Delivery, EventField, EventKind, EventLevel, EventSpan, FieldValue, ProducerEvent,
+};
 use std::{
     fmt::{self, Write},
     sync::{
@@ -18,7 +20,7 @@ use tracing::{
 };
 use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
-const TEXT_LIMIT: usize = 4096;
+pub(super) const TEXT_LIMIT: usize = 4096;
 const FIELD_BYTES: usize = 16 * 1024;
 const SPAN_BYTES: usize = 16 * 1024;
 const LIVE_SPANS: usize = 1024;
@@ -32,8 +34,13 @@ const LIVE_SPANS: usize = 1024;
 /// Capture failures enter `Delivery`'s drop counters and prevent a clean flush fence.
 /// User-defined formatters still control their own computation and allocations.
 pub struct TracingLayer {
-    delivery: Delivery,
+    output: Output,
     slots: Arc<AtomicUsize>,
+}
+
+enum Output {
+    Remote(Delivery),
+    Console(Console),
 }
 
 struct SpanCapture {
@@ -54,8 +61,22 @@ impl TracingLayer {
     /// Share the existing delivery worker and its diagnostics/fences.
     pub fn new(delivery: Delivery) -> Self {
         Self {
-            delivery,
+            output: Output::Remote(delivery),
             slots: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub(super) fn with_console(console: Console) -> Self {
+        Self {
+            slots: console.slots.clone(),
+            output: Output::Console(console),
+        }
+    }
+
+    fn capture_failed(&self) {
+        match &self.output {
+            Output::Remote(delivery) => delivery.capture_failed(),
+            Output::Console(console) => console.capture_failed(),
         }
     }
 
@@ -65,10 +86,13 @@ impl TracingLayer {
     /// `Delivery::stats`, and the next flush or shutdown returns it as `FlushError::Dropped`.
     fn emit(&self, event: Result<ProducerEvent, ()>) {
         match event {
-            Ok(event) => {
-                self.delivery.try_send(event);
-            }
-            Err(()) => self.delivery.capture_failed(),
+            Ok(event) => match &self.output {
+                Output::Console(console) => console.emit(event),
+                Output::Remote(delivery) => {
+                    delivery.try_send(event);
+                }
+            },
+            Err(()) => self.capture_failed(),
         }
     }
 
@@ -102,32 +126,8 @@ impl TracingLayer {
             span: id.map(|id| self.span_identity(id, ctx)).transpose()?,
             follows_from: follows.map(|id| self.span_identity(id, ctx)).transpose()?,
         };
-        let mut bytes = event.admission_bytes().map_err(|_| ())?;
-        if let Some(id) = id {
-            let span = ctx.span(id).ok_or(())?;
-            // Walk leaf-to-root: Scope::from_root would first collect an unbounded ancestry.
-            for span in span.scope() {
-                if event.context.len() == crate::MAX_EVENT_SPANS {
-                    return Err(());
-                }
-                let extensions = span.extensions();
-                let capture = extensions.get::<SpanCapture>().ok_or(())?;
-                if !Arc::ptr_eq(&capture.owner, &self.slots)
-                    || capture.invalid.load(Ordering::SeqCst)
-                {
-                    return Err(());
-                }
-                let snapshot = capture.snapshot.try_lock().map_err(|_| ())?;
-                let snapshot = snapshot.as_ref().ok_or(())?;
-                bytes += snapshot.admission_bytes().map_err(|_| ())?;
-                if bytes > crate::MAX_EVENT_BYTES {
-                    return Err(());
-                }
-                event.context.push(snapshot.clone());
-            }
-            event.context.reverse();
-        }
-        event.admission_bytes().map_err(|_| ())?;
+        let span = id.map(|id| ctx.span(id).ok_or(())).transpose()?;
+        with_span(&mut event, &self.slots, span)?;
         Ok(event)
     }
 
@@ -154,6 +154,13 @@ impl TracingLayer {
     where
         S: Subscriber + for<'a> LookupSpan<'a>,
     {
+        // Instrumented futures enter and exit on each poll. The registry maintains current
+        // scope, and a standalone terminal displays neither of these observations.
+        if matches!(kind, EventKind::SpanEnter | EventKind::SpanExit)
+            && matches!(&self.output, Output::Console(console) if console.delivery().is_none())
+        {
+            return;
+        }
         let result = ctx.span(id).ok_or(()).and_then(|span| {
             self.observation(span.metadata(), kind, Vec::new(), Some(id), follows, &ctx)
         });
@@ -167,7 +174,7 @@ where
 {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         let Some(span) = ctx.span(id) else {
-            self.delivery.capture_failed();
+            self.capture_failed();
             return;
         };
         let held = self
@@ -177,7 +184,7 @@ where
             })
             .is_ok();
         if !held {
-            self.delivery.capture_failed();
+            self.capture_failed();
             return;
         }
         let snapshot = (|| {
@@ -195,7 +202,14 @@ where
                     .or_else(|| ctx.current_span().id().cloned())
             };
             let snapshot = EventSpan {
-                id: self.delivery.next_span_id().map_err(|_| ())?,
+                id: match &self.output {
+                    Output::Remote(delivery) => Some(delivery),
+                    Output::Console(console) => console.delivery(),
+                }
+                .map_or_else(
+                    || Ok(id.into_u64()),
+                    |delivery| delivery.next_span_id().map_err(|_| ()),
+                )?,
                 parent: parent
                     .as_ref()
                     .map(|parent| self.span_identity(parent, &ctx))
@@ -212,7 +226,7 @@ where
             if held {
                 self.slots.fetch_sub(1, Ordering::SeqCst);
             }
-            self.delivery.capture_failed();
+            self.capture_failed();
             return;
         }
         extensions.insert(SpanCapture {
@@ -322,8 +336,66 @@ where
                 capture.invalid.store(true, Ordering::SeqCst);
             }
         }
-        self.delivery.capture_failed();
+        self.capture_failed();
     }
+}
+
+fn with_span<'a, S>(
+    event: &mut ProducerEvent,
+    slots: &Arc<AtomicUsize>,
+    span: Option<tracing_subscriber::registry::SpanRef<'a, S>>,
+) -> Result<(), ()>
+where
+    S: LookupSpan<'a>,
+{
+    let mut bytes = event.admission_bytes().map_err(|_| ())?;
+    if let Some(span) = span {
+        // Walk leaf-to-root: Scope::from_root would first collect an unbounded ancestry.
+        for span in span.scope() {
+            if event.context.len() == crate::MAX_EVENT_SPANS {
+                return Err(());
+            }
+            let extensions = span.extensions();
+            let capture = extensions.get::<SpanCapture>().ok_or(())?;
+            if !Arc::ptr_eq(&capture.owner, slots) || capture.invalid.load(Ordering::SeqCst) {
+                return Err(());
+            }
+            let snapshot = capture.snapshot.try_lock().map_err(|_| ())?;
+            let snapshot = snapshot.as_ref().ok_or(())?;
+            bytes += snapshot.admission_bytes().map_err(|_| ())?;
+            if bytes > crate::MAX_EVENT_BYTES {
+                return Err(());
+            }
+            event.context.push(snapshot.clone());
+        }
+        event.span = event.context.first().map(|leaf| leaf.id);
+        event.context.reverse();
+    }
+    event.admission_bytes().map_err(|_| ())?;
+    Ok(())
+}
+
+pub(super) fn in_current_span(
+    mut event: ProducerEvent,
+    slots: &Arc<AtomicUsize>,
+) -> Result<ProducerEvent, ()> {
+    tracing::dispatcher::get_default(|dispatch| {
+        let current = dispatch.current_span();
+        let our_layer = dispatch
+            .downcast_ref::<TracingLayer>()
+            .is_some_and(|layer| Arc::ptr_eq(&layer.slots, slots));
+        let span = match (our_layer, current.id()) {
+            (true, Some(id)) => Some(
+                dispatch
+                    .downcast_ref::<tracing_subscriber::Registry>()
+                    .and_then(|registry| registry.span(id))
+                    .ok_or(())?,
+            ),
+            _ => None,
+        };
+        with_span(&mut event, slots, span)
+    })?;
+    Ok(event)
 }
 
 fn check_snapshot(span: &EventSpan) -> Result<(), ()> {
@@ -333,7 +405,7 @@ fn check_snapshot(span: &EventSpan) -> Result<(), ()> {
     Ok(())
 }
 
-fn bounded_text(value: &str) -> Result<String, ()> {
+pub(super) fn bounded_text(value: &str) -> Result<String, ()> {
     if value.len() > TEXT_LIMIT {
         return Err(());
     }
@@ -341,20 +413,23 @@ fn bounded_text(value: &str) -> Result<String, ()> {
 }
 
 #[derive(Default)]
-struct Fields {
+pub(super) struct Fields {
     fields: Vec<EventField>,
     bytes: usize,
     failed: bool,
 }
 impl Fields {
-    fn finish(self) -> Result<Vec<EventField>, ()> {
+    pub(super) fn failed(&self) -> bool {
+        self.failed
+    }
+    pub(super) fn finish(self) -> Result<Vec<EventField>, ()> {
         if self.failed {
             Err(())
         } else {
             Ok(self.fields)
         }
     }
-    fn push(&mut self, field: &Field, value: FieldValue) {
+    pub(super) fn push(&mut self, name: &str, value: FieldValue) {
         if self.failed {
             return;
         }
@@ -363,8 +438,8 @@ impl Fields {
             FieldValue::Bytes(v) => v.len(),
             _ => 16,
         };
-        let charge = bytes + field.name().len() + 128;
-        if field.name().len() > TEXT_LIMIT
+        let charge = bytes + name.len() + 128;
+        if name.len() > TEXT_LIMIT
             || self.fields.len() == crate::MAX_EVENT_FIELDS
             || charge > FIELD_BYTES - self.bytes
         {
@@ -373,13 +448,13 @@ impl Fields {
         }
         self.bytes += charge;
         self.fields.push(EventField {
-            name: field.name().to_owned(),
+            name: name.to_owned(),
             value,
         });
     }
     fn text(&mut self, field: &Field, value: Result<String, ()>, kind: fn(String) -> FieldValue) {
         match value {
-            Ok(value) => self.push(field, kind(value)),
+            Ok(value) => self.push(field.name(), kind(value)),
             Err(()) => self.failed = true,
         }
     }
@@ -399,7 +474,7 @@ impl fmt::Write for Render {
         Ok(())
     }
 }
-fn render(value: fmt::Arguments<'_>) -> Result<String, ()> {
+pub(super) fn render(value: fmt::Arguments<'_>) -> Result<String, ()> {
     let mut out = Render {
         text: String::new(),
         failed: false,
@@ -414,22 +489,22 @@ fn render(value: fmt::Arguments<'_>) -> Result<String, ()> {
 
 impl Visit for Fields {
     fn record_i64(&mut self, field: &Field, value: i64) {
-        self.push(field, FieldValue::Signed(value));
+        self.push(field.name(), FieldValue::Signed(value));
     }
     fn record_u64(&mut self, field: &Field, value: u64) {
-        self.push(field, FieldValue::Unsigned(value));
+        self.push(field.name(), FieldValue::Unsigned(value));
     }
     fn record_i128(&mut self, field: &Field, value: i128) {
-        self.push(field, FieldValue::Signed128(value));
+        self.push(field.name(), FieldValue::Signed128(value));
     }
     fn record_u128(&mut self, field: &Field, value: u128) {
-        self.push(field, FieldValue::Unsigned128(value));
+        self.push(field.name(), FieldValue::Unsigned128(value));
     }
     fn record_bool(&mut self, field: &Field, value: bool) {
-        self.push(field, FieldValue::Boolean(value));
+        self.push(field.name(), FieldValue::Boolean(value));
     }
     fn record_f64(&mut self, field: &Field, value: f64) {
-        self.push(field, FieldValue::Float64Bits(value.to_bits()));
+        self.push(field.name(), FieldValue::Float64Bits(value.to_bits()));
     }
     fn record_str(&mut self, field: &Field, value: &str) {
         if !self.failed {
@@ -444,7 +519,7 @@ impl Visit for Fields {
             self.failed = true;
             return;
         }
-        self.push(field, FieldValue::Bytes(value.to_owned()));
+        self.push(field.name(), FieldValue::Bytes(value.to_owned()));
     }
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
         if !self.failed {
@@ -513,7 +588,14 @@ mod tests {
                 .with_quarantine_dir(dir.path().join("quarantine")),
         )
         .unwrap();
-        let layer = TracingLayer::new(delivery.clone());
+        let console = Console::with_writers(
+            Some(delivery.clone()),
+            std::io::sink(),
+            std::io::sink(),
+            false,
+        )
+        .unwrap();
+        let layer = console.layer();
         let slots = layer.slots.clone();
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, || {
@@ -532,6 +614,17 @@ mod tests {
                 .map(|_| tracing::info_span!("capacity"))
                 .collect();
             assert_eq!(slots.load(Ordering::SeqCst), LIVE_SPANS);
+            // A facade record inside the refused span cannot acquire an invented root context.
+            let saturated = spans.last().unwrap().enter();
+            let rejected = console.stats().invalid;
+            log::Log::log(
+                &console,
+                &log::Record::builder()
+                    .args(format_args!("under missing context"))
+                    .build(),
+            );
+            assert_eq!(console.stats().invalid, rejected + 1);
+            drop(saturated);
             drop(spans);
             assert_eq!(slots.load(Ordering::SeqCst), 0);
         });

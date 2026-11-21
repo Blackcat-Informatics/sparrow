@@ -8927,8 +8927,16 @@ async fn tracing_layer_preserves_types_span_updates_and_durable_drop_accounting(
                 .with_quarantine_dir(dir.path().join("quarantine"));
             config.flush_interval = Duration::from_secs(60);
             let delivery = sparrow_client::Delivery::start(config).unwrap();
-            let subscriber = tracing_subscriber::registry()
-                .with(sparrow_client::TracingLayer::new(delivery.clone()));
+            let output_path = dir.path().join("console.log");
+            let console = sparrow_client::Console::with_writers(
+                Some(delivery.clone()),
+                std::io::sink(),
+                std::fs::File::create(&output_path).unwrap(),
+                false,
+            )
+            .unwrap();
+            let subscriber = tracing_subscriber::registry().with(console.layer());
+            let mut stdout_writer = console.writer(sparrow_client::ConsoleStream::Stdout);
             // Separate callback invocations to exercise capture rather than intentionally
             // contending the worker queue. The fence still audits every refused offer.
             let settle = || std::thread::sleep(Duration::from_millis(10));
@@ -8958,6 +8966,18 @@ async fn tracing_layer_preserves_types_span_updates_and_durable_drop_accounting(
                 }
                 tracing::info!(parent: None, explicit_root = true);
                 settle();
+                let captured = 37;
+                sparrow_client::sparrow_eprintln!("console capture {captured}");
+                log::Log::log(
+                    &console,
+                    &log::Record::builder()
+                        .target("worker.facade")
+                        .level(log::Level::Info)
+                        .args(format_args!("Uploaded item"))
+                        .key_values(&[("items", u64::MAX)])
+                        .build(),
+                );
+                std::io::Write::write_all(&mut stdout_writer, &[0xff]).unwrap();
                 drop(child_entered);
                 settle();
                 drop(child);
@@ -8967,6 +8987,8 @@ async fn tracing_layer_preserves_types_span_updates_and_durable_drop_accounting(
                 drop(root);
                 settle();
             });
+            // Finish the same fragment after the producing span and subscriber have exited.
+            std::io::Write::write_all(&mut stdout_writer, b"\n").unwrap();
             let watermark =
                 reached_delivery(delivery_barrier(&delivery, true, Duration::from_secs(5)).await);
             let stats = delivery.stats().unwrap();
@@ -8978,6 +9000,31 @@ async fn tracing_layer_preserves_types_span_updates_and_durable_drop_accounting(
                 let calls = state.calls.borrow();
                 let events: Vec<_> = calls.iter().flat_map(|batch| &batch.events).collect();
                 assert_eq!(events.len() as u64, watermark.durable_events);
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(
+                            |event| event.fields.iter().any(|field| field.name == "message"
+                                && field.value == FieldValue::Debug("console capture 37".into()))
+                        )
+                        .count(),
+                    1
+                );
+                let facade = events
+                    .iter()
+                    .find(|event| event.target == "worker.facade")
+                    .unwrap();
+                assert_eq!(facade.context.last().unwrap().name, "child");
+                assert!(
+                    facade.fields.iter().any(|field| field.name == "items"
+                        && field.value == FieldValue::Unsigned(u64::MAX))
+                );
+                let stdout = events.iter().find(|event| event.name == "stdio").unwrap();
+                assert_eq!(stdout.span, facade.span);
+                assert!(stdout.fields.iter().any(|field| field.name == "stream"
+                    && field.value == FieldValue::Text("stdout".into())));
+                assert!(stdout.fields.iter().any(|field| field.name == "message"
+                    && field.value == FieldValue::Bytes(vec![0xff, b'\n'])));
                 let typed = events
                     .iter()
                     .find(|event| event.target == "typed.capture")
@@ -9037,6 +9084,11 @@ async fn tracing_layer_preserves_types_span_updates_and_durable_drop_accounting(
                     );
                 }
             }
+            assert_eq!(console.flush().await.unwrap().refused, 0);
+            let output = std::fs::read_to_string(output_path).unwrap();
+            assert_eq!(output.matches("console capture 37").count(), 1);
+            assert_eq!(output.matches("typed tracing observation").count(), 3);
+            assert_eq!(output.matches("Uploaded item").count(), 1);
             let response = backend
                 .client
                 .status_request()
