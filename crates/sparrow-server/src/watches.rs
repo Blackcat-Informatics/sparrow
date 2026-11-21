@@ -1843,16 +1843,18 @@ impl Roster {
         }
     }
 
-    /// Hand a parked watch that holds no unfinished claim back to the open path. Its held root
-    /// descriptor may name a directory that was removed or replaced, which a rebuild from that
+    /// Hand a parked watch whose configured path no longer names its held root, and that holds no
+    /// unfinished claim, back to the open path. Its held root
+    /// descriptor names a directory that was removed or replaced, which a rebuild from that
     /// descriptor can never leave; opening from the configured path, as a restart does, adopts
     /// the root as it is now, and refuses it while an unfinished claim binds the watch to its
     /// original root. A watch with claims stays parked and resumes only on the exact root.
     fn release_parked(&mut self, store: &Store) -> Result<(), Error> {
-        let due = self
-            .detectors
-            .iter()
-            .any(|detector| detector.broken.failing() && detector.broken.due());
+        let due = self.detectors.iter().any(|detector| {
+            detector.broken.failing()
+                && detector.broken.due()
+                && detector.owner.root_binding(&detector.config.root).is_err()
+        });
         if !due {
             return Ok(());
         }
@@ -1862,6 +1864,7 @@ impl Roster {
             .partition(|detector| {
                 detector.broken.failing()
                     && detector.broken.due()
+                    && detector.owner.root_binding(&detector.config.root).is_err()
                     && !pending
                         .iter()
                         .any(|journal| journal.watch == detector.config.id)
