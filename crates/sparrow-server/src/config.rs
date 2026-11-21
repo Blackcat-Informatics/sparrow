@@ -642,7 +642,13 @@ impl ConsumeWatch {
         Self::validate_fields(watches)?;
         let mut roots = Vec::new();
         for watch in watches {
-            let root = watch.root.canonicalize()?;
+            // A root that does not resolve now is not a configuration fault: its watch is
+            // reported and retried until the root appears, and the structural checks of
+            // `validate_fields` already hold for its path. Only roots that resolve can alias
+            // one another through links.
+            let Ok(root) = watch.root.canonicalize() else {
+                continue;
+            };
             if roots
                 .iter()
                 .any(|other: &PathBuf| root.starts_with(other) || other.starts_with(&root))

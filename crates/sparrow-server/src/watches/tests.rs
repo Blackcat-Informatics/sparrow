@@ -1376,9 +1376,9 @@ async fn a_replaced_root_parks_its_watch_and_the_exact_root_resumes_it() {
     assert!(detector.status_failure().is_none());
 }
 
-/// Value (#445): one watch root missing at start refused the daemon's start (and every later
-/// start). Protects: opening a roster whose one root is missing yields the other watch open
-/// and this one reported with its reason; the exact root restored opens it on the retry.
+/// Value (#445): one watch root missing at start must not stop the other watches. Protects:
+/// opening a roster whose one root is missing yields the other watch open and this one reported with its
+/// reason; the exact root restored opens it on the retry.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_root_missing_at_start_leaves_the_other_watches_open_and_resumes_when_restored() {
     let directory = tempfile::tempdir().unwrap();
@@ -1999,4 +1999,72 @@ fn consume_root_binds_by_inode_across_a_renumbered_device_and_refuses_a_changed_
         )
         .unwrap();
     assert_eq!(retried.import_id, admitted.import_id);
+}
+
+/// Value (#455): one configured root that did not exist at start failed the whole daemon
+/// start, although a root that cannot be opened is meant to wait and retry. Protects: starting
+/// the consume worker over one present and one missing root succeeds, the present watch is
+/// served, and the status reports the missing watch with its failure (the retry itself is
+/// covered by the roster test above).
+#[test]
+fn a_root_missing_at_worker_start_does_not_refuse_the_start() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("store");
+    let config_path =
+        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
+    let store = crate::ServerConfig::read(&config_path)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let definitions = ["present", "absent"]
+        .map(|id| ConsumeWatch {
+            id: id.into(),
+            root: directory.path().join(id),
+            producer_contract: crate::ProducerContract::FinishedFiles,
+            source: id.into(),
+            format: "log".into(),
+            quiet_ms: 30_000,
+            max_directories: 2,
+            max_candidates: 2,
+            publish_hold: false,
+        })
+        .to_vec();
+    std::fs::create_dir(&definitions[0].root).unwrap();
+    let registry = WatchRegistry::default();
+    let worker = ConsumeWorker::start(
+        store,
+        &definitions,
+        data.join("rpc.sock"),
+        registry.clone(),
+        Arc::new(tokio::sync::Semaphore::new(2)),
+    )
+    .expect("a root that does not resolve is not a start refusal");
+    let status = registry.snapshot().unwrap();
+    assert_eq!(status.len(), 2);
+    assert!(status[0].failure.is_none(), "the present watch is served");
+    assert!(status[1].failure.is_some(), "the missing root is reported");
+    drop(worker);
+}
+
+/// Value (#455): deferring the filesystem resolution must not defer the structural checks.
+/// Protects: overlapping roots that both do not exist, and a relative root, remain refusals.
+#[test]
+fn unresolved_roots_still_fail_the_structural_checks() {
+    let directory = tempfile::tempdir().unwrap();
+    let watch = |id: &str, root: PathBuf| ConsumeWatch {
+        id: id.into(),
+        root,
+        producer_contract: crate::ProducerContract::FinishedFiles,
+        source: id.into(),
+        format: "log".into(),
+        quiet_ms: 30_000,
+        max_directories: 2,
+        max_candidates: 2,
+        publish_hold: false,
+    };
+    let outer = directory.path().join("outer");
+    let inner = outer.join("inner");
+    assert!(ConsumeWatch::validate(&[watch("a", outer.clone()), watch("b", inner)]).is_err());
+    assert!(ConsumeWatch::validate(&[watch("a", PathBuf::from("relative"))]).is_err());
+    ConsumeWatch::validate(&[watch("a", outer)]).unwrap();
 }
