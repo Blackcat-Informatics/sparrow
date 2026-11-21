@@ -27,6 +27,11 @@ impl Endpoint {
             Some(address) => Self::Tcp(address.parse().map_err(|_| {
                 crate::Error::InvalidArgument("TCP endpoint requires a numeric IP address and port")
             })?),
+            None if !value.starts_with('/') && value.contains("://") => {
+                return Err(crate::Error::InvalidArgument(
+                    "endpoint requires a Unix socket path or tcp://IP:PORT",
+                ));
+            }
             None => Self::Unix(value.into()),
         };
         endpoint.validate()?;
@@ -36,10 +41,8 @@ impl Endpoint {
     /// Read `[--secret-file PATH] ENDPOINT` from the front of command arguments.
     /// Returns the endpoint and the remaining arguments; a secret requires TCP.
     pub fn from_args(args: &[String]) -> Result<(Self, &[String]), crate::Error> {
-        let (secret, rest) = match args {
-            [flag, path, rest @ ..] if flag == "--secret-file" => {
-                (Some(crate::TcpSecret::read(Path::new(path))?), rest)
-            }
+        let (secret_path, rest) = match args {
+            [flag, path, rest @ ..] if flag == "--secret-file" => (Some(Path::new(path)), rest),
             rest => (None, rest),
         };
         let [endpoint, rest @ ..] = rest else {
@@ -48,26 +51,45 @@ impl Endpoint {
             ));
         };
         let endpoint = Self::parse(endpoint)?;
-        let endpoint = match (endpoint, secret) {
-            (endpoint, None) => endpoint,
-            (Self::Tcp(address), Some(secret)) => Self::AuthenticatedTcp(address, secret),
-            (_, Some(_)) => {
-                return Err(crate::Error::InvalidArgument(
-                    "--secret-file applies only to a tcp:// endpoint",
-                ));
-            }
+        let endpoint = match secret_path {
+            Some(path) => endpoint.with_secret_file(path)?,
+            None => endpoint,
         };
         Ok((endpoint, rest))
     }
 
-    pub(crate) fn validate(&self) -> Result<(), crate::Error> {
-        if match self {
-            Self::Unix(path) => path.as_os_str().is_empty() || path.as_os_str().len() > 4096,
-            Self::Tcp(address) | Self::AuthenticatedTcp(address, _) => address.port() == 0,
-        } {
+    /// Authenticate this TCP destination using a private shared-secret file.
+    pub fn with_secret_file(self, path: &Path) -> Result<Self, crate::Error> {
+        let Self::Tcp(address) = self else {
             return Err(crate::Error::InvalidArgument(
-                "endpoint requires a Unix path of 1..4096 bytes or a nonzero TCP port",
+                "a secret file requires an unauthenticated tcp:// endpoint",
             ));
+        };
+        Ok(Self::AuthenticatedTcp(
+            address,
+            crate::TcpSecret::read(path)?,
+        ))
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), crate::Error> {
+        match self {
+            Self::Unix(path) => {
+                let bytes = path.as_os_str().as_encoded_bytes();
+                if bytes.is_empty() || bytes.contains(&0) {
+                    return Err(crate::Error::InvalidArgument(
+                        "Unix socket endpoint requires a nonempty pathname without NUL bytes",
+                    ));
+                }
+                std::os::unix::net::SocketAddr::from_pathname(path).map_err(|_| {
+                    crate::Error::InvalidArgument("Unix socket endpoint exceeds the system address limit; shorten the resolved socket pathname (107 bytes maximum on Linux)")
+                })?;
+            }
+            Self::Tcp(address) | Self::AuthenticatedTcp(address, _) if address.port() == 0 => {
+                return Err(crate::Error::InvalidArgument(
+                    "TCP endpoint requires a nonzero port",
+                ));
+            }
+            _ => {}
         }
         Ok(())
     }

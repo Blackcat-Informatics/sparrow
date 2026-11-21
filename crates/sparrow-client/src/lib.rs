@@ -68,6 +68,8 @@ pub use events::{
     read_wide as decode_wide_integer, wide as encode_wide_integer,
 };
 mod delivery;
+mod producer_config;
+pub use producer_config::ConfigError;
 mod logging;
 mod quarantine;
 mod replay;
