@@ -4618,39 +4618,66 @@ or semantic engine. The public surface includes:
   lifecycle/context becomes typed relationships with source evidence.
 - Bounded batching/retry queues and visible delivery/drop counters. The default
   logging path is nonblocking and drops new events when full; it never silently
-  allocates an unlimited queue or stalls a production thread on network I/O. A
-  briefly held queue lock makes admission wait, never drop. A permanent daemon
-  refusal of a batch (a non-retryable `INVALID_ARGUMENT` or `CONFLICT`, or a batch that can
-  never be accepted) is never reduced to a number: the
-  client writes the batch's canonical event lines, the refusal code and reason and the event
-  count to one file in `quarantine_dir`, and only then settles the batch. The events are
-  counted (`quarantined_events`, with `last_quarantine` naming the refusal), reported by the
-  next flush as not delivered (`FlushError::Dropped`, whose `quarantined_before_fence` counts
-  those kept in files), and later events proceed. Status exposes `quarantine_dir`,
-  `quarantine_files`, `last_quarantine_file` and `quarantine_write_failures`. The client never
-  deletes or rewrites a quarantine file; its size is bounded only by the disk (a source whose
-  time mapping conflicts refuses every later batch, so each becomes one file until the operator
-  fixes the source). If the file cannot be written, the batch stays pending, the failure is
-  counted and reported as the transient failure, which names the refusal code and reason, the
-  directory and the I/O error, and the write is retried, so that batch is not dropped; later
-  events wait behind it and are refused as `Full` once the queue is full. Any other
-  non-retryable refusal (a replaced store, a read-only daemon) ends delivery as a terminal
-  failure, and the pending batch and queued events are first written to quarantine files.
-  A batch the client itself cannot encode takes this terminal route too: the client validates
-  every batch before it is sent, so the failure ends delivery and the batch is saved by the
-  terminal save under the code `CLIENT_REFUSED`, not by the per-batch route above. The
-  daemon storing a refused batch as a malformed record with its reason is the preferred form
-  and is not yet implemented (issue 216). A busy refusal (a retryable `RESOURCE_LIMIT`) is never quarantined:
-  the client holds the batch, bounded by the queue limits, with overflow counted
-  as `Full`. A full producer registry is not a refusal any more (#215): the daemon
-  stores the batch and counts the lost gap evidence, so the client no longer holds
-  a batch for it. A source past the 1024-mapping ceiling and an over-bound
-  batch are no longer retryable refusals either (#227): the daemon takes the
-  first and answers the second `INVALID_ARGUMENT`, which is quarantined. An
-  older daemon still answers these with `RESOURCE_LIMIT`, which the client
-  holds as before: held bytes are never lost, and the client cannot tell the
-  case from a busy daemon. A busy (retryable) refusal retries the same
-  batch on the same connection; only a transport failure reconnects.
+  allocates an unlimited queue or stalls a production thread on network I/O. The queue
+  holds at most 1024 events and 4 MiB by default (`max_queued_events`, `max_queued_bytes`); an event past either bound is refused as `Full` and
+  counted. A briefly held queue lock makes admission wait, never drop. The worker never
+  stops for good: every failed attempt is either set aside or held, and a hold clears when
+  its cause goes.
+  - Set aside. A refusal about the batch itself (a non-retryable `INVALID_ARGUMENT`,
+    `CONFLICT`, or input-bound `RESOURCE_LIMIT`, the client's own `INVALID_ARGUMENT`,
+    `STORE_MISMATCH`, or any non-retryable code this client does not know) is never reduced to a number: the client
+    writes the batch's canonical event lines, the refusal code and reason and the event
+    count to one file in `quarantine_dir`, and only then settles the batch. The events are
+    counted (`quarantined_events`, with `last_quarantine` naming the refusal), reported by
+    the next barrier as not delivered (`FlushError::Dropped`, whose `quarantined_before_fence`
+    counts those kept in files), and later events proceed. Status exposes `quarantine_dir`,
+    `quarantine_files`, `last_quarantine_file` and `quarantine_write_failures`. The worker never
+    deletes a quarantine file; its size is bounded only by the disk (a source whose time
+    mapping conflicts refuses every later batch, so each becomes one file until the operator
+    fixes the source). If the file cannot be written, the batch stays pending, the failure
+    is counted and reported as the transient failure, which names the refusal code and
+    reason, the directory and the I/O error, and the write is retried, so that batch is not
+    dropped; later events wait behind it and are refused as `Full` once the queue is full.
+  - Hold. Everything else keeps the immutable pending batch and retries it on the backoff
+    (1 s doubling to 30 s, restarted by an acknowledged or set-aside batch): a retryable
+    refusal (a busy `RESOURCE_LIMIT`, `STORAGE_PRESSURE` including the free-space floor,
+    `SHUTTING_DOWN`), a lost or refused connection, any transport, I/O, protocol or discovery
+    failure, and a refusal about the daemon rather than the batch: `READ_ONLY`,
+    `PERMISSION_DENIED`, `UNAUTHENTICATED`, `UNSUPPORTED` and `STORAGE_FAILURE`. A hold is visible as
+    `retries` and `last_transient_failure`, which clears when a batch is acknowledged or set
+    aside; the queue behind it is bounded as above. A busy refusal is never quarantined and
+    a full producer registry is not a refusal (#215).
+  - Replaced store. `STORE_MISMATCH` (the store behind the socket changed) is set aside, not
+    held: whether the old store holds the pending batch is unknown, and the batch must not
+    reach another store unrecorded, so it goes to a quarantine file with the refusal. The
+    worker then adopts the store now behind the socket and later batches are delivered there;
+    nothing stays in memory only and no restart is needed. Replaying the file into the
+    original store stores a batch that the original store may already hold a second time.
+  - Local failure. Only a local invariant failure (a poisoned lock, an exhausted counter, a
+    worker panic) ends the worker: `terminal_failure` is set, later events are refused as
+    `Failed`, and the pending batch and queued events are written to quarantine files. While
+    such a write fails, `held_unsaved_events` counts the events held only in memory and the
+    worker retries the write on the backoff until it succeeds; they are never counted
+    delivered.
+  - Replay. `sparrow_client::replay_quarantine(client, path)` and the CLI command
+    `sparrow $ENDPOINT quarantine-replay FILE` resend the batch in a quarantine file under
+    a replay identity derived from the file's request identity and producer instance: the
+    store refuses batches that lie behind positions it already accepted from the original
+    instance, so a live producer's later batches must not block replay. Retrying one replay
+    repeats the identity and is answered idempotently. A file larger than one batch (the
+    queued events saved at a local failure) is sent as several batches within the batch
+    limits, in order, each with its own stable identity. The file is removed only after the
+    store acknowledges every batch durably. A daemon refusal returns the error and keeps the file, recording the refusal in
+    its header (`replay_attempts`, `last_replay_code`, `last_replay_reason`); a transport
+    failure changes nothing. A file that does not parse back into exactly the stored event
+    lines is refused.
+  - Barriers. `flush` and `shutdown` report the drops and quarantines first seen since the
+    previous barrier that returned a watermark or `Dropped`, so a fence that reported them is
+    clean for later input without a restart. `DeliveryStats` keeps the running totals
+    (`dropped_by_reason`, `quarantined_events`).
+  - Tracing layer. The layer does not return admission results to the subscriber, which has
+    no caller to tell; every refusal is nevertheless visible in `DeliveryStats` and at the
+    next barrier.
 - Explicit buffered/durable delivery selection for direct ingestion and
   `flush(durable)`/shutdown that returns the reached receipt watermark or a typed
   error. Durable flush cannot certify events already dropped before enqueue.
