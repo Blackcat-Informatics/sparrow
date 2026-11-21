@@ -43,6 +43,15 @@ struct State {
     receipts: Vec<Receipt>,
 }
 
+/// What [`Catalog::retire_and_store`] did.
+pub(crate) enum Retirement {
+    Nothing,
+    Stored,
+    /// Pressure refused the write; the catalog is unchanged and the work stays due.
+    Deferred(String),
+}
+
+#[derive(Clone)]
 pub(crate) struct Catalog {
     state: State,
     raw: Option<Vec<u8>>,
@@ -623,6 +632,30 @@ impl Catalog {
         ))
     }
 
+    /// Drop the disabled watches that hold no unfinished journal and store the result with
+    /// `persist`. The drop is made on a copy, so a write that pressure refuses leaves this
+    /// catalog as stored and the next call finds the same work again.
+    pub(crate) fn retire_and_store(
+        &mut self,
+        pending: &[sparrow_core::ConsumptionJournal],
+        persist: impl FnOnce(&mut Self) -> Result<(), Error>,
+    ) -> Result<Retirement, Error> {
+        let mut next = self.clone();
+        if !next.retire(pending) {
+            return Ok(Retirement::Nothing);
+        }
+        match persist(&mut next) {
+            Ok(()) => {
+                *self = next;
+                Ok(Retirement::Stored)
+            }
+            Err(Error::Storage(error)) if error.code == "STORAGE_PRESSURE" => {
+                Ok(Retirement::Deferred(error.message))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn retire(&mut self, pending: &[sparrow_core::ConsumptionJournal]) -> bool {
         let before = self.state.watches.len();
         self.state.watches.retain(|watch| {
@@ -765,5 +798,38 @@ mod tests {
             .expect("an older shape refuses a held catalog")
             .to_string();
         assert!(refused.contains("publish_hold"), "{refused}");
+    }
+
+    /// INVARIANT (#440): a retirement that pressure refuses leaves the catalog as stored and
+    /// the work due, so the next pass stores it; it does not end the worker or lose the work.
+    #[test]
+    fn a_refused_retirement_stays_due_and_is_stored_by_the_next_call() {
+        let mut disabled = managed(false);
+        disabled.enabled = false;
+        let mut catalog = Catalog {
+            state: State {
+                version: 1,
+                store_id: "store:test".into(),
+                revision: 3,
+                watches: vec![disabled],
+                receipts: Vec::new(),
+            },
+            raw: Some(Vec::new()),
+            configured: std::collections::BTreeMap::new(),
+        };
+        let refused = catalog.retire_and_store(&[], |_| {
+            Err(failure("STORAGE_PRESSURE", "write would cross the reserve").into())
+        });
+        assert!(matches!(refused, Ok(Retirement::Deferred(_))));
+        assert_eq!(
+            catalog.watches().len(),
+            1,
+            "a refused write changed the catalog"
+        );
+        let stored = catalog.retire_and_store(&[], |_| Ok(()));
+        assert!(matches!(stored, Ok(Retirement::Stored)));
+        assert!(catalog.watches().is_empty());
+        let other = catalog.retire_and_store(&[], |_| Ok(()));
+        assert!(matches!(other, Ok(Retirement::Nothing)));
     }
 }

@@ -6099,6 +6099,68 @@ async fn daemon_starts_below_the_free_space_floor_and_serves_reads() {
         .await;
 }
 
+/// INVARIANT (#440): the wait to open covers the replay of write-ahead log an unclean stop
+/// left, not only the maintenance reserve: with a log in `data_dir` larger than the free
+/// space, the daemon waits without opening the store, and exits cleanly on an interrupt.
+#[tokio::test(flavor = "current_thread")]
+async fn startup_waits_for_the_space_to_replay_a_left_write_ahead_log() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("store");
+    let socket = data.join("rpc.sock");
+    let config = write_server_config(dir.path(), &data, &socket);
+    std::fs::create_dir_all(&data).unwrap();
+    // A sparse log of more bytes than the filesystem has free: it costs no blocks, and the
+    // reserve alone (8 MiB) is far below the free space, so only the replay can hold the open.
+    let stat = rustix::fs::statvfs(&data).unwrap();
+    let free = stat.f_bavail.saturating_mul(stat.f_frsize);
+    let log = data.join("000001.log");
+    std::fs::File::create(&log)
+        .unwrap()
+        .set_len(free + (1 << 30))
+        .unwrap();
+    let base = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        base.replace(
+            "min_free_bytes = 1048576",
+            "min_free_bytes = 9223372036854775807",
+        ),
+    )
+    .unwrap();
+    let mut daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrowd"))
+        .arg("--config")
+        .arg(&config)
+        .kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .admitted_spawn()
+        .unwrap();
+    let pid = rustix::process::Pid::from_raw(daemon.id().unwrap() as i32).unwrap();
+    let mut stderr = tokio::io::BufReader::new(daemon.stderr.take().unwrap());
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(30), stderr.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        line.starts_with("sparrowd: waiting to open the store: only "),
+        "{line}"
+    );
+    assert!(
+        !socket.exists(),
+        "the store opened over a log it could not replay"
+    );
+    rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    stderr.read_to_string(&mut line).await.unwrap();
+    assert!(status.success(), "{status}: {line}");
+    assert!(!line.contains("sparrowd: store="), "{line}");
+}
+
 /// Run the packaged shipper once over `config`; it must only read the producer files.
 fn ship(config: &Path) -> std::process::Output {
     Command::new(concat!(

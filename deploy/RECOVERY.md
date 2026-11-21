@@ -55,7 +55,7 @@ every watch in `consume_watches` names a root that exists.
   watches keep their files); it logs a line when the pause begins, one a minute
   while it lasts and one when it ends. A write that still fails with durability uncertain makes the
   daemon exit, and `Restart=on-failure` reopens the store; at startup it waits
-  only for the maintenance reserve's worth of space before opening, so a full disk does not spend
+  only for the maintenance reserve plus any write-ahead log an unclean stop left (the open replays it), so a full disk does not spend
   the start limit, and below the floor alone the store opens and serves reads.
 - `/SPARROW` is on the same btrfs device as `/home`, so the move to `/SPARROW`
   did not isolate Sparrow from a full `/home`.

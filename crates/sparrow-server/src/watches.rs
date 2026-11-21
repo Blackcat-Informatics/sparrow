@@ -7,7 +7,7 @@
 use crate::{
     ConsumeWatch,
     consumption::{ClaimRoot, Error, Recovery, Refusal, RootBinding},
-    watch_admin::{self, Action, Catalog, ManagedWatch},
+    watch_admin::{self, Action, Catalog, ManagedWatch, Retirement},
 };
 use rustix::fs::{
     self,
@@ -1691,14 +1691,19 @@ async fn run(
             commit_initial_catalog(&mut catalog, &store)?;
         }
         let pending = store.consumption_pending()?;
-        if space_ok && catalog.retire(&pending) {
-            catalog.persist(&store)?;
-            detectors.retain(|detector| {
-                catalog
-                    .watches()
-                    .iter()
-                    .any(|watch| watch.definition.id == detector.config.id)
-            });
+        if space_ok {
+            match catalog.retire_and_store(&pending, |next| next.persist(&store))? {
+                Retirement::Nothing => {}
+                Retirement::Stored => detectors.retain(|detector| {
+                    catalog
+                        .watches()
+                        .iter()
+                        .any(|watch| watch.definition.id == detector.config.id)
+                }),
+                Retirement::Deferred(reason) => eprintln!(
+                    "sparrowd: watch retirement not stored yet: {reason}; retrying on each pass"
+                ),
+            }
         }
         for _ in 0..watch_admin::MAX_WATCH_COMMANDS {
             let command = match received
