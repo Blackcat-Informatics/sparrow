@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/9-give-producers-a-stable-versioned",
+  "branch": "paudley/9-give-producers-a-stable-versioned",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "cd3aaad52cfc0108e512b9788b003a63fac9ea4e",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/9-give-producers-a-stable-versioned/.stage/give-producers-a-stable-versioned/sync/20261121T233924-c1e9ebe2d0b94825aae64d7deebea5e2",
+  "conflicts": [],
+  "status": "completed",
+  "base": "a6aba950716394e2871f4052af3623e9e71d0ce4",
+  "merge_bases": [
+    "cc938dd8b5ba3e544056c78d32b96fd31e09914d"
+  ],
+  "merge_index": "a2e5f1ca59440852a92c59b00a73ccf2f07251aa2087420e0a828de001cee3a2",
+  "candidate_tree": "1a88096e22163505efec286ecdfc0a0edaa0aed3",
+  "candidate_patch": "candidate-ecc64d5d99e644d7badbd3bd51b35583.patch",
+  "stdout_log": "commit-ecc64d5d99e644d7badbd3bd51b35583.stdout.log",
+  "stderr_log": "commit-ecc64d5d99e644d7badbd3bd51b35583.stderr.log",
+  "validation_records": [],
+  "commit_duration_seconds": 18.150790399988182,
+  "commit": "725a3a10982ebd78f5daf06aabb9cc4090e478b9",
+  "tree": "1a88096e22163505efec286ecdfc0a0edaa0aed3",
+  "exit_code": 0
+}

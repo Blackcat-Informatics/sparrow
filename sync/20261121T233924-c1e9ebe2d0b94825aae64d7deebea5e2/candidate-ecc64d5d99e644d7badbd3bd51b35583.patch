@@ -1,0 +1,1774 @@
+diff --git Cargo.lock Cargo.lock
+index 4b234e8..eb1dcab 100644
+--- Cargo.lock
++++ Cargo.lock
+@@ -579,6 +579,12 @@ version = "0.12.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+ 
++[[package]]
++name = "log"
++version = "0.4.35"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
++
+ [[package]]
+ name = "lz4-sys"
+ version = "1.11.1+lz4-1.10.0"
+@@ -1378,6 +1384,7 @@ dependencies = [
+  "capnpc",
+  "futures",
+  "getrandom 0.3.4",
++ "log",
+  "purrdf-ed25519",
+  "purrdf-hash",
+  "purrdf-lex",
+@@ -1426,6 +1433,7 @@ dependencies = [
+  "capnp-rpc",
+  "futures",
+  "getrandom 0.3.4",
++ "log",
+  "purrdf",
+  "purrdf-hash",
+  "purrdf-lex",
+diff --git Cargo.toml Cargo.toml
+index e61e44a..b189896 100644
+--- Cargo.toml
++++ Cargo.toml
+@@ -23,6 +23,7 @@ purrdf-core = "=4"
+ getrandom = "0.3"
+ rustix = { version = "1.1.5", features = ["fs"] }
+ tracing = "0.1.44"
++log = { version = "0.4", features = ["std", "kv"] }
+ tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std", "fmt"] }
+ capnp = "0.27"
+ capnp-rpc = "0.27"
+diff --git README.md README.md
+index e2452c1..a69623d 100644
+--- README.md
++++ README.md
+@@ -65,6 +65,11 @@ views, with explicit admission refusals; see
+ 
+ ## Operating model
+ 
++Rust applications can use the [developer console](docs/interfaces.md#developer-console)
++with local display alone or send structured observations to Sparrow. The
++[console example](crates/sparrow-client/examples/console.rs) shows a print-style
++call, typed tracing fields and a `log` record in one span.
++
+ Sparrow runs as a Rust service on one Linux server with local storage. The
+ initial workload is under 10 GiB of new, uncompressed data per day, including
+ large directories of JSONL and `.log` files. Sustained throughput, import bursts,
+diff --git crates/sparrow-client/Cargo.toml crates/sparrow-client/Cargo.toml
+index ed9dbd2..84004c2 100644
+--- crates/sparrow-client/Cargo.toml
++++ crates/sparrow-client/Cargo.toml
+@@ -24,6 +24,7 @@ serde.workspace = true
+ toml.workspace = true
+ getrandom.workspace = true
+ tracing.workspace = true
++log.workspace = true
+ tracing-subscriber.workspace = true
+ 
+ [build-dependencies]
+diff --git crates/sparrow-client/examples/console.rs crates/sparrow-client/examples/console.rs
+new file mode 100644
+index 0000000..89c0eb9
+--- /dev/null
++++ crates/sparrow-client/examples/console.rs
+@@ -0,0 +1,39 @@
++// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++//! Run without arguments for local display, or pass an explicit destination to also deliver events.
++use sparrow_client::{Console, Delivery, DeliveryConfig, Endpoint, sparrow_eprintln};
++use std::time::Duration;
++
++#[tokio::main(flavor = "current_thread")]
++async fn main() -> Result<(), Box<dyn std::error::Error>> {
++    let delivery = match std::env::args().nth(1) {
++        Some(value) => {
++            let config = DeliveryConfig::for_endpoint(Endpoint::parse(&value)?, "console-example");
++            Some(Delivery::start_async(config).await?)
++        }
++        None => None,
++    };
++    let console = Console::install(delivery.clone())?;
++    log::set_boxed_logger(Box::new(console.clone()))?;
++    log::set_max_level(log::LevelFilter::Info);
++
++    let files = 12;
++    let span = tracing::info_span!("import", files);
++    span.in_scope(|| {
++        sparrow_eprintln!("Reading {files} files");
++        tracing::info!(files, bytes = 847216_u64, "Import complete");
++        log::warn!(target: "upload", retry_secs = 2_u64; "Upload deferred\nConnection refused");
++    });
++    drop(span);
++    let stats = console.flush().await?;
++    if stats.invalid + stats.refused > 0 {
++        return Err(
++            std::io::Error::other(format!("console refused observations: {stats:?}")).into(),
++        );
++    }
++    if let Some(delivery) = delivery {
++        delivery.shutdown_async(Duration::from_secs(5)).await?;
++    }
++    Ok(())
++}
+diff --git crates/sparrow-client/src/console.rs crates/sparrow-client/src/console.rs
+new file mode 100644
+index 0000000..b6146b9
+--- /dev/null
++++ crates/sparrow-client/src/console.rs
+@@ -0,0 +1,302 @@
++// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++//! Human-readable diagnostics and byte-exact explicit console capture.
++
++mod facade;
++mod render;
++mod stream;
++pub use stream::{ConsoleStream, ConsoleWriter};
++
++use crate::{Delivery, EventKind, ProducerEvent, TracingLayer};
++use std::{
++    io::{self, IsTerminal, Write},
++    sync::{
++        Arc,
++        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
++    },
++};
++use tokio::sync::{mpsc, oneshot};
++
++// Each event has already passed the producer's 64 KiB admission bound.
++const QUEUE_CAPACITY: usize = 64;
++
++enum Command {
++    Event(render::Line),
++    Raw(ConsoleStream, Vec<u8>),
++    Flush {
++        reply: oneshot::Sender<Option<Arc<FenceFailure>>>,
++        report_errors: bool,
++    },
++}
++
++struct FenceFailure {
++    cause: Arc<io::Error>,
++    observed: AtomicBool,
++}
++
++#[derive(Default)]
++struct Counts {
++    fence: tokio::sync::Mutex<()>,
++    displayed: AtomicU64,
++    refused: AtomicU64,
++    invalid: AtomicU64,
++    errors: AtomicU64,
++}
++
++/// Cumulative local output counts. Remote receipts and drops are available from `Delivery`.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct ConsoleStats {
++    /// Formatted events and raw fragments successfully written.
++    pub displayed: u64,
++    /// Local log observations refused by a full or closed output queue.
++    pub refused: u64,
++    /// Observations that exceeded capture bounds or had an invalid capture context.
++    pub invalid: u64,
++    /// Write and flush failures on the local output streams.
++    pub write_errors: u64,
++}
++
++/// A bounded, off-thread console with an optional structured delivery destination.
++///
++/// A standalone console opens no socket, spool or configuration file. Attach
++/// `layer()` to the application's subscriber. Use `flush().await` before exiting
++/// a short-lived process to wait for already admitted local output.
++#[derive(Clone)]
++pub struct Console {
++    pub(super) slots: Arc<AtomicUsize>,
++    tx: mpsc::Sender<Command>,
++    counts: Arc<Counts>,
++    delivery: Option<Delivery>,
++}
++
++impl Console {
++    /// Start local display and install its tracing subscriber for this application.
++    /// Returns `AlreadyExists` when another global subscriber owns tracing. Applications
++    /// composing multiple layers can use `start` and `layer` instead.
++    pub fn install(delivery: Option<Delivery>) -> io::Result<Self> {
++        use tracing_subscriber::prelude::*;
++        let console = Self::start(delivery)?;
++        let subscriber = tracing_subscriber::registry().with(console.layer());
++        tracing::subscriber::set_global_default(subscriber)
++            .map_err(|error| io::Error::new(io::ErrorKind::AlreadyExists, error))?;
++        Ok(console)
++    }
++
++    /// Start the console with the process's stdout and stderr. ANSI styling follows stderr's
++    /// terminal capability and a nonempty `NO_COLOR` environment variable disables it.
++    pub fn start(delivery: Option<Delivery>) -> io::Result<Self> {
++        let stderr = io::stderr();
++        let color =
++            stderr.is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
++        Self::with_writers(delivery, io::stdout(), stderr, color)
++    }
++
++    /// Supply the local destinations and select styling explicitly. Normal log events go to
++    /// stderr; explicit writers and pipes send their original bytes to the matching stream.
++    pub fn with_writers(
++        delivery: Option<Delivery>,
++        stdout: impl Write + Send + 'static,
++        stderr: impl Write + Send + 'static,
++        color: bool,
++    ) -> io::Result<Self> {
++        let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
++        let counts = Arc::new(Counts::default());
++        let worker_counts = counts.clone();
++        std::thread::Builder::new()
++            .name("sparrow-console".into())
++            .spawn(move || run(stdout, stderr, color, rx, &worker_counts))?;
++        Ok(Self {
++            tx,
++            counts,
++            delivery,
++            slots: Arc::new(AtomicUsize::new(0)),
++        })
++    }
++
++    /// Capture logs and span context through a subscriber owned by the application.
++    #[must_use]
++    pub fn layer(&self) -> TracingLayer {
++        TracingLayer::with_console(self.clone())
++    }
++
++    /// The structured producer attached to this console, when configured.
++    #[must_use]
++    pub fn delivery(&self) -> Option<&Delivery> {
++        self.delivery.as_ref()
++    }
++
++    /// Inspect cumulative local output outcomes, including overload and capture refusals.
++    #[must_use]
++    pub fn stats(&self) -> ConsoleStats {
++        ConsoleStats {
++            displayed: self.counts.displayed.load(Ordering::Relaxed),
++            refused: self.counts.refused.load(Ordering::Relaxed),
++            invalid: self.counts.invalid.load(Ordering::Relaxed),
++            write_errors: self.counts.errors.load(Ordering::Relaxed),
++        }
++    }
++
++    /// Wait for earlier local writes and flush both streams. Every output error since the
++    /// previous acknowledged flush is counted. The first error is returned with its cause.
++    pub async fn flush(&self) -> io::Result<ConsoleStats> {
++        // Serialize checked fences until the caller observes the reply or cancels.
++        let _fence = self.counts.fence.lock().await;
++        self.flush_local(true).await
++    }
++
++    async fn flush_local(&self, report_errors: bool) -> io::Result<ConsoleStats> {
++        let (reply, result) = oneshot::channel();
++        self.tx
++            .send(Command::Flush {
++                reply,
++                report_errors,
++            })
++            .await
++            .map_err(|_| worker_closed())?;
++        if let Some(failure) = result.await.map_err(|_| worker_closed())? {
++            failure.observed.store(true, Ordering::Release);
++            return Err(io::Error::new(failure.cause.kind(), failure.cause.clone()));
++        }
++        Ok(self.stats())
++    }
++
++    fn flush_sync(&self, report_errors: bool) -> io::Result<ConsoleStats> {
++        // A blocking writer cannot wait on an async fence owned by an unpolled future on
++        // the same executor. The process logger drains without acknowledging failures.
++        let _fence = if report_errors {
++            Some(self.counts.fence.try_lock().map_err(|_| {
++                io::Error::new(
++                    io::ErrorKind::WouldBlock,
++                    "another Sparrow console flush is active",
++                )
++            })?)
++        } else {
++            None
++        };
++        // A std::io::Write or log::Log caller can itself be running a futures LocalPool,
++        // which forbids nested block_on. Only an explicit synchronous fence needs this.
++        if let Ok(guard) = futures::executor::enter() {
++            drop(guard);
++            return futures::executor::block_on(self.flush_local(report_errors));
++        }
++        std::thread::scope(|scope| {
++            std::thread::Builder::new()
++                .name("sparrow-console-flush".into())
++                .spawn_scoped(scope, || {
++                    futures::executor::block_on(self.flush_local(report_errors))
++                })?
++                .join()
++                .map_err(|_| io::Error::other("Sparrow console flush thread panicked"))?
++        })
++    }
++
++    pub(super) fn capture_failed(&self) {
++        self.counts.invalid.fetch_add(1, Ordering::Relaxed);
++        if let Some(delivery) = &self.delivery {
++            delivery.capture_failed();
++        }
++    }
++
++    pub(super) fn emit(&self, mut event: ProducerEvent) {
++        if event.kind == EventKind::Log {
++            match self.tx.try_reserve() {
++                Ok(slot) => slot.send(Command::Event(render::Line::capture(
++                    &mut event,
++                    self.delivery.is_some(),
++                ))),
++                Err(_) => {
++                    self.counts.refused.fetch_add(1, Ordering::Relaxed);
++                }
++            }
++        }
++        if let Some(remote) = &self.delivery {
++            remote.try_send(event);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests;
++
++fn worker_closed() -> io::Error {
++    io::Error::new(
++        io::ErrorKind::BrokenPipe,
++        "Sparrow console output worker stopped",
++    )
++}
++
++fn run(
++    mut stdout: impl Write,
++    mut stderr: impl Write,
++    color: bool,
++    mut rx: mpsc::Receiver<Command>,
++    counts: &Counts,
++) {
++    let mut buffer = Vec::new();
++    let mut first_error = None;
++    let mut offered: Option<Arc<FenceFailure>> = None;
++    while let Some(command) = rx.blocking_recv() {
++        let result = match command {
++            Command::Event(event) => {
++                buffer.clear();
++                render::line(&mut buffer, &event, color).and_then(|()| stderr.write_all(&buffer))
++            }
++            Command::Raw(stream, data) => {
++                let output: &mut dyn Write = match stream {
++                    ConsoleStream::Stdout => &mut stdout,
++                    ConsoleStream::Stderr => &mut stderr,
++                };
++                output.write_all(&data).and_then(|()| {
++                    // The process stdout is line-buffered. A child may wait for a reply to
++                    // a prompt that has no newline.
++                    if data.ends_with(b"\n") {
++                        Ok(())
++                    } else {
++                        output.flush()
++                    }
++                })
++            }
++            Command::Flush {
++                reply,
++                report_errors,
++            } => {
++                for result in [stdout.flush(), stderr.flush()] {
++                    if let Err(error) = result {
++                        counts.errors.fetch_add(1, Ordering::Relaxed);
++                        first_error.get_or_insert(error);
++                    }
++                }
++                // The log facade has no return channel for output errors. Keep those for a
++                // checked fence even when an intervening log::Log::flush drains the output.
++                if report_errors {
++                    let current = first_error.take();
++                    if offered
++                        .as_ref()
++                        .is_none_or(|e| e.observed.load(Ordering::Acquire))
++                    {
++                        offered = current.map(|cause| {
++                            Arc::new(FenceFailure {
++                                cause: Arc::new(cause),
++                                observed: AtomicBool::new(false),
++                            })
++                        });
++                    }
++                }
++                // Keep the first unobserved failure even when a cancelled future received
++                // its reply into the oneshot buffer and never polled that buffer.
++                let _ = reply.send(if report_errors { offered.clone() } else { None });
++                continue;
++            }
++        };
++        match result {
++            Ok(()) => {
++                counts.displayed.fetch_add(1, Ordering::Relaxed);
++            }
++            Err(error) => {
++                counts.errors.fetch_add(1, Ordering::Relaxed);
++                first_error.get_or_insert(error);
++            }
++        }
++    }
++}
+diff --git crates/sparrow-client/src/console/facade.rs crates/sparrow-client/src/console/facade.rs
+new file mode 100644
+index 0000000..16f59bc
+--- /dev/null
++++ crates/sparrow-client/src/console/facade.rs
+@@ -0,0 +1,121 @@
++// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++use super::Console;
++use crate::{
++    EventKind, EventLevel, FieldValue, ProducerEvent,
++    logging::{Fields, bounded_text, render},
++};
++use log::kv::{self, VisitSource, VisitValue};
++
++// Use the native log visitor so a u64 doesn't become text and an i128 doesn't narrow.
++struct Pair<'a> {
++    name: &'a str,
++    fields: &'a mut Fields,
++}
++
++fn invalid_field() -> kv::Error {
++    kv::Error::msg("Sparrow log field exceeds its capture bound")
++}
++
++impl<'v> VisitValue<'v> for Pair<'_> {
++    fn visit_any(&mut self, v: kv::Value<'_>) -> Result<(), kv::Error> {
++        let text = render(format_args!("{v:?}")).map_err(|()| invalid_field())?;
++        self.fields.push(self.name, FieldValue::Debug(text));
++        Ok(())
++    }
++    fn visit_str(&mut self, v: &str) -> Result<(), kv::Error> {
++        self.fields.push(
++            self.name,
++            FieldValue::Text(bounded_text(v).map_err(|()| invalid_field())?),
++        );
++        Ok(())
++    }
++    fn visit_i64(&mut self, v: i64) -> Result<(), kv::Error> {
++        self.fields.push(self.name, FieldValue::Signed(v));
++        Ok(())
++    }
++    fn visit_u64(&mut self, v: u64) -> Result<(), kv::Error> {
++        self.fields.push(self.name, FieldValue::Unsigned(v));
++        Ok(())
++    }
++    fn visit_i128(&mut self, v: i128) -> Result<(), kv::Error> {
++        self.fields.push(self.name, FieldValue::Signed128(v));
++        Ok(())
++    }
++    fn visit_u128(&mut self, v: u128) -> Result<(), kv::Error> {
++        self.fields.push(self.name, FieldValue::Unsigned128(v));
++        Ok(())
++    }
++    fn visit_f64(&mut self, v: f64) -> Result<(), kv::Error> {
++        self.fields
++            .push(self.name, FieldValue::Float64Bits(v.to_bits()));
++        Ok(())
++    }
++    fn visit_bool(&mut self, v: bool) -> Result<(), kv::Error> {
++        self.fields.push(self.name, FieldValue::Boolean(v));
++        Ok(())
++    }
++}
++
++impl<'v> VisitSource<'v> for Fields {
++    fn visit_pair(&mut self, key: kv::Key<'v>, value: kv::Value<'v>) -> Result<(), kv::Error> {
++        value.visit(Pair {
++            name: key.as_str(),
++            fields: self,
++        })?;
++        if self.failed() {
++            Err(invalid_field())
++        } else {
++            Ok(())
++        }
++    }
++}
++
++impl Console {
++    fn capture_record(&self, record: &log::Record<'_>) -> Result<ProducerEvent, ()> {
++        let mut fields = Fields::default();
++        fields.push("message", FieldValue::Text(render(*record.args())?));
++        record.key_values().visit(&mut fields).map_err(|_| ())?;
++        let event = ProducerEvent {
++            sequence: 0,
++            event_time: crate::unix_millis_now().map_err(|_| ())?,
++            kind: EventKind::Log,
++            level: match record.level() {
++                log::Level::Error => EventLevel::Error,
++                log::Level::Warn => EventLevel::Warn,
++                log::Level::Info => EventLevel::Info,
++                log::Level::Debug => EventLevel::Debug,
++                log::Level::Trace => EventLevel::Trace,
++            },
++            name: "log".into(),
++            target: bounded_text(record.target())?,
++            fields: fields.finish()?,
++            context: Vec::new(),
++            span: None,
++            follows_from: None,
++        };
++        crate::logging::in_current_span(event, &self.slots)
++    }
++}
++
++/// Use `log::set_boxed_logger(Box::new(console.clone()))` and set the desired
++/// `log::set_max_level` in an application that owns the process logger.
++impl log::Log for Console {
++    fn enabled(&self, _: &log::Metadata<'_>) -> bool {
++        true
++    }
++
++    fn log(&self, record: &log::Record<'_>) {
++        match self.capture_record(record) {
++            Ok(event) => self.emit(event),
++            Err(()) => self.capture_failed(),
++        }
++    }
++
++    fn flush(&self) {
++        // The synchronous facade has no result channel. A deliberate flush may wait for a
++        // slow console even inside a Tokio task, so the async API is preferable there.
++        let _ = self.flush_sync(false);
++    }
++}
+diff --git crates/sparrow-client/src/console/render.rs crates/sparrow-client/src/console/render.rs
+new file mode 100644
+index 0000000..57ba47a
+--- /dev/null
++++ crates/sparrow-client/src/console/render.rs
+@@ -0,0 +1,130 @@
++// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++use crate::{EventField, EventLevel, FieldValue, ProducerEvent};
++use std::{
++    fmt,
++    io::{self, Write},
++};
++
++struct Visible<'a>(&'a str, bool);
++const CONTINUATION: &str = "\n                  │ ";
++
++impl fmt::Display for Visible<'_> {
++    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
++        use fmt::Write as _;
++        for ch in self.0.chars() {
++            match ch {
++                '\n' if self.1 => out.write_str(CONTINUATION)?,
++                ch if ch.is_control() => write!(out, "{}", ch.escape_default())?,
++                ch => out.write_char(ch)?,
++            }
++        }
++        Ok(())
++    }
++}
++
++fn value(out: &mut Vec<u8>, field: &FieldValue) -> io::Result<()> {
++    match field {
++        FieldValue::Text(s) | FieldValue::Debug(s) | FieldValue::Error(s) => {
++            write!(out, "{}", Visible(s, false))
++        }
++        FieldValue::Signed(n) => write!(out, "{n}"),
++        FieldValue::Unsigned(n) => write!(out, "{n}"),
++        FieldValue::Signed128(n) => write!(out, "{n}"),
++        FieldValue::Unsigned128(n) => write!(out, "{n}"),
++        FieldValue::Float64Bits(bits) => write!(out, "{}", f64::from_bits(*bits)),
++        FieldValue::Boolean(flag) => write!(out, "{flag}"),
++        FieldValue::Bytes(bytes) => write!(out, "0x{}", purrdf_hash::hex::encode(bytes)),
++    }
++}
++
++pub(super) struct Line {
++    event_time: u64,
++    level: EventLevel,
++    target: String,
++    name: String,
++    fields: Vec<EventField>,
++    span: Option<String>,
++}
++
++impl Line {
++    // The local queue owns only what it prints. Copy no ancestry or span fields, and
++    // transfer the event's allocations outright when the console is its only destination.
++    pub(super) fn capture(event: &mut ProducerEvent, retain: bool) -> Self {
++        let span = event.context.last().map(|span| span.name.clone());
++        let (name, target, fields) = if retain {
++            (
++                event.name.clone(),
++                event.target.clone(),
++                event.fields.clone(),
++            )
++        } else {
++            (
++                std::mem::take(&mut event.name),
++                std::mem::take(&mut event.target),
++                std::mem::take(&mut event.fields),
++            )
++        };
++        Self {
++            event_time: event.event_time,
++            level: event.level,
++            target,
++            name,
++            fields,
++            span,
++        }
++    }
++}
++
++pub(super) fn line(out: &mut Vec<u8>, event: &Line, color: bool) -> io::Result<()> {
++    let sec = event.event_time / 1000;
++    let (label, style) = match event.level {
++        EventLevel::Trace => ("TRACE", "\x1b[2m"),
++        EventLevel::Debug => ("DEBUG", "\x1b[36m"),
++        EventLevel::Info => ("INFO", "\x1b[32m"),
++        EventLevel::Warn => ("WARN", "\x1b[1;33m"),
++        EventLevel::Error => ("ERROR", "\x1b[1;31m"),
++    };
++    let dim = if color { "\x1b[2m" } else { "" };
++    let reset = if color { "\x1b[0m" } else { "" };
++    let style = if color { style } else { "" };
++    write!(
++        out,
++        "{dim}{:02}:{:02}:{:02}{reset}  {style}{label:<5}{reset}  {dim}{}{reset}  ",
++        sec / 3600 % 24,
++        sec / 60 % 60,
++        sec % 60,
++        Visible(&event.target, false)
++    )?;
++    let message = event.fields.iter().position(|f| f.name == "message");
++    let text = match message.map(|i| &event.fields[i].value) {
++        Some(FieldValue::Text(s) | FieldValue::Debug(s) | FieldValue::Error(s)) => Some(s.as_str()),
++        None => Some(event.name.as_str()),
++        Some(other) => {
++            value(out, other)?;
++            None
++        }
++    };
++    let mut continuation = None;
++    if let Some(text) = text {
++        let (first, detail) = text
++            .split_once('\n')
++            .map_or((text, None), |(a, b)| (a, Some(b)));
++        write!(out, "{}", Visible(first, false))?;
++        continuation = detail;
++    }
++    for (idx, field) in event.fields.iter().enumerate() {
++        if Some(idx) != message {
++            write!(out, "  {dim}{}={reset}", Visible(&field.name, false))?;
++            value(out, &field.value)?;
++        }
++    }
++    if let Some(span) = &event.span {
++        write!(out, "  {dim}in {}{reset}", Visible(span, false))?;
++    }
++    if let Some(details) = continuation {
++        write!(out, "{CONTINUATION}{}", Visible(details, true))?;
++    }
++    writeln!(out)
++}
+diff --git crates/sparrow-client/src/console/stream.rs crates/sparrow-client/src/console/stream.rs
+new file mode 100644
+index 0000000..9ea1923
+--- /dev/null
++++ crates/sparrow-client/src/console/stream.rs
+@@ -0,0 +1,220 @@
++// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++use super::{Command, Console, worker_closed};
++use crate::{EventField, EventKind, EventLevel, FieldValue, ProducerEvent, logging::TEXT_LIMIT};
++use std::io::{self, Write};
++use tokio::{
++    io::{AsyncBufReadExt, AsyncRead, BufReader},
++    sync::mpsc::{Permit, error::TrySendError},
++};
++
++/// The original local output stream, also attached to the structured observation.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ConsoleStream {
++    /// Standard output, including command product bytes.
++    Stdout,
++    /// Standard error, including diagnostics.
++    Stderr,
++}
++
++impl ConsoleStream {
++    fn label(self) -> &'static str {
++        match self {
++            Self::Stdout => "stdout",
++            Self::Stderr => "stderr",
++        }
++    }
++}
++
++impl Console {
++    /// Capture complete lines or bounded fragments from explicit writes, including invalid UTF-8.
++    #[must_use]
++    pub fn writer(&self, stream: ConsoleStream) -> ConsoleWriter {
++        ConsoleWriter {
++            console: self.clone(),
++            stream,
++            fragment: Fragment::default(),
++        }
++    }
++
++    /// Forward the original bytes of a selected pipe to its named local stream and capture each
++    /// line in order. Long lines split after 4096 bytes. A full local queue backpressures reading.
++    pub async fn tee(
++        &self,
++        stream: ConsoleStream,
++        reader: impl AsyncRead + Unpin,
++    ) -> io::Result<u64> {
++        let mut reader = BufReader::new(reader);
++        let mut writer = self.writer(stream);
++        let mut read = 0_u64;
++        loop {
++            let input = reader.fill_buf().await?;
++            if input.is_empty() {
++                break;
++            }
++            // This poll observed bytes from the pipe. Capture its context before waiting
++            // for a local writer permit; a future can resume under another subscriber.
++            writer.fragment.observe_start(self, stream);
++            let slot = self.tx.reserve().await.map_err(|_| worker_closed())?;
++            let n = writer.fragment.forward(self, stream, input, slot);
++            reader.consume(n);
++            read = read
++                .checked_add(n as u64)
++                .ok_or_else(|| io::Error::other("console stream offset exhausted"))?;
++        }
++        writer.fragment.deliver(self);
++        Ok(read)
++    }
++
++    /// Drain a child's piped stdout and stderr concurrently. Unpiped streams keep their original
++    /// routing. The caller retains ownership of the child and awaits its exit status.
++    pub async fn tee_child(&self, child: &mut tokio::process::Child) -> io::Result<()> {
++        let stdout = child.stdout.take();
++        let stderr = child.stderr.take();
++        let out = async {
++            if let Some(pipe) = stdout {
++                self.tee(ConsoleStream::Stdout, pipe).await?;
++            }
++            Ok::<_, io::Error>(())
++        };
++        let err = async {
++            if let Some(pipe) = stderr {
++                self.tee(ConsoleStream::Stderr, pipe).await?;
++            }
++            Ok::<_, io::Error>(())
++        };
++        // A failure on one stream still permits the other stream to reach EOF.
++        let (out, err) = tokio::join!(out, err);
++        out.and(err)
++    }
++}
++
++/// A line-oriented `Write` adapter. A full console queue returns `WouldBlock` before consuming
++/// the next complete fragment. Call `flush` to publish a final partial line and drain both streams.
++/// A checked flush already in progress also makes a synchronous writer flush return
++/// `WouldBlock`, even with room in the queue.
++pub struct ConsoleWriter {
++    console: Console,
++    stream: ConsoleStream,
++    fragment: Fragment,
++}
++
++impl Write for ConsoleWriter {
++    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
++        if input.is_empty() {
++            return Ok(0);
++        }
++        let slot = self.console.tx.try_reserve().map_err(reservation_error)?;
++        self.fragment.observe_start(&self.console, self.stream);
++        Ok(self
++            .fragment
++            .forward(&self.console, self.stream, input, slot))
++    }
++
++    fn flush(&mut self) -> io::Result<()> {
++        self.fragment.deliver(&self.console);
++        self.console.flush_sync(true)?;
++        Ok(())
++    }
++}
++
++impl Drop for ConsoleWriter {
++    fn drop(&mut self) {
++        self.fragment.deliver(&self.console);
++    }
++}
++
++fn reservation_error(error: TrySendError<()>) -> io::Error {
++    match error {
++        TrySendError::Full(()) => {
++            io::Error::new(io::ErrorKind::WouldBlock, "Sparrow console queue is full")
++        }
++        TrySendError::Closed(()) => worker_closed(),
++    }
++}
++
++#[derive(Default)]
++struct Fragment {
++    bytes: Vec<u8>,
++    observation: Option<Result<ProducerEvent, ()>>,
++}
++
++impl Fragment {
++    fn prefix(&self, input: &[u8]) -> (usize, bool) {
++        let available = TEXT_LIMIT - self.bytes.len();
++        let input = &input[..input.len().min(available)];
++        if let Some(newline) = input.iter().position(|b| *b == b'\n') {
++            (newline + 1, true)
++        } else {
++            (input.len(), input.len() == available)
++        }
++    }
++
++    fn forward(
++        &mut self,
++        console: &Console,
++        stream: ConsoleStream,
++        input: &[u8],
++        slot: Permit<'_, Command>,
++    ) -> usize {
++        let (n, ready) = self.prefix(input);
++        let bytes = &input[..n];
++        slot.send(Command::Raw(stream, bytes.to_vec()));
++        if console.delivery().is_some() {
++            self.bytes.extend_from_slice(bytes);
++            if ready {
++                self.deliver(console);
++            }
++        }
++        n
++    }
++
++    fn observe_start(&mut self, console: &Console, stream: ConsoleStream) {
++        if self.bytes.is_empty() && console.delivery().is_some() {
++            self.observation = Some(Self::begin(console, stream));
++        }
++    }
++
++    fn begin(console: &Console, stream: ConsoleStream) -> Result<ProducerEvent, ()> {
++        let event = ProducerEvent {
++            sequence: 0,
++            event_time: crate::unix_millis_now().map_err(|_| ())?,
++            kind: EventKind::Log,
++            level: EventLevel::Info,
++            name: "stdio".into(),
++            target: "stdio".into(),
++            fields: vec![EventField {
++                name: "stream".into(),
++                value: FieldValue::Text(stream.label().into()),
++            }],
++            context: Vec::new(),
++            span: None,
++            follows_from: None,
++        };
++        crate::logging::in_current_span(event, &console.slots)
++    }
++
++    fn deliver(&mut self, console: &Console) {
++        let observation = self.observation.take();
++        let bytes = std::mem::take(&mut self.bytes);
++        if bytes.is_empty() {
++            return;
++        }
++        match (observation, console.delivery()) {
++            (Some(Ok(mut event)), Some(delivery)) => {
++                let message = match String::from_utf8(bytes) {
++                    Ok(text) => FieldValue::Text(text),
++                    Err(binary) => FieldValue::Bytes(binary.into_bytes()),
++                };
++                event.fields.push(EventField {
++                    name: "message".into(),
++                    value: message,
++                });
++                delivery.try_send(event);
++            }
++            (Some(Err(())), _) => console.capture_failed(),
++            _ => {}
++        }
++    }
++}
+diff --git crates/sparrow-client/src/console/tests.rs crates/sparrow-client/src/console/tests.rs
+new file mode 100644
+index 0000000..c589aa7
+--- /dev/null
++++ crates/sparrow-client/src/console/tests.rs
+@@ -0,0 +1,172 @@
++// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++use super::*;
++use std::fs::{File, read};
++use tracing_subscriber::prelude::*;
++
++/// A pipe keeps its original bytes and stream identity across partial lines and EOF,
++/// including output from both sides of a child in standalone mode.
++#[tokio::test]
++async fn standalone_child_and_partial_writer_keep_exact_output() {
++    let dir = tempfile::tempdir().unwrap();
++    let stdout = dir.path().join("stdout");
++    let stderr = dir.path().join("stderr");
++    let console = Console::with_writers(
++        None,
++        File::create(&stdout).unwrap(),
++        File::create(&stderr).unwrap(),
++        false,
++    )
++    .unwrap();
++    let mut child = tokio::process::Command::new("sh")
++        .args(["-c", r#"printf 'one\n\377tail'; printf 'two\nlast' >&2"#])
++        .stdout(std::process::Stdio::piped())
++        .stderr(std::process::Stdio::piped())
++        .spawn()
++        .unwrap();
++    console.tee_child(&mut child).await.unwrap();
++    assert!(child.wait().await.unwrap().success());
++    let mut writer = console.writer(ConsoleStream::Stdout);
++    let tail = vec![b'v'; crate::logging::TEXT_LIMIT + 17];
++    writer.write_all(&tail).unwrap();
++    futures::executor::block_on(async { writer.flush().unwrap() });
++    tracing::subscriber::with_default(tracing_subscriber::registry().with(console.layer()), || {
++        tracing::warn!(target: "app", retries = 2_u64, "Retry deferred\nI/O failure\x1b");
++    });
++    let stats = console.flush().await.unwrap();
++    let mut expected = b"one\n\xfftail".to_vec();
++    expected.extend_from_slice(&tail);
++    assert_eq!(read(stdout).unwrap(), expected);
++    let errors = std::fs::read_to_string(stderr).unwrap();
++    assert!(errors.starts_with("two\nlast"));
++    assert!(
++        errors.contains(
++            "WARN   app  Retry deferred  retries=2\n                  │ I/O failure\\u{1b}"
++        ),
++        "{errors:?}"
++    );
++    assert!(!errors.contains('\x1b'));
++    assert_eq!(stats.displayed, 7);
++    assert_eq!(stats.invalid + stats.refused + stats.write_errors, 0);
++}
++
++/// A stalled terminal cannot stall tracing callers. Overflow stays visible and the next
++/// local fence reports an output error after admitted observations reach the writer.
++#[tokio::test]
++async fn slow_broken_terminal_counts_overflow_and_preserves_error() {
++    use std::sync::mpsc as sync;
++    struct Slow {
++        entered: sync::Sender<()>,
++        release: sync::Receiver<()>,
++        first: bool,
++    }
++    impl Write for Slow {
++        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++            if self.first {
++                self.first = false;
++                self.entered.send(()).unwrap();
++                self.release
++                    .recv_timeout(std::time::Duration::from_secs(5))
++                    .unwrap();
++                return Err(io::ErrorKind::BrokenPipe.into());
++            }
++            Ok(bytes.len())
++        }
++        fn flush(&mut self) -> io::Result<()> {
++            Ok(())
++        }
++    }
++    let (entered, waiting) = sync::channel();
++    let (release, resume) = sync::channel();
++    let console = Console::with_writers(
++        None,
++        io::sink(),
++        Slow {
++            entered,
++            release: resume,
++            first: true,
++        },
++        false,
++    )
++    .unwrap();
++    tracing::subscriber::with_default(tracing_subscriber::registry().with(console.layer()), || {
++        tracing::info!("first");
++        waiting
++            .recv_timeout(std::time::Duration::from_secs(5))
++            .unwrap();
++        for _ in 0..=QUEUE_CAPACITY {
++            tracing::info!("burst");
++        }
++        assert_eq!(console.stats().refused, 1);
++        release.send(()).unwrap();
++    });
++    assert_eq!(
++        console.flush().await.unwrap_err().kind(),
++        io::ErrorKind::BrokenPipe
++    );
++    assert_eq!(console.stats().displayed, QUEUE_CAPACITY as u64);
++    assert_eq!(console.stats().write_errors, 1);
++}
++
++/// A checked fence only acknowledges an output error when the caller polls its response.
++/// Cancelling it after the worker replied lets the next concurrent caller observe the error.
++#[tokio::test]
++async fn cancelled_completed_flush_preserves_error_for_waiting_caller() {
++    use std::sync::mpsc as sync;
++    let (hold, resume) = sync::channel();
++    let (processed, observed) = sync::channel();
++    struct Writer {
++        resume: Option<sync::Receiver<()>>,
++        processed: sync::Sender<()>,
++        writes: usize,
++    }
++    impl Write for Writer {
++        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++            self.writes += 1;
++            if self.writes == 1 {
++                return Err(io::ErrorKind::BrokenPipe.into());
++            }
++            self.processed.send(()).unwrap();
++            Ok(bytes.len())
++        }
++        fn flush(&mut self) -> io::Result<()> {
++            if let Some(resume) = self.resume.take() {
++                resume
++                    .recv_timeout(std::time::Duration::from_secs(5))
++                    .unwrap();
++            }
++            Ok(())
++        }
++    }
++    let console = Console::with_writers(
++        None,
++        io::sink(),
++        Writer {
++            resume: Some(resume),
++            processed,
++            writes: 0,
++        },
++        false,
++    )
++    .unwrap();
++    let mut writer = console.writer(ConsoleStream::Stderr);
++    writer.write_all(b"first\n").unwrap();
++    let mut cancelled = Box::pin(console.flush());
++    assert!(futures::poll!(cancelled.as_mut()).is_pending());
++    let mut next = Box::pin(console.flush());
++    assert!(futures::poll!(next.as_mut()).is_pending());
++    hold.send(()).unwrap();
++    writer.write_all(b"prompt without newline").unwrap();
++    observed
++        .recv_timeout(std::time::Duration::from_secs(5))
++        .unwrap();
++    assert_eq!(
++        writer.flush().unwrap_err().kind(),
++        io::ErrorKind::WouldBlock
++    );
++    log::Log::flush(&console);
++    drop(cancelled);
++    assert_eq!(next.await.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
++    assert_eq!(console.flush().await.unwrap().write_errors, 1);
++}
+diff --git crates/sparrow-client/src/lib.rs crates/sparrow-client/src/lib.rs
+index 2b52e1c..c5ef42c 100644
+--- crates/sparrow-client/src/lib.rs
++++ crates/sparrow-client/src/lib.rs
+@@ -3,7 +3,21 @@
+ 
+ //! Typed Sparrow producer access over Unix or public TCP, without a database dependency.
+ //!
+-//! Run the client inside a Tokio `LocalSet`; Cap'n Proto capabilities stay on its
++//! A Rust application can start with a local console and configure delivery by passing
++//! `Some(delivery)` to [`Console::install`]. An application composing its own subscriber
++//! can attach [`Console::layer`] instead.
++//!
++//! ```no_run
++//! # async fn example() -> std::io::Result<()> {
++//! let console = sparrow_client::Console::install(None)?;
++//! let files = 12;
++//! sparrow_client::sparrow_eprintln!("Read {files} files");
++//! console.flush().await?;
++//! # Ok(())
++//! # }
++//! ```
++//!
++//! Run the low-level [`Client`] inside a Tokio `LocalSet`; Cap'n Proto capabilities stay on its
+ //! owning task. A retry must reuse the original request ID, source, format and bytes.
+ //!
+ //! ```no_run
+@@ -67,16 +81,31 @@ pub use events::{
+     MAX_EVENT_BYTES, MAX_EVENT_FIELDS, MAX_EVENT_SPANS, ProducerEvent,
+     read_wide as decode_wide_integer, wide as encode_wide_integer,
+ };
++mod console;
+ mod delivery;
+ mod producer_config;
+ pub use producer_config::ConfigError;
+ mod logging;
+ mod quarantine;
+ mod replay;
++pub use console::{Console, ConsoleStats, ConsoleStream, ConsoleWriter};
+ pub use delivery::{
+     Admission, Delivery, DeliveryConfig, DeliveryStats, DeliveryWatermark, DropReason, FlushError,
+ };
+ pub use logging::TracingLayer;
++
++#[doc(hidden)]
++pub use tracing as __tracing;
++
++/// Emit a stderr-labelled, INFO-level structured event through the current subscriber.
++/// Accepts the same formatting arguments and captured identifiers as `eprintln!`.
++#[macro_export]
++macro_rules! sparrow_eprintln {
++    () => { $crate::sparrow_eprintln!("") };
++    ($($arg:tt)*) => {
++        $crate::__tracing::info!(stream = "stderr", message = %format_args!($($arg)*))
++    };
++}
+ pub use replay::{ReplayReceipt, replay_quarantine};
+ 
+ pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
+diff --git crates/sparrow-client/src/logging.rs crates/sparrow-client/src/logging.rs
+index 73fa806..2c1d5eb 100644
+--- crates/sparrow-client/src/logging.rs
++++ crates/sparrow-client/src/logging.rs
+@@ -3,7 +3,9 @@
+ 
+ //! Bounded tracing capture feeding the single producer delivery path.
+ 
+-use crate::{Delivery, EventField, EventKind, EventLevel, EventSpan, FieldValue, ProducerEvent};
++use crate::{
++    Console, Delivery, EventField, EventKind, EventLevel, EventSpan, FieldValue, ProducerEvent,
++};
+ use std::{
+     fmt::{self, Write},
+     sync::{
+@@ -18,7 +20,7 @@ use tracing::{
+ };
+ use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
+ 
+-const TEXT_LIMIT: usize = 4096;
++pub(super) const TEXT_LIMIT: usize = 4096;
+ const FIELD_BYTES: usize = 16 * 1024;
+ const SPAN_BYTES: usize = 16 * 1024;
+ const LIVE_SPANS: usize = 1024;
+@@ -32,10 +34,15 @@ const LIVE_SPANS: usize = 1024;
+ /// Capture failures enter `Delivery`'s drop counters and prevent a clean flush fence.
+ /// User-defined formatters still control their own computation and allocations.
+ pub struct TracingLayer {
+-    delivery: Delivery,
++    output: Output,
+     slots: Arc<AtomicUsize>,
+ }
+ 
++enum Output {
++    Remote(Delivery),
++    Console(Console),
++}
++
+ struct SpanCapture {
+     owner: Arc<AtomicUsize>,
+     held: bool,
+@@ -54,21 +61,38 @@ impl TracingLayer {
+     /// Share the existing delivery worker and its diagnostics/fences.
+     pub fn new(delivery: Delivery) -> Self {
+         Self {
+-            delivery,
++            output: Output::Remote(delivery),
+             slots: Arc::new(AtomicUsize::new(0)),
+         }
+     }
+ 
++    pub(super) fn with_console(console: Console) -> Self {
++        Self {
++            slots: console.slots.clone(),
++            output: Output::Console(console),
++        }
++    }
++
++    fn capture_failed(&self) {
++        match &self.output {
++            Output::Remote(delivery) => delivery.capture_failed(),
++            Output::Console(console) => console.capture_failed(),
++        }
++    }
++
+     /// The admission result is not returned to the subscriber: a tracing layer has no caller
+     /// to tell, and logging a drop from inside the log path would feed the queue it is
+     /// reporting on. Every refusal is nevertheless visible: `try_send` counts it by reason in
+     /// `Delivery::stats`, and the next flush or shutdown returns it as `FlushError::Dropped`.
+     fn emit(&self, event: Result<ProducerEvent, ()>) {
+         match event {
+-            Ok(event) => {
+-                self.delivery.try_send(event);
+-            }
+-            Err(()) => self.delivery.capture_failed(),
++            Ok(event) => match &self.output {
++                Output::Console(console) => console.emit(event),
++                Output::Remote(delivery) => {
++                    delivery.try_send(event);
++                }
++            },
++            Err(()) => self.capture_failed(),
+         }
+     }
+ 
+@@ -102,32 +126,8 @@ impl TracingLayer {
+             span: id.map(|id| self.span_identity(id, ctx)).transpose()?,
+             follows_from: follows.map(|id| self.span_identity(id, ctx)).transpose()?,
+         };
+-        let mut bytes = event.admission_bytes().map_err(|_| ())?;
+-        if let Some(id) = id {
+-            let span = ctx.span(id).ok_or(())?;
+-            // Walk leaf-to-root: Scope::from_root would first collect an unbounded ancestry.
+-            for span in span.scope() {
+-                if event.context.len() == crate::MAX_EVENT_SPANS {
+-                    return Err(());
+-                }
+-                let extensions = span.extensions();
+-                let capture = extensions.get::<SpanCapture>().ok_or(())?;
+-                if !Arc::ptr_eq(&capture.owner, &self.slots)
+-                    || capture.invalid.load(Ordering::SeqCst)
+-                {
+-                    return Err(());
+-                }
+-                let snapshot = capture.snapshot.try_lock().map_err(|_| ())?;
+-                let snapshot = snapshot.as_ref().ok_or(())?;
+-                bytes += snapshot.admission_bytes().map_err(|_| ())?;
+-                if bytes > crate::MAX_EVENT_BYTES {
+-                    return Err(());
+-                }
+-                event.context.push(snapshot.clone());
+-            }
+-            event.context.reverse();
+-        }
+-        event.admission_bytes().map_err(|_| ())?;
++        let span = id.map(|id| ctx.span(id).ok_or(())).transpose()?;
++        with_span(&mut event, &self.slots, span)?;
+         Ok(event)
+     }
+ 
+@@ -154,6 +154,13 @@ impl TracingLayer {
+     where
+         S: Subscriber + for<'a> LookupSpan<'a>,
+     {
++        // Instrumented futures enter and exit on each poll. The registry maintains current
++        // scope, and a standalone terminal displays neither of these observations.
++        if matches!(kind, EventKind::SpanEnter | EventKind::SpanExit)
++            && matches!(&self.output, Output::Console(console) if console.delivery().is_none())
++        {
++            return;
++        }
+         let result = ctx.span(id).ok_or(()).and_then(|span| {
+             self.observation(span.metadata(), kind, Vec::new(), Some(id), follows, &ctx)
+         });
+@@ -167,7 +174,7 @@ where
+ {
+     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+         let Some(span) = ctx.span(id) else {
+-            self.delivery.capture_failed();
++            self.capture_failed();
+             return;
+         };
+         let held = self
+@@ -177,7 +184,7 @@ where
+             })
+             .is_ok();
+         if !held {
+-            self.delivery.capture_failed();
++            self.capture_failed();
+             return;
+         }
+         let snapshot = (|| {
+@@ -195,7 +202,14 @@ where
+                     .or_else(|| ctx.current_span().id().cloned())
+             };
+             let snapshot = EventSpan {
+-                id: self.delivery.next_span_id().map_err(|_| ())?,
++                id: match &self.output {
++                    Output::Remote(delivery) => Some(delivery),
++                    Output::Console(console) => console.delivery(),
++                }
++                .map_or_else(
++                    || Ok(id.into_u64()),
++                    |delivery| delivery.next_span_id().map_err(|_| ()),
++                )?,
+                 parent: parent
+                     .as_ref()
+                     .map(|parent| self.span_identity(parent, &ctx))
+@@ -212,7 +226,7 @@ where
+             if held {
+                 self.slots.fetch_sub(1, Ordering::SeqCst);
+             }
+-            self.delivery.capture_failed();
++            self.capture_failed();
+             return;
+         }
+         extensions.insert(SpanCapture {
+@@ -322,10 +336,68 @@ where
+                 capture.invalid.store(true, Ordering::SeqCst);
+             }
+         }
+-        self.delivery.capture_failed();
++        self.capture_failed();
+     }
+ }
+ 
++fn with_span<'a, S>(
++    event: &mut ProducerEvent,
++    slots: &Arc<AtomicUsize>,
++    span: Option<tracing_subscriber::registry::SpanRef<'a, S>>,
++) -> Result<(), ()>
++where
++    S: LookupSpan<'a>,
++{
++    let mut bytes = event.admission_bytes().map_err(|_| ())?;
++    if let Some(span) = span {
++        // Walk leaf-to-root: Scope::from_root would first collect an unbounded ancestry.
++        for span in span.scope() {
++            if event.context.len() == crate::MAX_EVENT_SPANS {
++                return Err(());
++            }
++            let extensions = span.extensions();
++            let capture = extensions.get::<SpanCapture>().ok_or(())?;
++            if !Arc::ptr_eq(&capture.owner, slots) || capture.invalid.load(Ordering::SeqCst) {
++                return Err(());
++            }
++            let snapshot = capture.snapshot.try_lock().map_err(|_| ())?;
++            let snapshot = snapshot.as_ref().ok_or(())?;
++            bytes += snapshot.admission_bytes().map_err(|_| ())?;
++            if bytes > crate::MAX_EVENT_BYTES {
++                return Err(());
++            }
++            event.context.push(snapshot.clone());
++        }
++        event.span = event.context.first().map(|leaf| leaf.id);
++        event.context.reverse();
++    }
++    event.admission_bytes().map_err(|_| ())?;
++    Ok(())
++}
++
++pub(super) fn in_current_span(
++    mut event: ProducerEvent,
++    slots: &Arc<AtomicUsize>,
++) -> Result<ProducerEvent, ()> {
++    tracing::dispatcher::get_default(|dispatch| {
++        let current = dispatch.current_span();
++        let our_layer = dispatch
++            .downcast_ref::<TracingLayer>()
++            .is_some_and(|layer| Arc::ptr_eq(&layer.slots, slots));
++        let span = match (our_layer, current.id()) {
++            (true, Some(id)) => Some(
++                dispatch
++                    .downcast_ref::<tracing_subscriber::Registry>()
++                    .and_then(|registry| registry.span(id))
++                    .ok_or(())?,
++            ),
++            _ => None,
++        };
++        with_span(&mut event, slots, span)
++    })?;
++    Ok(event)
++}
++
+ fn check_snapshot(span: &EventSpan) -> Result<(), ()> {
+     if span.admission_bytes().map_err(|_| ())? > SPAN_BYTES {
+         return Err(());
+@@ -333,7 +405,7 @@ fn check_snapshot(span: &EventSpan) -> Result<(), ()> {
+     Ok(())
+ }
+ 
+-fn bounded_text(value: &str) -> Result<String, ()> {
++pub(super) fn bounded_text(value: &str) -> Result<String, ()> {
+     if value.len() > TEXT_LIMIT {
+         return Err(());
+     }
+@@ -341,20 +413,23 @@ fn bounded_text(value: &str) -> Result<String, ()> {
+ }
+ 
+ #[derive(Default)]
+-struct Fields {
++pub(super) struct Fields {
+     fields: Vec<EventField>,
+     bytes: usize,
+     failed: bool,
+ }
+ impl Fields {
+-    fn finish(self) -> Result<Vec<EventField>, ()> {
++    pub(super) fn failed(&self) -> bool {
++        self.failed
++    }
++    pub(super) fn finish(self) -> Result<Vec<EventField>, ()> {
+         if self.failed {
+             Err(())
+         } else {
+             Ok(self.fields)
+         }
+     }
+-    fn push(&mut self, field: &Field, value: FieldValue) {
++    pub(super) fn push(&mut self, name: &str, value: FieldValue) {
+         if self.failed {
+             return;
+         }
+@@ -363,8 +438,8 @@ impl Fields {
+             FieldValue::Bytes(v) => v.len(),
+             _ => 16,
+         };
+-        let charge = bytes + field.name().len() + 128;
+-        if field.name().len() > TEXT_LIMIT
++        let charge = bytes + name.len() + 128;
++        if name.len() > TEXT_LIMIT
+             || self.fields.len() == crate::MAX_EVENT_FIELDS
+             || charge > FIELD_BYTES - self.bytes
+         {
+@@ -373,13 +448,13 @@ impl Fields {
+         }
+         self.bytes += charge;
+         self.fields.push(EventField {
+-            name: field.name().to_owned(),
++            name: name.to_owned(),
+             value,
+         });
+     }
+     fn text(&mut self, field: &Field, value: Result<String, ()>, kind: fn(String) -> FieldValue) {
+         match value {
+-            Ok(value) => self.push(field, kind(value)),
++            Ok(value) => self.push(field.name(), kind(value)),
+             Err(()) => self.failed = true,
+         }
+     }
+@@ -399,7 +474,7 @@ impl fmt::Write for Render {
+         Ok(())
+     }
+ }
+-fn render(value: fmt::Arguments<'_>) -> Result<String, ()> {
++pub(super) fn render(value: fmt::Arguments<'_>) -> Result<String, ()> {
+     let mut out = Render {
+         text: String::new(),
+         failed: false,
+@@ -414,22 +489,22 @@ fn render(value: fmt::Arguments<'_>) -> Result<String, ()> {
+ 
+ impl Visit for Fields {
+     fn record_i64(&mut self, field: &Field, value: i64) {
+-        self.push(field, FieldValue::Signed(value));
++        self.push(field.name(), FieldValue::Signed(value));
+     }
+     fn record_u64(&mut self, field: &Field, value: u64) {
+-        self.push(field, FieldValue::Unsigned(value));
++        self.push(field.name(), FieldValue::Unsigned(value));
+     }
+     fn record_i128(&mut self, field: &Field, value: i128) {
+-        self.push(field, FieldValue::Signed128(value));
++        self.push(field.name(), FieldValue::Signed128(value));
+     }
+     fn record_u128(&mut self, field: &Field, value: u128) {
+-        self.push(field, FieldValue::Unsigned128(value));
++        self.push(field.name(), FieldValue::Unsigned128(value));
+     }
+     fn record_bool(&mut self, field: &Field, value: bool) {
+-        self.push(field, FieldValue::Boolean(value));
++        self.push(field.name(), FieldValue::Boolean(value));
+     }
+     fn record_f64(&mut self, field: &Field, value: f64) {
+-        self.push(field, FieldValue::Float64Bits(value.to_bits()));
++        self.push(field.name(), FieldValue::Float64Bits(value.to_bits()));
+     }
+     fn record_str(&mut self, field: &Field, value: &str) {
+         if !self.failed {
+@@ -444,7 +519,7 @@ impl Visit for Fields {
+             self.failed = true;
+             return;
+         }
+-        self.push(field, FieldValue::Bytes(value.to_owned()));
++        self.push(field.name(), FieldValue::Bytes(value.to_owned()));
+     }
+     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+         if !self.failed {
+@@ -513,7 +588,14 @@ mod tests {
+                 .with_quarantine_dir(dir.path().join("quarantine")),
+         )
+         .unwrap();
+-        let layer = TracingLayer::new(delivery.clone());
++        let console = Console::with_writers(
++            Some(delivery.clone()),
++            std::io::sink(),
++            std::io::sink(),
++            false,
++        )
++        .unwrap();
++        let layer = console.layer();
+         let slots = layer.slots.clone();
+         let subscriber = tracing_subscriber::registry().with(layer);
+         tracing::subscriber::with_default(subscriber, || {
+@@ -532,6 +614,17 @@ mod tests {
+                 .map(|_| tracing::info_span!("capacity"))
+                 .collect();
+             assert_eq!(slots.load(Ordering::SeqCst), LIVE_SPANS);
++            // A facade record inside the refused span cannot acquire an invented root context.
++            let saturated = spans.last().unwrap().enter();
++            let rejected = console.stats().invalid;
++            log::Log::log(
++                &console,
++                &log::Record::builder()
++                    .args(format_args!("under missing context"))
++                    .build(),
++            );
++            assert_eq!(console.stats().invalid, rejected + 1);
++            drop(saturated);
+             drop(spans);
+             assert_eq!(slots.load(Ordering::SeqCst), 0);
+         });
+diff --git crates/sparrow-server/Cargo.toml crates/sparrow-server/Cargo.toml
+index b18e900..61e9ffa 100644
+--- crates/sparrow-server/Cargo.toml
++++ crates/sparrow-server/Cargo.toml
+@@ -38,6 +38,7 @@ tracing.workspace = true
+ tracing-subscriber.workspace = true
+ 
+ [dev-dependencies]
++log.workspace = true
+ # Sub-second delivery timing for tests only; the production dependency above cannot reach it.
+ sparrow-client = { path = "../sparrow-client", features = ["test-timing"] }
+ sparrow-test-support = { path = "../sparrow-test-support" }
+diff --git crates/sparrow-server/tests/rpc.rs crates/sparrow-server/tests/rpc.rs
+index 4bd2a98..7e4a698 100644
+--- crates/sparrow-server/tests/rpc.rs
++++ crates/sparrow-server/tests/rpc.rs
+@@ -8927,8 +8927,16 @@ async fn tracing_layer_preserves_types_span_updates_and_durable_drop_accounting(
+                 .with_quarantine_dir(dir.path().join("quarantine"));
+             config.flush_interval = Duration::from_secs(60);
+             let delivery = sparrow_client::Delivery::start(config).unwrap();
+-            let subscriber = tracing_subscriber::registry()
+-                .with(sparrow_client::TracingLayer::new(delivery.clone()));
++            let output_path = dir.path().join("console.log");
++            let console = sparrow_client::Console::with_writers(
++                Some(delivery.clone()),
++                std::io::sink(),
++                std::fs::File::create(&output_path).unwrap(),
++                false,
++            )
++            .unwrap();
++            let subscriber = tracing_subscriber::registry().with(console.layer());
++            let mut stdout_writer = console.writer(sparrow_client::ConsoleStream::Stdout);
+             // Separate callback invocations to exercise capture rather than intentionally
+             // contending the worker queue. The fence still audits every refused offer.
+             let settle = || std::thread::sleep(Duration::from_millis(10));
+@@ -8958,6 +8966,18 @@ async fn tracing_layer_preserves_types_span_updates_and_durable_drop_accounting(
+                 }
+                 tracing::info!(parent: None, explicit_root = true);
+                 settle();
++                let captured = 37;
++                sparrow_client::sparrow_eprintln!("console capture {captured}");
++                log::Log::log(
++                    &console,
++                    &log::Record::builder()
++                        .target("worker.facade")
++                        .level(log::Level::Info)
++                        .args(format_args!("Uploaded item"))
++                        .key_values(&[("items", u64::MAX)])
++                        .build(),
++                );
++                std::io::Write::write_all(&mut stdout_writer, &[0xff]).unwrap();
+                 drop(child_entered);
+                 settle();
+                 drop(child);
+@@ -8967,6 +8987,8 @@ async fn tracing_layer_preserves_types_span_updates_and_durable_drop_accounting(
+                 drop(root);
+                 settle();
+             });
++            // Finish the same fragment after the producing span and subscriber have exited.
++            std::io::Write::write_all(&mut stdout_writer, b"\n").unwrap();
+             let watermark =
+                 reached_delivery(delivery_barrier(&delivery, true, Duration::from_secs(5)).await);
+             let stats = delivery.stats().unwrap();
+@@ -8978,6 +9000,31 @@ async fn tracing_layer_preserves_types_span_updates_and_durable_drop_accounting(
+                 let calls = state.calls.borrow();
+                 let events: Vec<_> = calls.iter().flat_map(|batch| &batch.events).collect();
+                 assert_eq!(events.len() as u64, watermark.durable_events);
++                assert_eq!(
++                    events
++                        .iter()
++                        .filter(
++                            |event| event.fields.iter().any(|field| field.name == "message"
++                                && field.value == FieldValue::Debug("console capture 37".into()))
++                        )
++                        .count(),
++                    1
++                );
++                let facade = events
++                    .iter()
++                    .find(|event| event.target == "worker.facade")
++                    .unwrap();
++                assert_eq!(facade.context.last().unwrap().name, "child");
++                assert!(
++                    facade.fields.iter().any(|field| field.name == "items"
++                        && field.value == FieldValue::Unsigned(u64::MAX))
++                );
++                let stdout = events.iter().find(|event| event.name == "stdio").unwrap();
++                assert_eq!(stdout.span, facade.span);
++                assert!(stdout.fields.iter().any(|field| field.name == "stream"
++                    && field.value == FieldValue::Text("stdout".into())));
++                assert!(stdout.fields.iter().any(|field| field.name == "message"
++                    && field.value == FieldValue::Bytes(vec![0xff, b'\n'])));
+                 let typed = events
+                     .iter()
+                     .find(|event| event.target == "typed.capture")
+@@ -9037,6 +9084,11 @@ async fn tracing_layer_preserves_types_span_updates_and_durable_drop_accounting(
+                     );
+                 }
+             }
++            assert_eq!(console.flush().await.unwrap().refused, 0);
++            let output = std::fs::read_to_string(output_path).unwrap();
++            assert_eq!(output.matches("console capture 37").count(), 1);
++            assert_eq!(output.matches("typed tracing observation").count(), 3);
++            assert_eq!(output.matches("Uploaded item").count(), 1);
+             let response = backend
+                 .client
+                 .status_request()
+diff --git docs/interfaces.md docs/interfaces.md
+index 4ac7478..e888d9b 100644
+--- docs/interfaces.md
++++ docs/interfaces.md
+@@ -4833,6 +4833,71 @@ that remap cloned span IDs are refused visibly rather than silently rewriting
+ identities. The normal Registry preserves IDs. Application formatters and the
+ subscriber's own bookkeeping remain application-controlled; the layer bounds its
+ own buffers and uses nonblocking access to its snapshot and delivery state.
++### Developer console
++
++Start a bounded console with `Console::start(None)` for local output or
++`Console::start(Some(delivery.clone()))` to send the same structured observations to
++Sparrow. Standalone operation opens stdout and stderr for display and starts one output
++thread. All socket, spool and retry activity belongs to a configured delivery handle.
++The application owns its subscriber and selects its filters.
++
++```rust
++use sparrow_client::{Console, sparrow_eprintln};
++let console = Console::install(None)?;
++let files = 12;
++sparrow_eprintln!("Reading {files} files");
++tracing::info!(files, bytes = 847216_u64, "Import complete");
++let local = console.flush().await?;
++```
++
++`Console::install` explicitly installs the application's global tracing subscriber.
++An existing subscriber returns `AlreadyExists`. Compose `console.layer()` with
++an existing subscriber during application setup. The process logger is a separate choice.
++
++Terminal output on stderr shows UTC time, aligned severity, target, message,
++ordered fields and the current span name. Multiline messages indent their
++continuations. Redirected diagnostics use plain text. A nonempty `NO_COLOR`
++disables terminal styling. Control characters in formatted fields are escaped.
++The formatter runs after capture and its styling is local. The namespaced
++`sparrow_eprintln!` macro emits an INFO event with a `stream` field of
++`stderr` and accepts Rust format strings with captured identifiers.
++
++To collect the Rust `log` facade, register a clone of the console with
++`log::set_boxed_logger` and select a level with `log::set_max_level`.
++Use one logger for facade events. Enabling tracing's `log-always` feature mirrors
++tracing observations into `log` even with an active subscriber. Applications
++that install both Sparrow adapters must leave that mirroring disabled to keep
++one stored and displayed observation per tracing call. The visitor preserves
++integer widths, signedness, floating-point bits, booleans and strings.
++Facade records and explicit writes inside a span inherit the context of this
++console's layer on a `tracing_subscriber::Registry`. Tracing events use their
++subscriber's own declared parent and span context.
++
++Log callbacks enqueue bounded observations. The local output queue holds up to
++64 items, each subject to the producer's event bound. A slow terminal can fill
++this queue. `Console::stats` reports successful writes, local queue refusals,
++invalid captures and write errors. Remote admission proceeds independently and
++has its own counters. `Console::flush().await` drains earlier admitted local
++output, flushes both streams and returns the local counts or the output error.
++Use the producer's barrier for remote receipts.
++
++`Console::writer(ConsoleStream::Stdout)` and the stderr equivalent implement
++`std::io::Write`. They forward original bytes to the named local stream as they
++arrive, including a prompt without a newline. Structured capture produces
++one record per newline or 4096-byte fragment. The message holds exact text or,
++for invalid UTF-8, the original binary field. The newline belongs to the
++record. The fragment keeps the event time and span context of its first accepted
++byte across later writes, a context change, flushing and queue backpressure.
++A full queue returns `WouldBlock` before taking more input.
++Flush the writer to finish a partial line and check the outcome.
++A synchronous writer flush encountering an active checked fence returns
++`WouldBlock`. Concurrent asynchronous flushes await their turn.
++For pipes, `Console::tee` awaits capacity while reading. `tee_child` drains
++a child's selected piped stdout and stderr concurrently to EOF. The caller
++retains the child process and reads its exit status. The
++`sparrow-client --example console` example runs with zero arguments for local
++display or an explicit endpoint for delivery.
++
+ ### Tracing relationship observations (schema 59)
+ 
+ Source schema 59 adds occurrence-owned tracing RDF to typed producer records.
+diff --git helpers-ledger.toml helpers-ledger.toml
+index f34adf4..1600b79 100644
+--- helpers-ledger.toml
++++ helpers-ledger.toml
+@@ -1403,7 +1403,7 @@ names = ['^(allocate_tracing_span_id|allocate_direct_span_id)$']
+ 
+ [[job]]
+ id = "producer-tracing-field-admission"
+-summary = "One typed visitor owner applies field-count and captured-byte bounds before admitting owned fields."
++summary = "Tracing and log facade visitors share one field-count and captured-byte bound before admitting owned fields."
+ home = "sparrow_client::logging::Fields::push"
+ entry_points = []
+ spec = "docs/interfaces.md: bounded Rust field capture."
+@@ -1429,6 +1429,34 @@ constants = []
+ fingerprints = []
+ names = ['^(capture_direct_tracing_event|capture_alternate_span_context)$']
+ 
++[[job]]
++id = "developer-console-display"
++summary = "Structured producers share one human-readable severity, message and field formatter on the bounded console output thread."
++home = "sparrow_client::console::render::line"
++entry_points = ["sparrow_client::Console::layer"]
++spec = "docs/interfaces.md: Developer console."
++vectors = ["crates/sparrow-server/tests/rpc.rs"]
++bench = []
++enforced = true
++[job.forbidden]
++constants = []
++fingerprints = []
++names = ['^(render_alternate_console_event|format_separate_log_record)$']
++
++[[job]]
++id = "explicit-console-streams"
++summary = "Explicit writers and piped child output share the same raw fragment, stream label and optional producer observation."
++home = "sparrow_client::console::stream::Fragment::forward"
++entry_points = ["sparrow_client::Console::writer", "sparrow_client::Console::tee"]
++spec = "docs/interfaces.md: Developer console."
++vectors = ["crates/sparrow-client/src/console/tests.rs", "crates/sparrow-server/tests/rpc.rs"]
++bench = []
++enforced = true
++[job.forbidden]
++constants = []
++fingerprints = []
++names = ['^(make_second_console_fragment|recapture_child_log_line)$']
++
+ [[job]]
+ id = "producer-span-charge"
+ summary = "Price owned span snapshots once for event admission and bounded tracing state."

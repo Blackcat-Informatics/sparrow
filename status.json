@@ -1,0 +1,79 @@
+{
+  "issue": 9,
+  "pr_number": 469,
+  "branch": "paudley/9-give-producers-a-stable-versioned",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/9-give-producers-a-stable-versioned/.stage/give-producers-a-stable-versioned",
+  "observed_at": "2026-11-21T23:50:39.627678+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/9-give-producers-a-stable-versioned/.stage/give-producers-a-stable-versioned/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/9-give-producers-a-stable-versioned/.stage/give-producers-a-stable-versioned/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/9-give-producers-a-stable-versioned/.stage/give-producers-a-stable-versioned/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/9-give-producers-a-stable-versioned/.stage/give-producers-a-stable-versioned/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/9-give-producers-a-stable-versioned/.stage/give-producers-a-stable-versioned/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 469,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Negotiate a stable producer profile independently of the query schema",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/469",
+    "baseRefName": "main",
+    "baseRefOid": "a6aba950716394e2871f4052af3623e9e71d0ce4",
+    "headRefName": "paudley/9-give-producers-a-stable-versioned",
+    "headRefOid": "725a3a10982ebd78f5daf06aabb9cc4090e478b9",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/448/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "725a3a10982ebd78f5daf06aabb9cc4090e478b9",
+    "branch": "paudley/9-give-producers-a-stable-versioned",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 469,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #469 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}
