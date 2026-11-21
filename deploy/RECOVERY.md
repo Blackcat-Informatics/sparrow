@@ -266,7 +266,9 @@ every watch in `consume_watches` names a root that exists.
   `claim directory must be owned by the daemon and mode 0700`, `watch list`
   shows a `failure` on that watch alone, or files stay in a root without being
   consumed. The daemon and the other watches keep running, and the watch is
-  retried every minute at most.
+  retried every minute at most. A root missing when the daemon starts is the same
+  case: the daemon starts and serves, reports that watch, and the watch begins
+  when the root appears.
 - Diagnose: `sparrow /SPARROW/store/rpc.sock watch list`;
   `ls -la /SPARROW/intake/NAME /SPARROW/intake/NAME/.sparrow-inflight`;
   `getfacl /SPARROW/intake/NAME`. A file the daemon cannot read is mode 0600
