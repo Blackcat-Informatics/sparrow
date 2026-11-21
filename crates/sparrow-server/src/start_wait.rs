@@ -11,6 +11,14 @@
 //! start failure (configuration, format, identity, lexicon) is deterministic: a restart repeats
 //! it, so it still ends the start at once with its message.
 //!
+//! A start that cannot pass by itself ends with [`REFUSED_EXIT_STATUS`], which the unit lists in
+//! `RestartPreventExitStatus=`: a restart would repeat it, so the unit neither loops on it nor
+//! spends its start limit, and the journal names the refusal.
+//!
+//! While it waits the daemon holds no socket (the endpoint needs the store's lock, which the open
+//! takes), so the wait is reported where a person and the upgrade script can read it: the
+//! journal lines below, and the unit's `StatusText` through `sd_notify` `STATUS=` ([`notify`]).
+//!
 //! Each wait journals what it waits for on its first observation, again when the reason
 //! changes and as a reminder every [`REMINDER`], re-checks on an interval chosen per condition,
 //! and ends at once on SIGINT. SIGTERM keeps its default action, which ends the process at
@@ -18,7 +26,21 @@
 //! after it SIGINT alone takes the orderly teardown.
 
 use crate::ServerConfig;
-use std::{error::Error, io, path::Path, time::Duration};
+use std::{
+    error::Error,
+    ffi::OsStr,
+    io,
+    os::{
+        linux::net::SocketAddrExt,
+        unix::{
+            ffi::OsStrExt,
+            net::{SocketAddr, UnixDatagram},
+        },
+    },
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 use tokio::{signal::unix::Signal, time::Instant};
 
 /// How often a free-space shortfall is measured: one `statvfs`, the cadence the serving loop
@@ -35,6 +57,52 @@ pub const BIND_RETRY: Duration = Duration::from_secs(1);
 /// A wait whose reason has not changed is journaled again after this long, so a long wait stays
 /// visible in the journal without a line per check.
 const REMINDER: Duration = Duration::from_secs(60);
+
+/// The exit status of a start that no wait clears: a configuration, image, store or watch-root
+/// condition only a person changes. `EX_CONFIG` of `sysexits.h`; the unit's
+/// `RestartPreventExitStatus=` names it, so the supervisor does not restart the refusal.
+pub const REFUSED_EXIT_STATUS: u8 = 78;
+
+static NOTIFY_FAILURE_JOURNALED: AtomicBool = AtomicBool::new(false);
+
+/// Send `state` (`sd_notify` text such as `STATUS=...`) to the service manager. Outside a unit
+/// there is no `NOTIFY_SOCKET` and nothing is sent. A refused send is journaled once and never
+/// stops the start: the journal lines carry the same facts.
+pub fn notify(state: &str) {
+    let Some(path) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    if let Err(error) = send_notification(&path, state)
+        && !NOTIFY_FAILURE_JOURNALED.swap(true, Ordering::Relaxed)
+    {
+        eprintln!(
+            "sparrowd: the service manager's notification socket {} refused a status: {error}; the journal lines still name each wait",
+            path.to_string_lossy()
+        );
+    }
+}
+
+/// `STATUS=` for `text`, which stays on one line.
+fn status(text: &str) -> String {
+    format!("STATUS={}", text.replace(['\n', '\r'], " "))
+}
+
+fn send_notification(path: &OsStr, state: &str) -> io::Result<()> {
+    let address = match path.as_bytes().strip_prefix(b"@") {
+        Some(name) => SocketAddr::from_abstract_name(name)?,
+        None => SocketAddr::from_pathname(path)?,
+    };
+    let socket = UnixDatagram::unbound()?;
+    // A full queue is a refusal to report, not a reason to block the start.
+    socket.set_nonblocking(true)?;
+    socket.send_to_addr(state.as_bytes(), &address)?;
+    Ok(())
+}
+
+/// Report that the daemon serves.
+pub fn notify_serving() {
+    notify("READY=1\nSTATUS=serving");
+}
 
 /// A start condition that will pass: what it is (its key, for journal de-duplication) and how
 /// soon to look again.
@@ -74,6 +142,7 @@ pub async fn until<T, E: std::fmt::Display>(
                         "sparrowd: {what}: the condition cleared after {} s; proceeding",
                         started.elapsed().as_secs()
                     );
+                    notify(&status("starting"));
                 }
                 return Ok(Wait::Ready(value));
             }
@@ -87,6 +156,7 @@ pub async fn until<T, E: std::fmt::Display>(
                 "sparrowd: waiting to {what}: {error}; checking again every {} s",
                 interval.as_secs().max(1)
             );
+            notify(&status(&format!("waiting to {what}: {error}")));
             last = Some((key, Instant::now()));
         }
         tokio::select! {
@@ -359,6 +429,27 @@ mod tests {
             panic!("the wait was interrupted");
         };
         assert_eq!(listener.local_addr().unwrap(), address);
+    }
+
+    /// Value: the unit's StatusText and the upgrade gate read the wait through the service
+    /// manager's socket. Protects: a status reaches a datagram socket as one `STATUS=` line.
+    #[test]
+    fn a_status_reaches_the_notification_socket_on_one_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notify");
+        let receiver = UnixDatagram::bind(&path).unwrap();
+        send_notification(
+            path.as_os_str(),
+            &status("waiting to open the store: only 5 bytes\nfree"),
+        )
+        .unwrap();
+        let mut buffer = [0_u8; 256];
+        let length = receiver.recv(&mut buffer).unwrap();
+        assert_eq!(
+            &buffer[..length],
+            b"STATUS=waiting to open the store: only 5 bytes free"
+        );
+        assert!(send_notification(dir.path().join("absent").as_os_str(), "STATUS=x").is_err());
     }
 
     /// Value: a wait must end promptly on SIGINT so a stop is never blocked by it.

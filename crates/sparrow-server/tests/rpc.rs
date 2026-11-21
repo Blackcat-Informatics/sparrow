@@ -507,12 +507,107 @@ impl ProcessStart for tokio::process::Command {
 trait ProcessOutput {
     fn admitted_output(&mut self) -> std::io::Result<std::process::Output>;
 }
+/// The longest a test waits for a child it runs to completion. A child that does not end (a
+/// daemon that waits on a start condition nothing clears) fails its test here, with the child
+/// killed, instead of holding the process-start lock and every other test behind it.
+const CHILD_DEADLINE: Duration = Duration::from_secs(180);
+
 impl ProcessOutput for Command {
     fn admitted_output(&mut self) -> std::io::Result<std::process::Output> {
-        let _guard = PROCESS_START.lock().unwrap();
-        self.output()
+        let child = {
+            let _guard = PROCESS_START.lock().unwrap();
+            self.stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .stdin(Stdio::null())
+                .spawn()?
+        };
+        let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(child.wait_with_output());
+        });
+        match receiver.recv_timeout(CHILD_DEADLINE) {
+            Ok(output) => output,
+            Err(_) => {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                panic!(
+                    "a child process did not end within {} s and was killed",
+                    CHILD_DEADLINE.as_secs()
+                );
+            }
+        }
     }
 }
+
+/// A daemon started with its journal lines piped, for tests of a start that waits: the test
+/// reads what it waits for, then clears the condition or interrupts it. Every read is bounded.
+struct Watched {
+    child: tokio::process::Child,
+    stderr: tokio::io::BufReader<tokio::process::ChildStderr>,
+}
+
+impl Watched {
+    fn spawn(config: &Path, notify: Option<&Path>) -> Self {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrowd"));
+        command
+            .arg("--config")
+            .arg(config)
+            .kill_on_drop(true)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if let Some(path) = notify {
+            command.env("NOTIFY_SOCKET", path);
+        }
+        let mut child = command.admitted_spawn().unwrap();
+        let stderr = tokio::io::BufReader::new(child.stderr.take().unwrap());
+        Self { child, stderr }
+    }
+
+    /// Read journal lines until one contains `needle`; return the lines read. Fails the test if
+    /// the daemon ends first or none arrives within a minute.
+    async fn until(&mut self, needle: &str) -> String {
+        use tokio::io::AsyncBufReadExt;
+        let mut seen = String::new();
+        loop {
+            let mut line = String::new();
+            let length =
+                tokio::time::timeout(Duration::from_secs(60), self.stderr.read_line(&mut line))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("no journal line with {needle:?} within 60 s: {seen}")
+                    })
+                    .unwrap();
+            assert!(length > 0, "the daemon ended without {needle:?}: {seen}");
+            seen.push_str(&line);
+            if line.contains(needle) {
+                return seen;
+            }
+        }
+    }
+
+    fn interrupt(&self) {
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(self.child.id().unwrap() as i32).unwrap(),
+            rustix::process::Signal::INT,
+        )
+        .unwrap();
+    }
+
+    /// The exit status and the journal lines that remain.
+    async fn exit(&mut self) -> (std::process::ExitStatus, String) {
+        use tokio::io::AsyncReadExt;
+        let status = tokio::time::timeout(Duration::from_secs(30), self.child.wait())
+            .await
+            .expect("the daemon did not end within 30 s")
+            .unwrap();
+        let mut rest = String::new();
+        self.stderr.read_to_string(&mut rest).await.unwrap();
+        (status, rest)
+    }
+}
+
+/// The exit status of a refused start: no wait clears it and the unit does not restart it.
+const REFUSED: i32 = sparrow_server::start_wait::REFUSED_EXIT_STATUS as i32;
 
 struct Daemon(Child);
 
@@ -5522,7 +5617,7 @@ fn query_only_and_no_intake_refuse_conflicting_configuration() {
         command.args(flags);
         let output = command.admitted_output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(!output.status.success(), "{extra}");
+        assert_eq!(output.status.code(), Some(REFUSED), "{extra}: {stderr}");
         let mode = match flags.first() {
             Some(&"--no-intake") => "--no-intake",
             Some(&"--private-intake") => "--private-intake",
@@ -5694,7 +5789,7 @@ fn daemon_refuses_a_soft_open_file_limit_without_room_for_the_table_cache() {
         .admitted_output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&result.stderr);
-    assert!(!result.status.success(), "{stderr}");
+    assert_eq!(result.status.code(), Some(REFUSED), "{stderr}");
     assert!(!socket.exists());
     assert!(
         stderr.contains("soft open-file limit is 1024") && stderr.contains("LimitNOFILE=65536"),
@@ -5721,7 +5816,7 @@ fn corrupt_durable_watch_catalog_is_a_hard_startup_failure() {
         .arg(&config)
         .admitted_output()
         .unwrap();
-    assert!(!result.status.success());
+    assert_eq!(result.status.code(), Some(REFUSED));
     assert!(!socket.exists());
     assert!(String::from_utf8_lossy(&result.stderr).contains("invalid durable watch catalog"));
 }
@@ -9245,8 +9340,11 @@ async fn killed_owner_restarts_without_socket_unlink_and_preserves_durable_evide
         .await;
 }
 
-#[test]
-fn endpoint_startup_preserves_files_symlinks_and_foreign_live_listeners() {
+/// A name that is not a socket, or a symlink, is a deterministic refusal: the start ends with the
+/// status the unit does not restart and the name is preserved. A live foreign listener is an owner
+/// that may leave, so the start waits for it, says so, preserves it, and ends cleanly on SIGINT.
+#[tokio::test(flavor = "current_thread")]
+async fn endpoint_startup_preserves_files_symlinks_and_foreign_live_listeners() {
     use std::os::unix::fs::MetadataExt;
     for kind in ["file", "symlink", "listener"] {
         let dir = tempfile::tempdir().unwrap();
@@ -9268,16 +9366,31 @@ fn endpoint_startup_preserves_files_symlinks_and_foreign_live_listeners() {
             _ => Some(std::os::unix::net::UnixListener::bind(&socket).unwrap()),
         };
         let before = std::fs::symlink_metadata(&socket).unwrap();
-        let result = Command::new(env!("CARGO_BIN_EXE_sparrowd"))
-            .arg("--config")
-            .arg(&config)
-            .admitted_output()
-            .unwrap();
-        assert!(
-            !result.status.success(),
-            "occupied endpoint was admitted: {kind}"
-        );
-        let stderr = String::from_utf8(result.stderr).unwrap();
+        let stderr = if foreign.is_some() {
+            let mut daemon = Watched::spawn(&config, None);
+            let waiting = daemon.until("waiting to bind the local endpoint").await;
+            assert!(waiting.contains("preserving it"), "{waiting}");
+            assert!(daemon.child.try_wait().unwrap().is_none());
+            daemon.interrupt();
+            let (status, rest) = daemon.exit().await;
+            assert!(
+                status.success(),
+                "a waiting start refused SIGINT: {status}: {rest}"
+            );
+            format!("{waiting}{rest}")
+        } else {
+            let result = Command::new(env!("CARGO_BIN_EXE_sparrowd"))
+                .arg("--config")
+                .arg(&config)
+                .admitted_output()
+                .unwrap();
+            assert_eq!(
+                result.status.code(),
+                Some(REFUSED),
+                "occupied endpoint was admitted: {kind}"
+            );
+            String::from_utf8(result.stderr).unwrap()
+        };
         assert!(
             stderr.contains("preserving it"),
             "unexpected refusal: {stderr}"
@@ -9324,9 +9437,16 @@ async fn startup_below_the_maintenance_reserve_waits_without_opening_the_store()
             ),
     )
     .unwrap();
+    // The service manager's notification socket: the wait is also its StatusText.
+    let notify = dir.path().join("notify");
+    let receiver = std::os::unix::net::UnixDatagram::bind(&notify).unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
     let mut daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrowd"))
         .arg("--config")
         .arg(&config)
+        .env("NOTIFY_SOCKET", &notify)
         .kill_on_drop(true)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -9342,6 +9462,13 @@ async fn startup_below_the_maintenance_reserve_waits_without_opening_the_store()
     assert!(
         line.starts_with("sparrowd: waiting to open the store: only "),
         "{line}"
+    );
+    let mut status = [0_u8; 512];
+    let length = receiver.recv(&mut status).unwrap();
+    assert!(
+        String::from_utf8_lossy(&status[..length])
+            .starts_with("STATUS=waiting to open the store: only "),
+        "the wait was not reported as the unit's status"
     );
     assert!(!data.exists(), "store opened below the maintenance reserve");
     rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
@@ -9451,28 +9578,23 @@ async fn shutdown_syslog_bind_refusal_cleans_owned_endpoint_and_allows_retry() {
                 "tcp",
                 Some("lf"),
             );
-            let result = Command::new(env!("CARGO_BIN_EXE_sparrowd"))
-                .arg("--config")
-                .arg(&config)
-                .admitted_output()
-                .unwrap();
-            assert!(!result.status.success());
-            let stderr = String::from_utf8(result.stderr).unwrap();
+            // The held port is a departing owner: the start waits for it, says so, keeps no
+            // endpoint of its own while it waits, and proceeds when the holder leaves.
+            let mut daemon = Watched::spawn(&config, None);
+            let waiting = daemon.until("waiting to bind the syslog listeners").await;
             assert!(
-                stderr.contains("Address already in use"),
-                "unexpected refusal: {stderr}"
+                waiting.contains("Address already in use"),
+                "unexpected wait: {waiting}"
             );
             assert!(
-                !stderr.contains("pthread lock"),
-                "unjoined startup worker: {stderr}"
+                !waiting.contains("pthread lock"),
+                "unjoined startup worker: {waiting}"
             );
-            assert!(
-                !socket.exists(),
-                "startup refusal left its owned socket behind"
-            );
+            assert!(daemon.child.try_wait().unwrap().is_none());
             assert!(std::net::TcpStream::connect(address).is_ok());
             drop(occupied);
-            let _daemon = start(&config, &socket).await;
+            daemon.until("the condition cleared").await;
+            daemon.until("sparrowd: store=").await;
             let client = sparrow_client::Client::connect(&socket).await.unwrap();
             let receipt = client
                 .ingest("startup-retry", "source", wire::Format::Log, b"recovered\n")

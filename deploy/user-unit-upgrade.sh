@@ -217,6 +217,20 @@ fi
 restore_ship_timer() {
     ((ship_timer_was_active == 0)) || "${USER_SYSTEMCTL[@]}" start sparrow-ship.timer
 }
+# The daemon's last journal line of KIND ("waiting to" or "refused to start") since this unit
+# start, empty when it has none or has since cleared the wait. A daemon waiting on a start
+# condition that will pass (space, a pending upgrade's allowance, a held address) holds no socket,
+# so status cannot answer; it says what it waits for in these lines and, when the unit allows it,
+# in StatusText. A daemon that refuses to start names the refusal in the last.
+start_condition() {
+    local since line
+    since=$("${USER_SYSTEMCTL[@]}" show -p ActiveEnterTimestamp --value sparrow.service)
+    [[ -n $since ]] || since=-5min
+    line=$(journalctl --user -u sparrow.service --since "$since" -o cat --no-pager 2>/dev/null \
+        | grep -E "^sparrowd: (waiting to |refused to start|.*the condition cleared)" | tail -n 1) || true
+    [[ $line == *"$1"* && $line != *"the condition cleared"* ]] && printf '%s\n' "$line"
+    return 0
+}
 # Wait for the first status answer, not for pressure "ready". pressure.phase is the disk-budget
 # maintenance state (sparrow-core storage/pressure.rs): it opens ready, or awaitingReclamation
 # when a recovered marker says so, and only data-budget admission and pressure passes move it.
@@ -231,10 +245,20 @@ wait_first_status() {
         state=$("${USER_SYSTEMCTL[@]}" show -p ActiveState --value sparrow.service)
         if [[ $state == inactive || $state == failed ]]; then
             "${USER_SYSTEMCTL[@]}" status --no-pager --lines=20 sparrow.service >&2 || true
+            refusal=$(start_condition 'refused to start')
+            if [[ -n $refusal ]]; then
+                die "sparrow.service is $state: the daemon refused to start with exit status 78, which no wait clears and the unit does not restart: $refusal"
+            fi
             die "sparrow.service is $state before its first status answer"
         fi
         if out=$("$CLI_LINK" "$SOCKET" status 2>/dev/null); then break; fi
-        ((SECONDS < deadline)) || die "no status answer within ${STATUS_SECONDS}s, the switch gate; the daemon is left running"
+        if ((SECONDS >= deadline)); then
+            waiting=$(start_condition 'waiting to')
+            if [[ -n $waiting ]]; then
+                die "no status answer within ${STATUS_SECONDS}s, the switch gate; the daemon is waiting on a start condition it reports and is left running: $waiting"
+            fi
+            die "no status answer within ${STATUS_SECONDS}s, the switch gate; the daemon is left running"
+        fi
         sleep 5
     done
 }

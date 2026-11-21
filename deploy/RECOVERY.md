@@ -113,26 +113,43 @@ every watch in `consume_watches` names a root that exists.
   the change), or stop the
   process that holds the address. The daemon proceeds by itself and journals
   `the condition cleared after N s; proceeding`. No restart is needed.
+- Where it shows: the journal lines above, and `systemctl show -p StatusText
+  sparrow.service` (`waiting to open the store: only N bytes free ...`; the
+  daemon sets it through `NotifyAccess=main`, and it reads `serving` once the
+  daemon serves). No socket exists during a wait: the Unix socket needs the
+  store's lock, which the open takes. `deploy/user-unit-upgrade.sh` names the
+  wait when its status gate times out.
 - Stop: `systemctl stop` sends SIGINT, which ends the wait at once. The
   unit stays `active (running)` through a wait because it is `Type=exec`: a
-  readiness notification would hold the unit in `activating` and its start
-  timeout would kill a wait that is meant to last as long as the condition.
-- Configuration errors, a store format, identity, lexicon or archive mismatch
-  and corruption are not waits: the start ends at once and spends a start
-  (next section).
+  readiness gate would hold the unit in `activating` and its start timeout
+  would kill a wait that is meant to last as long as the condition.
+- Not a wait: a condition that cannot pass without a change of configuration,
+  image, store or watch root (a bad argument or configuration key, a format,
+  identity, analyzer or lexicon mismatch, a missing `[archive]` table after the
+  store's archive fence, a watch root that must be restored, a spill directory
+  or ingest socket directory with the wrong owner or mode). The daemon journals
+  `sparrowd: refused to start: <reason>` and exits with status 78, which the
+  unit lists in `RestartPreventExitStatus=`: it is not restarted, spends no
+  start, and `systemctl status` shows the unit `failed` with
+  `status=78/CONFIG`. Correct the cause (restore the image, lexicon or
+  configuration that wrote the store, see "Refused open"), then
+  `sudo systemctl reset-failed sparrow.service && sudo deploy/start.sh`.
+  The old user unit has no such line: add `RestartPreventExitStatus=78` to it.
 - Reversible: yes.
 
 ## Unit start-limit hit
 
 - Symptom: `systemctl status sparrow.service` shows `start-limit-hit`; five
-  failed starts within ten minutes stopped the unit.
-- Diagnose: the cause is in the failed starts' output:
+  failed runs within ten minutes stopped the unit. A refused start (a refused
+  open below, a missing lexicon bundle or credential, a watch root that does not
+  exist, a `socket_path` longer than 107 bytes) exits with status 78 and is not
+  restarted, so it shows `failed` with `status=78/CONFIG` and does not reach the
+  limit; free space, a pending upgrade's allowance and a held port or socket
+  name are waited for (see "Start waiting").
+- Diagnose: the cause is in the failed runs' output:
   `journalctl -u sparrow.service -b --no-pager | tail -100`. Common causes are
-  a refused open (below), an AppArmor denial, a missing lexicon bundle or
-  credential, a watch root that does not exist, or a `socket_path` longer than
-  107 bytes (`path must be shorter than SUN_LEN`; `start.sh` refuses one). Free
-  space, a pending upgrade's allowance and a held port or socket name are waited
-  for and do not reach the limit (see "Start waiting").
+  an AppArmor denial, a crash, an out-of-memory kill, or a worker that ended
+  (`... worker terminated unexpectedly`).
 - Recover: fix the cause, then
   `sudo systemctl reset-failed sparrow.service && sudo deploy/start.sh`.
 - Reversible: yes.

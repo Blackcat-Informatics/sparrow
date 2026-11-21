@@ -104,8 +104,32 @@ async fn worker_health(
     }
 }
 
+/// Set once the daemon serves. A failure before it is a refused start; one after it is a run
+/// that failed, which the supervisor restarts.
+static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        // Every start condition that passes is waited for (start_wait), so a start that fails
+        // here repeats on a restart: end it with the status the unit does not restart.
+        Err(error) if !SERVING.load(std::sync::atomic::Ordering::Relaxed) => {
+            eprintln!(
+                "sparrowd: refused to start: {error}; a restart repeats it, so the exit status is {} and the unit does not restart it. Correct the configuration, image, store or watch root, then start the unit",
+                start_wait::REFUSED_EXIT_STATUS
+            );
+            start_wait::notify(&format!("STATUS=refused to start: {error}"));
+            std::process::ExitCode::from(start_wait::REFUSED_EXIT_STATUS)
+        }
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     sparrow_server::journal_log::install()?;
     let args: Vec<_> = std::env::args().skip(1).collect();
     let (path, mode) = arguments(&args)?;
@@ -372,6 +396,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.max_ingest_connections
         );
     }
+    SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
+    start_wait::notify_serving();
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
