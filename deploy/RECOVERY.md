@@ -128,11 +128,11 @@ every watch in `consume_watches` names a root that exists.
   readiness gate would hold the unit in `activating` and its start timeout
   would kill a wait that is meant to last as long as the condition.
 - Not a wait: a condition named as deterministic, which cannot pass without a
-  change of configuration, image, store or watch root: a bad argument,
+  change of configuration, image or store: a bad argument,
   configuration key or secret file; a store format (`UNSUPPORTED`) or
   identity, analyzer, lexicon, profile or archive-fence refusal
   (`INVALID_ARGUMENT`, including a missing `[archive]` table after the store's
-  archive fence); a watch root that is missing, replaced or unreadable; a socket
+  archive fence); a watch configuration that contradicts a pending claim; a socket
   name that is not a socket, an ingest socket
   directory or socket with the wrong owner or mode. The daemon journals
   `sparrowd: refused to start: <reason>` and exits with status 78, which the
@@ -152,7 +152,7 @@ every watch in `consume_watches` names a root that exists.
 - Symptom: `systemctl status sparrow.service` shows `start-limit-hit`; five
   failed runs within ten minutes stopped the unit. A refused start named as deterministic (a
   refused open for format, identity, analyzer, lexicon or archive fence below, a
-  missing lexicon bundle or credential, a watch root that does not exist, a
+  missing lexicon bundle or credential, a bad `[[syslog]]` block, a
   `socket_path` longer than 107 bytes) exits with status 78 and is not
   restarted, so it shows `failed` with `status=78/CONFIG` and does not reach the
   limit; free space, a pending upgrade's allowance and a held port or socket

@@ -11,7 +11,7 @@
 //! name a departing owner still holds. A refusal a restart repeats (configuration, format,
 //! identity, lexicon) is not waited for; it ends the start at once with its message.
 //!
-//! A start refusal that only a change of configuration, image, store or watch root clears is marked
+//! A start refusal that only a change of configuration, image or store clears is marked
 //! [`Permanent`] where it is produced ([`permanent`], [`bind_failure`], [`open_failure`],
 //! [`consume_start_failure`]). It ends with [`REFUSED_EXIT_STATUS`], which the unit lists in
 //! `RestartPreventExitStatus=`: a restart would repeat it, so the unit neither loops on it nor
@@ -65,7 +65,7 @@ pub const BIND_RETRY: Duration = Duration::from_secs(1);
 /// visible in the journal without a line per check.
 const REMINDER: Duration = Duration::from_secs(60);
 
-/// The exit status of a start that no wait clears: a configuration, image, store or watch-root
+/// The exit status of a start that no wait clears: a configuration, image or store
 /// condition only a person changes. `EX_CONFIG` of `sysexits.h`; the unit's
 /// `RestartPreventExitStatus=` names it, so the supervisor does not restart the refusal.
 pub const REFUSED_EXIT_STATUS: u8 = 78;
@@ -154,21 +154,18 @@ pub fn open_failure(error: Box<dyn Error>) -> Box<dyn Error> {
     if refused { permanent(error) } else { error }
 }
 
-/// A consume worker that cannot start: a contradictory or unsupported watch state, a root that
-/// is missing, replaced or unreadable, and the store's own `UNSUPPORTED` or `INVALID_ARGUMENT`
-/// are permanent (restore the root or the watch configuration). Transport and other I/O
-/// failures are not classified.
+/// A consume worker that cannot start: a contradictory or unsupported watch state (a watch
+/// configuration that omits an unfinished journal, two roots sharing a private root) and the
+/// store's own `UNSUPPORTED` or `INVALID_ARGUMENT` are permanent. I/O failures, including a
+/// root that does not resolve (a mount may not be up yet), and transport failures are not
+/// classified.
 #[must_use]
 pub fn consume_start_failure(error: crate::consumption::Error) -> Box<dyn Error> {
     use crate::consumption::Error as Start;
     let refused = match &error {
         Start::State(_) | Start::FinishedGeneration(_) | Start::PrivateRootShared { .. } => true,
-        Start::Io(error) => matches!(
-            error.kind(),
-            io::ErrorKind::NotFound
-                | io::ErrorKind::NotADirectory
-                | io::ErrorKind::PermissionDenied
-        ),
+        // A root that does not resolve may be a mount that is not up yet; it is not named.
+        Start::Io(_) => false,
         Start::Storage(error) => matches!(error.code, "UNSUPPORTED" | "INVALID_ARGUMENT"),
         Start::Upload(_) => false,
     };
@@ -562,9 +559,9 @@ mod tests {
                 false,
             ),
             (
-                "root missing",
+                "root does not resolve (may be a mount not yet up)",
                 consume_start_failure(crate::consumption::Error::Io(io::Error::from(NotFound))),
-                true,
+                false,
             ),
             (
                 "watch state contradicts",

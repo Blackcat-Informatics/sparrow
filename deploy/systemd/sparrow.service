@@ -22,7 +22,7 @@ RequiresMountsFor=/SPARROW
 # start-limit hit"). A start condition that will pass does not spend them: the daemon waits, and does
 # not exit, for free space for the open and the WAL replay, for a pending upgrade's write allowance,
 # and for a port or socket name a departing owner holds (deploy/RECOVERY.md, "Start waiting"). A start
-# condition that cannot pass without a change of configuration, image, store or watch root ends with
+# condition that cannot pass without a change of configuration, image or store ends with
 # exit status 78 (RestartPreventExitStatus below), which the unit does not restart, and the journal
 # names it.
 #

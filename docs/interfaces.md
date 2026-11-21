@@ -608,9 +608,9 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
   port a departing owner still holds. Each wait journals
   `sparrowd: waiting to ...` with its reason, checks again (one second for space, a held lock and addresses, 30 seconds
   for an open refused for space or allowance), repeats the line each minute while its reason stands, ends at once on SIGINT and journals when it proceeds.
-  A start condition that cannot pass without a change of configuration, image, store or watch root (configuration,
+  A start condition that cannot pass without a change of configuration, image or store (configuration,
   a format, identity, analyzer or archive mismatch, a missing `[archive]` table after the archive fence, a
-  watch root that must be restored) is not waited for: the daemon journals `sparrowd: refused to start: ...` and exits
+  watch configuration that contradicts a pending claim) is not waited for: the daemon journals `sparrowd: refused to start: ...` and exits
   with status 78, which the unit's `RestartPreventExitStatus=` does not restart. Only conditions named as deterministic
   take that status; any other failure before the daemon serves (corruption or I/O at the open, a descriptor limit) exits 1
   with `sparrowd: start failed: ...; not classified as permanent`, and the unit restarts it within its start limit. A wait is also reported as the unit's

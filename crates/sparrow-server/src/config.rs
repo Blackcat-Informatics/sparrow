@@ -376,7 +376,10 @@ impl ServerConfig {
             archive.validate(&config.data_dir)?;
         }
         config.output_paths().refuse_overlap(&config.consume)?;
-        crate::syslog_listener::validate(&config.syslog)?;
+        // A refusal of the configured listeners, not a failed read: it keeps a kind that names it.
+        crate::syslog_listener::validate(&config.syslog).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
         if config.rpc_tcp_address.is_some() != config.rpc_tcp_secret_file.is_some() {
             return Err(
                 "rpc_tcp_address and rpc_tcp_secret_file must be configured together".into(),
@@ -770,6 +773,30 @@ mod tests {
         assert!(floor.shortfall().unwrap().is_some());
         floor.set_free_for_tests(Some(5 << 20));
         assert!(floor.shortfall().unwrap().is_none());
+    }
+
+    /// Value: a bad `[[syslog]]` block is a refusal only a configuration change clears, and a
+    /// restart repeats it (#446). Protects: it reads as a permanent start refusal, not as a
+    /// failed read that the unit would restart until its start limit.
+    #[test]
+    fn a_bad_syslog_block_is_a_permanent_configuration_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let path =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let block = "\n[[syslog]]\nid = \"dup\"\naddress = \"127.0.0.1:5514\"\nsource = \"s\"\ntransport = \"udp\"\nmax_message_bytes = 480\nmax_connections = 1\nread_timeout_ms = 1000\n";
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(block);
+        text.push_str(block);
+        std::fs::write(&path, text).unwrap();
+        let error = ServerConfig::read(&path).err().expect("a refusal");
+        let io = error
+            .downcast_ref::<std::io::Error>()
+            .expect("an I/O-typed refusal");
+        assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(crate::start_wait::is_permanent(
+            crate::start_wait::config_failure(error).as_ref()
+        ));
     }
 
     /// Value: a daemon waiting on a pending upgrade's write allowance never saw the budget an
