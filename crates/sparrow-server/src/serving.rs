@@ -21,6 +21,51 @@ use std::{error::Error, future::Future, sync::Arc, time::Duration};
 /// pause caused by another process freeing space has no event to wait on.
 pub const SPACE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How the loop answers accept errors (#445). An accept error (descriptor exhaustion, a
+/// connection aborted before accept, a transient kernel refusal) belongs to no daemon state:
+/// the loop counts it, stops accepting for a backoff and tries again, so it never ends the
+/// daemon. The wait doubles from 10 ms to a 1 s ceiling, and starts over at the next
+/// success. A descriptor shortage clears when a served connection closes, which a 1 s ceiling
+/// notices promptly, and a persistent fault costs one attempt and one journal line a second.
+#[derive(Default)]
+struct AcceptFaults {
+    consecutive: u32,
+    total: u64,
+}
+
+impl AcceptFaults {
+    /// Count one accept error and return how long accepting pauses and the journal line.
+    fn failed(&mut self, error: &std::io::Error) -> (Duration, String) {
+        self.consecutive = self.consecutive.saturating_add(1);
+        self.total = self.total.saturating_add(1);
+        let wait = Duration::from_millis(10)
+            .saturating_mul(1 << self.consecutive.saturating_sub(1).min(7))
+            .min(Duration::from_secs(1));
+        (
+            wait,
+            format!(
+                "sparrowd: accept failed: {error}; {} accept error(s) so far; accepting again in {} ms",
+                self.total,
+                wait.as_millis()
+            ),
+        )
+    }
+
+    fn succeeded(&mut self) {
+        self.consecutive = 0;
+    }
+}
+
+/// Await one accept; under test a counted number of accepts fail first, as a descriptor
+/// shortage does.
+async fn accepted<T>(accept: impl Future<Output = std::io::Result<T>>) -> std::io::Result<T> {
+    #[cfg(test)]
+    if let Some(error) = tests::injected_accept_error() {
+        return Err(error);
+    }
+    accept.await
+}
+
 /// The listeners the loop accepts on.
 pub struct Sockets<'a> {
     /// The private Unix socket.
@@ -39,8 +84,11 @@ pub struct Sockets<'a> {
 /// held ahead for the private socket and public TCP together, which share a ceiling, and one
 /// for the ingest socket.
 ///
+/// An accept error, a failed floor measurement or a clock failure does not end the loop: it is
+/// counted, journaled and retried (`AcceptFaults`).
+///
 /// # Errors
-/// An accept failure, a clock or floor-measurement failure, or the failure `health` reports.
+/// The interrupt's failure, or the failure `health` reports.
 pub async fn serve(
     sockets: Sockets<'_>,
     rpc: &Rpc,
@@ -59,6 +107,11 @@ pub async fn serve(
     let mut rpc_wait = None;
     let mut ingest_slot = None;
     let mut ingest_wait = None;
+    let mut faults = AcceptFaults::default();
+    // While set, no listener is accepted: the backoff after an accept error.
+    let mut resume = std::pin::pin!(tokio::time::sleep(Duration::ZERO));
+    let mut paused = false;
+    let mut measuring = None::<String>;
     loop {
         if rpc_slot.is_none() && rpc_wait.is_none() {
             match connections.try_slot() {
@@ -87,11 +140,23 @@ pub async fn serve(
                 return Ok(());
             }
             failure = &mut health => return Err(failure),
+            () = &mut resume, if paused => paused = false,
             _ = space.tick() => {
-                let now = crate::now()?;
-                let shortfall = floor.observe(now)?;
-                if let Some(line) = pause_journal.observe(shortfall.as_deref(), now, rpc.floor_pause()) {
-                    journal(&line);
+                match crate::now().and_then(|now| Ok((now, floor.observe(now)?))) {
+                    Ok((now, shortfall)) => {
+                        measuring = None;
+                        if let Some(line) = pause_journal.observe(shortfall.as_deref(), now, rpc.floor_pause()) {
+                            journal(&line);
+                        }
+                    }
+                    // The measurement is retried at the next tick; the text is journaled once per change.
+                    Err(error) => {
+                        let text = error.to_string();
+                        if measuring.as_deref() != Some(text.as_str()) {
+                            journal(&format!("sparrowd: free-space measurement failed: {text}; retrying every second"));
+                            measuring = Some(text);
+                        }
+                    }
                 }
                 // A socket name removed while the daemon runs is bound again (#447).
                 for endpoint in std::iter::once(sockets.private).chain(ingest.map(|(endpoint, _)| endpoint)) {
@@ -100,8 +165,17 @@ pub async fn serve(
                     }
                 }
             }
-            accepted = sockets.private.accept(), if rpc_slot.is_some() => {
-                let (stream, _) = accepted?;
+            accepted = accepted(sockets.private.accept()), if rpc_slot.is_some() && !paused => {
+                let stream = match accepted {
+                    Ok((stream, _)) => { faults.succeeded(); stream }
+                    Err(error) => {
+                        let (wait, line) = faults.failed(&error);
+                        journal(&line);
+                        resume.as_mut().reset(tokio::time::Instant::now() + wait);
+                        paused = true;
+                        continue;
+                    }
+                };
                 let Some(slot) = rpc_slot.take() else { continue };
                 rpc.floor_pause().connection_accepted();
                 // A connection whose peer the kernel cannot name is dropped unanswered.
@@ -110,17 +184,39 @@ pub async fn serve(
                     Err(error) => eprintln!("sparrowd: private socket peer unreadable: {error}"),
                 }
             }
-            accepted = async { ingest.expect("enabled ingest branch").0.accept().await }, if ingest.is_some() && ingest_slot.is_some() => {
-                let (stream, _) = accepted?;
+            accepted = async { accepted(ingest.expect("enabled ingest branch").0.accept()).await }, if ingest.is_some() && ingest_slot.is_some() && !paused => {
+                let stream = match accepted {
+                    Ok((stream, _)) => { faults.succeeded(); stream }
+                    Err(error) => {
+                        let (wait, line) = faults.failed(&error);
+                        journal(&line);
+                        resume.as_mut().reset(tokio::time::Instant::now() + wait);
+                        paused = true;
+                        continue;
+                    }
+                };
                 let Some(slot) = ingest_slot.take() else { continue };
                 rpc.floor_pause().connection_accepted();
                 let _ = ingest.expect("enabled ingest branch").1.admit(stream, rpc.clone(), slot);
             }
-            accepted = async { sockets.tcp.as_ref().expect("enabled TCP branch").0.accept().await }, if sockets.tcp.is_some() && rpc_slot.is_some() => {
-                let (stream, peer) = accepted?;
+            accepted = async { accepted(sockets.tcp.as_ref().expect("enabled TCP branch").0.accept()).await }, if sockets.tcp.is_some() && rpc_slot.is_some() && !paused => {
+                let (stream, peer) = match accepted {
+                    Ok(accepted) => { faults.succeeded(); accepted }
+                    Err(error) => {
+                        let (wait, line) = faults.failed(&error);
+                        journal(&line);
+                        resume.as_mut().reset(tokio::time::Instant::now() + wait);
+                        paused = true;
+                        continue;
+                    }
+                };
                 let Some(slot) = rpc_slot.take() else { continue };
                 rpc.floor_pause().connection_accepted();
-                stream.set_nodelay(true)?;
+                // A peer that reset before this call is dropped; it is not the daemon's failure.
+                if let Err(error) = stream.set_nodelay(true) {
+                    eprintln!("sparrowd: TCP peer {peer} dropped before it was served: {error}");
+                    continue;
+                }
                 let secret = sockets.tcp.as_ref().expect("enabled TCP branch").1.clone();
                 crate::admit_connection(stream, rpc.clone(), slot, Access::PublicTcp(secret, peer.to_string()));
             }
@@ -134,6 +230,22 @@ mod tests {
     use crate::sparrow_capnp as wire;
     use std::{cell::RefCell, rc::Rc};
     use tokio::sync::{Semaphore, oneshot};
+
+    thread_local! {
+        /// Accept errors the next accepts return, for the test thread's loop.
+        static INJECTED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The next injected accept error, a descriptor shortage (EMFILE), if any remain.
+    pub(super) fn injected_accept_error() -> Option<std::io::Error> {
+        INJECTED.with(|left| {
+            let remaining = left.get();
+            (remaining > 0).then(|| {
+                left.set(remaining - 1);
+                std::io::Error::from_raw_os_error(24)
+            })
+        })
+    }
 
     /// A store, its RPC, the private socket's path and the stop for the loop serving it.
     struct Fixture {
@@ -367,6 +479,33 @@ mod tests {
             tokio::time::advance(SPACE_CHECK_INTERVAL).await;
             reached(&fixture, 2).await;
             assert!(fixture.lines.borrow()[1].contains("free space restored"));
+            fixture.stop.take().unwrap().send(()).unwrap();
+            fixture.served.await.unwrap().unwrap();
+        })
+        .await;
+    }
+
+    /// Value (#445): a descriptor shortage on accept ended the daemon (`accepted?`). Protects, on
+    /// the real accept loop: three accept errors are journaled with their running count, the
+    /// loop keeps running, and the next client is accepted and served once accepting resumes.
+    /// Fails on the old loop, which returns the first error.
+    #[tokio::test(start_paused = true)]
+    async fn accept_errors_are_counted_backed_off_and_do_not_end_the_loop() {
+        on_local_set(async {
+            INJECTED.with(|left| left.set(3));
+            let mut fixture = fixture().await;
+            let client = sparrow_client::Client::connect(&fixture.socket)
+                .await
+                .unwrap();
+            assert!(client.artifact("absent").await.is_err());
+            assert!(!fixture.served.is_finished(), "the loop ended");
+            let lines = fixture.lines.borrow().clone();
+            let failed: Vec<_> = lines
+                .iter()
+                .filter(|l| l.contains("accept failed"))
+                .collect();
+            assert_eq!(failed.len(), 3, "{lines:?}");
+            assert!(failed[2].contains("3 accept error(s) so far"), "{failed:?}");
             fixture.stop.take().unwrap().send(()).unwrap();
             fixture.served.await.unwrap().unwrap();
         })

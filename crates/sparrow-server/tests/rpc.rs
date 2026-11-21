@@ -2740,7 +2740,7 @@ async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn syslog_connection_failure_stops_siblings_and_reopens_exact_durable_packet() {
+async fn syslog_connection_failure_is_counted_keeps_siblings_and_reopens_exact_durable_packet() {
     use tokio::io::AsyncWriteExt;
     tokio::task::LocalSet::new()
         .run_until(async {
@@ -2822,14 +2822,28 @@ async fn syslog_connection_failure_stops_siblings_and_reopens_exact_durable_pack
                 .write_all(b"<13>1 - host app - - - refused\n")
                 .await
                 .unwrap();
+            // The failed connection is counted against its listener (#445); the listener
+            // group keeps running.
             let deadline = Instant::now() + Duration::from_secs(5);
-            while !worker.is_finished() {
+            loop {
+                let response = observer.status_request().send().promise.await.unwrap();
+                let listeners = rpc_ok(response.get().unwrap().get_result().unwrap())
+                    .get_syslog_listeners()
+                    .unwrap();
+                if listeners.get(0).get_listener_errors() >= 1 {
+                    break;
+                }
                 assert!(
                     Instant::now() < deadline,
-                    "failed listener group did not stop"
+                    "failed connection was not counted"
                 );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            assert!(
+                !worker.is_finished(),
+                "one connection's failure ended the group"
+            );
+            // The closed budget still fails the shutdown's own publications, and says so.
             let error = worker.shutdown().await.unwrap_err().to_string();
             assert!(
                 error.contains("semaphore closed"),
@@ -6822,8 +6836,11 @@ async fn configured_consumer_recovers_confirmed_journal_and_reports_late_write_w
         .await;
 }
 
+/// Lost watch coverage (the directory limit, a replaced root) parks that watch with a visible
+/// failure and never retires its source evidence, and the daemon stays up and answers
+/// (#445: it used to exit, and only a restart cleared it).
 #[tokio::test(flavor = "current_thread")]
-async fn consume_coverage_limit_and_root_replacement_fail_without_source_retirement() {
+async fn consume_coverage_limit_and_root_replacement_park_the_watch_without_source_retirement() {
     for replace_root in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("completed");
@@ -6847,13 +6864,13 @@ async fn consume_coverage_limit_and_root_replacement_fail_without_source_retirem
                 .admitted_spawn()
                 .unwrap(),
         );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !socket.exists() {
+            assert!(daemon.0.try_wait().unwrap().is_none());
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let preserved = if replace_root {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while !socket.exists() {
-                assert!(daemon.0.try_wait().unwrap().is_none());
-                assert!(Instant::now() < deadline);
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
             let old = dir.path().join("old-root");
             std::fs::rename(&root, &old).unwrap();
             std::fs::create_dir(&root).unwrap();
@@ -6862,22 +6879,23 @@ async fn consume_coverage_limit_and_root_replacement_fail_without_source_retirem
         } else {
             root.clone()
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let status = loop {
-            if let Some(status) = daemon.0.try_wait().unwrap() {
-                break status;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(
+                daemon.0.try_wait().unwrap().is_none(),
+                "lost watch coverage ended the daemon"
+            );
+            let status = cli(&socket, &["status"]);
+            if status["consume_watches"][0]["failure"].as_str().is_some() {
+                break;
             }
             assert!(
                 Instant::now() < deadline,
-                "lost watch coverage was not a terminal visible refusal"
+                "lost watch coverage was not a visible failure"
             );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
-        assert!(!status.success());
-        assert!(
-            !socket.exists(),
-            "terminal daemon left its owned socket behind"
-        );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(daemon.0.try_wait().unwrap().is_none());
         assert_eq!(
             std::fs::read(preserved.join("nested/evidence.jsonl")).unwrap(),
             b"preserved evidence"
@@ -9797,94 +9815,6 @@ async fn shutdown_syslog_bind_refusal_cleans_owned_endpoint_and_allows_retry() {
                     .unwrap()
                     .len(),
                 1
-            );
-        })
-        .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn shutdown_terminal_worker_failure_preserves_primary_and_replacement_errors() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path().join("input");
-            std::fs::create_dir(&root).unwrap();
-            let data = dir.path().join("store");
-            let socket = data.join("rpc.sock");
-            let config = write_server_config(dir.path(), &data, &socket);
-            append_consume_config(&config, &root, 1000, 8, 8);
-            append_syslog_config(
-                &config,
-                "active",
-                "127.0.0.1:0",
-                "syslog-fixture",
-                "tcp",
-                Some("lf"),
-            );
-            let mut daemon = start_with_stderr(&config, &socket, Stdio::piped()).await;
-            let client = sparrow_client::Client::connect(&socket).await.unwrap();
-            let receipt = client
-                .ingest(
-                    "terminal-cleanup",
-                    "source",
-                    wire::Format::Log,
-                    b"durable\n",
-                )
-                .await
-                .unwrap();
-            drop(client);
-            let old_socket = data.join("original.sock");
-            std::fs::rename(&socket, &old_socket).unwrap();
-            std::fs::write(&socket, b"preserve replacement").unwrap();
-            let old_root = dir.path().join("original-input");
-            std::fs::rename(&root, &old_root).unwrap();
-            std::fs::create_dir(&root).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let status = loop {
-                if let Some(status) = daemon.0.try_wait().unwrap() {
-                    break status;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "terminal worker shutdown stalled"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            };
-            assert!(!status.success());
-            let mut stderr = String::new();
-            std::io::Read::read_to_string(&mut daemon.0.stderr.take().unwrap(), &mut stderr)
-                .unwrap();
-            assert!(
-                stderr.contains("root changed"),
-                "primary failure was lost: {stderr}"
-            );
-            assert!(
-                stderr.contains("local endpoint cleanup") && stderr.contains("preserving it"),
-                "cleanup failure was lost: {stderr}"
-            );
-            assert!(!stderr.contains("pthread lock"));
-            assert_eq!(std::fs::read(&socket).unwrap(), b"preserve replacement");
-            std::fs::remove_dir(&root).unwrap();
-            std::fs::rename(&old_root, &root).unwrap();
-            std::fs::remove_file(&socket).unwrap();
-            std::fs::rename(&old_socket, &socket).unwrap();
-            let _reopened = start(&config, &socket).await;
-            assert_eq!(
-                cli(&socket, &["status"])["live_records"].as_str(),
-                Some("1")
-            );
-            let client = sparrow_client::Client::connect(&socket).await.unwrap();
-            assert_eq!(
-                client
-                    .ingest(
-                        "terminal-cleanup",
-                        "source",
-                        wire::Format::Log,
-                        b"durable\n"
-                    )
-                    .await
-                    .unwrap(),
-                receipt
             );
         })
         .await;

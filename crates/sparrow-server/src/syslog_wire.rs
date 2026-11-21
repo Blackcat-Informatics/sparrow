@@ -152,6 +152,14 @@ pub(crate) fn listener(
                 "reader_full_longest_ms",
                 listener.get_reader_full_longest_ms().to_string(),
             )
+            .with(
+                "holds_store_failure",
+                listener.get_holds_store_failure().to_string(),
+            )
+            .with(
+                "listener_errors",
+                listener.get_listener_errors().to_string(),
+            )
             .with("restamped", listener.get_restamped().to_string())
             .with(
                 "restamped_past_watermark",

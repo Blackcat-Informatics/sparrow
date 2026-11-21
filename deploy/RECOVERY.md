@@ -241,16 +241,19 @@ every watch in `consume_watches` names a root that exists.
 
 ## Watch root missing, replaced or unreadable
 
-- Symptom: startup fails validating a watch, the journal names
-  `configured consume root changed`, `watch root was replaced`, or
-  `claim directory must be owned by the daemon and mode 0700`; or files stay
-  in a root without being consumed.
+- Symptom: the journal names `configured consume root changed`,
+  `watch root was replaced`, or
+  `claim directory must be owned by the daemon and mode 0700`, `watch list`
+  shows a `failure` on that watch alone, or files stay in a root without being
+  consumed. The daemon and the other watches keep running, and the watch is
+  retried every minute at most.
 - Diagnose: `sparrow /SPARROW/store/rpc.sock watch list`;
   `ls -la /SPARROW/intake/NAME /SPARROW/intake/NAME/.sparrow-inflight`;
   `getfacl /SPARROW/intake/NAME`. A file the daemon cannot read is mode 0600
   or not in the `sparrow` group.
-- Recover: recreate a missing root with plain `mkdir` as a member of
-  `sparrow`. A replaced root with pending claims must be restored to the
+- Recover: no restart is needed: the watch resumes by itself within a minute
+  of the exact root being restored. Recreate a missing root with plain `mkdir`
+  as a member of `sparrow`. A replaced root with pending claims must be restored to the
   original directory (the claim binds its inode); never discard
   `.sparrow-inflight`. A root that lost group access: `sudo systemd-tmpfiles
   --create sparrow.conf` restores the parent; fix the root itself with
