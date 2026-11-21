@@ -722,6 +722,7 @@ pub(crate) fn encode_claims(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sparrow_core::Config;
 
     /// The stored watch shape an older build reads: the same fields, without `publish_hold`.
     #[derive(Deserialize, Serialize)]
@@ -800,10 +801,13 @@ mod tests {
         assert!(refused.contains("publish_hold"), "{refused}");
     }
 
-    /// INVARIANT (#440): a retirement that pressure refuses leaves the catalog as stored and
-    /// the work due, so the next pass stores it; it does not end the worker or lose the work.
+    /// INVARIANT (#440): a retirement that the real store refuses under pressure leaves the
+    /// stored registry and the catalog as they were and the work due, so the next pass stores
+    /// it; the refusal does not end the worker or lose the work.
     #[test]
-    fn a_refused_retirement_stays_due_and_is_stored_by_the_next_call() {
+    fn a_retirement_refused_by_the_store_stays_due_and_is_stored_by_the_next_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), sparrow_test_support::storage_config!(Config)).unwrap();
         let mut disabled = managed(false);
         disabled.enabled = false;
         let mut catalog = Catalog {
@@ -814,22 +818,25 @@ mod tests {
                 watches: vec![disabled],
                 receipts: Vec::new(),
             },
-            raw: Some(Vec::new()),
+            raw: store.watch_registry().unwrap(),
             configured: std::collections::BTreeMap::new(),
         };
-        let refused = catalog.retire_and_store(&[], |_| {
-            Err(failure("STORAGE_PRESSURE", "write would cross the reserve").into())
-        });
+        let before = store.watch_registry().unwrap();
+        store.space_floor().refuse_writes_for_tests(true);
+        let refused = catalog.retire_and_store(&[], |next| next.persist(&store));
         assert!(matches!(refused, Ok(Retirement::Deferred(_))));
         assert_eq!(
             catalog.watches().len(),
             1,
             "a refused write changed the catalog"
         );
-        let stored = catalog.retire_and_store(&[], |_| Ok(()));
+        assert_eq!(store.watch_registry().unwrap(), before);
+        store.space_floor().refuse_writes_for_tests(false);
+        let stored = catalog.retire_and_store(&[], |next| next.persist(&store));
         assert!(matches!(stored, Ok(Retirement::Stored)));
         assert!(catalog.watches().is_empty());
-        let other = catalog.retire_and_store(&[], |_| Ok(()));
-        assert!(matches!(other, Ok(Retirement::Nothing)));
+        assert_ne!(store.watch_registry().unwrap(), before);
+        let none = catalog.retire_and_store(&[], |next| next.persist(&store));
+        assert!(matches!(none, Ok(Retirement::Nothing)));
     }
 }
