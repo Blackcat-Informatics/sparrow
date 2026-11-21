@@ -526,8 +526,8 @@ failing.
 
 Deletion takes two runs, because a spool script opens a file by name and appends
 a line a moment later, so a line can land in a file the store already holds. In
-the run that finds every part of a file held, the shipper renames the file to
-`.reaping-NAME`, which neither the shipper nor the spool scripts read; a script
+the run that finds every part of a file held, the shipper links the file to
+`.reaping-NAME` and unlinks NAME, which neither the shipper nor the spool scripts read; a script
 that opens NAME afterwards creates a new file under it. At its next run the
 shipper looks at each `.reaping-` file again and deletes it only if the store
 holds every part of its present content. A file that now holds a line the store

@@ -372,10 +372,11 @@ def settle_set_aside(source, config, store):
     """Decide every file an earlier run set aside, by what it holds now.
 
     A spool script opens a file by name and appends a line a moment later, so a line can land
-    in a file after it was acknowledged and renamed. The set-aside file is therefore deleted a
+    in a file after it was acknowledged and set aside. The set-aside file is therefore deleted a
     run later, and only if the store holds every part of its present content; otherwise it goes
-    back under its own name (or a `-late-` name when that is in use again) and ships like any
-    finished file. Returns the number deleted.
+    back under its own name (or a `-late-` name when that is in use again); a file whose
+    content the store never held ships like any finished file, and one whose ledger identity is
+    unchanged (the store retired it) stays, counted as not acknowledged. Returns the number deleted.
     """
     deleted = 0
     directory = Path(source["dir"])
@@ -398,8 +399,8 @@ def settle_set_aside(source, config, store):
 def reap(source, config, store, now):
     """Set aside the finished files of a spool source whose every part the store holds.
 
-    Returns (deleted, set_aside, unacknowledged). Nothing is unlinked in the run that finds a
-    file acknowledged: it is renamed to `.reaping-NAME`, which the shipper and the spool scripts
+    Returns (deleted, set_aside, unacknowledged). No file is deleted in the run that finds a
+    file acknowledged: its bytes move to `.reaping-NAME` (a hard link; NAME is then unlinked), which the shipper and the spool scripts
     ignore, and `settle_set_aside` decides it on the next run. A set-aside name that is already
     taken is left alone.
     """

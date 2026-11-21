@@ -6273,6 +6273,12 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
                 std::fs::read(spool.join(&late[0])).unwrap(),
                 b"{\"a\":1}\n{\"late\":1}\n"
             );
+            // Let the watch publish everything fed so far, so only pressure keeps a file out.
+            watch_until(producer.capability(), |watch| {
+                watch.get_pending_claims() == 0
+                    && std::fs::read_dir(intake.join("spool")).unwrap().count() == 0
+            })
+            .await;
             // Storage pressure refuses publication: the store holds none of the new files, so
             // nothing is set aside while it lasts.
             let ballast = data.join("test-owned-pressure-ballast");
