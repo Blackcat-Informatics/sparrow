@@ -1843,6 +1843,46 @@ impl Roster {
         }
     }
 
+    /// Hand a parked watch that holds no unfinished claim back to the open path. Its held root
+    /// descriptor may name a directory that was removed or replaced, which a rebuild from that
+    /// descriptor can never leave; opening from the configured path, as a restart does, adopts
+    /// the root as it is now, and refuses it while an unfinished claim binds the watch to its
+    /// original root. A watch with claims stays parked and resumes only on the exact root.
+    fn release_parked(&mut self, store: &Store) -> Result<(), Error> {
+        let due = self
+            .detectors
+            .iter()
+            .any(|detector| detector.broken.failing() && detector.broken.due());
+        if !due {
+            return Ok(());
+        }
+        let pending = store.consumption_pending()?;
+        let (parked, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.detectors)
+            .into_iter()
+            .partition(|detector| {
+                detector.broken.failing()
+                    && detector.broken.due()
+                    && !pending
+                        .iter()
+                        .any(|journal| journal.watch == detector.config.id)
+            });
+        self.detectors = kept;
+        for detector in parked {
+            let what = format!("watch={} open", detector.config.id);
+            let mut retry = Backoff::default();
+            retry.failed(&what, detector.status_failure().unwrap_or_default());
+            self.unopened.push(Unopened {
+                watch: ManagedWatch {
+                    definition: detector.config.clone(),
+                    revision: detector.revision,
+                    enabled: detector.enabled,
+                },
+                retry,
+            });
+        }
+        Ok(())
+    }
+
     /// Open again each unopened watch whose retry is due. A root that is still missing,
     /// unreadable or replaced stays unopened (a replacement is refused by the same checks as
     /// at start, and pending claims stay bound to the original root); the exact root restored
@@ -2060,6 +2100,7 @@ async fn pass(
         note_retired(store, &mut fill)?;
         *retired_logged = Some(fill);
     }
+    roster.release_parked(store)?;
     roster.reopen(store, binding);
     if space_ok {
         commit_initial_catalog(catalog, store, catalog_retry);

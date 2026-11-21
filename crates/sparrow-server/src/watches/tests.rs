@@ -1431,6 +1431,32 @@ async fn a_root_missing_at_start_leaves_the_other_watches_open_and_resumes_when_
     assert!(roster.unopened.is_empty());
 }
 
+/// Value (#445): a root removed while the daemon ran and then recreated stayed parked, because
+/// the parked watch kept rebuilding from its held descriptor of the deleted directory. Protects:
+/// a parked watch with no unfinished claim is opened again from its configured path and runs on
+/// the recreated root, with the failure cleared; its backoff has to pass first.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_parked_watch_without_claims_reopens_from_its_path_when_the_root_is_recreated() {
+    let (_directory, store, mut detector) = held_fixture("recreated");
+    let root = detector.config.root.clone();
+    std::fs::remove_dir_all(&root).unwrap();
+    assert!(detector.attempt(Detector::ready).is_none());
+    std::fs::create_dir(&root).unwrap();
+    let mut roster = Roster {
+        detectors: vec![detector],
+        unopened: Vec::new(),
+    };
+    roster.release_parked(&store).unwrap();
+    assert_eq!(roster.detectors.len(), 1, "the backoff has not passed");
+    tokio::time::advance(STORE_RETRY_CEILING).await;
+    roster.release_parked(&store).unwrap();
+    assert!(roster.detectors.is_empty() && roster.unopened.len() == 1);
+    tokio::time::advance(STORE_RETRY_CEILING).await;
+    roster.reopen(&store, RootBinding::Stored);
+    assert_eq!(roster.detectors.len(), 1);
+    assert!(roster.detectors[0].live() && roster.detectors[0].status_failure().is_none());
+}
+
 /// A finished-file detector under a fresh store, for a root that tests rename and replace.
 fn held_fixture(id: &str) -> (tempfile::TempDir, Store, Detector) {
     let directory = tempfile::tempdir().unwrap();

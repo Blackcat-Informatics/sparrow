@@ -403,7 +403,9 @@ publishing), one tail drain, or one watch's root (missing, replaced, unreadable,
 directory limit) stops only that claim or watch: the cause is in that watch's `failure`, the other
 watches run, and the watch is rebuilt on the same backoff. A replacement root is never adopted
 and a pending claim stays bound to the original root and is kept; the exact root restored
-resumes the watch. A root that cannot be opened at start leaves the watch reported with its
+resumes the watch. A parked watch that holds no unfinished claim is opened again from its
+configured path on each retry, as a start opens it, so a root removed and recreated resumes
+without a restart. A root that cannot be opened at start leaves the watch reported with its
 reason and does not delay the daemon's start or the other watches.
 
 Socket-bind refusal, syslog-start refusal, terminal serving/worker failure and
@@ -4844,11 +4846,10 @@ refusal and every refusal of an older daemon.
 
 `ARCHIVE_WATERMARK` is a publication at or behind the archive watermark: a clock
 regression, or a datagram stamped with its read instant that waited past the
-watermark. It is not retryable as sent. It was `STORAGE_FAILURE` before the UDP
-syslog publisher needed to tell it apart, and every other caller treats it exactly
-as it treated `STORAGE_FAILURE`: the watch worker, which stops on a storage
-failure, stops on it too. Only the UDP syslog publisher handles it, as described
-with the UDP hold. `STORAGE_FAILURE` also covers retirement reaching unarchived evidence.
+watermark. It is not retryable as sent. The UDP syslog publisher restamps a
+datagram it refuses, as described with the UDP hold; a TCP syslog frame it refuses is held
+and offered again, as a `STORAGE_FAILURE` is. The watch worker records either code against the
+claim or watch it hit and retries; neither ends the worker. `STORAGE_FAILURE` also covers retirement reaching unarchived evidence.
 `INVALID_ARGUMENT` covers opening an archiving store without its `[archive]`
 table.
 
