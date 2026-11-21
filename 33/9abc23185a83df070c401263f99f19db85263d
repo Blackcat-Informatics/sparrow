@@ -1,0 +1,18 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: a463b890659270dd07efb21365b99ddfe760b551
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 456
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/456
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: dfec49f0eceef34e8171ed28b8acaccbd9c81ce3
+GhpRsq-Head-Ref: paudley/455-watch-root-missing-at-start-fails-the
+GhpRsq-Head-OID: a463b890659270dd07efb21365b99ddfe760b551
+GhpRsq-Result-Tree: a025a1b5dc3d3140b014d0018598a0b521ce28fb
+GhpRsq-Result-Commit: 339abc23185a83df070c401263f99f19db85263d
+GhpRsq-Parent-Hashes: a463b890659270dd07efb21365b99ddfe760b551
+GhpRsq-Squash-Notes-SHA256: 5b08493ad087e2a43e4560584a1f768b5faf8e29451d2f284503c06d1321daf6
+GhpRsq-Stage-Evidence: none
