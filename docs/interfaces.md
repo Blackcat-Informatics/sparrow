@@ -578,7 +578,7 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
   they observe and claim nothing), the daemon's maintenance that writes more than it
   frees (import reclamation and online migration; ageing out, the lease purge and the
   pressure pass run, under the maintenance reserve). A daemon that starts below the floor opens its store and serves
-  reads. Only free space below the maintenance reserve, which an open writes its manifest and WAL into,
+  reads. Only free space below the maintenance reserve (or below `min_free_bytes` when that is smaller), which an open writes its manifest and WAL into,
   keeps it waiting (`sparrowd: waiting to open the store`, nothing can answer then), and a startup write that
   pressure refuses (the first store of the configured watch catalog) is retried on each worker pass. A paused
   watch worker owns no timer: it observes the floor through the floor's ledger and

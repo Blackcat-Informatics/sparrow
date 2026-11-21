@@ -6025,6 +6025,12 @@ async fn daemon_starts_on_a_store_over_its_reserve_and_recovers_without_a_restar
                     matches!(refused, sparrow_client::Error::Domain { ref code, retryable: true, .. } if code == "STORAGE_PRESSURE"),
                     "{refused:?}"
                 );
+                // The refused write moves the pressure phase off `ready`.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while cli(&socket, &["status"])["pressure"]["phase"].as_str() == Some("ready") {
+                    assert!(Instant::now() < deadline, "pressure phase stayed ready");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 std::fs::remove_file(&ballast).unwrap();
                 let deadline = Instant::now() + Duration::from_secs(30);
                 loop {
