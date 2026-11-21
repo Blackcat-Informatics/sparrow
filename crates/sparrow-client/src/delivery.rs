@@ -859,7 +859,7 @@ impl Shared {
         }
         self.notify_barrier();
     }
-    fn next(&self) -> Result<Action, Error> {
+    fn next(&self, advertised: Option<crate::events::BatchLimits>) -> Result<Action, Error> {
         let mut state = self
             .state
             .lock()
@@ -885,10 +885,13 @@ impl Shared {
         let remaining =
             (first.at + self.config.flush_interval).saturating_duration_since(Instant::now());
         let at = first.at;
+        let limits = advertised
+            .unwrap_or(crate::events::BatchLimits::NATIVE)
+            .bounded(self.config.batch_events, self.config.batch_bytes);
         if !state.closing
             && state.force_through < first.event.sequence
-            && state.queue.len() < self.config.batch_events
-            && state.bytes < self.config.batch_bytes
+            && state.queue.len() < limits.events
+            && state.bytes < limits.payload_bytes
             && !remaining.is_zero()
         {
             return Ok(Action::Wait(Some(remaining)));
@@ -905,9 +908,16 @@ impl Shared {
         let overhead = 1024 + 6 * (request_id.len() + self.config.source.len());
         let mut bytes = 0;
         let mut events = Vec::new();
+        // Before discovery only one event is certain to fit the count ceiling. A singleton
+        // that exceeds a newly advertised byte ceiling is kept whole for input quarantine.
+        let count_limit = if advertised.is_some() {
+            limits.events
+        } else {
+            1
+        };
         while let Some(next) = state.queue.front() {
-            if events.len() == self.config.batch_events
-                || bytes + next.bytes + overhead > self.config.batch_bytes
+            if events.len() == count_limit
+                || (!events.is_empty() && bytes + next.bytes + overhead > limits.payload_bytes)
             {
                 break;
             }
@@ -1300,9 +1310,13 @@ enum Action {
 }
 async fn run(shared: &Shared) -> Result<(), Error> {
     let mut connection: Option<Client> = None;
+    let mut may_have_sent = false;
     let mut backoff = Backoff::new(&shared.config);
     loop {
-        match shared.next()? {
+        let advertised = connection
+            .as_ref()
+            .map(|client| client.discovery().event_limits());
+        match shared.next(advertised)? {
             Action::Stop => return Ok(()),
             Action::Wait(duration) => match duration {
                 Some(duration) => {
@@ -1313,19 +1327,36 @@ async fn run(shared: &Shared) -> Result<(), Error> {
             Action::Send(batch) => {
                 let attempt = async {
                     if connection.is_none() {
-                        let client =
-                            Client::open(&shared.config.endpoint, shared.config.expect.as_ref())
-                                .await?;
-                        shared.bind_store(&client.discovery().store_id)?;
-                        connection = Some(client);
-                    }
-                    let receipt = connection
-                        .as_ref()
-                        .ok_or(Error::Protocol(
-                            "producer connection missing after discovery",
-                        ))?
-                        .events(&batch)
+                        let client = Client::open(
+                            &shared.config.endpoint,
+                            shared.config.expect.as_ref(),
+                            crate::receipt::Contract::Producer,
+                        )
                         .await?;
+                        let bound = shared.bind_store(&client.discovery().store_id);
+                        connection = Some(client);
+                        bound?;
+                    }
+                    let client = connection.as_ref().ok_or(Error::Protocol(
+                        "producer connection missing after discovery",
+                    ))?;
+                    // Once the RPC can have left the process, even a timeout must keep the
+                    // immutable identity. Client-side size validation runs before dispatch.
+                    let previous_attempt = may_have_sent;
+                    may_have_sent = true;
+                    let receipt = match client.events(&batch).await {
+                        Err(error @ Error::InvalidArgument(_)) => {
+                            may_have_sent = previous_attempt;
+                            return Err(if previous_attempt {
+                                Error::Unsupported(
+                                    "current producer ceilings cannot admit the immutable batch with an unknown delivery outcome",
+                                )
+                            } else {
+                                error
+                            });
+                        }
+                        result => result?,
+                    };
                     // A store replaced behind a live connection answers with its own receipt:
                     // refuse it here, as a hold, rather than as a worker failure.
                     shared.bind_store(&receipt.store_id)?;
@@ -1341,9 +1372,18 @@ async fn run(shared: &Shared) -> Result<(), Error> {
                 match result {
                     Ok(receipt) => {
                         shared.accepted(&batch, receipt)?;
+                        may_have_sent = false;
                         backoff.reset();
                     }
                     Err(error) => {
+                        // A refusal during connection, discovery or CHAP cannot be about the
+                        // pending event batch. Store binding, once connected, is a separate
+                        // identity check with its own replacement policy.
+                        let action = if connection.is_some() {
+                            disposition(&error)
+                        } else {
+                            Disposition::Hold
+                        };
                         // A daemon answer, even a refusal, proves the connection works; only
                         // a transport, I/O or protocol failure, or a store that is not the
                         // bound one, means the connection may be wrong. A needless reconnect on
@@ -1358,10 +1398,11 @@ async fn run(shared: &Shared) -> Result<(), Error> {
                         // dropped. Every other failure holds the batch and retries it.
                         let mismatch =
                             matches!(&error, Error::Domain { code, .. } if code == STORE_MISMATCH);
-                        let error = match disposition(&error) {
+                        let error = match action {
                             Disposition::SetAside => match shared.save(&batch, &error) {
                                 Ok(_) => {
                                     shared.quarantine(&batch, error)?;
+                                    may_have_sent = false;
                                     if mismatch {
                                         shared.forget_store()?;
                                     }
@@ -1372,12 +1413,18 @@ async fn run(shared: &Shared) -> Result<(), Error> {
                             },
                             Disposition::Hold => error,
                         };
+                        let delay = if matches!(error, Error::Unsupported(crate::PRODUCER_PROFILE))
+                        {
+                            Duration::from_secs(30)
+                        } else {
+                            backoff.take()
+                        };
                         shared.retry(error)?;
                         if wait_out_retry_delay(
                             &shared.abort_wake,
                             &shared.retry_wake,
                             &shared.barrier_active,
-                            backoff.take(),
+                            delay,
                         )
                         .await
                         {

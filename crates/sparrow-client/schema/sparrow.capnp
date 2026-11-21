@@ -347,6 +347,7 @@ struct Status {
   # and no row is removed; at the bound no claim can be retired. A reader that does not know
   # these fields sees no change.
   retiredClaimCount @66 :UInt32; maxRetiredClaims @67 :UInt32;
+  producerProfiles @68 :List(Text);
 }
 # What a store is for, fixed at creation from the `instance_role` configuration key. A sender
 # that must refuse the live store reads it from `Discovery`. `unspecified` is a store with no
@@ -491,6 +492,7 @@ struct Discovery {
   retireRecordCharge @15 :UInt64;
   # Additive (#371): the store's role; `unspecified` from an older daemon or a store with none.
   instanceRole @16 :InstanceRole;
+  producerProfiles @17 :List(Text);
 }
 
 enum PressurePhase { ready @0; requested @1; awaitingReclamation @2; blocked @3; awaitingArchive @4; }

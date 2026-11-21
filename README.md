@@ -50,7 +50,8 @@ WAL flush controls, and helper-census tooling are implemented. Active tailing
 with explicit completed-generation retirement, typed public TCP
 ingestion, and syslog are implemented. Stored-view SELECT, ASK, CONSTRUCT,
 DESCRIBE, measured EXPLAIN and native stored-text rank/span relations are
-implemented. The wire schema is version 71. The archive is implemented and not
+implemented. The wire schema is version 72. Producers negotiate the
+`sparrow-producer/1` profile across compatible schema versions. The archive is implemented and not
 yet running on the live daemon ([Archive status](docs/archive-format.md#archive-status)). See [Development runtime](docs/development-runtime.md) for
 present commands, verified behavior and limits.
 

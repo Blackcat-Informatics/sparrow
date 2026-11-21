@@ -9,7 +9,7 @@
 //! ```no_run
 //! # async fn example(socket: &std::path::Path) -> Result<(), sparrow_client::Error> {
 //! tokio::task::LocalSet::new().run_until(async {
-//!     let client = sparrow_client::Client::connect(socket).await?;
+//!     let client = sparrow_client::Client::connect_producer(&sparrow_client::Endpoint::Unix(socket.into())).await?;
 //!     let receipt = client.ingest("app-session-001", "my-app",
 //!         sparrow_client::Format::Log, b"startup complete\n").await?;
 //!     assert_eq!(receipt.durability, sparrow_client::Durability::Durable);
@@ -36,7 +36,7 @@ mod result_release;
 pub use result_release::{ResultReleaseReceipt, release_result};
 mod receipt;
 pub use bytes::{decode_evidence, encode_evidence, read_bytes};
-pub use receipt::{ArtifactReceipt, Discovery, DurabilityWatermark, flush_through};
+pub use receipt::{ArtifactReceipt, Discovery, DurabilityWatermark, ProducerLimits, flush_through};
 mod expect;
 pub use expect::{Expect, RequiredRole, instance_role_label};
 mod imports;
@@ -81,8 +81,10 @@ pub use replay::{ReplayReceipt, replay_quarantine};
 
 pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
 
-/// Required discovery contract; incompatible daemons are refused before mutation.
-pub const SCHEMA_VERSION: u32 = 71;
+/// Exact schema version used by query and administrative clients.
+pub const SCHEMA_VERSION: u32 = 72;
+/// Ingestion and durability profile advertised across compatible schema versions.
+pub const PRODUCER_PROFILE: &str = "sparrow-producer/1";
 /// Fixed upload unit admitted by the schema's private staging contract.
 pub const IMPORT_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -153,6 +155,7 @@ impl Client {
 
     /// Read an exact artifact, record, or complete retained file-generation range.
     pub async fn bytes(&self, id: &str, offset: u64, length: u32) -> Result<Vec<u8>, Error> {
+        self.discovery.require(receipt::Contract::Query)?;
         read_bytes(
             self.capability(),
             &self.discovery.store_id,
@@ -176,7 +179,8 @@ impl Client {
         batch: &EventBatch,
         durability: Durability,
     ) -> Result<ArtifactReceipt, Error> {
-        let bytes = batch.source_bytes()?;
+        self.discovery.require(receipt::Contract::Producer)?;
+        let bytes = batch.source_bytes_with_limits(self.discovery.event_limits())?;
         let expected = receipt::ExpectedArtifact::bytes(
             &self.discovery,
             &batch.source,
@@ -206,7 +210,7 @@ impl Client {
 
     /// Connect and validate discovery through the selected typed transport.
     pub async fn connect_endpoint(endpoint: &Endpoint) -> Result<Self, Error> {
-        Self::open(endpoint, None).await
+        Self::open(endpoint, None, receipt::Contract::Query).await
     }
 
     /// Connect as [`Client::connect_endpoint`] does and refuse a daemon whose discovery does not
@@ -217,10 +221,27 @@ impl Client {
         endpoint: &Endpoint,
         expect: &Expect,
     ) -> Result<Self, Error> {
-        Self::open(endpoint, Some(expect)).await
+        Self::open(endpoint, Some(expect), receipt::Contract::Query).await
     }
 
-    async fn open(endpoint: &Endpoint, expect: Option<&Expect>) -> Result<Self, Error> {
+    /// Open for ingestion, resumable imports and flush using the advertised producer profile.
+    pub async fn connect_producer(endpoint: &Endpoint) -> Result<Self, Error> {
+        Self::open(endpoint, None, receipt::Contract::Producer).await
+    }
+
+    /// Open a producer connection and require the configured role or store id.
+    pub async fn connect_producer_expecting(
+        endpoint: &Endpoint,
+        expect: &Expect,
+    ) -> Result<Self, Error> {
+        Self::open(endpoint, Some(expect), receipt::Contract::Producer).await
+    }
+
+    async fn open(
+        endpoint: &Endpoint,
+        expect: Option<&Expect>,
+        contract: receipt::Contract,
+    ) -> Result<Self, Error> {
         endpoint.validate()?;
         let mut connection = match endpoint {
             Endpoint::Unix(socket) => transport::connect_typed(socket).await?,
@@ -228,7 +249,7 @@ impl Client {
                 transport::connect_tcp(*address).await?
             }
         };
-        let discovery = Discovery::fetch(&connection.client).await?;
+        let discovery = contract.discover(&connection.client).await?;
         expect::require(expect, &discovery)?;
         if let Endpoint::AuthenticatedTcp(_, secret) = endpoint {
             connection.client =
@@ -291,6 +312,7 @@ impl Client {
         bytes: &[u8],
         durability: Durability,
     ) -> Result<ArtifactReceipt, Error> {
+        self.discovery.require(receipt::Contract::Producer)?;
         if request_id.is_empty()
             || request_id.len() > 128
             || source.is_empty()
@@ -339,6 +361,7 @@ impl Client {
     /// Synchronize through a current-session acceptance fence. Timeout/transport loss
     /// leaves synchronization unknown and permits retrying this same fence.
     pub async fn flush(&self, through: &DurabilityWatermark) -> Result<DurabilityWatermark, Error> {
+        self.discovery.require(receipt::Contract::Producer)?;
         if through.store_id != self.discovery.store_id {
             return Err(Error::InvalidArgument(
                 "durability fence belongs to another discovered store",
@@ -401,6 +424,7 @@ impl Client {
         file: &mut std::fs::File,
         progress: Option<std::sync::Arc<parts::PartsProgress>>,
     ) -> Result<ArtifactReceipt, Error> {
+        self.discovery.require(receipt::Contract::Producer)?;
         imports::upload_or_cancel(
             self.capability(),
             &self.discovery,
@@ -415,6 +439,7 @@ impl Client {
 
     /// Inspect the daemon's recorded artifact receipt by persistent store-scoped ID.
     pub async fn artifact(&self, id: &str) -> Result<ArtifactReceipt, Error> {
+        self.discovery.require(receipt::Contract::Query)?;
         let mut request = self.capability().artifact_get_request();
         let mut reference = request.get().init_artifact();
         reference.set_store_id(&self.discovery.store_id);

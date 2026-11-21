@@ -668,9 +668,10 @@ it from one kept image pair to another:
 deploy/user-unit-upgrade.sh --from sparrowd-schema71-fda2812 --to sparrowd-schema71-a50820e --keep-copy /SPARROW/store.before-a50820e
 ```
 
-The live service runs `sparrowd-schema71-fda2812`. The next image keeps schema 71, so no CLI or
-producer changes with it; a switch that changes the schema number makes the daemon refuse the
-clients of every other schema, since it admits only its own. "Switch 1" and "Switch 2" below write
+The live service runs `sparrowd-schema71-fda2812`. Both images in the example use schema 71.
+A schema change requires a matching CLI and an upgrade of producers built before profile
+negotiation. Starting with schema 72, a producer can connect across schema versions when both
+ends support `sparrow-producer/1`. "Switch 1" and "Switch 2" below write
 out the two steps that bring the live store to the next image and then enable the archive worker.
 
 Both arguments name daemon images under `~/.local/libexec/sparrow`. Each CLI

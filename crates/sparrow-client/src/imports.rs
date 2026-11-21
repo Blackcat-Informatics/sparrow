@@ -292,10 +292,7 @@ impl Checkpoint {
 async fn reconnect(endpoint: &Endpoint, expect: Option<&Expect>) -> Result<Client, Error> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        let connected = match expect {
-            Some(expect) => Client::connect_endpoint_expecting(endpoint, expect).await,
-            None => Client::connect_endpoint(endpoint).await,
-        };
+        let connected = Client::open(endpoint, expect, crate::receipt::Contract::Producer).await;
         match connected {
             Err(error)
                 if crate::delivery::reconnectable(&error)
@@ -364,7 +361,7 @@ pub async fn import_open_file(
     file: &mut File,
 ) -> Result<ArtifactReceipt, Error> {
     // Discovery refuses an older daemon before allocating private staging.
-    let discovery = crate::Discovery::fetch(client).await?;
+    let discovery = crate::receipt::Contract::Producer.discover(client).await?;
     let mut checkpoint = Checkpoint::default();
     upload_or_cancel(
         client,

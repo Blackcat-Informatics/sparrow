@@ -13,7 +13,17 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         result::Ok(value) => value?,
         result::Error(error) => return Err(failure(error?)),
     };
-    if value.get_schema_version() != discovery.schema_version
+    let profiles = value.get_producer_profiles()?;
+    for (actual, expected) in profiles.iter().zip(&discovery.producer_profiles) {
+        if actual?.to_str()? != expected {
+            return Err(sparrow_client::Error::Protocol(
+                "status contradicts discovered producer profiles",
+            )
+            .into());
+        }
+    }
+    if profiles.len() as usize != discovery.producer_profiles.len()
+        || value.get_schema_version() != discovery.schema_version
         || value.get_store_id()?.to_str()? != discovery.store_id
         || value.get_durability_status()?.get_session_id()?.to_str()?
             != discovery.durability_session
@@ -201,6 +211,10 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         .with("store_id", value.get_store_id()?.to_str()?)
         .with("store_format", value.get_store_format()?.to_str()?)
         .with("schema_version", u64::from(value.get_schema_version()))
+        .with(
+            "producer_profiles",
+            Value::array(discovery.producer_profiles.iter().map(String::as_str)),
+        )
         .with(
             "max_event_batch_bytes",
             u64::from(value.get_max_event_batch_bytes()),
@@ -610,13 +624,24 @@ fn admission(status: wire::admission_status::Reader<'_>) -> capnp::Result<Value>
 /// The identity the connection learned when it opened, which the ingest socket admits: the store
 /// and its role, so a sender can refuse a store that is not `scratch` before it sends anything.
 pub(super) fn discovery(discovery: &sparrow_client::Discovery) -> Value {
-    Object::new()
+    let object = Object::new()
         .with("operation", "discover")
         .with("store_id", discovery.store_id.as_str())
         .with("schema_version", discovery.schema_version)
         .with(
-            "instance_role",
-            sparrow_client::instance_role_label(discovery.instance_role),
-        )
-        .into()
+            "producer_profiles",
+            Value::array(discovery.producer_profiles.iter().map(String::as_str)),
+        );
+    match discovery.unknown_instance_role {
+        Some(ordinal) => object
+            .with("instance_role", "unknown")
+            .with("instance_role_ordinal", u64::from(ordinal))
+            .into(),
+        None => object
+            .with(
+                "instance_role",
+                sparrow_client::instance_role_label(discovery.instance_role),
+            )
+            .into(),
+    }
 }

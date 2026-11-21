@@ -14,7 +14,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let identity = sparrow_client::CompletedFileIdentity::capture(&file.metadata()?);
     tokio::task::LocalSet::new()
         .run_until(async {
-            let client = sparrow_client::Client::connect(std::path::Path::new(&args[1])).await?;
+            let client = sparrow_client::Client::connect_producer(&sparrow_client::Endpoint::Unix(
+                (&args[1]).into(),
+            ))
+            .await?;
             identity.require(&file)?;
             let receipt = client
                 .import_open_file(&args[2], &args[3], format, &mut file)

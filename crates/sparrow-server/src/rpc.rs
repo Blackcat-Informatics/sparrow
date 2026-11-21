@@ -3164,6 +3164,9 @@ impl wire::sparrow::Server for Rpc {
                 let mut out = results.get().init_result().init_ok();
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                out.reborrow()
+                    .init_producer_profiles(1)
+                    .set(0, sparrow_client::PRODUCER_PROFILE);
                 out.set_max_inline_artifact_bytes(number(&value, "max_inline_artifact_bytes")?);
                 out.set_max_records_per_artifact(number(&value, "max_records_per_artifact")?);
                 out.set_max_import_bytes(number(&value, "max_import_bytes")?);
@@ -3318,6 +3321,9 @@ impl wire::sparrow::Server for Rpc {
                 }
                 out.set_max_event_batch_bytes(sparrow_client::MAX_EVENT_BATCH_BYTES as u32);
                 producer_limits(out.reborrow().init_producer_limits(), &value)?;
+                out.reborrow()
+                    .init_producer_profiles(1)
+                    .set(0, sparrow_client::PRODUCER_PROFILE);
                 out.set_max_event_batch_events(sparrow_client::MAX_EVENT_BATCH_EVENTS as u32);
                 out.set_rdf_profile(field::<String>(&value, "rdf_profile")?);
                 out.set_text_analyzer(field::<String>(&value, "text_analyzer")?);

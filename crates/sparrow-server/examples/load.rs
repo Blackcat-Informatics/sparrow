@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
     }
     tokio::task::LocalSet::new()
         .run_until(async {
-            let producer = Client::connect_endpoint(&endpoint).await?;
+            let producer = Client::connect_producer(&endpoint).await?;
             let reader = Client::connect_endpoint(&endpoint).await?;
             if producer.discovery().store_id != reader.discovery().store_id {
                 return Err("connections reached different stores".into());
