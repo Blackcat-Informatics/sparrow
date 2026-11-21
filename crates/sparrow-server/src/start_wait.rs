@@ -12,9 +12,14 @@
 //! start failure (configuration, format, identity, lexicon) is deterministic: a restart repeats
 //! it, so it still ends the start at once with its message.
 //!
-//! A start that cannot pass by itself ends with [`REFUSED_EXIT_STATUS`], which the unit lists in
+//! A start refusal that only a change of configuration, image, store or watch root clears is marked
+//! [`Permanent`] where it is produced ([`permanent`], [`bind_failure`], [`open_failure`],
+//! [`consume_start_failure`]). It ends with [`REFUSED_EXIT_STATUS`], which the unit lists in
 //! `RestartPreventExitStatus=`: a restart would repeat it, so the unit neither loops on it nor
-//! spends its start limit, and the journal names the refusal.
+//! spends its start limit, and the journal names the refusal. Any other failure before the daemon
+//! serves (a transient I/O error, descriptor exhaustion, a mount that has not come up) keeps the
+//! ordinary failure status, so the unit restarts it within its start limit, and the journal says
+//! it was not classified as permanent.
 //!
 //! While it waits the daemon serves nothing: before the store opens it holds no socket (the
 //! endpoint needs the store's lock, which the open takes), and in a later bind wait its sockets
@@ -65,6 +70,96 @@ const REMINDER: Duration = Duration::from_secs(60);
 /// condition only a person changes. `EX_CONFIG` of `sysexits.h`; the unit's
 /// `RestartPreventExitStatus=` names it, so the supervisor does not restart the refusal.
 pub const REFUSED_EXIT_STATUS: u8 = 78;
+
+/// A start refusal a restart repeats. The marker wraps the cause and is the only thing that
+/// selects [`REFUSED_EXIT_STATUS`].
+#[derive(Debug)]
+pub struct Permanent(Box<dyn Error>);
+
+impl std::fmt::Display for Permanent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl Error for Permanent {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+/// Mark `cause` as a start refusal a restart repeats.
+#[must_use]
+pub fn permanent(cause: impl Into<Box<dyn Error>>) -> Box<dyn Error> {
+    Box::new(Permanent(cause.into()))
+}
+
+/// Whether `error` was marked by [`permanent`].
+#[must_use]
+pub fn is_permanent(error: &(dyn Error + 'static)) -> bool {
+    error.is::<Permanent>()
+}
+
+/// A bind, spill or socket-directory failure: the kinds that name a refusal of the configured
+/// address, name, mode or owner are permanent; any other kind is not classified.
+#[must_use]
+pub fn bind_failure(error: io::Error) -> Box<dyn Error> {
+    use io::ErrorKind::{
+        AddrNotAvailable, AlreadyExists, InvalidData, InvalidInput, NotADirectory, NotFound,
+        PermissionDenied, Unsupported,
+    };
+    if matches!(
+        error.kind(),
+        AddrNotAvailable
+            | AlreadyExists
+            | InvalidData
+            | InvalidInput
+            | NotADirectory
+            | NotFound
+            | PermissionDenied
+            | Unsupported
+    ) {
+        permanent(error)
+    } else {
+        Box::new(error)
+    }
+}
+
+/// A refused open that no wait clears: `UNSUPPORTED` (format) and `INVALID_ARGUMENT`
+/// (identity, analyzer, lexicon, profile, archive fence, configuration) are permanent. Corruption
+/// and I/O failures (`STORAGE_FAILURE`) are not classified.
+#[must_use]
+pub fn open_failure(error: Box<dyn Error>) -> Box<dyn Error> {
+    let refused = error
+        .downcast_ref::<sparrow_core::Error>()
+        .is_some_and(|error| matches!(error.code, "UNSUPPORTED" | "INVALID_ARGUMENT"));
+    if refused { permanent(error) } else { error }
+}
+
+/// A consume worker that cannot start: a contradictory or unsupported watch state, a root that
+/// is missing, replaced or unreadable, and the store's own `UNSUPPORTED` or `INVALID_ARGUMENT`
+/// are permanent (restore the root or the watch configuration). Transport and other I/O
+/// failures are not classified.
+#[must_use]
+pub fn consume_start_failure(error: crate::consumption::Error) -> Box<dyn Error> {
+    use crate::consumption::Error as Start;
+    let refused = match &error {
+        Start::State(_) | Start::FinishedGeneration(_) | Start::PrivateRootShared { .. } => true,
+        Start::Io(error) => matches!(
+            error.kind(),
+            io::ErrorKind::NotFound
+                | io::ErrorKind::NotADirectory
+                | io::ErrorKind::PermissionDenied
+        ),
+        Start::Storage(error) => matches!(error.code, "UNSUPPORTED" | "INVALID_ARGUMENT"),
+        Start::Upload(_) => false,
+    };
+    if refused {
+        permanent(error)
+    } else {
+        Box::new(error)
+    }
+}
 
 static NOTIFY_FAILURE_JOURNALED: AtomicBool = AtomicBool::new(false);
 
@@ -312,7 +407,8 @@ pub async fn open_store(
     match outcome {
         Ok(wait) => Ok(wait),
         Err(Refusal::Space(text)) => Err(text.into()),
-        Err(Refusal::Open(error) | Refusal::Fatal(error)) => Err(error),
+        Err(Refusal::Open(error)) => Err(open_failure(error)),
+        Err(Refusal::Fatal(error)) => Err(error),
     }
 }
 
@@ -366,6 +462,107 @@ mod tests {
         assert!(wait("INVALID_ARGUMENT", "analyzer fingerprint differs").is_none());
         // An error that is not the typed storage error is not recognised as passing.
         assert!(open_hold(&io::Error::other("No space left on device")).is_none());
+    }
+
+    /// Value: only a start failure named as deterministic ends with the status the unit does
+    /// not restart; a transient or unclassified one keeps the ordinary failure status and is
+    /// restarted (#446). Protects: the class of each producer's errors.
+    #[test]
+    fn only_named_deterministic_refusals_are_permanent() {
+        use io::ErrorKind::*;
+        let core = |code| -> Box<dyn Error> { Box::new(sparrow_core::Error::new(code, "x")) };
+        let table: Vec<(&str, Box<dyn Error>, bool)> = vec![
+            ("format mismatch", open_failure(core("UNSUPPORTED")), true),
+            (
+                "identity, analyzer, lexicon, fence",
+                open_failure(core("INVALID_ARGUMENT")),
+                true,
+            ),
+            (
+                "corruption or I/O at open",
+                open_failure(core("STORAGE_FAILURE")),
+                false,
+            ),
+            (
+                "descriptor limit at open",
+                open_failure(core("RESOURCE_LIMIT")),
+                false,
+            ),
+            (
+                "open not typed as a store error",
+                open_failure("x".into()),
+                false,
+            ),
+            (
+                "address not on this host",
+                bind_failure(io::Error::from(AddrNotAvailable)),
+                true,
+            ),
+            (
+                "name is not a socket",
+                bind_failure(io::Error::from(AlreadyExists)),
+                true,
+            ),
+            (
+                "ingest directory refused",
+                bind_failure(io::Error::from(InvalidInput)),
+                true,
+            ),
+            (
+                "ingest socket mode refused",
+                bind_failure(io::Error::from(InvalidData)),
+                true,
+            ),
+            (
+                "bind denied",
+                bind_failure(io::Error::from(PermissionDenied)),
+                true,
+            ),
+            (
+                "descriptors exhausted",
+                bind_failure(io::Error::from(io::ErrorKind::Other)),
+                false,
+            ),
+            (
+                "interrupted",
+                bind_failure(io::Error::from(Interrupted)),
+                false,
+            ),
+            (
+                "root missing",
+                consume_start_failure(crate::consumption::Error::Io(io::Error::from(NotFound))),
+                true,
+            ),
+            (
+                "watch state contradicts",
+                consume_start_failure(crate::consumption::Error::State("x")),
+                true,
+            ),
+            (
+                "watch catalog format",
+                consume_start_failure(crate::consumption::Error::Storage(
+                    sparrow_core::Error::new("UNSUPPORTED", "x"),
+                )),
+                true,
+            ),
+            (
+                "catalog I/O",
+                consume_start_failure(crate::consumption::Error::Storage(
+                    sparrow_core::Error::new("STORAGE_FAILURE", "x"),
+                )),
+                false,
+            ),
+            (
+                "transient read of a root",
+                consume_start_failure(crate::consumption::Error::Io(io::Error::from(
+                    io::ErrorKind::Other,
+                ))),
+                false,
+            ),
+        ];
+        for (name, error, expected) in table {
+            assert_eq!(is_permanent(error.as_ref()), expected, "{name}");
+        }
     }
 
     /// Value: a port or socket name held by a departing owner spent the start limit (#446).

@@ -127,18 +127,24 @@ every watch in `consume_watches` names a root that exists.
   unit stays `active (running)` through a wait because it is `Type=exec`: a
   readiness gate would hold the unit in `activating` and its start timeout
   would kill a wait that is meant to last as long as the condition.
-- Not a wait: a condition that cannot pass without a change of configuration,
-  image, store or watch root (a bad argument or configuration key, a format,
-  identity, analyzer or lexicon mismatch, a missing `[archive]` table after the
-  store's archive fence, a watch root that must be restored, a spill directory
-  or ingest socket directory with the wrong owner or mode). The daemon journals
+- Not a wait: a condition named as deterministic, which cannot pass without a
+  change of configuration, image, store or watch root: a bad argument,
+  configuration key or secret file; a store format (`UNSUPPORTED`) or
+  identity, analyzer, lexicon, profile or archive-fence refusal
+  (`INVALID_ARGUMENT`, including a missing `[archive]` table after the store's
+  archive fence); a watch root that is missing, replaced or unreadable; a socket
+  name that is not a socket, an address not on the host, an ingest socket
+  directory or socket with the wrong owner or mode. The daemon journals
   `sparrowd: refused to start: <reason>` and exits with status 78, which the
   unit lists in `RestartPreventExitStatus=`: it is not restarted, spends no
   start, and `systemctl status` shows the unit `failed` with
   `status=78/CONFIG`. Correct the cause (restore the image, lexicon or
   configuration that wrote the store, see "Refused open"), then
   `sudo systemctl reset-failed sparrow.service && sudo deploy/start.sh`.
-  The old user unit has no such line: add `RestartPreventExitStatus=78` to it.
+  Any other failure before the daemon serves (corruption or an I/O error at the
+  open, a descriptor limit, a mount that has not come up) is not classified as
+  permanent: the daemon journals `sparrowd: start failed: ...; not classified as
+  permanent` and exits 1, and the unit restarts it within its start limit.
 - Reversible: yes.
 
 ## Unit start-limit hit

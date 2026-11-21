@@ -5789,7 +5789,9 @@ fn daemon_refuses_a_soft_open_file_limit_without_room_for_the_table_cache() {
         .admitted_output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&result.stderr);
-    assert_eq!(result.status.code(), Some(REFUSED), "{stderr}");
+    // Not named as deterministic, so the ordinary failure status: the unit restarts it.
+    assert_eq!(result.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("not classified as permanent"), "{stderr}");
     assert!(!socket.exists());
     assert!(
         stderr.contains("soft open-file limit is 1024") && stderr.contains("LimitNOFILE=65536"),
@@ -5816,9 +5818,11 @@ fn corrupt_durable_watch_catalog_is_a_hard_startup_failure() {
         .arg(&config)
         .admitted_output()
         .unwrap();
-    assert_eq!(result.status.code(), Some(REFUSED));
+    assert_eq!(result.status.code(), Some(1));
     assert!(!socket.exists());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("invalid durable watch catalog"));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("invalid durable watch catalog"));
+    assert!(stderr.contains("not classified as permanent"), "{stderr}");
 }
 
 #[tokio::test(flavor = "current_thread")]

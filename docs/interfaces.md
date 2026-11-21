@@ -589,9 +589,11 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
   `sparrowd: waiting to ...` with its reason, checks again (one second for space, a held lock and addresses, 30 seconds
   for an open refused for space or allowance), repeats the line each minute while its reason stands, ends at once on SIGINT and journals when it proceeds.
   A start condition that cannot pass without a change of configuration, image, store or watch root (configuration,
-  a format, identity, analyzer or archive mismatch, a missing `[archive]` table after the archive fence, corruption, a
+  a format, identity, analyzer or archive mismatch, a missing `[archive]` table after the archive fence, a
   watch root that must be restored) is not waited for: the daemon journals `sparrowd: refused to start: ...` and exits
-  with status 78, which the unit's `RestartPreventExitStatus=` does not restart. A wait is also reported as the unit's
+  with status 78, which the unit's `RestartPreventExitStatus=` does not restart. Only conditions named as deterministic
+  take that status; any other failure before the daemon serves (corruption or I/O at the open, a descriptor limit) exits 1
+  with `sparrowd: start failed: ...; not classified as permanent`, and the unit restarts it within its start limit. A wait is also reported as the unit's
   `StatusText` (`sd_notify` `STATUS=`), which reads `serving` once the daemon serves.
   A write of the watch catalog that
   pressure refuses (the first store of the configured catalog, and the retirement of a disabled watch) is retried on each worker pass. A paused

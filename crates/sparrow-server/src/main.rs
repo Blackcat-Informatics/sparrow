@@ -114,6 +114,18 @@ async fn main() -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         // Every start condition that passes is waited for (start_wait), so a start that fails
         // here repeats on a restart: end it with the status the unit does not restart.
+        Err(error)
+            if !SERVING.load(std::sync::atomic::Ordering::Relaxed)
+                && !start_wait::is_permanent(error.as_ref()) =>
+        {
+            // Not named as deterministic (a transient I/O error, descriptor exhaustion, a mount
+            // that has not come up): the ordinary failure status, so the unit restarts it
+            // within its start limit.
+            eprintln!(
+                "sparrowd: start failed: {error}; not classified as permanent, so the exit status is 1 and the unit restarts it"
+            );
+            std::process::ExitCode::FAILURE
+        }
         Err(error) if !SERVING.load(std::sync::atomic::Ordering::Relaxed) => {
             eprintln!(
                 "sparrowd: refused to start: {error}; a restart repeats it, so the exit status is {} and the unit does not restart it. Correct the configuration, image, store or watch root, then start the unit",
@@ -132,24 +144,26 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     sparrow_server::journal_log::install()?;
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let (path, mode) = arguments(&args)?;
-    let mut config = ServerConfig::read(Path::new(path))?;
+    let (path, mode) = arguments(&args).map_err(start_wait::permanent)?;
+    let mut config = ServerConfig::read(Path::new(path)).map_err(start_wait::permanent)?;
     // A no-intake daemon writes and runs maintenance but, like a query-only one, opens no
     // stored watch root, so a copy of a store never consumes the intake its catalog names.
     // A private-intake daemon opens every watch at a private root instead.
     let intake = !matches!(mode, Mode::NoIntake);
     let private = match &mode {
         Mode::QueryOnly => {
-            config = config.into_query_only()?;
+            config = config.into_query_only().map_err(start_wait::permanent)?;
             None
         }
         Mode::NoIntake => {
-            config.check_no_intake()?;
+            config.check_no_intake().map_err(start_wait::permanent)?;
             None
         }
         Mode::PrivateIntake(dir) => {
-            config.check_private_intake()?;
-            Some(sparrow_server::watches::PrivateIntake::new(dir)?)
+            config
+                .check_private_intake()
+                .map_err(start_wait::permanent)?;
+            Some(sparrow_server::watches::PrivateIntake::new(dir).map_err(start_wait::permanent)?)
         }
         Mode::Normal => None,
     };
@@ -158,7 +172,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         (None, true) => "true",
         (None, false) => "false",
     };
-    let tcp_secret = config.tcp_secret()?;
+    let tcp_secret = config.tcp_secret().map_err(start_wait::permanent)?;
     // Keep the subscription alive through startup and awaited maintenance work.
     // Recreating ctrl_c() inside select drops its listener when another branch wins.
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -171,7 +185,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             async || tokio::net::TcpListener::bind(address).await,
             start_wait::bind_hold,
         )
-        .await?
+        .await
+        .map_err(start_wait::bind_failure)?
         {
             Wait::Ready(listener) => Some(listener),
             Wait::Interrupted => return Ok(()),
@@ -231,7 +246,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             operations.clone(),
             private,
             config.output_paths(),
-        )?;
+        )
+        .map_err(start_wait::consume_start_failure)?;
         (watches, Some(consumer))
     };
     // Validate the catalog first; recover only a refused socket under exclusive store ownership.
@@ -247,7 +263,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(Wait::Ready(endpoint)) => endpoint,
         stopped => {
             return shutdown::finish(
-                stopped.map(|_| ()).map_err(Into::into),
+                stopped.map(|_| ()).map_err(start_wait::bind_failure),
                 shutdown::Workers {
                     consumer: consumer.take(),
                     ..Default::default()
@@ -280,7 +296,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )),
                 stopped => {
                     return shutdown::finish(
-                        stopped.map(|_| ()).map_err(Into::into),
+                        stopped.map(|_| ()).map_err(start_wait::bind_failure),
                         shutdown::Workers {
                             consumer: consumer.take(),
                             ..Default::default()
@@ -310,7 +326,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &config.syslog,
     ) {
         return shutdown::finish(
-            Err(error.into()),
+            Err(start_wait::bind_failure(error)),
             shutdown::Workers {
                 consumer: consumer.take(),
                 ..Default::default()
@@ -347,7 +363,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(Wait::Ready(worker)) => Some(worker),
             stopped => {
                 return shutdown::finish(
-                    stopped.map(|_| ()).map_err(Into::into),
+                    stopped.map(|_| ()).map_err(start_wait::bind_failure),
                     shutdown::Workers {
                         consumer: consumer.take(),
                         ..Default::default()
