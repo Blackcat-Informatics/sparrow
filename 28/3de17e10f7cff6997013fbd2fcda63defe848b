@@ -1,0 +1,18 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: f293ba40d1dd1513dbad6bec841f69a7031cca94
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 451
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/451
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 2aab6b12f5bde93e1d2b5a642f64d0f339613fbb
+GhpRsq-Head-Ref: paudley/448-client-s-delivery-worker-never-stops
+GhpRsq-Head-OID: f293ba40d1dd1513dbad6bec841f69a7031cca94
+GhpRsq-Result-Tree: 456b6da72647211c72683a3a6a1cb3c06c7dded8
+GhpRsq-Result-Commit: 283de17e10f7cff6997013fbd2fcda63defe848b
+GhpRsq-Parent-Hashes: f293ba40d1dd1513dbad6bec841f69a7031cca94
+GhpRsq-Squash-Notes-SHA256: c6232607c2a38b75bdcba536b913d17f719bfb8f5706e80c0d48f0c6211261ab
+GhpRsq-Stage-Evidence: none
