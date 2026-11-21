@@ -4,8 +4,9 @@
 //! The client quarantine directory: bytes the daemon cannot take are kept, never reduced to a
 //! count. One file per batch holds a header line (reason code, reason, counts, identity)
 //! followed by the batch's canonical event lines, exactly the bytes a daemon would have been
-//! given. The client never deletes, rewrites or expires a quarantine file; an operator or a
-//! later replay owns it.
+//! given. The worker never deletes or expires a quarantine file. [`crate::replay_quarantine`]
+//! resends one and removes it once the store acknowledges it; a refusal that recurs is recorded
+//! in the file's header and the file stays.
 
 use crate::EventBatch;
 use purrdf_lex::json::{self, Object};
