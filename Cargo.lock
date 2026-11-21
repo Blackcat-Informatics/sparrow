@@ -1382,10 +1382,12 @@ dependencies = [
  "purrdf-hash",
  "purrdf-lex",
  "rustix",
+ "serde",
  "sparrow-test-support",
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

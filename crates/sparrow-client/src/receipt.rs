@@ -3,6 +3,10 @@
 
 use crate::{Error, sparrow_capnp as wire};
 
+pub(crate) fn valid_store_id(id: &str) -> bool {
+    id.starts_with("store:") && (7..=128).contains(&id.len())
+}
+
 pub(crate) fn optional_identity(
     value: wire::optional_text::Reader<'_>,
 ) -> Result<Option<String>, Error> {
@@ -102,9 +106,7 @@ impl Discovery {
             instance_role: value.get_instance_role()?,
         };
         if discovery.schema_version != crate::SCHEMA_VERSION
-            || !discovery.store_id.starts_with("store:")
-            || discovery.store_id.len() <= 6
-            || discovery.store_id.len() > 128
+            || !valid_store_id(&discovery.store_id)
             || discovery.max_inline_artifact_bytes == 0
             || discovery.max_records_per_artifact == 0
             || discovery.text_analyzer.is_empty()
@@ -224,9 +226,7 @@ impl ArtifactReceipt {
                 "artifact durability and synchronization fence disagree",
             ));
         }
-        if !receipt.store_id.starts_with("store:")
-            || receipt.store_id.len() <= 6
-            || receipt.store_id.len() > 128
+        if !valid_store_id(&receipt.store_id)
             || !receipt.id.starts_with("artifact:")
             || receipt.id.len() <= 9
             || receipt.id.len() > 128
