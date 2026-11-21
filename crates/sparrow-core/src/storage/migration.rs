@@ -283,6 +283,13 @@ pub(super) fn report(
         .collect()
 }
 
+// INVARIANT: the source-context rebuild runs last, so a latched rebuild re-verifying on each
+// retry (see `source_context::page`) never holds back another migration.
+const _: () = assert!(matches!(
+    Migration::RUN_ORDER[Migration::RUN_ORDER.len() - 1],
+    Migration::SourceContext
+));
+
 impl Writer {
     /// The first migration in run order with work left, if any.
     fn pending_migration(&self) -> Result<Option<Migration>, Error> {

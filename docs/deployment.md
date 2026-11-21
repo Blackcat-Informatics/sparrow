@@ -206,7 +206,8 @@ set on any image, and copying an image therefore needs no `setcap`. The client
 needs no capability.
 
 The private Unix socket is `rpc.sock` directly inside `data_dir`. The daemon
-sets `data_dir` to mode 0710 and the socket to 0660 each time it starts, so
+sets `data_dir` to mode 0710 and the socket to 0660 each time it binds it (at start, and
+again when the name was removed while it ran), so
 members of the daemon's group can connect and cannot list or read the store;
 store files stay owner-only under the unit's `UMask=0077`. Only the operator
 belongs to that group, for the CLI and administration. Fleet producers ingest

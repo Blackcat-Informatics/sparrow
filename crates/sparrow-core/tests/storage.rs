@@ -1479,6 +1479,56 @@ fn receiver_registry_admission_and_fence_corruption_are_hard_failures() {
     );
 }
 
+/// INVARIANT (#447): a latched source-context rebuild clears in the running store once its
+/// corrupt record metadata is repaired, not only when a reopen resets the cache. While the
+/// metadata is corrupt each retry re-verifies, commits nothing and fails; once the row is
+/// repaired the next page clears the latch in its own batch and the rebuild completes.
+#[test]
+fn a_latched_source_context_rebuild_clears_once_its_corrupt_record_is_retired() {
+    use sparrow_core::Migration;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let corrupt = store
+        .ingest("corrupt", "source", "json", br#"{"message":"old"}"#, 10)
+        .unwrap();
+    for (id, at) in [("inside", 20), ("future", 30)] {
+        store
+            .ingest(id, "source", "json", br#"{"message":"kept"}"#, at)
+            .unwrap();
+    }
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    let original = db.get(&corrupt.record_ids[0]).unwrap().unwrap();
+    db.put(&corrupt.record_ids[0], b"broken catalog encoding")
+        .unwrap();
+    sparrow_test_support::stale_source_context_cache(&db).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    let rebuild =
+        |store: &Store| store.migrations().unwrap()[Migration::SourceContext.index()].clone();
+    assert_eq!(
+        store.migrate_step().unwrap().unwrap().migration,
+        Migration::SourceContext
+    );
+    assert!(rebuild(&store).failure.is_some(), "{:?}", rebuild(&store));
+    assert_eq!(
+        store.migrate_step().unwrap_err().code,
+        "CONTEXT_CATALOG_INVALID"
+    );
+
+    store
+        .put_raw_for_tests(&corrupt.record_ids[0], &original)
+        .unwrap();
+    while let Some(page) = store.migrate_step().unwrap() {
+        assert_eq!(page.migration, Migration::SourceContext);
+    }
+    let cleared = rebuild(&store);
+    assert!(
+        cleared.failure.is_none() && cleared.complete(),
+        "{cleared:?}"
+    );
+}
+
 /// INVARIANT (#158): temporal reads never load a record outside their half-open interval,
 /// so corrupt metadata outside it does not fail them; the source timeline rebuild that
 /// meets that metadata latches a durable failure and stops paging, and context keeps
@@ -1508,10 +1558,13 @@ fn temporal_queries_do_not_load_records_outside_the_half_open_interval() {
     sparrow_test_support::stale_source_context_cache(&db).unwrap();
     drop(db);
     let store = Store::open(dir.path(), config()).unwrap();
-    // The rebuild latches the corruption durably and stops paging instead of retrying.
+    // The rebuild latches the corruption durably; a retry re-verifies, commits nothing and fails.
     let page = store.migrate_step().unwrap().unwrap();
     assert_eq!(page.migration, sparrow_core::Migration::SourceContext);
-    assert_eq!(store.migrate_step().unwrap(), None);
+    assert_eq!(
+        store.migrate_step().unwrap_err().code,
+        "CONTEXT_CATALOG_INVALID"
+    );
     let rebuild =
         store.migrations().unwrap()[sparrow_core::Migration::SourceContext.index()].clone();
     assert!(
@@ -23967,30 +24020,66 @@ fn status_reads_fixed_keys_without_the_writer_while_a_migration_runs() {
     assert_counts_match_recount(&store);
 }
 
-/// INVARIANT (#146): status and the three observed states read without the writer lock, yet
-/// still refuse with the poisoned-writer failure every locked operation reports once a writer
-/// panicked while holding it, rather than serving state that writer may have left half done.
+/// INVARIANT (#447): a writer that panicked while holding the writer lock no longer leaves
+/// every later operation refused until a restart. The next operation recovers the lock,
+/// re-validating the state the writer left; status and the observed states read without the
+/// lock report the recovered writer and count the recovery, and writes are accepted again.
 #[test]
-fn status_refuses_once_the_writer_is_poisoned() {
+fn a_poisoned_writer_is_recovered_by_the_next_operation() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
     let now = 2;
     store.status(now).unwrap();
     store.poison_writer_for_tests();
-    let refused = |error: sparrow_core::Error| {
-        assert_eq!(error.code, "STORAGE_FAILURE");
-        assert!(
-            error.message.contains("catalog writer poisoned"),
-            "{}",
-            error.message
-        );
-    };
-    refused(store.status(now).unwrap_err());
-    refused(store.status_report(now).unwrap_err());
-    refused(store.durability_status().unwrap_err());
-    refused(store.pressure_status().unwrap_err());
-    refused(store.recompression_status().unwrap_err());
-    refused(store.unique_payload_chunks().unwrap_err());
+    store.status(now).unwrap();
+    store.status_report(now).unwrap();
+    store.pressure_status().unwrap();
+    store.recompression_status().unwrap();
+    store.unique_payload_chunks().unwrap();
+    let durability = store.durability_status().unwrap();
+    assert_eq!(durability.writer_recoveries, 1);
+    assert!(durability.failure.is_none());
+    store
+        .ingest("after-panic", "source", "log", b"accepted\n", now)
+        .unwrap();
+    store.poison_writer_for_tests();
+    store
+        .ingest("second-panic", "source", "log", b"accepted\n", now)
+        .unwrap();
+    assert_eq!(store.durability_status().unwrap().writer_recoveries, 2);
+}
+
+/// INVARIANT (#447): an artifact read is served while durability is latched uncertain,
+/// reporting the artifact's still-pending fence, because a read certifies nothing. Writes and
+/// fences stay refused.
+#[test]
+fn an_artifact_read_is_served_while_durability_is_latched() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let buffered = store
+        .ingest_with_durability(
+            "buffered",
+            "source",
+            "log",
+            b"uncertain\n",
+            1,
+            sparrow_core::Durability::Buffered,
+        )
+        .unwrap();
+    let fence = buffered.buffered.clone().unwrap();
+    store
+        .latch_durability_for_tests("injected WAL sync failure")
+        .unwrap();
+    assert_eq!(
+        store.artifact(&buffered.id).unwrap().buffered,
+        Some(fence.clone())
+    );
+    assert!(store.flush_through(&fence).is_err());
+    assert!(
+        store
+            .ingest("refused", "source", "log", b"refused\n", 1)
+            .is_err()
+    );
 }
 
 /// INVARIANT (#146): while a migration pages back to back, each page holding the writer

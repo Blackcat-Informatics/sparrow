@@ -3,11 +3,10 @@
 
 //! One database owner, serving typed Cap'n Proto RPC over Unix and configured TCP sockets.
 
-use sparrow_server::{Rpc, ServerConfig};
+use sparrow_server::{Rpc, ServerConfig, local_endpoint};
 use std::{path::Path, sync::Arc};
 use tokio::sync::Semaphore;
 
-mod local_endpoint;
 mod maintenance;
 mod pressure_duty;
 mod shutdown;
@@ -383,10 +382,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // once a second and journals the episode; connection slots, taken before accept, and
                 // the 60 s lease are unchanged.
                 let sockets = sparrow_server::serving::Sockets {
-                    private: &endpoint.listener,
-                    ingest: ingest
-                        .as_ref()
-                        .map(|(endpoint, socket)| (&endpoint.listener, socket)),
+                    private: &endpoint,
+                    ingest: ingest.as_ref().map(|(endpoint, socket)| (endpoint, socket)),
                     tcp: tcp_listener.as_ref().map(|listener| {
                         (
                             listener,

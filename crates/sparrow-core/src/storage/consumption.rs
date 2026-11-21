@@ -1248,7 +1248,7 @@ impl Store {
     /// Every retired unrecoverable claim, read by one iterator (its own implicit snapshot)
     /// without the writer lock, so status and watch listings never wait for a writer.
     pub fn consumption_retired(&self) -> Result<Vec<RetiredConsumption>, Error> {
-        self.refuse_poisoned()?;
+        self.recover_poisoned()?;
         let mut retired = Vec::new();
         for entry in self.unlocked.db.prefix_iterator(RETIRED_PREFIX) {
             let (name, bytes) = entry?;
@@ -1382,7 +1382,7 @@ impl Store {
                 "a claim window must not end before it starts",
             ));
         }
-        self.refuse_poisoned()?;
+        self.recover_poisoned()?;
         let window = since..=until;
         let snapshot = self.unlocked.db.snapshot();
         let mut claims = Vec::new();

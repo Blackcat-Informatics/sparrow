@@ -302,7 +302,9 @@ retention or of the data budget, so the gate is rarely reached in normal
 operation. Pins only delay deletion. Archiving ignores them, and an archived
 pinned record survives until its pin ends. A dedicated archive thread performs
 every NAS operation, one at a time, so a hung NAS degrades archiving without
-blocking queries, ingest or maintenance. A store format fence keeps older
+blocking queries, ingest or maintenance. A pass that panics does not end the thread:
+the worker journals it, reports it in status and starts the next pass from the
+store's durable watermark. A store format fence keeps older
 binaries away from an archiving store, and a clock-regression guard refuses
 publication behind the watermark. Archive reads give way to waiting writers
 (`lock_page`, once per batch of 256 index entries or records, and for record bytes also
@@ -410,6 +412,9 @@ durability. The default flush interval is two seconds; a durable mode and explic
 flush are available. It is an intended buffering interval, not a guarantee that a
 failing disk will complete synchronization on schedule. Expose flush lag and stop
 admitting buffered writes when the durability queue cannot remain bounded.
+
+While durability is latched uncertain the store serves reads; an artifact read reports
+its pending fence, which certifies nothing.
 
 Keep the write-ahead log enabled. Pin success and source deletion require a
 durable boundary covering their complete dependency set. For a large import,

@@ -613,6 +613,8 @@ struct Unlocked {
     import_ledger: Arc<import::ImportLedger>,
     /// RDF staging refusals counted at the write that raised them (#340).
     staging: Arc<staging_refusal::StagingLedger>,
+    /// Times the writer lock was recovered after a writer panicked while holding it.
+    writer_recoveries: std::sync::atomic::AtomicU64,
 }
 
 /// A non-blocking callback that asks the retention duty to run a pass now.
@@ -729,11 +731,12 @@ struct Writer {
     registry_walks: std::cell::Cell<u64>,
 }
 
-/// The refusal every operation reports once a writer panicked while holding the writer lock.
-fn writer_poisoned() -> Error {
+/// The refusal of an operation that found the writer lock poisoned and could not re-validate
+/// the state the panicked writer left; the next operation tries again.
+fn writer_unrecovered(cause: &Error) -> Error {
     Error::new(
         "STORAGE_FAILURE",
-        "catalog writer poisoned; reopen and inspect the store",
+        format!("catalog writer poisoned and not yet recovered: {cause}"),
     )
 }
 
@@ -1178,6 +1181,37 @@ fn store_properties(
 }
 
 impl Writer {
+    /// Re-validate the state a writer that panicked while holding the writer lock left.
+    ///
+    /// Every catalog change is one atomic batch, so the database holds no half-applied write;
+    /// only the writer's working state may be half updated. Each part that derives from the
+    /// database is loaded again, as an open loads it: the pressure, table rewrite and archive
+    /// states, and the session-local eviction and expiry cursors. The durability ledger may
+    /// lack a write that reached the WAL, so a WAL sync certifies everything accepted; a sync
+    /// that fails latches durability uncertain instead, which keeps writes refused on its own
+    /// terms and is cleared by [`Writer::reestablish`].
+    fn revalidate(&self) -> Result<(), Error> {
+        *self.pressure.borrow_mut() = pressure::State::load(&self.db)?;
+        *self.recompression.borrow_mut() = recompression::State::load(&self.db)?;
+        if let Some(state) = &self.archive {
+            let reloaded =
+                archive::open(&self.db, self.config.archive.as_ref())?.ok_or_else(|| {
+                    Error::new("STORAGE_FAILURE", "archive state missing on re-validation")
+                })?;
+            *state.borrow_mut() = reloaded;
+        }
+        *self.eviction.borrow_mut() = eviction::Cursor::default();
+        *self.expiry.borrow_mut() = expiry::Cursor::default();
+        self.reclaiming.set(false);
+        if !self.durability.borrow().latched() {
+            // A failed sync latches durability uncertain, which status reports and which
+            // refuses writes; the writer itself is re-validated either way, so the result
+            // is not returned.
+            drop(self.synchronize());
+        }
+        Ok(())
+    }
+
     fn payload_chunk(&self, digest: &str) -> Result<Vec<u8>, Error> {
         Ok(self.payload_chunk_view(digest, None)?.to_vec())
     }
@@ -1843,6 +1877,7 @@ impl Store {
                 tail_evidence: tail_evidence::Ledger::default(),
                 import_ledger: Arc::clone(&import_ledger),
                 staging: Arc::clone(&staging),
+                writer_recoveries: std::sync::atomic::AtomicU64::new(0),
             }),
             inner: Arc::new(Mutex::new(Writer {
                 db,
@@ -1948,19 +1983,40 @@ impl Store {
     }
 
     /// Take the writer lock without registering as a waiting writer: migration pages,
-    /// which defer to registered writers before they ask.
+    /// which defer to registered writers before they ask. A lock a panicked writer poisoned
+    /// is recovered here (see [`Writer::revalidate`]).
     fn lock_uncounted(&self) -> Result<std::sync::MutexGuard<'_, Writer>, Error> {
-        self.inner.lock().map_err(|_| writer_poisoned())
+        let poisoned = match self.inner.lock() {
+            Ok(writer) => return Ok(writer),
+            Err(poisoned) => poisoned,
+        };
+        let writer = poisoned.into_inner();
+        // A refused re-validation leaves the lock poisoned, so the next operation retries it.
+        writer
+            .revalidate()
+            .map_err(|error| writer_unrecovered(&error))?;
+        self.inner.clear_poison();
+        self.unlocked
+            .writer_recoveries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(writer)
     }
 
-    /// Refuse, without waiting for the writer lock, once a writer panicked while holding it.
-    /// Reads that never take the lock (status and the observed states) call this so they
-    /// report the poisoned writer as every locked operation does, rather than stale state.
-    pub(crate) fn refuse_poisoned(&self) -> Result<(), Error> {
+    /// Recover a poisoned writer before a read that never takes the writer lock (status and
+    /// the observed states), so it reports the re-validated state rather than what the
+    /// panicked writer left. It waits for the writer only while the lock is poisoned.
+    pub(crate) fn recover_poisoned(&self) -> Result<(), Error> {
         if self.inner.is_poisoned() {
-            return Err(writer_poisoned());
+            drop(self.lock_uncounted()?);
         }
         Ok(())
+    }
+
+    /// Times the writer lock was recovered after a writer panicked while holding it.
+    pub(crate) fn writer_recoveries(&self) -> u64 {
+        self.unlocked
+            .writer_recoveries
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Durably ingest one bounded complete artifact, preserving every original byte.
@@ -3147,7 +3203,7 @@ impl Store {
     /// `None` while the store counters seed (status `counts` is `pending`): the counter row
     /// then holds only the chunks below the seeding watermark, which is not the total.
     pub fn unique_payload_chunks(&self) -> Result<Option<u64>, Error> {
-        self.refuse_poisoned()?;
+        self.recover_poisoned()?;
         let snapshot = self.unlocked.db.snapshot();
         let reader = store_counters::Reader::snapshot(&snapshot);
         let positions = store_counters::Positions::read(|key| reader.get(key.as_bytes()))?;
@@ -3185,7 +3241,7 @@ impl Store {
         &self,
         now: u64,
     ) -> Result<((Value, Vec<migration::MigrationStatus>), u64), Error> {
-        self.refuse_poisoned()?;
+        self.recover_poisoned()?;
         let ReadLeaseStats {
             pin: (pin_handles, pin_bytes),
             artifact: (artifact_handles, artifact_bytes),
@@ -3327,6 +3383,13 @@ impl Store {
             .rdf_read_lease(rdf_view::ReadSlot::Archive)
             .map_err(|error| Error::clone(&error))?;
         Ok(operation())
+    }
+
+    /// Dev-only: overwrite one catalog row in the running store, as a repair of corrupt
+    /// metadata does.
+    #[cfg(feature = "test-support")]
+    pub fn put_raw_for_tests(&self, key: &str, value: &[u8]) -> Result<(), Error> {
+        Ok(self.lock()?.db.put(key, value)?)
     }
 
     /// Dev-only: poison the writer lock, as a writer that panicked while holding it does.
