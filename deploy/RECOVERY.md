@@ -109,7 +109,8 @@ every watch in `consume_watches` names a root that exists.
     `sudo ss -ltnp 'sport = :518'`.
 - Recover: free the space, or raise `disk_budget` in `/etc/sparrow/server.toml`
   (the wait reads `disk_budget`, `maintenance_reserve` and `min_free_bytes` from
-  the file again before each open attempt and journals the change), or stop the
+  the file again before each attempt that follows a refused open and journals
+  the change), or stop the
   process that holds the address. The daemon proceeds by itself and journals
   `the condition cleared after N s; proceeding`. No restart is needed.
 - Stop: `systemctl stop` sends SIGINT, which ends the wait at once. The

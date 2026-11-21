@@ -14,7 +14,8 @@
 //! Each wait journals what it waits for on its first observation, again when the reason
 //! changes and as a reminder every [`REMINDER`], re-checks on an interval chosen per condition,
 //! and ends at once on SIGINT. SIGTERM keeps its default action, which ends the process at
-//! once; before the store opens there is nothing to drain.
+//! once, as it does while serving: before the store opens there is nothing to drain, and
+//! after it SIGINT alone takes the orderly teardown.
 
 use crate::ServerConfig;
 use std::{error::Error, io, path::Path, time::Duration};
