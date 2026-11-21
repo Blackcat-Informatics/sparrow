@@ -4785,6 +4785,71 @@ that remap cloned span IDs are refused visibly rather than silently rewriting
 identities. The normal Registry preserves IDs. Application formatters and the
 subscriber's own bookkeeping remain application-controlled; the layer bounds its
 own buffers and uses nonblocking access to its snapshot and delivery state.
+### Developer console
+
+Start a bounded console with `Console::start(None)` for local output or
+`Console::start(Some(delivery.clone()))` to send the same structured observations to
+Sparrow. Standalone operation opens stdout and stderr for display and starts one output
+thread. All socket, spool and retry activity belongs to a configured delivery handle.
+The application owns its subscriber and selects its filters.
+
+```rust
+use sparrow_client::{Console, sparrow_eprintln};
+let console = Console::install(None)?;
+let files = 12;
+sparrow_eprintln!("Reading {files} files");
+tracing::info!(files, bytes = 847216_u64, "Import complete");
+let local = console.flush().await?;
+```
+
+`Console::install` explicitly installs the application's global tracing subscriber.
+An existing subscriber returns `AlreadyExists`. Compose `console.layer()` with
+an existing subscriber during application setup. The process logger is a separate choice.
+
+Terminal output on stderr shows UTC time, aligned severity, target, message,
+ordered fields and the current span name. Multiline messages indent their
+continuations. Redirected diagnostics use plain text. A nonempty `NO_COLOR`
+disables terminal styling. Control characters in formatted fields are escaped.
+The formatter runs after capture and its styling is local. The namespaced
+`sparrow_eprintln!` macro emits an INFO event with a `stream` field of
+`stderr` and accepts Rust format strings with captured identifiers.
+
+To collect the Rust `log` facade, register a clone of the console with
+`log::set_boxed_logger` and select a level with `log::set_max_level`.
+Use one logger for facade events. Enabling tracing's `log-always` feature mirrors
+tracing observations into `log` even with an active subscriber. Applications
+that install both Sparrow adapters must leave that mirroring disabled to keep
+one stored and displayed observation per tracing call. The visitor preserves
+integer widths, signedness, floating-point bits, booleans and strings.
+Facade records and explicit writes inside a span inherit the context of this
+console's layer on a `tracing_subscriber::Registry`. Tracing events use their
+subscriber's own declared parent and span context.
+
+Log callbacks enqueue bounded observations. The local output queue holds up to
+64 items, each subject to the producer's event bound. A slow terminal can fill
+this queue. `Console::stats` reports successful writes, local queue refusals,
+invalid captures and write errors. Remote admission proceeds independently and
+has its own counters. `Console::flush().await` drains earlier admitted local
+output, flushes both streams and returns the local counts or the output error.
+Use the producer's barrier for remote receipts.
+
+`Console::writer(ConsoleStream::Stdout)` and the stderr equivalent implement
+`std::io::Write`. They forward original bytes to the named local stream as they
+arrive, including a prompt without a newline. Structured capture produces
+one record per newline or 4096-byte fragment. The message holds exact text or,
+for invalid UTF-8, the original binary field. The newline belongs to the
+record. The fragment keeps the event time and span context of its first accepted
+byte across later writes, a context change, flushing and queue backpressure.
+A full queue returns `WouldBlock` before taking more input.
+Flush the writer to finish a partial line and check the outcome.
+A synchronous writer flush encountering an active checked fence returns
+`WouldBlock`. Concurrent asynchronous flushes await their turn.
+For pipes, `Console::tee` awaits capacity while reading. `tee_child` drains
+a child's selected piped stdout and stderr concurrently to EOF. The caller
+retains the child process and reads its exit status. The
+`sparrow-client --example console` example runs with zero arguments for local
+display or an explicit endpoint for delivery.
+
 ### Tracing relationship observations (schema 59)
 
 Source schema 59 adds occurrence-owned tracing RDF to typed producer records.

@@ -64,6 +64,11 @@ views, with explicit admission refusals; see
 
 ## Operating model
 
+Rust applications can use the [developer console](docs/interfaces.md#developer-console)
+with local display alone or send structured observations to Sparrow. The
+[console example](crates/sparrow-client/examples/console.rs) shows a print-style
+call, typed tracing fields and a `log` record in one span.
+
 Sparrow runs as a Rust service on one Linux server with local storage. The
 initial workload is under 10 GiB of new, uncompressed data per day, including
 large directories of JSONL and `.log` files. Sustained throughput, import bursts,

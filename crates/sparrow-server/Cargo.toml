@@ -38,6 +38,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+log.workspace = true
 # Sub-second delivery timing for tests only; the production dependency above cannot reach it.
 sparrow-client = { path = "../sparrow-client", features = ["test-timing"] }
 sparrow-test-support = { path = "../sparrow-test-support" }
