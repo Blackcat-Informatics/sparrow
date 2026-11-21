@@ -77,9 +77,11 @@ every watch in `consume_watches` names a root that exists.
 - Symptom: the journal shows `free space is below the floor` (writes paused
   below `min_free_bytes`; connections are still accepted and reads served),
   write clients get `STORAGE_PRESSURE` with the floor class and hold, `status`
-  shows a nonzero `floorPause.pausedSince`, or the unit waits at startup with
+  shows a nonzero `floorPause.pausedSince`, or, only when free space is below
+  the maintenance reserve, the unit waits at startup with
   `waiting to open the store` (nothing can answer then, so `check.sh` cannot
-  connect).
+  connect). Between the reserve and `min_free_bytes` a restart opens the store
+  and serves reads.
 - Diagnose: `df -h /SPARROW /home`, then find what grew:
   `sudo du -xsh /home/* /SPARROW/* | sort -h | tail`.
 - Recover: free space on the filesystem (another program's files, a read-only

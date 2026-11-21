@@ -1097,9 +1097,7 @@ impl ConsumeWorker {
             .map(|watch| Detector::open(store.clone(), watch, binding))
             .collect::<Result<Vec<_>, _>>()?;
         registry.update(&detectors, &pending)?;
-        if catalog.needs_initial_commit() {
-            catalog.persist(&store)?;
-        }
+        commit_initial_catalog(&mut catalog, &store)?;
         let (controller, commands) = watch_admin::channel();
         let (stop, stopped) = tokio::sync::watch::channel(false);
         let (alive, ended) = tokio::sync::oneshot::channel();
@@ -1632,6 +1630,26 @@ struct Control {
     outputs: crate::config::OutputPaths,
 }
 
+/// Store the catalog seeded from the configuration, once. A store over its maintenance reserve
+/// refuses the write with `STORAGE_PRESSURE`; that must not end the daemon, which has to come up
+/// to reclaim. The catalog stays unstored (`needs_initial_commit`) and the worker tries again on
+/// each pass; any other failure still ends the start.
+fn commit_initial_catalog(catalog: &mut Catalog, store: &Store) -> Result<(), Error> {
+    if !catalog.needs_initial_commit() {
+        return Ok(());
+    }
+    match catalog.persist(store) {
+        Err(Error::Storage(error)) if error.code == "STORAGE_PRESSURE" => {
+            eprintln!(
+                "sparrowd: watch catalog not stored yet: {}; retrying on each pass",
+                error.message
+            );
+            Ok(())
+        }
+        result => result,
+    }
+}
+
 async fn run(
     store: Store,
     mut detectors: Vec<Detector>,
@@ -1669,6 +1687,9 @@ async fn run(
         // No timer waits for it.
         let space_ok = store.space_floor().observe(crate::now()?)?.is_none();
         wake.resume = !space_ok;
+        if space_ok {
+            commit_initial_catalog(&mut catalog, &store)?;
+        }
         let pending = store.consumption_pending()?;
         if space_ok && catalog.retire(&pending) {
             catalog.persist(&store)?;

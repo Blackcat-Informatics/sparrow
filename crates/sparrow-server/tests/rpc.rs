@@ -5959,6 +5959,140 @@ async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopene
         .await;
 }
 
+/// INVARIANT (#438): a daemon started on a store that is already over its maintenance reserve
+/// comes up instead of exiting. It answers status in a pressure phase, serves reads, refuses a
+/// write with the retryable `STORAGE_PRESSURE`, and accepts writes again once space returns,
+/// without a restart. Both starts that reach a startup write are covered: a first start that
+/// seeds a consume watch into the store's catalog, and a restart with a stored catalog.
+#[tokio::test(flavor = "current_thread")]
+async fn daemon_starts_on_a_store_over_its_reserve_and_recovers_without_a_restart() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for restart in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path().join("completed");
+                std::fs::create_dir(&root).unwrap();
+                let data = dir.path().join("store");
+                let socket = data.join("rpc.sock");
+                let config = write_server_config(dir.path(), &data, &socket);
+                let text = std::fs::read_to_string(&config)
+                    .unwrap()
+                    .replace("disk_budget = 134217728", "disk_budget = 16777216")
+                    .replace("maintenance_reserve = 8388608", "maintenance_reserve = 4194304");
+                std::fs::write(&config, text).unwrap();
+                append_consume_config(&config, &root, 30_000, 16, 16);
+                let ballast = data.join("test-owned-pressure-ballast");
+                let kept = if restart {
+                    // A first start without pressure stores the catalog and one record.
+                    let mut daemon = start(&config, &socket).await;
+                    let producer = sparrow_client::Client::connect(&socket).await.unwrap();
+                    let kept = producer
+                        .ingest("kept", "source", wire::Format::Log, b"kept\n")
+                        .await
+                        .unwrap();
+                    rustix::process::kill_process(
+                        rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
+                        rustix::process::Signal::INT,
+                    )
+                    .unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while daemon.0.try_wait().unwrap().is_none() {
+                        assert!(Instant::now() < deadline, "graceful stop stalled");
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Some(kept)
+                } else {
+                    std::fs::create_dir_all(&data).unwrap();
+                    None
+                };
+                std::fs::write(&ballast, vec![0_u8; 13 * 1024 * 1024]).unwrap();
+                let _daemon = start(&config, &socket).await;
+                let producer = sparrow_client::Client::connect(&socket).await.unwrap();
+                // The daemon answers on its socket: status is served under pressure.
+                assert!(cli(&socket, &["status"])["store_id"].as_str().is_some());
+                if let Some(kept) = &kept {
+                    assert_eq!(
+                        producer.bytes(&kept.id, 0, 5).await.unwrap(),
+                        b"kept\n",
+                        "a read is served under pressure"
+                    );
+                }
+                let refused = producer
+                    .ingest("over", "source", wire::Format::Log, b"over\n")
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(refused, sparrow_client::Error::Domain { ref code, retryable: true, .. } if code == "STORAGE_PRESSURE"),
+                    "{refused:?}"
+                );
+                std::fs::remove_file(&ballast).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    match producer
+                        .ingest("over", "source", wire::Format::Log, b"over\n")
+                        .await
+                    {
+                        Ok(_) => break,
+                        Err(error) => assert!(
+                            Instant::now() < deadline,
+                            "writes never resumed after space returned: {error:?}"
+                        ),
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        })
+        .await;
+}
+
+/// INVARIANT (#438): a daemon started with less free space than `min_free_bytes` comes up
+/// instead of exiting or hanging: status answers, a stored record reads back, and a write is
+/// refused with the retryable `STORAGE_PRESSURE`.
+#[tokio::test(flavor = "current_thread")]
+async fn daemon_starts_below_the_free_space_floor_and_serves_reads() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let mut daemon = start(&config, &socket).await;
+            let producer = sparrow_client::Client::connect(&socket).await.unwrap();
+            let kept = producer
+                .ingest("kept", "source", wire::Format::Log, b"kept\n")
+                .await
+                .unwrap();
+            rustix::process::kill_process(
+                rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
+                rustix::process::Signal::INT,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while daemon.0.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "graceful stop stalled");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // A floor no host can meet: every start below it is a start under pressure.
+            let text = std::fs::read_to_string(&config)
+                .unwrap()
+                .replace("min_free_bytes = 1048576", "min_free_bytes = 1000000000000000");
+            std::fs::write(&config, text).unwrap();
+            let _daemon = start(&config, &socket).await;
+            let producer = sparrow_client::Client::connect(&socket).await.unwrap();
+            assert!(cli(&socket, &["status"])["store_id"].as_str().is_some());
+            assert_eq!(producer.bytes(&kept.id, 0, 5).await.unwrap(), b"kept\n");
+            let refused = producer
+                .ingest("over", "source", wire::Format::Log, b"over\n")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(refused, sparrow_client::Error::Domain { ref code, retryable: true, .. } if code == "STORAGE_PRESSURE"),
+                "{refused:?}"
+            );
+        })
+        .await;
+}
+
 /// Run the packaged shipper once over `config`; it must only read the producer files.
 fn ship(config: &Path) -> std::process::Output {
     Command::new(concat!(
@@ -9095,10 +9229,10 @@ fn endpoint_startup_preserves_files_symlinks_and_foreign_live_listeners() {
     }
 }
 
-/// INVARIANT: below the free-space floor the daemon neither opens its store nor
-/// accepts connections, and an interrupt while it waits for space exits cleanly.
+/// INVARIANT: below the maintenance reserve (the space an open writes into) the daemon
+/// neither opens its store nor accepts connections, and an interrupt while it waits for space exits cleanly.
 #[tokio::test(flavor = "current_thread")]
-async fn startup_below_the_free_space_floor_waits_without_opening_the_store() {
+async fn startup_below_the_maintenance_reserve_waits_without_opening_the_store() {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("store");
@@ -9107,9 +9241,19 @@ async fn startup_below_the_free_space_floor_waits_without_opening_the_store() {
     let base = std::fs::read_to_string(&config).unwrap();
     let floor = "min_free_bytes = 1048576";
     assert!(base.contains(floor));
+    // No filesystem holds the reserve the open needs, so the daemon waits. (Below the floor
+    // alone it opens and serves reads: `daemon_starts_below_the_free_space_floor_and_serves_reads`.)
     std::fs::write(
         &config,
-        base.replace(floor, "min_free_bytes = 9223372036854775807"),
+        base.replace(floor, "min_free_bytes = 9223372036854775807")
+            .replace(
+                "disk_budget = 134217728",
+                "disk_budget = 9223372036854775807",
+            )
+            .replace(
+                "maintenance_reserve = 8388608",
+                "maintenance_reserve = 9223372036854775000",
+            ),
     )
     .unwrap();
     let mut daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrowd"))
@@ -9131,7 +9275,7 @@ async fn startup_below_the_free_space_floor_waits_without_opening_the_store() {
         line.starts_with("sparrowd: waiting to open the store: only "),
         "{line}"
     );
-    assert!(!data.exists(), "store opened below the free-space floor");
+    assert!(!data.exists(), "store opened below the maintenance reserve");
     rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
     let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
         .await
