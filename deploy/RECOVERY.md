@@ -133,7 +133,7 @@ every watch in `consume_watches` names a root that exists.
   identity, analyzer, lexicon, profile or archive-fence refusal
   (`INVALID_ARGUMENT`, including a missing `[archive]` table after the store's
   archive fence); a watch root that is missing, replaced or unreadable; a socket
-  name that is not a socket, an address not on the host, an ingest socket
+  name that is not a socket, an ingest socket
   directory or socket with the wrong owner or mode. The daemon journals
   `sparrowd: refused to start: <reason>` and exits with status 78, which the
   unit lists in `RestartPreventExitStatus=`: it is not restarted, spends no
@@ -150,9 +150,10 @@ every watch in `consume_watches` names a root that exists.
 ## Unit start-limit hit
 
 - Symptom: `systemctl status sparrow.service` shows `start-limit-hit`; five
-  failed runs within ten minutes stopped the unit. A refused start (a refused
-  open below, a missing lexicon bundle or credential, a watch root that does not
-  exist, a `socket_path` longer than 107 bytes) exits with status 78 and is not
+  failed runs within ten minutes stopped the unit. A refused start named as deterministic (a
+  refused open for format, identity, analyzer, lexicon or archive fence below, a
+  missing lexicon bundle or credential, a watch root that does not exist, a
+  `socket_path` longer than 107 bytes) exits with status 78 and is not
   restarted, so it shows `failed` with `status=78/CONFIG` and does not reach the
   limit; free space, a pending upgrade's allowance and a held port or socket
   name are waited for (see "Start waiting").
@@ -194,6 +195,9 @@ every watch in `consume_watches` names a root that exists.
   archiving, or
   `STORAGE_FAILURE: log time interpretation law and writer fence disagree`
   on a store with a log time profile.
+  The `UNSUPPORTED` and archive refusals end the start with status 78; the
+  `STORAGE_FAILURE` one is not classified as permanent and exits 1, so the unit
+  restarts it until its start limit.
 - Diagnose: which image runs (`readlink /usr/local/libexec/sparrow/sparrowd`),
   which image last opened the store (the receipts and the journal), and
   whether `text_lexicon_dir` changed (`grep text_lexicon_dir /etc/sparrow/server.toml`).

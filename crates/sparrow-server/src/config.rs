@@ -510,7 +510,15 @@ impl ServerConfig {
             .as_deref()
             .map(|path| {
                 sparrow_client::TcpSecret::read(path).map_err(|error| {
-                    format!("rpc_tcp_secret_file {}: {error}", path.display()).into()
+                    let text = format!("rpc_tcp_secret_file {}: {error}", path.display());
+                    match error {
+                        // The kind survives so a start can tell a missing file from a failed read.
+                        sparrow_client::Error::Io(io) => {
+                            Box::new(std::io::Error::new(io.kind(), text))
+                                as Box<dyn std::error::Error>
+                        }
+                        _ => text.into(),
+                    }
                 })
             })
             .transpose()

@@ -1080,7 +1080,14 @@ impl ConsumeWorker {
             .collect::<Vec<_>>();
         ConsumeWatch::validate(&definitions)
             .and_then(|()| outputs.refuse_overlap(&definitions))
-            .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
+            .map_err(|error| {
+                // The kind survives so a start can tell a root that must be restored from a
+                // failed read.
+                let kind = error
+                    .downcast_ref::<std::io::Error>()
+                    .map_or(std::io::ErrorKind::Other, std::io::Error::kind);
+                Error::Io(std::io::Error::new(kind, error.to_string()))
+            })?;
         let pending = store.consumption_pending()?;
         if pending
             .iter()

@@ -111,8 +111,7 @@ static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 async fn main() -> std::process::ExitCode {
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
-        // Every start condition that passes is waited for (start_wait), so a start that fails
-        // here repeats on a restart: end it with the status the unit does not restart.
+        // A start failure not named as deterministic keeps the ordinary failure status.
         Err(error)
             if !SERVING.load(std::sync::atomic::Ordering::Relaxed)
                 && !start_wait::is_permanent(error.as_ref()) =>
@@ -125,6 +124,8 @@ async fn main() -> std::process::ExitCode {
             );
             std::process::ExitCode::FAILURE
         }
+        // A refusal named as deterministic repeats on a restart: end it with the status the
+        // unit does not restart.
         Err(error) if !SERVING.load(std::sync::atomic::Ordering::Relaxed) => {
             eprintln!(
                 "sparrowd: refused to start: {error}; a restart repeats it, so the exit status is {} and the unit does not restart it. Correct the configuration, image, store or watch root, then start the unit",
@@ -144,7 +145,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     sparrow_server::journal_log::install()?;
     let args: Vec<_> = std::env::args().skip(1).collect();
     let (path, mode) = arguments(&args).map_err(start_wait::permanent)?;
-    let mut config = ServerConfig::read(Path::new(path)).map_err(start_wait::permanent)?;
+    let mut config = ServerConfig::read(Path::new(path)).map_err(start_wait::config_failure)?;
     // A no-intake daemon writes and runs maintenance but, like a query-only one, opens no
     // stored watch root, so a copy of a store never consumes the intake its catalog names.
     // A private-intake daemon opens every watch at a private root instead.
@@ -162,7 +163,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config
                 .check_private_intake()
                 .map_err(start_wait::permanent)?;
-            Some(sparrow_server::watches::PrivateIntake::new(dir).map_err(start_wait::permanent)?)
+            Some(
+                sparrow_server::watches::PrivateIntake::new(dir)
+                    .map_err(start_wait::consume_start_failure)?,
+            )
         }
         Mode::Normal => None,
     };
@@ -171,7 +175,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         (None, true) => "true",
         (None, false) => "false",
     };
-    let tcp_secret = config.tcp_secret().map_err(start_wait::permanent)?;
+    let tcp_secret = config.tcp_secret().map_err(start_wait::config_failure)?;
     // Keep the subscription alive through startup and awaited maintenance work.
     // Recreating ctrl_c() inside select drops its listener when another branch wins.
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;

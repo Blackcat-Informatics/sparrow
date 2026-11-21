@@ -8,9 +8,8 @@
 //! operator clears spends that limit and leaves the unit failed until `reset-failed`. The
 //! conditions that pass are free space for the open and the WAL replay, a pending upgrade's
 //! write allowance, the store's lock while another process holds it, and a TCP port or socket
-//! name a departing owner still holds. Every other
-//! start failure (configuration, format, identity, lexicon) is deterministic: a restart repeats
-//! it, so it still ends the start at once with its message.
+//! name a departing owner still holds. A refusal a restart repeats (configuration, format,
+//! identity, lexicon) is not waited for; it ends the start at once with its message.
 //!
 //! A start refusal that only a change of configuration, image, store or watch root clears is marked
 //! [`Permanent`] where it is produced ([`permanent`], [`bind_failure`], [`open_failure`],
@@ -100,25 +99,44 @@ pub fn is_permanent(error: &(dyn Error + 'static)) -> bool {
     error.is::<Permanent>()
 }
 
-/// A bind, spill or socket-directory failure: the kinds that name a refusal of the configured
-/// address, name, mode or owner are permanent; any other kind is not classified.
-#[must_use]
-pub fn bind_failure(error: io::Error) -> Box<dyn Error> {
+/// The I/O error kinds that name a refusal of a path, mode or permission, which a restart repeats.
+/// Every other kind (an interrupted or exhausted resource, a device error) may pass.
+fn refusing_kind(kind: io::ErrorKind) -> bool {
     use io::ErrorKind::{
-        AddrNotAvailable, AlreadyExists, InvalidData, InvalidInput, NotADirectory, NotFound,
+        AlreadyExists, InvalidData, InvalidInput, IsADirectory, NotADirectory, NotFound,
         PermissionDenied, Unsupported,
     };
-    if matches!(
-        error.kind(),
-        AddrNotAvailable
-            | AlreadyExists
+    matches!(
+        kind,
+        AlreadyExists
             | InvalidData
             | InvalidInput
+            | IsADirectory
             | NotADirectory
             | NotFound
             | PermissionDenied
             | Unsupported
-    ) {
+    )
+}
+
+/// A configuration, secret-file or private-intake failure: a parse or validation refusal is
+/// permanent; an I/O failure is permanent only for the kinds that name a missing, unreadable or
+/// malformed file ([`refusing_kind`]) and is not classified otherwise.
+#[must_use]
+pub fn config_failure(error: Box<dyn Error>) -> Box<dyn Error> {
+    match error.downcast_ref::<io::Error>() {
+        Some(io) if !refusing_kind(io.kind()) => error,
+        _ => permanent(error),
+    }
+}
+
+/// A bind, spill or socket-directory failure: the kinds that name a refusal of the configured
+/// address, name, mode or owner are permanent; any other kind is not classified.
+#[must_use]
+pub fn bind_failure(error: io::Error) -> Box<dyn Error> {
+    // `AddrNotAvailable` is not here: a bind to a specific address fails with it until the
+    // interface has the address (DHCP or duplicate address detection at boot), which passes.
+    if refusing_kind(error.kind()) {
         permanent(error)
     } else {
         Box::new(error)
@@ -494,9 +512,9 @@ mod tests {
                 false,
             ),
             (
-                "address not on this host",
+                "address not yet on the host",
                 bind_failure(io::Error::from(AddrNotAvailable)),
-                true,
+                false,
             ),
             (
                 "name is not a socket",
@@ -526,6 +544,21 @@ mod tests {
             (
                 "interrupted",
                 bind_failure(io::Error::from(Interrupted)),
+                false,
+            ),
+            (
+                "configuration unparsable",
+                config_failure("bad key".into()),
+                true,
+            ),
+            (
+                "configuration file missing",
+                config_failure(Box::new(io::Error::from(NotFound))),
+                true,
+            ),
+            (
+                "configuration read hit an I/O error",
+                config_failure(Box::new(io::Error::from(io::ErrorKind::Other))),
                 false,
             ),
             (
