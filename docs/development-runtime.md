@@ -5247,7 +5247,8 @@ writes or 64 MiB of atomic batch byte charge. Repeated requests consume no new
 ledger entry. Successful synchronized writes/explicit WAL sync retire earlier
 pending charges. Empty control batches use an explicit sync rather than treating
 an empty write as a boundary. Write/WAL-sync failure latches uncertainty and
-refuses receipt certification until the store is reopened. Native WAL is shared
+refuses receipt certification, retryably, until every memtable is written to a
+synchronized table file and the WAL syncs, or the store is reopened. Native WAL is shared
 across families; see [RocksDB WAL](https://github.com/facebook/rocksdb/wiki/Write-Ahead-Log-(WAL)).
 
 The default intended periodic sync interval is 2000 ms, configurable through

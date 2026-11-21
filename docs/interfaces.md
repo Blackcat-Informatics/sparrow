@@ -1425,7 +1425,7 @@ free-space floor it is skipped, as import reclamation and retention are; buffere
 synchronization, the table rewrite and pressure maintenance still run there.
 Each page commits its rows and its checkpoint in one synchronized batch through
 the ordinary write path, so it is admitted against the data allowance and a
-failed write latches durability uncertainty as any write does; a restart resumes
+failed write latches durability uncertainty as any write does; the migration resumes
 after the last committed page. While pages succeed the next one follows at once,
 except that writers come first: an ingest, a consume publication or an RPC write
 that is waiting for the writer lock takes it before the next page does. Before a
@@ -2522,7 +2522,8 @@ Corrupt record metadata found during reconstruction latches a durable failure:
 `Status.migrations` reports the failure, and context keeps walking the primary
 `time:` index. The latched rebuild re-verifies on the maintenance worker's migration
 retry interval (60 s): the page runs again from its checkpoint, commits nothing and
-fails while the metadata is still corrupt, and once the row is repaired the page succeeds, clears the latch in the same batch and
+fails while the metadata is still corrupt, and once the record is gone (retired by
+retention, or repaired) the page succeeds, clears the latch in the same batch and
 the rebuild continues. The rebuild runs last of the migrations, so a latched one
 holds back no other. A reopen also resets the cache and rebuilds it. A context read that reaches the
 corrupt record itself refuses with a storage failure. The failure does not
@@ -4856,10 +4857,18 @@ with retryable `STORAGE_PRESSURE` before publication. Default intended WAL sync 
 2000 ms, configurable from 1..60000 ms. Status exposes session, accepted/durable
 sequences, pending count/bytes, age, interval, lag and latched storage uncertainty.
 Any synchronized control write covers earlier WAL writes; empty control batches
-use explicit synchronization. Write/WAL-sync failure latches uncertainty and
-refuses further receipt certification until reopening; reads are served, and an artifact
-read reports its still-pending fence. Status counts writer-lock recoveries
-(`writerRecoveries`). Opening synchronizes
+use explicit synchronization. Write/WAL-sync failure latches uncertainty: writes and fences are refused
+with the retryable `STORAGE_PRESSURE` naming the latch, and reads are served (an artifact read
+reports its still-pending fence) until the store proves every
+accepted write durable (every memtable written to a synchronized table file, then a
+WAL sync), which clears the latch in place and certifies the ledger. The maintenance worker
+leaves a latched store alone while free space is below RocksDB's recovery buffer, proves once
+space has been adequate for 15 s, and spaces further proofs 30 s then 60 s apart. A latch that
+still stands 120 s after space became adequate ends the daemon with an ordinary failure status
+so the store is reopened; an I/O error other than no space (EIO) is expected to end it that way
+until #449 lands. Status counts latches,
+in-place recoveries and writer-lock recoveries (`latches`, `recoveries`,
+`writerRecoveries`). Opening synchronizes
 recovered data before starting a fresh session. These fences certify storage
 durability, not retention extension, producer drops or power-loss qualification.
 

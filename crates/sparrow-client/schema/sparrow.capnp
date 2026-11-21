@@ -26,6 +26,10 @@ struct DurabilityStatus {
   # it, since the store opened. In memory, so it restarts at zero. A reader that does not know
   # this field sees no change.
   writerRecoveries @11 :UInt64;
+  # Additive (#447): since the store opened, times durability latched uncertain and times a latch
+  # cleared in place once every accepted write was proven durable. In memory, so they restart at
+  # zero. A reader that does not know these fields sees no change.
+  latches @12 :UInt64; recoveries @13 :UInt64;
 }
 enum JsonKind { string @0; number @1; booleanTrue @2; booleanFalse @3; null @4; array @5; object @6; }
 struct OptionalKind { union { absent @0 :Void; value @1 :JsonKind; } }

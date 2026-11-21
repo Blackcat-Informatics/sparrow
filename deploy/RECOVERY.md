@@ -53,8 +53,8 @@ every watch in `consume_watches` names a root that exists.
   `freeSpaceFloor` class, keeps accepting Unix, ingest, TCP and syslog TCP
   connections, serves reads, and claims no consumed files (consume and tail
   watches keep their files); it logs a line when the pause begins, one a minute
-  while it lasts and one when it ends. A write that still fails with durability uncertain makes the
-  daemon exit, and `Restart=on-failure` reopens the store; at startup it waits
+  while it lasts and one when it ends. A write that still fails with durability uncertain
+  latches the store (see "Store latched: durability uncertain"); when the proof of durability keeps failing the daemon exits, and `Restart=on-failure` reopens the store; at startup it waits
   only for the maintenance reserve plus any write-ahead log an unclean stop left (the open replays it), so a full disk does not spend
   the start limit, and below the floor alone the store opens and serves reads.
 - `/SPARROW` is on the same btrfs device as `/home`, so the move to `/SPARROW`
@@ -63,14 +63,29 @@ every watch in `consume_watches` names a root that exists.
 
 ## Store latched: durability uncertain
 
-- Symptom: refusals with `durability uncertain; reopen and inspect the store`,
-  or the journal line `store durability uncertain; exiting so it is reopened`
-  followed by a restart.
-- Diagnose: `df -h /SPARROW`, `sudo btrfs filesystem usage /`,
-  `journalctl -u sparrow.service -b | grep -i -e durab -e space -e ENOSPC`.
-- Recover: make space if the disk is full (see "Full disk"), then
-  `sudo systemctl restart sparrow.service` if the daemon has not already
-  restarted itself. Confirm `durability.failure` is `null`.
+- Symptom: writes refused with the retryable `STORAGE_PRESSURE` and `durability
+  uncertain; writes resume once the store re-establishes it`, `durability.failure`
+  set in status, and then either the journal line `store durability re-established
+  in place after: ...` or, for the fatal class only, the line `store durability uncertain after a fatal WAL
+  error, which RocksDB clears only by reopening; exiting so it is reopened` followed by a
+  restart.
+- Cause: a RocksDB write or WAL sync failed. The maintenance worker proves every accepted
+  write durable: it writes every memtable to a synchronized table file and syncs the WAL.
+  It leaves the store alone while free space is below RocksDB's 32 MiB recovery buffer,
+  proves once space has been adequate for 15 s, and spaces further proofs 30 s then 60 s
+  apart. When the proof succeeds the latch clears in place and `durability.recoveries`
+  counts it. A latch still standing 120 s after space became adequate ends the daemon with
+  an ordinary failure status (exit 1, never 78), the journal line names the cause, and
+  `Restart=on-failure` reopens the store; at startup the daemon waits for space.
+- Observed and not observed: in the full-disk test on a tmpfs (`tools/enospc-check.sh`) a
+  WAL append that failed with no space left cleared in place after space returned. An I/O
+  error other than no space (EIO and similar) is not known to clear and ends the daemon as
+  above until #449 lands. An explicit RocksDB `Resume()` and a real filesystem near full are
+  untested.
+- Recover: make space if the disk is full (see "Full disk"). The daemon
+  restarts itself; run `sudo systemctl restart sparrow.service` only if it has
+  not. Confirm `durability.failure` is `null`; `durability.latches` and
+  `durability.recoveries` count the latches and in-place clears since the open.
 - Reversible: yes.
 
 ## Full disk

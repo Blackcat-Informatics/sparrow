@@ -70,6 +70,8 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
                 wire::optional_text::Value(value) => Value::from(value?.to_str()?),
             },
         )
+        .with("latches", durability.get_latches().to_string())
+        .with("recoveries", durability.get_recoveries().to_string())
         .with(
             "writer_recoveries",
             durability.get_writer_recoveries().to_string(),

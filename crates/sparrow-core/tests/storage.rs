@@ -24049,6 +24049,28 @@ fn a_poisoned_writer_is_recovered_by_the_next_operation() {
     assert_eq!(store.durability_status().unwrap().writer_recoveries, 2);
 }
 
+/// INVARIANT (#447): a writer poisoned while durability is latched is not stranded: recovering
+/// the lock re-establishes durability first, so the latch and the poison clear together and the
+/// next write is accepted without a reopen.
+#[test]
+fn a_poisoned_writer_under_a_durability_latch_recovers_and_clears_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .latch_durability_for_tests("injected WAL sync failure")
+        .unwrap();
+    store.poison_writer_for_tests();
+    let status = store.durability_status().unwrap();
+    assert!(status.failure.is_none(), "{status:?}");
+    assert_eq!(
+        (status.writer_recoveries, status.latches, status.recoveries),
+        (1, 1, 1)
+    );
+    store
+        .ingest("after", "source", "log", b"accepted\n", 2)
+        .unwrap();
+}
+
 /// INVARIANT (#447): an artifact read is served while durability is latched uncertain,
 /// reporting the artifact's still-pending fence, because a read certifies nothing. Writes and
 /// fences stay refused.
@@ -24080,6 +24102,75 @@ fn an_artifact_read_is_served_while_durability_is_latched() {
             .ingest("refused", "source", "log", b"refused\n", 1)
             .is_err()
     );
+}
+
+/// INVARIANT (#447): a latched durability failure refuses writes with the retryable
+/// `STORAGE_PRESSURE` naming the latch, never certifies the buffered write it left uncertain,
+/// and clears in the running store once every accepted write is proven durable: the buffered
+/// write is then certified, the latch and its clearing are counted, and writes are accepted.
+#[test]
+fn a_durability_latch_refuses_writes_retryably_and_clears_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let buffered = store
+        .ingest_with_durability(
+            "buffered",
+            "source",
+            "log",
+            b"uncertain\n",
+            1,
+            sparrow_core::Durability::Buffered,
+        )
+        .unwrap();
+    let fence = buffered.buffered.clone().unwrap();
+    store
+        .latch_durability_for_tests("injected WAL sync failure")
+        .unwrap();
+    for refused in [
+        store
+            .ingest("refused", "source", "log", b"refused\n", 1)
+            .unwrap_err(),
+        store.flush_through(&fence).unwrap_err(),
+    ] {
+        assert_eq!(refused.code, "STORAGE_PRESSURE", "{refused:?}");
+        assert!(refused.is_retryable());
+        assert!(
+            refused.message.contains("durability uncertain"),
+            "{refused:?}"
+        );
+        assert!(
+            refused.message.contains("injected WAL sync failure"),
+            "{refused:?}"
+        );
+    }
+    // Reads stay served while latched; the artifact still carries its uncertain fence.
+    assert_eq!(
+        store.artifact(&buffered.id).unwrap().buffered,
+        Some(fence.clone())
+    );
+    let latched = store.durability_status().unwrap();
+    assert_eq!(
+        (latched.latches, latched.recoveries, latched.pending_writes),
+        (1, 0, 1)
+    );
+    assert!(latched.durable_through < latched.accepted_through);
+
+    assert_eq!(
+        store.reestablish_durability().unwrap().as_deref(),
+        Some("injected WAL sync failure")
+    );
+    let cleared = store.durability_status().unwrap();
+    assert!(cleared.failure.is_none());
+    assert_eq!(
+        (cleared.latches, cleared.recoveries, cleared.pending_writes),
+        (1, 1, 0)
+    );
+    assert_eq!(cleared.durable_through, cleared.accepted_through);
+    assert_eq!(store.reestablish_durability().unwrap(), None);
+    assert!(store.flush_through(&fence).unwrap().sequence >= fence.sequence);
+    store
+        .ingest("refused", "source", "log", b"refused\n", 1)
+        .unwrap();
 }
 
 /// INVARIANT (#146): while a migration pages back to back, each page holding the writer

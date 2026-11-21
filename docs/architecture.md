@@ -413,8 +413,22 @@ flush are available. It is an intended buffering interval, not a guarantee that 
 failing disk will complete synchronization on schedule. Expose flush lag and stop
 admitting buffered writes when the durability queue cannot remain bounded.
 
-While durability is latched uncertain the store serves reads; an artifact read reports
-its pending fence, which certifies nothing.
+A failed write or WAL sync latches durability uncertain: the store refuses writes
+and fences with a retryable refusal naming the latch and certifies nothing it accepted
+after the last successful sync. Reads are served; an artifact read reports its pending
+fence. The latch clears in the running store once every accepted write is proven durable
+by writing every memtable to a synchronized table file and syncing the WAL. The maintenance
+worker leaves a latched store alone while free space is below RocksDB's recovery buffer
+(32 MiB, or the maintenance reserve or floor if larger), proves once after space has been
+adequate for 15 s, spaces further proofs 30 s then 60 s apart, and exits with an ordinary
+failure status when the latch has stood 120 s with space adequate, so the supervisor reopens
+the store. A WAL append that failed with no space left cleared in place after space returned
+in the full-disk test on a tmpfs (`tools/enospc-check.sh`, ignored in the gate). Any other
+I/O error on the WAL (EIO and similar) is not known to clear and ends the daemon after that
+bound until #449 lands. An explicit RocksDB `Resume()` and a real filesystem near full are
+untested. Reopening in place is not used, because buffered writes held only in the stopped
+handle's memtables can be lost by it while the daemon's workers keep state derived from
+them; a restart resets both together.
 
 Keep the write-ahead log enabled. Pin success and source deletion require a
 durable boundary covering their complete dependency set. For a large import,

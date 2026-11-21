@@ -153,8 +153,8 @@ names the key.
 `min_free_bytes` (default 4 GiB) is a floor on free space in the filesystem
 that holds `data_dir`. `disk_budget` bounds only the store's own bytes, while
 other programs on the host can fill the same disk. A write that fails because
-the disk is full leaves durability uncertain until the store is reopened. To
-avoid that, every write is checked first: below the floor it is refused with a
+the disk is full latches durability uncertain, and RocksDB accepts no further write on
+that handle until the store is reopened. To avoid that, every write is checked first: below the floor it is refused with a
 retriable `STORAGE_PRESSURE`, and buffered writes that were already accepted
 are still synchronized. The daemon checks free space every second. Below the
 floor it keeps accepting Unix, ingest and TCP connections, including syslog TCP
@@ -179,8 +179,14 @@ the daemon's memory and then the kernel buffer only. At startup it waits for the
 reserve plus the write-ahead log an unclean stop left (the open replays it) before opening the store, so a restart on a full disk does not use up the
 unit's bounded restarts; below the floor alone it opens and serves reads. If a write
 still fails with durability uncertain, for example because another program
-filled the disk between checks, the daemon exits with an error and
-`Restart=on-failure` reopens the store.
+filled the disk between checks, writes are refused with the retryable
+`STORAGE_PRESSURE`. The maintenance worker leaves the store alone while free space is
+below RocksDB's 32 MiB recovery buffer, proves durability once space has been adequate for
+15 s, and clears the latch in place when the proof succeeds; the daemon stays up. A latch
+that still stands 120 s after space became adequate, which is what an I/O error other than
+no space (EIO) is expected to leave until #449 lands, makes the daemon exit with an ordinary
+failure status so that `Restart=on-failure` reopens the store and the start waits for
+space.
 
 Each UDP syslog socket asks for an 8 MiB receive buffer. The kernel clamps the
 request to `net.core.rmem_max` (stock 212992) and stores twice the result; the
