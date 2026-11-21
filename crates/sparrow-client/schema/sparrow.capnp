@@ -22,6 +22,10 @@ struct DurabilityStatus {
   oldestPendingMs @5 :UInt64; failure @6 :OptionalText;
   maxPendingWrites @7 :UInt32; maxPendingBytes @8 :UInt64;
   flushIntervalMs @9 :UInt32; flushLagMs @10 :UInt64;
+  # Additive (#447): times the catalog writer was recovered after a writer panicked while holding
+  # it, since the store opened. In memory, so it restarts at zero. A reader that does not know
+  # this field sees no change.
+  writerRecoveries @11 :UInt64;
 }
 enum JsonKind { string @0; number @1; booleanTrue @2; booleanFalse @3; null @4; array @5; object @6; }
 struct OptionalKind { union { absent @0 :Void; value @1 :JsonKind; } }
@@ -352,6 +356,10 @@ enum ArchivePhase { notConfigured @0; idle @1; preparing @2; writing @3; verifyi
 struct ArchiveWorkerStatus {
   phase @0 :ArchivePhase; through @1 :Text; intentInFlight @2 :Bool;
   failure @3 :OptionalArchiveFailure;
+  # Additive (#447): passes that panicked since the daemon started. The worker restarts from the
+  # store's durable watermark after each and records the panic as the `ARCHIVE_PANIC` failure. A
+  # reader that does not know this field sees no change.
+  restarts @4 :UInt64;
 }
 # `code` is the error class (`ARCHIVE_VERIFY`, `ARCHIVE_IO`, `STORAGE_PRESSURE`, ...); `segment`
 # is the segment's file name, empty when the failure came before a segment was chosen; `reason`

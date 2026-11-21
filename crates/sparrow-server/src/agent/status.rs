@@ -69,6 +69,10 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
                 wire::optional_text::Absent(()) => Value::Null,
                 wire::optional_text::Value(value) => Value::from(value?.to_str()?),
             },
+        )
+        .with(
+            "writer_recoveries",
+            durability.get_writer_recoveries().to_string(),
         );
     let mut watches = Vec::new();
     for watch in value.get_consume_watches()? {
@@ -551,6 +555,7 @@ fn archive_worker(status: wire::archive_worker_status::Reader<'_>) -> Result<Val
         .with("through", status.get_through()?.to_str()?)
         .with("intent_in_flight", status.get_intent_in_flight())
         .with("failure", failure)
+        .with("restarts", status.get_restarts().to_string())
         .into())
 }
 

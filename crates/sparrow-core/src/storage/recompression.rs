@@ -315,9 +315,9 @@ impl Writer {
 
 impl Store {
     /// Rewrite progress for the running binary's table options profile.
-    /// Reads the observed state without the writer lock, and refuses once it is poisoned.
+    /// Reads the observed state without the writer lock, and recovers a poisoned writer first.
     pub fn recompression_status(&self) -> Result<RecompressionStatus, Error> {
-        self.refuse_poisoned()?;
+        self.recover_poisoned()?;
         Ok(self.unlocked.recompression.read())
     }
 

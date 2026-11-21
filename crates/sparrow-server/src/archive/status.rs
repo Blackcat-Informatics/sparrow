@@ -54,6 +54,8 @@ pub(crate) struct Snapshot {
     /// A prepared segment is recorded and not yet committed.
     pub(crate) intent_in_flight: bool,
     pub(crate) failure: Option<Failure>,
+    /// Passes that panicked and were restarted since the daemon started.
+    pub(crate) restarts: u64,
 }
 
 /// The shared copy: the worker writes it, `status` reads it.
@@ -95,6 +97,13 @@ impl ArchiveStatus {
         state.failure = None;
     }
 
+    /// Count a pass that panicked and was restarted; returns the count.
+    pub(crate) fn restarted(&self) -> u64 {
+        let mut state = self.lock();
+        state.restarts += 1;
+        state.restarts
+    }
+
     /// A pass failed at `now`, when the clock could be read. A failure with the same code and
     /// segment as the one standing keeps its start, so `since` dates the trouble and not the
     /// latest retry; a start missing for want of a clock is filled in once `now` is known.
@@ -133,6 +142,7 @@ impl ArchiveStatus {
         });
         out.set_through(state.through.as_deref().unwrap_or(""));
         out.set_intent_in_flight(state.intent_in_flight);
+        out.set_restarts(state.restarts);
         match state.failure {
             None => out.init_failure().set_absent(()),
             Some(failure) => {

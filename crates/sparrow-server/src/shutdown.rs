@@ -3,8 +3,8 @@
 
 //! Complete owned teardown, preserving the primary failure and every cleanup failure.
 
-use crate::local_endpoint::LocalEndpoint;
 use sparrow_server::admission::Admission;
+use sparrow_server::local_endpoint::LocalEndpoint;
 use std::sync::Arc;
 use tokio::sync::OwnedSemaphorePermit;
 

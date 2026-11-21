@@ -3890,9 +3890,9 @@ names = ['^(peer_credentials_elsewhere|record_caller_identity_elsewhere)$']
 
 [[job]]
 id = "owned-local-endpoint"
-summary = "Under exclusive store ownership, recover only a refused socket with unchanged device/inode, preserve live or unproven endpoints and non-sockets, and remove only the original owned name on shutdown."
+summary = "Under exclusive store ownership, recover only a refused socket with unchanged device/inode, preserve live or unproven endpoints and non-sockets, bind a removed name again under the same rules, and remove only the owned name on shutdown."
 home = "sparrowd::local_endpoint::LocalEndpoint::bind"
-entry_points = ["sparrowd::local_endpoint::LocalEndpoint::bind_ingest", "sparrowd::local_endpoint::LocalEndpoint::bind_recovering", "sparrowd::local_endpoint::LocalEndpoint::remove_name", "sparrowd::local_endpoint::remove_socket", "sparrowd::local_endpoint::socket_identity"]
+entry_points = ["sparrowd::local_endpoint::LocalEndpoint::bind_ingest", "sparrowd::local_endpoint::LocalEndpoint::bound", "sparrowd::local_endpoint::LocalEndpoint::rebind", "sparrowd::local_endpoint::LocalEndpoint::remove_name", "sparrowd::local_endpoint::LocalEndpoint::restore_name", "sparrowd::local_endpoint::bind_name", "sparrowd::local_endpoint::recover_stale", "sparrowd::local_endpoint::remove_socket", "sparrowd::local_endpoint::socket_identity"]
 spec = "docs/interfaces.md: local endpoint recovery."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []

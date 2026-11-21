@@ -60,6 +60,8 @@ pub struct DurabilityStatus {
     pub oldest_pending_ms: u64,
     /// Latched storage uncertainty; reopening is required before receipt certification.
     pub failure: Option<String>,
+    /// Times the catalog writer was recovered after a writer panicked holding it.
+    pub writer_recoveries: u64,
 }
 
 struct Pending {
@@ -138,7 +140,9 @@ impl Writer {
         mut artifact: Artifact,
         mode: Durability,
     ) -> Result<Artifact, Error> {
-        self.durability.borrow().check()?;
+        // No latch check here: a read of an artifact is served while durability is latched and
+        // reports its still-pending fence, which certifies nothing. A durable receipt that must
+        // synchronize is refused by `synchronize`, which checks the latch.
         if mode == Durability::Durable
             && self.durability.borrow().pending.contains_key(&artifact.id)
         {
@@ -335,6 +339,14 @@ impl Store {
         writer.synchronize()
     }
 
+    /// Dev-only: latch durability uncertain with `cause`, as a failed write or WAL sync does.
+    #[cfg(feature = "test-support")]
+    pub fn latch_durability_for_tests(&self, cause: &str) -> Result<(), Error> {
+        let writer = self.lock()?;
+        writer.durability.borrow_mut().failure = Some(cause.to_owned());
+        Ok(())
+    }
+
     /// Intended periodic boundary; does no I/O when there is no pending buffered intake.
     pub fn flush_buffered(&self) -> Result<(), Error> {
         let writer = self.lock()?;
@@ -346,9 +358,9 @@ impl Store {
     }
 
     /// Inspect current sequence, queue charge, age and any latched uncertainty.
-    /// Reads the observed state without the writer lock, and refuses once it is poisoned.
+    /// Reads the observed state without the writer lock, and recovers a poisoned writer first.
     pub fn durability_status(&self) -> Result<DurabilityStatus, Error> {
-        self.refuse_poisoned()?;
+        self.recover_poisoned()?;
         let state = self.unlocked.durability.read();
         let oldest_pending_ms = state
             .oldest
@@ -367,6 +379,7 @@ impl Store {
             pending_bytes: state.pending_bytes,
             oldest_pending_ms,
             failure: state.failure,
+            writer_recoveries: self.writer_recoveries(),
         })
     }
 }
