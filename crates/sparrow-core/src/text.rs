@@ -12,19 +12,34 @@ pub(crate) const MAX_OCCURRENCES: u64 = 16384;
 
 pub(crate) const PROFILE: &str = "sparrow-record-raw-and-decoded-v1";
 
+/// A failure to read the lexicon bundle: a missing, unreadable or malformed bundle is the
+/// configuration's fault (`INVALID_ARGUMENT`); any other I/O failure may pass (`STORAGE_FAILURE`).
+fn lexicon_io(error: &std::io::Error, message: String) -> Error {
+    use std::io::ErrorKind::{
+        InvalidData, InvalidInput, IsADirectory, NotADirectory, NotFound, PermissionDenied,
+    };
+    let code = match error.kind() {
+        NotFound | PermissionDenied | NotADirectory | IsADirectory | InvalidInput | InvalidData => {
+            "INVALID_ARGUMENT"
+        }
+        _ => "STORAGE_FAILURE",
+    };
+    Error::new(code, message)
+}
+
 /// Resolve PurRDF's standard law from exactly five supplied CBOR lexicons.
 /// Missing, oversized, corrupt or drifted artifacts are hard failures.
 pub fn resolve_text_analyzer(directory: impl AsRef<Path>) -> Result<Analyzer, Error> {
     let mut paths = std::fs::read_dir(directory.as_ref())
         .map_err(|e| {
-            Error::new(
-                "INVALID_ARGUMENT",
+            lexicon_io(
+                &e,
                 format!("text lexicons {}: {e}", directory.as_ref().display()),
             )
         })?
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| Error::new("INVALID_ARGUMENT", e.to_string()))?;
+        .map_err(|e| lexicon_io(&e, e.to_string()))?;
     paths.retain(|path| path.extension().is_some_and(|ext| ext == "cbor"));
     paths.sort();
     if paths.len() != 5 {
@@ -38,12 +53,7 @@ pub fn resolve_text_analyzer(directory: impl AsRef<Path>) -> Result<Analyzer, Er
         let mut bytes = Vec::new();
         std::fs::File::open(&path)
             .and_then(|file| file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes))
-            .map_err(|e| {
-                Error::new(
-                    "INVALID_ARGUMENT",
-                    format!("text lexicon {}: {e}", path.display()),
-                )
-            })?;
+            .map_err(|e| lexicon_io(&e, format!("text lexicon {}: {e}", path.display())))?;
         if bytes.len() > 16 * 1024 * 1024 {
             return Err(Error::new("RESOURCE_LIMIT", "text lexicon exceeds 16 MiB"));
         }

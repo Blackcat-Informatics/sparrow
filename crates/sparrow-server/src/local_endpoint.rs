@@ -46,7 +46,8 @@ impl LocalEndpoint {
     /// failure.
     pub async fn bind(path: &Path, store: &sparrow_core::Store) -> io::Result<Self> {
         if path.parent() != Some(store.data_path().map_err(io::Error::other)?.as_path()) {
-            return Err(io::Error::other(
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
                 "local endpoint must be inside the owned private store",
             ));
         }

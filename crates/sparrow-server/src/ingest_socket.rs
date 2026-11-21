@@ -102,10 +102,13 @@ fn peer_credential(stream: &tokio::net::UnixStream) -> io::Result<sparrow_core::
 }
 
 fn refuse(path: &Path, problem: &str, remedy: &str) -> io::Error {
-    io::Error::other(format!(
-        "ingest socket directory {}: {problem}; {remedy}",
-        path.display()
-    ))
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "ingest socket directory {}: {problem}; {remedy}",
+            path.display()
+        ),
+    )
 }
 
 /// Refuse to serve the ingest socket from `dir` unless it is a real directory, owned by
@@ -161,11 +164,14 @@ pub fn check_socket(path: &Path, gid: u32) -> io::Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
     let mode = metadata.mode() & 0o7777;
     if !metadata.file_type().is_socket() || metadata.gid() != gid || mode != SOCKET_MODE {
-        return Err(io::Error::other(format!(
-            "ingest socket {} has group {} and mode {mode:04o}, not group {gid} and mode {SOCKET_MODE:04o}; check that its directory is setgid and nothing else changes the name",
-            path.display(),
-            metadata.gid()
-        )));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "ingest socket {} has group {} and mode {mode:04o}, not group {gid} and mode {SOCKET_MODE:04o}; check that its directory is setgid and nothing else changes the name",
+                path.display(),
+                metadata.gid()
+            ),
+        ));
     }
     Ok(())
 }

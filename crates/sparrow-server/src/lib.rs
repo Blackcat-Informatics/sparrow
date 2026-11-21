@@ -14,6 +14,7 @@ pub mod journal_log;
 pub mod local_endpoint;
 mod source_file;
 pub mod staging_refusal;
+pub mod start_wait;
 pub mod syslog_listener;
 mod syslog_spill;
 mod syslog_wire;
