@@ -1012,17 +1012,19 @@ hung mount still reports where it stopped.
 | `through` | 1 | The durable `archive:through` watermark; empty before the first commit. The worker reads it, with `intentInFlight`, from the store when it starts and at the top of every pass, so status is right after a restart and on passes that fail before they choose a segment. |
 | `intentInFlight` | 2 | A prepared segment is recorded and not yet committed. |
 | `failure` | 3 | `OptionalArchiveFailure`: absent, or the last failed pass. |
+| `restarts` | 4 | Passes that panicked since the daemon started. The worker journals each, records it as the `ARCHIVE_PANIC` failure with the panic message, and starts the next pass from the store's durable watermark. |
 
 `ArchiveFailure` carries `code` (ordinal 0: `ARCHIVE_VERIFY`, `ARCHIVE_IO`, `ARCHIVE_ROOT`,
-`ARCHIVE_NOT_ON_MOUNT`, `ARCHIVE_OVERRAN`, `INVALID_ARGUMENT`, or the store's own code such as
+`ARCHIVE_NOT_ON_MOUNT`, `ARCHIVE_OVERRAN`, `ARCHIVE_PANIC`, `INVALID_ARGUMENT`, or the store's own code such as
 `STORAGE_PRESSURE`), `segment` (1: the segment file name, empty when the failure came before a
 segment was chosen), `reason` (2: the cause, cut to 512 characters; the journal line holds it
 whole) and `since` (3: an `OptionalInstant`, when the failure began, kept while the same code and
 segment keep failing; absent while the clock could not be read, and filled in on the first pass
 that reads it). A pass that ends without error clears
 the failure and returns the phase to `idle`. CLI and MCP status render the field as
-`archive_worker` with `phase`, `through`, `intent_in_flight` and `failure` (`code`, `segment`,
-`reason`, `since` as an instant or null, or the whole failure null).
+`archive_worker` with `phase`, `through`, `intent_in_flight`, `failure` (`code`, `segment`,
+`reason`, `since` as an instant or null, or the whole failure null) and `restarts` as a decimal
+string.
 
 ### Instance role (#371)
 
@@ -1266,7 +1268,13 @@ through the pending read paths and its `status` reports each migration's
 progress where the copy left it. A store that still owes the
 table rewrite reports `recompression` as `running`, but the rewrite never runs.
 The daemon sets `data_dir` to mode 0710, creates its socket name and removes it
-at shutdown. Every daemon, query-only or not, logs
+at shutdown. The accept loop checks its Unix socket names once a second: a name removed
+while the daemon runs is bound again at once with its mode (and, for the ingest socket,
+its directory, group and mode checks), and journaled as `sparrowd: local endpoint PATH
+was removed; bound it again`. The start's liveness rules hold: a name another live
+listener answers on, or that is not a socket, is preserved and journaled once while it
+lasts, and a socket left on the name is replaced only after a refused connection proves
+it dead. Every daemon, query-only or not, logs
 `sparrowd: closed store=ID unique_payload_chunks=N` once its workers have stopped
 and its final flush has succeeded. A later shutdown error can still follow it. Query captures use anonymous temporary files that leave no name
 behind.
@@ -1519,8 +1527,14 @@ across commits; when a change ends the writer publishes a small copy, and status
 reads only that copy. A status reply therefore waits for no migration page,
 write, pressure pass or rewrite step, at most for one short copy. It still
 checks, without waiting, whether a writer panicked while holding the writer
-lock, and then refuses with `STORAGE_FAILURE` ("catalog writer poisoned") as
-every locked operation does, as do the three observed-status reads.
+lock. A lock a panicked writer left is recovered by the next operation that takes
+it, status and the three observed-status reads included: the writer reloads the
+state it derives from the store (pressure, table rewrite and archive state, the
+eviction and expiry cursors) as an open does, and syncs the WAL so the durability
+ledger certifies every accepted write. `durability.writerRecoveries` counts the
+recoveries. A re-validation that fails (including a WAL sync that fails) leaves the lock poisoned and
+refuses with the retryable `STORAGE_PRESSURE` ("catalog writer poisoned and not yet
+recovered"); the next operation tries again.
 
 One owner, `store_counters::apply`, runs on every write batch after the
 per-source counters and adds its row changes to the same batch. A key the batch
@@ -2485,9 +2499,12 @@ stale cache its context reads keep using the time index until a writable daemon
 completes the rebuild. Selected entries must agree with the primary time index and the
 record's source; disagreement refuses the capture without a global scan fallback.
 Corrupt record metadata found during reconstruction latches a durable failure:
-the migration stops paging, `Status.migrations` reports the failure, and
-context keeps walking the primary `time:` index until catalog repair and a
-reopen, which resets the cache and rebuilds it. A context read that reaches the
+`Status.migrations` reports the failure, and context keeps walking the primary
+`time:` index. The latched rebuild re-verifies on the maintenance worker's migration
+retry interval (60 s): the page runs again from its checkpoint, commits nothing and
+fails while the metadata is still corrupt, and once the row is repaired the page succeeds, clears the latch in the same batch and
+the rebuild continues. The rebuild runs last of the migrations, so a latched one
+holds back no other. A reopen also resets the cache and rebuilds it. A context read that reaches the
 corrupt record itself refuses with a storage failure. The failure does not
 publish a partial timeline or prevent unrelated evidence reads. Other page failures, such
 as storage I/O or admission, are retried like any migration page. The daemon
@@ -4811,7 +4828,9 @@ with retryable `STORAGE_PRESSURE` before publication. Default intended WAL sync 
 sequences, pending count/bytes, age, interval, lag and latched storage uncertainty.
 Any synchronized control write covers earlier WAL writes; empty control batches
 use explicit synchronization. Write/WAL-sync failure latches uncertainty and
-refuses further receipt certification until reopening. Opening synchronizes
+refuses further receipt certification until reopening; reads are served, and an artifact
+read reports its still-pending fence. Status counts writer-lock recoveries
+(`writerRecoveries`). Opening synchronizes
 recovered data before starting a fresh session. These fences certify storage
 durability, not retention extension, producer drops or power-loss qualification.
 
