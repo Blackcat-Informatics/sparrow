@@ -1,0 +1,19 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 93a675cfdc2afd2ed8f60efb0b1421f9f26b7c8e
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 439
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/439
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 25ac5b980c942850159b6cff044190d2d7563b03
+GhpRsq-Head-Ref: paudley/437-interim-katamari-spool-units-delete
+GhpRsq-Head-OID: 93a675cfdc2afd2ed8f60efb0b1421f9f26b7c8e
+GhpRsq-Result-Tree: a148c772ef93bedc318b717c5cfb188bc3d677e5
+GhpRsq-Result-Commit: f84bd9494b9e7af28cb4bed3f7c37f9b6f9782e2
+GhpRsq-Parent-Hashes: 93a675cfdc2afd2ed8f60efb0b1421f9f26b7c8e
+GhpRsq-Squash-Notes-SHA256: f4e08c3681833d13e65494b8f499ab67d197250982d97e92a6a212f155dea5fd
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
