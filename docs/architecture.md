@@ -422,11 +422,15 @@ worker leaves a latched store alone while free space is below RocksDB's recovery
 (32 MiB, or the maintenance reserve or floor if larger), proves once after space has been
 adequate for 15 s, spaces further proofs 30 s then 60 s apart, and exits with an ordinary
 failure status when the latch has stood 120 s with space adequate, so the supervisor reopens
-the store. A WAL append that failed with no space left cleared in place after space returned
-in the full-disk test on a tmpfs (`tools/enospc-check.sh`, ignored in the gate). Any other
-I/O error on the WAL (EIO and similar) is not known to clear and ends the daemon after that
-bound until #449 lands. An explicit RocksDB `Resume()` and a real filesystem near full are
-untested. Reopening in place is not used, because buffered writes held only in the stopped
+the store. In the full-disk test on a tmpfs (`tools/enospc-check.sh`, ignored in the gate) the latch
+cleared in place after space returned in 5 clean runs. Repeated proofs from the instant space
+returned never let RocksDB resume in 3 runs, while one proof at that instant resumed; the
+threshold is not isolated, and the worker's 15 s grace avoids that window by schedule only.
+A recovery that does not resume ends the daemon (exit 1, restart, the start waits for space)
+until #449 lands, which is required before the switch image. An I/O error other than no space
+(EIO and similar) is not known to clear and ends the daemon the same way. A forced
+compaction has no latch check. An explicit RocksDB `Resume()` and a real filesystem near
+full are untested. Reopening in place is not used, because buffered writes held only in the stopped
 handle's memtables can be lost by it while the daemon's workers keep state derived from
 them; a restart resets both together.
 

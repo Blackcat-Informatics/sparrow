@@ -77,11 +77,16 @@ every watch in `consume_watches` names a root that exists.
   counts it. A latch still standing 120 s after space became adequate ends the daemon with
   an ordinary failure status (exit 1, never 78), the journal line names the cause, and
   `Restart=on-failure` reopens the store; at startup the daemon waits for space.
-- Observed and not observed: in the full-disk test on a tmpfs (`tools/enospc-check.sh`) a
-  WAL append that failed with no space left cleared in place after space returned. An I/O
-  error other than no space (EIO and similar) is not known to clear and ends the daemon as
-  above until #449 lands. An explicit RocksDB `Resume()` and a real filesystem near full are
-  untested.
+- Observed and not observed: in the full-disk test on a tmpfs (`tools/enospc-check.sh`) the
+  latch cleared in place after space returned in 5 clean runs. Repeated proofs from the
+  instant space returned (every 0.5 s) never let RocksDB resume in 3 runs, while one proof at
+  that instant resumed; the threshold between them is not isolated. The worker's 15 s grace
+  avoids that window by schedule only, and does not if a resume takes longer than 15 s. A
+  recovery that does not resume still ends the daemon (exit 1, restart, the start waits for
+  space) until #449 lands, and #449 is required before the switch image. An I/O error other
+  than no space (EIO and similar) is not known to clear and ends the daemon the same way. A
+  forced compaction has no latch check. Untested: EIO, an explicit RocksDB `Resume()` and a
+  real filesystem near full.
 - Recover: make space if the disk is full (see "Full disk"). The daemon
   restarts itself; run `sudo systemctl restart sparrow.service` only if it has
   not. Confirm `durability.failure` is `null`; `durability.latches` and
