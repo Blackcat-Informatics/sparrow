@@ -133,7 +133,7 @@ async fn main() -> std::process::ExitCode {
         // unit does not restart.
         Err(error) if !SERVING.load(std::sync::atomic::Ordering::Relaxed) => {
             eprintln!(
-                "sparrowd: refused to start: {error}; a restart repeats it, so the exit status is {} and the unit does not restart it. Correct the configuration, image, store or watch root, then start the unit",
+                "sparrowd: refused to start: {error}; a restart repeats it, so the exit status is {} and the unit does not restart it. Correct the configuration, image or store, then start the unit",
                 start_wait::REFUSED_EXIT_STATUS
             );
             start_wait::notify(&format!("STATUS=refused to start: {error}"));
