@@ -7,15 +7,13 @@ use std::time::Duration;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let delivery = std::env::args()
-        .nth(1)
-        .map(|value| {
-            Delivery::start(DeliveryConfig::for_endpoint(
-                Endpoint::parse(&value)?,
-                "console-example",
-            ))
-        })
-        .transpose()?;
+    let delivery = match std::env::args().nth(1) {
+        Some(value) => {
+            let config = DeliveryConfig::for_endpoint(Endpoint::parse(&value)?, "console-example");
+            Some(Delivery::start_async(config).await?)
+        }
+        None => None,
+    };
     let console = Console::install(delivery.clone())?;
     log::set_boxed_logger(Box::new(console.clone()))?;
     log::set_max_level(log::LevelFilter::Info);
@@ -35,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     if let Some(delivery) = delivery {
-        tokio::task::spawn_blocking(move || delivery.shutdown(Duration::from_secs(5))).await??;
+        delivery.shutdown_async(Duration::from_secs(5)).await?;
     }
     Ok(())
 }
