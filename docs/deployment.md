@@ -503,6 +503,32 @@ production slice, with `sparrow-ship.timer`.
 The timer runs five minutes after each completed run. Shipped data arrives when
 its producer finishes a file, not as it is written.
 
+### Deleting acknowledged spool files
+
+A source with `delete_acknowledged = true` is a spool the shipper owns, such as
+the Katamari journal spool below; never set it on a producer's own directory.
+At the end of each run the shipper deletes a finished file of that source once
+the store holds every byte of it, and nothing else ever deletes one. It hashes
+each part the file ships as (the whole file, or each line-bounded part, split
+exactly as when it was queued) with `b3sum` and asks the store
+`sparrow SOCKET payload STORE_ID blake3:HEX`. The file goes only when every part
+lists an artifact, which the store answers only while it holds all of that
+artifact's bytes ([Payload id index](interfaces.md#payload-id-index-store-format)).
+A file that is still queued, waiting in a consume root, refused under storage
+pressure, quarantined, or held once and since retired lists nothing and stays.
+The ledger keeps its entry either way.
+
+The source needs the top-level keys `sparrow` (the CLI) and `socket` (the store
+socket the CLI queries), and `b3sum` on the path; the configuration is refused
+at load without them. While the store does not answer, the run reports
+`store unreachable` and deletes nothing, however long the outage lasts, without
+failing. A producer may append to a file by name at any time, so the shipper
+renames the file to `.reaping-NAME` before its last identity check and deletes it
+only if the identity is unchanged; otherwise it puts the file back. A run puts
+back any `.reaping-` file an interrupted run left before it ships. A file that
+cannot be put back because its name exists again is reported as a failure and
+both files are kept.
+
 ## Katamari's journal in the spool
 
 Two interim user units on the operator's host spool `katamari-stored.service`
@@ -535,9 +561,13 @@ in the buckets it belongs to.
 
 The shipper reads both prefixes through one source, because both go to the same
 consume root and watch. `~/.config/sparrow/ship.toml` needs the pattern
-widened, with no new watch and no change to the ledger (it keys each file):
+widened and `delete_acknowledged` set, with no new watch and no change to the
+ledger (it keys each file):
 
 ```toml
+sparrow = "/home/paudley/.local/bin/sparrow"
+socket = "/SPARROW/store/rpc.sock"
+
 [[source]]
 name = "katamari.stored"
 dir = "/home/paudley/.local/state/sparrow/katamari-journal"
@@ -545,6 +575,7 @@ pattern = "katamari-*.jsonl"
 rule = "settled"
 format = "jsonl"
 settle_seconds = 120
+delete_acknowledged = true
 ```
 
 Deploy (the operator; nothing here restarts the node or the namespace forwarder):
@@ -2184,8 +2215,10 @@ notice states this and gives the length only after the rehearsal has read `N`.
     under `~/.local/libexec/sparrow/` with `Restart=always`. They never connect to Sparrow, so they
     keep writing from their own units while the daemon is down, and the shipper sends those files
     after the start. Neither unit deletes a spool file (`katamari-stored-*.jsonl` or
-    `katamari-manager-*.jsonl`), so an outage of any length loses no spooled line; the spool grows by
-    about 4 MB a day (read for 17 to 19 November 2026) while nothing removes files. Both units and `sparrow-ship.timer` read `active` on the host
+    `katamari-manager-*.jsonl`); the shipper deletes one only once the store holds every part of it
+    ([Deleting acknowledged spool files](#deleting-acknowledged-spool-files)), so an outage of any
+    length loses no spooled line. The spool grows by about 4 MB a day (read for 17 to 19 November
+    2026) while the store is away. Both units and `sparrow-ship.timer` read `active` on the host
     (`systemctl --user is-active`, saved in `.stage/416/host-reads.log`).
   A producer that rotates or deletes its own file in the window is outside Sparrow's reach.
 - Her CLI and MCP tools (`lillith_decodes`) and every other client of the CLI and the MCP tools get
