@@ -55,7 +55,8 @@ every watch in `consume_watches` names a root that exists.
   watches keep their files); it logs a line when the pause begins, one a minute
   while it lasts and one when it ends. A write that still fails with durability uncertain makes the
   daemon exit, and `Restart=on-failure` reopens the store; at startup it waits
-  for the floor before opening, so a full disk does not spend the start limit.
+  only for the maintenance reserve's worth of space before opening, so a full disk does not spend
+  the start limit, and below the floor alone the store opens and serves reads.
 - `/SPARROW` is on the same btrfs device as `/home`, so the move to `/SPARROW`
   did not isolate Sparrow from a full `/home`.
 - Reversible: yes; the restart only reopens the store.
@@ -77,9 +78,11 @@ every watch in `consume_watches` names a root that exists.
 - Symptom: the journal shows `free space is below the floor` (writes paused
   below `min_free_bytes`; connections are still accepted and reads served),
   write clients get `STORAGE_PRESSURE` with the floor class and hold, `status`
-  shows a nonzero `floorPause.pausedSince`, or the unit waits at startup with
+  shows a nonzero `floorPause.pausedSince`, or, only when free space is below
+  the maintenance reserve, the unit waits at startup with
   `waiting to open the store` (nothing can answer then, so `check.sh` cannot
-  connect).
+  connect). Between the reserve and `min_free_bytes` a restart opens the store
+  and serves reads.
 - Diagnose: `df -h /SPARROW /home`, then find what grew:
   `sudo du -xsh /home/* /SPARROW/* | sort -h | tail`.
 - Recover: free space on the filesystem (another program's files, a read-only

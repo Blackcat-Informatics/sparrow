@@ -522,6 +522,18 @@ impl ServerConfig {
         sparrow_core::SpaceFloor::new(&self.data_dir, self.min_free_bytes)
     }
 
+    /// The free space the daemon needs to open the store (a manifest and a WAL): the
+    /// maintenance reserve, which is kept for exactly such writes, and never more than the
+    /// floor. Below it the daemon waits to open; between it and `min_free_bytes` the daemon
+    /// opens and the floor pauses writes, so reads are served and reclaim can run.
+    #[must_use]
+    pub fn open_floor(&self) -> sparrow_core::SpaceFloor {
+        sparrow_core::SpaceFloor::new(
+            &self.data_dir,
+            self.maintenance_reserve.min(self.min_free_bytes),
+        )
+    }
+
     /// Open the one storage owner with native analyzer artifacts and private permissions.
     pub fn open_store(&self) -> Result<Store, Box<dyn std::error::Error>> {
         let store = Store::open(
