@@ -140,6 +140,10 @@ impl Job {
     /// crossed: expiry then runs under the maintenance reserve and without import
     /// reclamation (#267).
     fn execute(self, store: &Store, paused: bool) -> Result<Outcome, Error> {
+        #[cfg(test)]
+        if matches!(self, Self::Expiry) {
+            inject::expiry(store);
+        }
         let done = Outcome::Continue;
         match self {
             Self::Flush => store.flush_buffered().map(|_| done),
@@ -509,6 +513,71 @@ fn latched(store: &Store) -> Result<bool, String> {
         .map_err(|error| error.to_string())
 }
 
+/// The first wait before a duty that panicked runs again.
+const PANIC_RETRY_FIRST: Duration = Duration::from_secs(1);
+
+/// The longest wait before a duty that panicked runs again.
+const PANIC_RETRY_LONGEST: Duration = Duration::from_secs(30);
+
+/// The wait before a duty that keeps panicking runs again: 1 s, doubling to 30 s, the same
+/// bounds as a failing pressure pass (see [`pressure_failed`]). A panic that was a one-off is
+/// retried at once and a recurring one settles at two attempts a minute, so it neither spins
+/// the worker nor goes quiet, and its other duties keep their own clocks. A duty that completes
+/// resets the streak.
+#[derive(Default)]
+struct PanicBackoff {
+    streak: u32,
+}
+
+impl PanicBackoff {
+    /// Record a panic and return the wait before the duty runs again.
+    fn panicked(&mut self) -> Duration {
+        self.streak = self.streak.saturating_add(1);
+        PANIC_RETRY_FIRST
+            .saturating_mul(1_u32 << (self.streak - 1).min(16))
+            .min(PANIC_RETRY_LONGEST)
+    }
+
+    /// Record a duty that completed.
+    fn recovered(&mut self) {
+        self.streak = 0;
+    }
+}
+
+/// A panic injected into the retention duty of one store, so a test drives the worker's panic
+/// arm. The store's identity keeps other tests' workers out of it.
+#[cfg(test)]
+mod inject {
+    use super::Store;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static TARGET: Mutex<Option<String>> = Mutex::new(None);
+    static ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+    /// Panics are injected only for this many attempts, so a worker that retries without a
+    /// delay finishes its run instead of spinning for the whole test.
+    const LIMIT: u32 = 200;
+
+    /// Panic the retention duty of `store` on each of its next attempts.
+    pub(super) fn arm(store: &Store) {
+        *TARGET.lock().unwrap() = Some(store.store_id().unwrap());
+        ATTEMPTS.store(0, Ordering::SeqCst);
+    }
+
+    /// Attempts the retention duty has made since [`arm`].
+    pub(super) fn attempts() -> u32 {
+        ATTEMPTS.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn expiry(store: &Store) {
+        let armed = TARGET.lock().unwrap().clone();
+        if armed.is_some() && armed == store.store_id().ok() {
+            let attempt = ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+            assert!(attempt >= LIMIT, "injected duty panic");
+        }
+    }
+}
+
 /// Skipped-duty counts of the test running on this thread, so a test waits for the skip it
 /// exercises as an event instead of sleeping.
 /// One structured line for an expiry pass that retired or held evidence. The counts are the
@@ -770,6 +839,9 @@ async fn run(
     let mut migrating = false;
     let mut deferral: Option<tokio::task::JoinHandle<std::time::Duration>> = None;
     let mut stale = false;
+    // How long a duty that keeps panicking waits; the other duties run on their own clocks.
+    let mut pressure_panics = PanicBackoff::default();
+    let mut expiry_panics = PanicBackoff::default();
     // The proofs of the standing latch and the last failure they met.
     let mut proofs = Proofs::default();
     let mut proof_failure: Option<String> = None;
@@ -839,8 +911,28 @@ async fn run(
         let result = match joined {
             Ok(outcome) => outcome,
             Err(error) => {
+                // The duties on a deadline (pressure and expiry) are due again at once, so a
+                // panic that recurs waits on a growing delay; the interval duties keep their
+                // own clocks.
+                let delay = match job {
+                    Job::Pressure => {
+                        let delay = pressure_panics.panicked();
+                        pressure_at = tokio::time::Instant::now() + delay;
+                        Some(delay)
+                    }
+                    Job::Expiry => {
+                        let delay = expiry_panics.panicked();
+                        expiry_at = tokio::time::Instant::now() + delay;
+                        Some(delay)
+                    }
+                    Job::Migrate { .. } => {
+                        migrate.reset();
+                        None
+                    }
+                    _ => None,
+                };
                 eprintln!(
-                    "sparrowd: {} panicked; the next duty recovers the writer: {error}",
+                    "sparrowd: {} panicked; the next duty recovers the writer and it runs again after {delay:?}: {error}",
                     job.name()
                 );
                 continuation = false;
@@ -928,6 +1020,7 @@ async fn run(
                         report.anomalies
                     );
                 }
+                expiry_panics.recovered();
                 continuation = report.continuation;
                 expiry_at = tokio::time::Instant::now()
                     + if continuation {
@@ -953,6 +1046,7 @@ async fn run(
             Ok(Outcome::Pressured(status)) => {
                 held.wake();
                 journal_eviction(&status, &mut journaled_eviction_passes);
+                pressure_panics.recovered();
                 let verdict = pressure_duty.observe(&status);
                 for line in &verdict.lines {
                     eprintln!("{line}");
@@ -1528,6 +1622,51 @@ mod tests {
             .shutdown()
             .await
             .expect("the worker was still running");
+    }
+
+    /// INVARIANT (#447): a duty that keeps panicking is retried on a growing delay (1 s
+    /// doubling to 30 s) and never in a busy loop, and the worker keeps serving its other
+    /// duties and shuts down cleanly. Time is the runtime's paused clock, so the test does not
+    /// sleep. Fails on a worker whose panic arm leaves the duty due at once: it retries
+    /// without a pause, hundreds of times in no time.
+    #[tokio::test(start_paused = true)]
+    async fn a_duty_that_keeps_panicking_is_retried_on_a_growing_delay_not_in_a_busy_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let path =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let store = sparrow_server::ServerConfig::read(&path)
+            .unwrap()
+            .open_store()
+            .unwrap();
+        let now = sparrow_server::now().unwrap();
+        store
+            .ingest_with_durability(
+                "buffered",
+                "source",
+                "opaque",
+                b"buffered",
+                now,
+                sparrow_core::Durability::Buffered,
+            )
+            .unwrap();
+        inject::arm(&store);
+        let worker = Worker::start_paced(
+            store.clone(),
+            Duration::from_secs(1),
+            Default::default(),
+            Pace::DAEMON,
+        );
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        // Attempts at about 0, 1, 3, 7, 15 and 31 s.
+        let attempts = inject::attempts();
+        assert!(
+            (4..=7).contains(&attempts),
+            "{attempts} attempts in 40 s of a duty that panics every time"
+        );
+        // The flush duty ran beside it.
+        assert_eq!(store.durability_status().unwrap().pending_writes, 0);
+        worker.shutdown().await.unwrap();
     }
 
     /// INVARIANT (#183, #249): an import's slot is freed by an event, not by the one-second
