@@ -5092,10 +5092,13 @@ socket I/O; admission waits only for the queue lock, whose holders do bounded
 in-memory work and never I/O, so a briefly held lock never drops an event. The
 worker assigns increasing sequences under queue serialization. Full, invalid,
 closed, failed and counter-exhausted admission each have visible drop counters.
-A batch the daemon permanently refuses (a non-retryable `INVALID_ARGUMENT` or
-`CONFLICT`) is written to a quarantine file with its reason and count, then counted,
-reported as not delivered at the next flush, and later events proceed. The client never
-deletes the file; if it cannot be written the batch stays pending. A source whose time
+A batch the daemon refuses for a reason about the batch (a non-retryable `INVALID_ARGUMENT`,
+`CONFLICT` or unknown code) is written to a quarantine file with its reason and count, then counted,
+reported as not delivered at the next flush, and later events proceed. `replay_quarantine` and
+`sparrow ENDPOINT quarantine-replay FILE` resend a file and remove it once the daemon acknowledges
+it. If a file cannot be written the batch stays pending. A failure
+about the connection or daemon holds the batch and retries it, and a replaced store sets the
+pending batch aside and continues against the new store; the worker never stops on a refusal. A source whose time
 mapping conflicts refuses every later batch, so each becomes one file (about one per
 flush interval per client) until the operator fixes the source; the disk is the only bound.
 A full-queue refusal can leave an explicit sequence gap;

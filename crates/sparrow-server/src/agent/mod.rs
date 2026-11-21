@@ -48,6 +48,7 @@ pub(crate) mod tool;
 pub(super) const USAGE: &str = concat!(
     "sparrow SOCKET_PATH sparql REQUEST.json | sparql-explain REQUEST.json | correlate REQUEST.json; ",
     "usage: sparrow SOCKET_PATH capabilities | discover | status | rdf STORE_ID RECORD_ID | ingest REQUEST_ID SOURCE FORMAT FILE | ingest-get STORE_ID IMPORT_ID | flush STORE_ID SESSION_ID SEQUENCE",
+    " | quarantine-replay FILE",
     " | retention-metrics STORE_ID [--max-visits N] [--catalog-bytes N] [--payload-bytes N]",
     " | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION]",
     " | pins STORE_ID [--cursor CURSOR] [--page-size N] [--scan-budget N]",
@@ -99,6 +100,7 @@ pub(super) enum Command {
     Syslog(syslog::Input),
     Tail(tail::Input),
     TailFinish(tail_finish::Input),
+    QuarantineReplay(std::path::PathBuf),
     Rdf {
         store: String,
         id: String,
@@ -229,6 +231,12 @@ impl Command {
             } else {
                 input
             })));
+        }
+        if args.first().is_some_and(|arg| arg == "quarantine-replay") {
+            let [_, file] = args else {
+                return Err(invalid("quarantine-replay requires FILE"));
+            };
+            return Ok(Self::QuarantineReplay(file.into()));
         }
         if args.first().is_some_and(|arg| arg == "ingest-get") {
             return Ok(Self::IngestStatus(ingest_status::Input::parse(&args[1..])?));
@@ -568,6 +576,17 @@ impl Command {
         }
         if let Self::Discover = self {
             return Ok(Some(status::discovery(connection.discovery())));
+        }
+        if let Self::QuarantineReplay(path) = self {
+            let replayed = sparrow_client::replay_quarantine(connection, path).await?;
+            return Ok(Some(
+                Object::new()
+                    .with("file", replayed.path.display().to_string())
+                    .with("events", replayed.events as u64)
+                    .with("replayed", true)
+                    .with("removed", true)
+                    .into(),
+            ));
         }
         if let Self::Sparql(input) = self {
             return Ok(Some(input.execute(client).await?));

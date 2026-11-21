@@ -42,9 +42,9 @@ pub struct DeliveryConfig {
     pub retry_interval: Duration,
     /// Longest delay between attempts of the same pending batch, at least `retry_interval`.
     pub retry_max_interval: Duration,
-    /// Directory that keeps every batch the daemon permanently refuses, with the reason and
-    /// count, as one file per batch. Created on first use. The client never deletes a file
-    /// here; its size is bounded only by the disk. Default: `sparrow-client/quarantine` under
+    /// Directory that keeps every batch set aside, with the reason and count, as one file per
+    /// batch. Created on first use. The worker never deletes a file here; only a successful
+    /// [`crate::replay_quarantine`] removes one. Its size is bounded only by the disk. Default: `sparrow-client/quarantine` under
     /// an absolute `XDG_STATE_HOME`, else under `$HOME/.local/state`. With neither the default
     /// is empty and [`Delivery::start`] fails until a directory is set: a refused log is never
     /// parked in a volatile fallback.
@@ -155,7 +155,9 @@ pub enum DropReason {
     Invalid,
     /// Shutdown or last-owner cancellation closed admission.
     Closed,
-    /// A permanent worker failure prevents further delivery.
+    /// The worker ended on a local invariant failure (a poisoned lock, an exhausted counter,
+    /// a panic). No daemon refusal and no transport failure ends the worker: those hold or
+    /// set aside the batch and delivery carries on.
     Failed,
     /// Sequence/diagnostic counters exhausted their exact range.
     CounterExhausted,
@@ -190,9 +192,12 @@ pub struct DeliveryWatermark {
     pub durable_sequence: u64,
     /// Count of independently acknowledged events in this instance.
     pub durable_events: u64,
-    /// Dropped offers and quarantined events counted by this fence; these were never certified.
+    /// Dropped offers and quarantined events first counted by this fence, that is, since the
+    /// previous barrier that returned a watermark or `Dropped`; these were never certified.
+    /// A barrier with nothing new is clean. `DeliveryStats` keeps the running totals.
     pub dropped_before_fence: u64,
-    /// The part of `dropped_before_fence` that is kept in quarantine files, not lost.
+    /// The part of `dropped_before_fence` that is kept in quarantine files, not lost; replay a
+    /// file with [`crate::replay_quarantine`].
     pub quarantined_before_fence: u64,
     /// Last durable batch receipt, absent before any accepted batch.
     pub last_receipt: Option<ArtifactReceipt>,
@@ -203,11 +208,13 @@ pub struct DeliveryWatermark {
 pub enum FlushError {
     /// Another flush/shutdown already owns the bounded control slot.
     Busy,
-    /// Admitted input reached durability, but earlier offered input was dropped.
+    /// Admitted input reached durability, but input offered since the previous barrier was
+    /// dropped or set aside. The next barrier counts only what happens after this one.
     Dropped(Box<DeliveryWatermark>),
     /// The deadline elapsed; accepted progress may still advance afterward.
     TimedOut(Box<DeliveryStats>),
-    /// A permanent transport/domain/protocol failure, with the pending batch retained.
+    /// The worker ended on a local invariant failure, with the pending batch retained and
+    /// written to a quarantine file. Refusals and transport failures never end the worker.
     Delivery(Arc<Error>),
     /// The worker/state/control invariant is unavailable.
     Unavailable(&'static str),
@@ -275,12 +282,16 @@ pub struct DeliveryStats {
     pub running: bool,
     /// Whether explicit shutdown closed producer admission.
     pub closing: bool,
-    /// Permanent failure; pending bodies remain inspectable.
+    /// A local invariant failure that ended the worker; pending bodies remain inspectable and
+    /// are in quarantine files. Never set by a refusal or a transport failure.
     pub terminal_failure: Option<Arc<Error>>,
-    /// Last transient failure, cleared when a batch is acknowledged.
+    /// Last failure that held the pending batch for a retry (a busy or paused daemon, a lost
+    /// connection, or a refusal about the daemon such as `READ_ONLY`),
+    /// cleared when a batch is acknowledged or set aside.
     pub last_transient_failure: Option<Arc<Error>>,
-    /// Admitted events whose batch the daemon permanently refused (a non-retryable
-    /// `INVALID_ARGUMENT`, `CONFLICT` or `RESOURCE_LIMIT`, or a batch the client itself cannot send): an answer
+    /// Admitted events whose batch was set aside: the daemon refused it with a non-retryable
+    /// refusal about the request (`INVALID_ARGUMENT`, `CONFLICT`, an input-bound
+    /// `RESOURCE_LIMIT`, `STORE_MISMATCH` or a code this client does not know), or the client cannot send it: an answer
     /// retrying the same batch can never change. Their bytes are in quarantine files, not
     /// lost. They kept their sequence; the daemon sees a gap only if it later accepts a
     /// higher sequence of an instance it already recorded, so this counter and the fence are
@@ -298,6 +309,9 @@ pub struct DeliveryStats {
     /// Quarantine writes that failed. The batch stays held and the write is retried; that
     /// batch is not dropped (events offered meanwhile can still be refused as `Full`).
     pub quarantine_write_failures: u64,
+    /// Events held in memory only: a failure that ended delivery found their quarantine
+    /// write failing, and the worker keeps retrying it. Zero once they are in files.
+    pub held_unsaved_events: u64,
 }
 
 struct Queued {
@@ -336,6 +350,12 @@ struct State {
     quarantine_files: u64,
     quarantine_failures: u64,
     quarantine_file: Option<PathBuf>,
+    /// Drop and quarantine totals the last successful or `Dropped` barrier already reported.
+    reported_drops: u64,
+    reported_quarantined: u64,
+    /// Held events whose terminal-failure quarantine write has not yet succeeded; the worker
+    /// keeps retrying the write and the events are never counted delivered.
+    held_unsaved_events: u64,
 }
 struct Shared {
     config: DeliveryConfig,
@@ -405,20 +425,17 @@ impl Delivery {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     runtime.block_on(tokio::task::LocalSet::new().run_until(run(&worker)))
                 }));
-                drop(runtime);
                 match result {
                     Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        let error = worker.save_held(error);
-                        worker.fail(error);
-                    }
-                    Err(_) => {
-                        let error = worker.save_held(Error::Protocol(
+                    Ok(Err(error)) => worker.settle_failure(&runtime, error),
+                    Err(_) => worker.settle_failure(
+                        &runtime,
+                        Error::Protocol(
                             "producer delivery worker panicked; no remaining delivery certified",
-                        ));
-                        worker.fail(error);
-                    }
+                        ),
+                    ),
                 }
+                drop(runtime);
                 worker.finished();
             })?;
         Ok(Self { shared })
@@ -519,7 +536,8 @@ impl Delivery {
         Ok(state.pending.as_ref().map(|pending| pending.batch.clone()))
     }
 
-    /// Force delivery through current admitted input; drops return an explicit gap error.
+    /// Force delivery through current admitted input; drops since the previous barrier return
+    /// an explicit gap error.
     /// Timeout leaves the owned worker and immutable pending request running.
     pub fn flush(&self, timeout: Duration) -> Result<DeliveryWatermark, FlushError> {
         self.barrier(timeout, false)
@@ -553,6 +571,9 @@ impl Delivery {
         state.closing |= closing;
         let target = state.admitted_sequence;
         let dropped = self.shared.drop_total();
+        // Drops and quarantines count against the barrier that first sees them: a fence that
+        // reported them is clean again for later input, while the totals stay in `stats`.
+        let new_drops = dropped.saturating_sub(state.reported_drops);
         state.force_through = state.force_through.max(target);
         self.shared.wake.notify_one();
         // A flush or shutdown asks for delivery now: end any retry delay so the pending batch
@@ -570,13 +591,16 @@ impl Delivery {
             if state.durable_sequence.max(state.quarantined_sequence) >= target
                 && (!closing || self.shared.stopped.load(Ordering::SeqCst))
             {
+                let new_quarantined = state.quarantined.saturating_sub(state.reported_quarantined);
+                state.reported_drops = state.reported_drops.max(dropped);
+                state.reported_quarantined = state.quarantined;
                 let watermark = DeliveryWatermark {
                     client_instance: self.shared.instance,
                     required_sequence: target,
                     durable_sequence: state.durable_sequence,
                     durable_events: state.durable,
-                    dropped_before_fence: dropped.saturating_add(state.quarantined),
-                    quarantined_before_fence: state.quarantined,
+                    dropped_before_fence: new_drops.saturating_add(new_quarantined),
+                    quarantined_before_fence: new_quarantined,
                     last_receipt: state.receipt.clone(),
                 };
                 return if watermark.dropped_before_fence == 0 {
@@ -643,6 +667,9 @@ impl Shared {
                 quarantine_files: 0,
                 quarantine_failures: 0,
                 quarantine_file: None,
+                reported_drops: 0,
+                reported_quarantined: 0,
+                held_unsaved_events: 0,
             }),
             control: Mutex::new(()),
             changed: Condvar::new(),
@@ -726,6 +753,7 @@ impl Shared {
             quarantine_files: state.quarantine_files,
             last_quarantine_file: state.quarantine_file.clone(),
             quarantine_write_failures: state.quarantine_failures,
+            held_unsaved_events: state.held_unsaved_events,
         }
     }
     fn fail(&self, error: Error) {
@@ -833,6 +861,16 @@ impl Shared {
         state.store = Some(store.to_owned());
         Ok(())
     }
+    /// Adopt whichever store answers next. Called once the batch that met a replaced store is in
+    /// a quarantine file: the producer's destination is its socket, so later batches go to the
+    /// store now behind it.
+    fn forget_store(&self) -> Result<(), Error> {
+        self.state
+            .lock()
+            .map_err(|_| Error::Protocol("producer queue state poisoned"))?
+            .store = None;
+        Ok(())
+    }
     fn accepted(&self, batch: &EventBatch, receipt: ArtifactReceipt) -> Result<(), Error> {
         // Client::events certifies the exact canonical payload and durable record count.
         // This queue additionally preserves its binding across reconnects.
@@ -936,12 +974,12 @@ impl Shared {
             }
         }
     }
-    /// Before a terminal failure ends delivery, keep what the worker still holds, the pending
-    /// batch and the queued events, in quarantine files: the process may exit and the daemon
-    /// never answers for them. Returns the error to report: unchanged when everything was
-    /// written, else an error that says which held bytes are not preserved (they stay held in
-    /// memory and the failure is counted).
-    fn save_held(&self, error: Error) -> Error {
+    /// Keep what the worker still holds, the pending batch and the queued events, in
+    /// quarantine files: the process may exit and the daemon never answers for them. `Ok`
+    /// means every held byte is in a file; `Err` names the batches that are not (they stay
+    /// held in memory and each failed write is counted). Saving again is safe: a batch
+    /// already in a file is reused, not written twice.
+    fn save_held(&self, error: &Error) -> Result<(), Error> {
         // A panicked worker may have poisoned the state; the held bytes are still readable.
         let (pending, queued, source) = {
             let state = self
@@ -973,18 +1011,52 @@ impl Shared {
             });
         }
         let mut unsaved = Vec::new();
+        let mut unsaved_events = 0_u64;
         for batch in &batches {
-            if let Err(write) = self.save(batch, &error) {
+            if let Err(write) = self.save(batch, error) {
                 unsaved.push(format!("{} ({write})", batch.request_id));
+                unsaved_events = unsaved_events.saturating_add(batch.events.len() as u64);
             }
         }
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .held_unsaved_events = unsaved_events;
         if unsaved.is_empty() {
-            error
+            Ok(())
         } else {
-            Error::Io(std::io::Error::other(format!(
+            Err(Error::Io(std::io::Error::other(format!(
                 "{error}; held events not written to quarantine and kept only in memory: {}",
                 unsaved.join(", ")
-            )))
+            ))))
+        }
+    }
+    /// End delivery for an invariant failure no later attempt can change (a poisoned lock, an
+    /// exhausted counter, a panicked worker). The held events are written to quarantine files
+    /// first; while a write fails the failure is published with the unsaved batches named,
+    /// `held_unsaved_events` counts them and the write is retried on the backoff until it
+    /// succeeds or the last producer handle is dropped. Nothing held is ever counted delivered.
+    fn settle_failure(&self, runtime: &tokio::runtime::Runtime, error: Error) {
+        let mut backoff = Backoff::new(&self.config);
+        loop {
+            match self.save_held(&error) {
+                Ok(()) => {
+                    self.fail(error);
+                    return;
+                }
+                Err(unsaved) => {
+                    self.fail(unsaved);
+                    let aborted = runtime.block_on(wait_out_retry_delay(
+                        &self.abort_wake,
+                        &self.retry_wake,
+                        &self.barriers_waiting,
+                        backoff.take(),
+                    ));
+                    if aborted || self.aborted.load(Ordering::SeqCst) {
+                        return;
+                    }
+                }
+            }
         }
     }
     /// Give up the immutable pending batch after its bytes reached a quarantine file: its
@@ -1148,13 +1220,17 @@ async fn run(shared: &Shared) -> Result<(), Error> {
                         shared.bind_store(&client.discovery().store_id)?;
                         connection = Some(client);
                     }
-                    connection
+                    let receipt = connection
                         .as_ref()
                         .ok_or(Error::Protocol(
                             "producer connection missing after discovery",
                         ))?
                         .events(&batch)
-                        .await
+                        .await?;
+                    // A store replaced behind a live connection answers with its own receipt:
+                    // refuse it here, as a hold, rather than as a worker failure.
+                    shared.bind_store(&receipt.store_id)?;
+                    Ok(receipt)
                 };
                 let result = tokio::select! {
                     _ = shared.abort_wake.notified() => return Ok(()),
@@ -1170,29 +1246,32 @@ async fn run(shared: &Shared) -> Result<(), Error> {
                     }
                     Err(error) => {
                         // A daemon answer, even a refusal, proves the connection works; only
-                        // a transport, I/O or protocol failure means it may be broken. A
-                        // needless reconnect on every busy retry also feeds the daemon's
-                        // connection ceiling.
-                        if !matches!(error, Error::Domain { .. }) {
+                        // a transport, I/O or protocol failure, or a store that is not the
+                        // bound one, means the connection may be wrong. A needless reconnect on
+                        // every busy retry also feeds the daemon's connection ceiling.
+                        if !matches!(&error, Error::Domain { code, .. } if code != STORE_MISMATCH) {
                             connection = None;
                         }
-                        // A permanent refusal's bytes must reach a quarantine file before the
-                        // batch is given up. If they cannot, the batch stays pending, the write
-                        // failure is counted and reported as the transient failure whatever its
-                        // kind, and the next attempt tries again: that batch is not dropped.
-                        let error = if permanent_refusal(&error) {
-                            match shared.save(&batch, &error) {
+                        // A refusal about this batch must reach a quarantine file before the
+                        // batch is given up. If it cannot, the batch stays pending, the write
+                        // failure is counted and reported as the transient failure whatever
+                        // its kind, and the next attempt tries again: that batch is not
+                        // dropped. Every other failure holds the batch and retries it.
+                        let mismatch =
+                            matches!(&error, Error::Domain { code, .. } if code == STORE_MISMATCH);
+                        let error = match disposition(&error) {
+                            Disposition::SetAside => match shared.save(&batch, &error) {
                                 Ok(_) => {
                                     shared.quarantine(&batch, error)?;
+                                    if mismatch {
+                                        shared.forget_store()?;
+                                    }
                                     backoff.reset();
                                     continue;
                                 }
                                 Err(write) => write,
-                            }
-                        } else if retryable(&error) {
-                            error
-                        } else {
-                            return Err(error);
+                            },
+                            Disposition::Hold => error,
                         };
                         shared.retry(error)?;
                         if wait_out_retry_delay(
@@ -1212,43 +1291,68 @@ async fn run(shared: &Shared) -> Result<(), Error> {
     }
 }
 
-/// Whether this batch can never be accepted, as opposed to the daemon being busy. The
-/// daemon marks a busy refusal (a retryable `RESOURCE_LIMIT`) retryable, and that batch is held.
-/// A `RESOURCE_LIMIT` the daemon marks non-retryable is a bound on the batch itself (#397), so
-/// it is quarantined like `INVALID_ARGUMENT`. A full
-/// producer registry is no longer a refusal: the daemon stores the batch and counts the lost
-/// gap evidence (#215), and a source past the 1024-mapping ceiling is stored without a time
-/// mapping (#227). An over-bound batch is answered `INVALID_ARGUMENT` and quarantined. Only an
-/// older daemon still answers these with a retryable `RESOURCE_LIMIT`, which stays held as
-/// before: the flag is the only signal, and held bytes are never lost. A
-/// non-retryable `INVALID_ARGUMENT` or `CONFLICT` (for example producer sequences that overlap
-/// accepted positions, or a source time mapping that differs) is about this batch alone: its
-/// bytes go to a quarantine file and later events proceed. The client's own
-/// `Error::InvalidArgument` is classed the same way, but the worker validates every batch
-/// before it sends one (`Shared::next`), with the checks `Client::events` encodes with, so a
-/// batch the client cannot encode ends delivery as a terminal failure through `run`, and
-/// `save_held` saves its bytes, instead of reaching this per-batch route. Any other
-/// non-retryable refusal (a replaced store, a read-only or unauthorized daemon) is not about
-/// this batch: it ends delivery as a terminal failure, and the held bytes are written to
-/// quarantine files first.
-fn permanent_refusal(error: &Error) -> bool {
+const STORE_MISMATCH: &str = "STORE_MISMATCH";
+
+/// What the worker does with one failed attempt. It never ends delivery: a failure is either
+/// about this batch, which is set aside durably so later batches proceed, or about the
+/// connection, the daemon or the store behind the socket, which holds the batch unchanged and
+/// retries it on the backoff until the cause goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Disposition {
+    /// Write the batch and the refusal to a quarantine file, release it, carry on.
+    SetAside,
+    /// Keep the batch pending and retry it. Visible as `retries` and `last_transient_failure`.
+    Hold,
+}
+
+/// Classify a failed attempt.
+///
+/// Set aside: a non-retryable daemon refusal about the request itself (`INVALID_ARGUMENT`,
+/// `CONFLICT`, a `RESOURCE_LIMIT` the daemon marks input-bound, #397) and the client's own
+/// `Error::InvalidArgument`. `STORE_MISMATCH` is set aside too: the store behind the socket was
+/// replaced, so whether the old store holds the pending batch is unknown and it must reach no
+/// other store unrecorded. The batch is written to a quarantine file with the refusal, the worker
+/// adopts the store now behind the socket (`forget_store`) and later batches go there, so a
+/// replaced store neither stops delivery nor holds events in memory only. A non-retryable
+/// refusal with a code this client does not know is
+/// set aside as well: the daemon says a retry cannot change it, the bytes are preserved in a
+/// replayable file, and delivery of later batches continues. The daemon's own flag decides
+/// retryability for every code, so a new code is never terminal here.
+///
+/// Hold: everything that is not about the batch. A retryable daemon refusal (busy
+/// `RESOURCE_LIMIT`, `STORAGE_PRESSURE`, `SHUTTING_DOWN`), the free-space floor, a client-built
+/// refusal (`FailureClass::Local`), and the codes that name the daemon or store state:
+/// `READ_ONLY`, `PERMISSION_DENIED`, `UNAUTHENTICATED` (a daemon that does not admit this
+/// producer until it is configured to), `UNSUPPORTED` (a daemon image that cannot take this
+/// client), `STORAGE_FAILURE` and the daemon's transport, protocol and file failures. Every transport, I/O, protocol and
+/// discovery error of the client is a hold as well: none says anything about the batch.
+pub(crate) fn disposition(error: &Error) -> Disposition {
     match error {
+        Error::InvalidArgument(_) => Disposition::SetAside,
         Error::Domain {
-            code,
-            retryable: false,
+            class: crate::FailureClass::FreeSpaceFloor | crate::FailureClass::Local,
             ..
-        } => matches!(
-            code.as_str(),
-            "INVALID_ARGUMENT" | "CONFLICT" | "RESOURCE_LIMIT"
-        ),
-        Error::InvalidArgument(_) => true,
-        _ => false,
+        }
+        | Error::Domain {
+            retryable: true, ..
+        } => Disposition::Hold,
+        Error::Domain { code, .. } => match code.as_str() {
+            STORE_MISMATCH => Disposition::SetAside,
+            "READ_ONLY" | "PERMISSION_DENIED" | "UNAUTHENTICATED" | "UNSUPPORTED"
+            | "STORAGE_FAILURE" | "STORAGE_PRESSURE" | "SHUTTING_DOWN" | "CANCELLED"
+            | "RPC_FAILURE" | "RPC_TIMEOUT" | "PROTOCOL_FAILURE" | "FILE_IO_FAILURE" => {
+                Disposition::Hold
+            }
+            _ => Disposition::SetAside,
+        },
+        _ => Disposition::Hold,
     }
 }
 
-/// Whether reconnecting and retrying the same identity may succeed, including
-/// a daemon whose socket is briefly absent or refusing while it restarts.
-pub(crate) fn retryable(error: &Error) -> bool {
+/// Whether reconnecting may succeed within a caller's bounded wait, including a daemon whose
+/// socket is briefly absent or refusing while it restarts. This is the import reconnect's
+/// narrow test; the delivery worker decides with [`disposition`] and never gives up.
+pub(crate) fn reconnectable(error: &Error) -> bool {
     // The floor label always means hold: the batch is never quarantined or dropped for it.
     if error.is_free_space_floor() {
         return true;
@@ -1647,9 +1751,9 @@ mod tests {
         ));
     }
 
-    /// INVARIANT (#216): a terminal failure first writes the queued events to a quarantine
-    /// file and returns the error unchanged; if the directory cannot be written the returned
-    /// error says the held events are kept only in memory and the failure is counted. Before,
+    /// INVARIANT (#216): before a terminal failure ends delivery, the queued events are
+    /// written to a quarantine file; if the directory cannot be written the result names the
+    /// held events as kept only in memory, counts the failure and the unsaved events. Before,
     /// nothing was written and the error did not mention the held bytes.
     #[test]
     fn terminal_failure_saves_held_events_or_says_they_are_unsaved() {
@@ -1664,14 +1768,14 @@ mod tests {
                 delivery.try_send(event()),
                 Admission::Queued { sequence: 1 }
             ));
-            let error = delivery
+            let saved = delivery
                 .shared
-                .save_held(Error::Protocol("terminal for the test"));
-            (delivery, error)
+                .save_held(&Error::Protocol("terminal for the test"));
+            (delivery, saved)
         };
         let good = dir.path().join("good");
-        let (delivery, error) = held(&good);
-        assert!(matches!(error, Error::Protocol("terminal for the test")));
+        let (delivery, saved) = held(&good);
+        assert!(saved.is_ok());
         let stats = delivery.stats().unwrap();
         assert_eq!(
             (stats.quarantine_files, stats.quarantine_write_failures),
@@ -1681,12 +1785,183 @@ mod tests {
         assert!(text.contains("\"events\":1") && text.contains("terminal for the test"));
         let blocker = dir.path().join("blocker");
         std::fs::write(&blocker, b"x").unwrap();
-        let (delivery, error) = held(&blocker.join("q"));
-        let Error::Io(error) = error else {
-            panic!("an unsaved queue must change the terminal error: {error:?}");
+        let (delivery, saved) = held(&blocker.join("q"));
+        let Err(Error::Io(error)) = saved else {
+            panic!("an unsaved queue must be reported: {saved:?}");
         };
         assert!(error.to_string().contains("kept only in memory"), "{error}");
-        assert_eq!(delivery.stats().unwrap().quarantine_write_failures, 1);
+        let stats = delivery.stats().unwrap();
+        assert_eq!(
+            (stats.quarantine_write_failures, stats.held_unsaved_events),
+            (1, 1)
+        );
+    }
+
+    /// INVARIANT (#448): held events whose quarantine write failed are not left in memory:
+    /// the worker keeps retrying the write on its backoff, `held_unsaved_events` counts them
+    /// until they are in a file, and they are never counted delivered. Before, one failed
+    /// write was final and the bytes died with the process.
+    #[test]
+    fn held_events_are_written_once_the_quarantine_directory_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut config = DeliveryConfig::new("unused.sock", "test").with_quarantine_dir(&blocker);
+        config = config.with_test_timing(
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+        let shared = Shared::new(config, [9; 16]);
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.queue.push_back(Queued {
+                event: ProducerEvent {
+                    sequence: 1,
+                    ..event()
+                },
+                bytes: 1,
+                at: Instant::now(),
+            });
+            state.count = 1;
+        }
+        let worker = shared.clone();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            worker.settle_failure(&runtime, Error::Protocol("terminal for the test"));
+        });
+        // Wait for the first failed write, then repair the directory.
+        let mut state = shared.state.lock().unwrap();
+        while state.held_unsaved_events == 0 {
+            state = shared
+                .changed
+                .wait_timeout(state, Duration::from_millis(5))
+                .unwrap()
+                .0;
+        }
+        assert!(state.quarantine_failures >= 1);
+        assert_eq!(state.held_unsaved_events, 1);
+        drop(state);
+        std::fs::remove_file(&blocker).unwrap();
+        handle.join().unwrap();
+        let state = shared.state.lock().unwrap();
+        assert_eq!(
+            (
+                state.held_unsaved_events,
+                state.quarantine_files,
+                state.durable
+            ),
+            (0, 1, 0)
+        );
+        let failure = state.failure.as_ref().unwrap().to_string();
+        assert!(
+            failure.contains("terminal for the test") && !failure.contains("only in memory"),
+            "{failure}"
+        );
+    }
+
+    /// INVARIANT (#448): a barrier reports the drops and quarantines since the previous
+    /// barrier, so a fence that reported them is clean for later input, while the statistics
+    /// keep the totals. Before, every later barrier of the instance returned `Dropped`.
+    #[test]
+    fn a_barrier_reports_drops_once_and_the_next_fence_is_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let delivery = Delivery::start(
+            DeliveryConfig::new(dir.path().join("missing.sock"), "test")
+                .with_quarantine_dir(dir.path().join("quarantine")),
+        )
+        .unwrap();
+        delivery.capture_failed();
+        let Err(FlushError::Dropped(first)) = delivery.flush(Duration::from_secs(2)) else {
+            panic!("the first barrier must report the drop");
+        };
+        assert_eq!(first.dropped_before_fence, 1);
+        let clean = delivery.flush(Duration::from_secs(2)).unwrap();
+        assert_eq!(clean.dropped_before_fence, 0);
+        assert_eq!(
+            delivery.stats().unwrap().dropped_by_reason[DropReason::Invalid as usize],
+            1
+        );
+        delivery.capture_failed();
+        assert!(matches!(
+            delivery.flush(Duration::from_secs(2)),
+            Err(FlushError::Dropped(_))
+        ));
+    }
+
+    /// INVARIANT (#448): the worker never ends on a refusal. A refusal about the batch,
+    /// including a code the client does not know, is set aside; a refusal about the
+    /// connection, the daemon or the store, and every transport, I/O, protocol and discovery
+    /// failure, holds the batch. Before, only three codes were set aside and everything not
+    /// on a short allow-list ended delivery for good.
+    #[test]
+    fn every_failure_is_set_aside_or_held_and_none_is_terminal() {
+        let domain = |code: &str, retryable: bool, class: crate::FailureClass| Error::Domain {
+            code: code.into(),
+            message: "m".into(),
+            retryable,
+            class,
+        };
+        let plain = crate::FailureClass::Unclassified;
+        for (error, expected) in [
+            (
+                domain("INVALID_ARGUMENT", false, plain),
+                Disposition::SetAside,
+            ),
+            (domain("CONFLICT", false, plain), Disposition::SetAside),
+            (
+                domain("RESOURCE_LIMIT", false, plain),
+                Disposition::SetAside,
+            ),
+            (
+                domain("A_CODE_FROM_THE_FUTURE", false, plain),
+                Disposition::SetAside,
+            ),
+            (domain("RESOURCE_LIMIT", true, plain), Disposition::Hold),
+            (
+                domain("A_CODE_FROM_THE_FUTURE", true, plain),
+                Disposition::Hold,
+            ),
+            (
+                domain(
+                    "STORAGE_PRESSURE",
+                    false,
+                    crate::FailureClass::FreeSpaceFloor,
+                ),
+                Disposition::Hold,
+            ),
+            (
+                domain("INVALID_ARGUMENT", false, crate::FailureClass::Local),
+                Disposition::Hold,
+            ),
+            (
+                domain("STORE_MISMATCH", false, plain),
+                Disposition::SetAside,
+            ),
+            (domain("READ_ONLY", false, plain), Disposition::Hold),
+            (domain("PERMISSION_DENIED", false, plain), Disposition::Hold),
+            (domain("UNSUPPORTED", false, plain), Disposition::Hold),
+            (domain("STORAGE_FAILURE", false, plain), Disposition::Hold),
+            (
+                Error::InvalidArgument("event text exceeds 16 KiB"),
+                Disposition::SetAside,
+            ),
+            (Error::Unsupported("discovery"), Disposition::Hold),
+            (Error::Protocol("receipt"), Disposition::Hold),
+            (
+                Error::Transport(capnp::Error::failed("x".into())),
+                Disposition::Hold,
+            ),
+            (
+                Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                Disposition::Hold,
+            ),
+        ] {
+            assert_eq!(disposition(&error), expected, "{error}");
+        }
     }
 
     /// INVARIANT (#216): with no usable quarantine directory (the empty default of a host
@@ -1727,7 +2002,7 @@ mod tests {
 
     /// INVARIANT: a worker that panicked while holding the state lock poisons it, and the
     /// bytes it held are still saved and reported saved: `save` writes the file and counts it,
-    /// and `save_held` returns the terminal error unchanged. The old code wrote the file and
+    /// and `save_held` reports success. The old code wrote the file and
     /// then answered "state poisoned", so a saved batch was reported unsaved.
     #[test]
     fn a_poisoned_state_lock_still_saves_and_reports_the_held_bytes_as_saved() {
@@ -1758,11 +2033,9 @@ mod tests {
                 bytes: 0,
                 at: Instant::now(),
             });
-        let error = shared.save_held(Error::Protocol("terminal for the test"));
-        assert!(
-            matches!(error, Error::Protocol("terminal for the test")),
-            "{error:?}"
-        );
+        shared
+            .save_held(&Error::Protocol("terminal for the test"))
+            .expect("a saved queue is not reported unsaved");
         let state = shared
             .state
             .lock()
@@ -1825,7 +2098,11 @@ mod tests {
                 retryable,
                 class: crate::FailureClass::Unclassified,
             };
-            assert_eq!(permanent_refusal(&refusal), quarantined, "{retryable}");
+            assert_eq!(
+                disposition(&refusal) == Disposition::SetAside,
+                quarantined,
+                "{retryable}"
+            );
         }
     }
 
@@ -1833,11 +2110,11 @@ mod tests {
     /// client's own code with the encoder's reason, so those bytes are kept too. This covers
     /// the classification and the file only: the worker validates each batch before the send,
     /// so no deterministic run drives a batch the queue built into that error (it ends
-    /// delivery as a terminal failure, saved by `save_held`, which the held-events test covers).
+    /// delivery as a local invariant failure, saved by `save_held`, which the held-events test covers).
     #[test]
     fn a_batch_the_client_cannot_encode_is_quarantined_under_a_client_code() {
         let refusal = Error::InvalidArgument("event text exceeds 16 KiB");
-        assert!(permanent_refusal(&refusal));
+        assert_eq!(disposition(&refusal), Disposition::SetAside);
         let dir = tempfile::tempdir().unwrap();
         let shared = shared(&dir.path().join("quarantine"));
         let path = shared

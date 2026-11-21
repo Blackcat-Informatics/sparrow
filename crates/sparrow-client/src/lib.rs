@@ -70,10 +70,12 @@ pub use events::{
 mod delivery;
 mod logging;
 mod quarantine;
+mod replay;
 pub use delivery::{
     Admission, Delivery, DeliveryConfig, DeliveryStats, DeliveryWatermark, DropReason, FlushError,
 };
 pub use logging::TracingLayer;
+pub use replay::{ReplayReceipt, replay_quarantine};
 
 pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
 

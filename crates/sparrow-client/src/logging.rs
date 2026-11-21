@@ -59,6 +59,10 @@ impl TracingLayer {
         }
     }
 
+    /// The admission result is not returned to the subscriber: a tracing layer has no caller
+    /// to tell, and logging a drop from inside the log path would feed the queue it is
+    /// reporting on. Every refusal is nevertheless visible: `try_send` counts it by reason in
+    /// `Delivery::stats`, and the next flush or shutdown returns it as `FlushError::Dropped`.
     fn emit(&self, event: Result<ProducerEvent, ()>) {
         match event {
             Ok(event) => {
