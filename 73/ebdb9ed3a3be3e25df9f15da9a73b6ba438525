@@ -1,0 +1,18 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 07792d0d90aec3cec18b07d2716f93d34608e801
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 457
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/457
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 339abc23185a83df070c401263f99f19db85263d
+GhpRsq-Head-Ref: paudley/447-durability-latch-clears-in-place
+GhpRsq-Head-OID: 07792d0d90aec3cec18b07d2716f93d34608e801
+GhpRsq-Result-Tree: c66fa7fa4e3082fbc2d08c38cc511aedbdbec7f4
+GhpRsq-Result-Commit: 73ebdb9ed3a3be3e25df9f15da9a73b6ba438525
+GhpRsq-Parent-Hashes: 07792d0d90aec3cec18b07d2716f93d34608e801
+GhpRsq-Squash-Notes-SHA256: 4fefb2f8ec6f91e8463bf1f2b00cf6eb458efca2646e18c07658884e17505651
+GhpRsq-Stage-Evidence: none
