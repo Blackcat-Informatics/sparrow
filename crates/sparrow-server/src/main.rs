@@ -50,6 +50,11 @@ fn arguments(args: &[String]) -> Result<(&str, Mode), Box<dyn std::error::Error>
 /// Every worker runs until shutdown, so any end before it is a failure the daemon exits
 /// on. Every mode is covered: a normal daemon has all three workers, a no-intake daemon only
 /// maintenance, a query-only one none, so this never returns there.
+///
+/// Ending the daemon here is deliberate. The consume and syslog workers recover from every
+/// error that can clear (one claim, one watch, one listener, a failing store), so they end
+/// only on a panic, which leaves unknown state and is a bug signal the daemon must show by
+/// exiting, or on a closed command channel, which happens only when the daemon is stopping.
 async fn worker_health(
     consumer: &mut Option<sparrow_server::watches::ConsumeWorker>,
     syslog: &mut Option<sparrow_server::syslog_listener::SyslogWorker>,

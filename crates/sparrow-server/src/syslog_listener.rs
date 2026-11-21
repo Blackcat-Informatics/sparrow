@@ -153,6 +153,11 @@ struct Counts {
     holds_storage_pressure: u64,
     /// Frames held at least once for an operation permit (#243).
     holds_no_permit: u64,
+    /// Frames held at least once for a store failure that is not pressure (#445).
+    holds_store_failure: u64,
+    /// Errors the listener survived (a failed accept, a failed connection) or was bound again
+    /// after (#445).
+    listener_errors: u64,
     /// Longest finished hold, in milliseconds.
     longest_hold_ms: u64,
     /// Times the UDP reader stopped because the queue was full (#255).
@@ -176,12 +181,17 @@ struct Counts {
 enum HoldReason {
     StoragePressure,
     NoPermit,
+    /// The store failed the write for a cause that is not pressure (a latched or uncertain
+    /// store, a clock behind the archive watermark). The frame is kept and offered again on
+    /// [`STORE_FAILURE_RETRY`] until the store takes it.
+    StoreFailure,
 }
 impl HoldReason {
     const fn name(self) -> &'static str {
         match self {
             Self::StoragePressure => "storage_pressure",
             Self::NoPermit => "no_permit",
+            Self::StoreFailure => "store_failure",
         }
     }
 }
@@ -356,7 +366,7 @@ impl Status {
     fn hold(
         &mut self,
         id: &mut Option<u64>,
-        seen: &mut [bool; 2],
+        seen: &mut [bool; 3],
         reason: HoldReason,
         now: tokio::time::Instant,
     ) -> io::Result<Option<String>> {
@@ -373,12 +383,17 @@ impl Status {
                 })
                 .frames += 1;
         }
-        let slot = usize::from(reason == HoldReason::NoPermit);
+        let slot = match reason {
+            HoldReason::StoragePressure => 0,
+            HoldReason::NoPermit => 1,
+            HoldReason::StoreFailure => 2,
+        };
         if !seen[slot] {
             seen[slot] = true;
             increment(match reason {
                 HoldReason::StoragePressure => &mut self.counts.holds_storage_pressure,
                 HoldReason::NoPermit => &mut self.counts.holds_no_permit,
+                HoldReason::StoreFailure => &mut self.counts.holds_store_failure,
             })?;
         }
         let quiet = self
@@ -442,14 +457,14 @@ impl Status {
 struct Hold<'a> {
     metrics: &'a Metrics,
     id: Option<u64>,
-    seen: [bool; 2],
+    seen: [bool; 3],
 }
 impl<'a> Hold<'a> {
     fn new(metrics: &'a Metrics) -> Self {
         Self {
             metrics,
             id: None,
-            seen: [false; 2],
+            seen: [false; 3],
         }
     }
 
@@ -571,6 +586,59 @@ enum Socket {
     Udp(UdpSocket),
 }
 
+/// Bind the socket DEFINITION describes, enlarging a UDP receive buffer and starting its kernel
+/// drop counter. Used at start and each time a failed listener is bound again.
+async fn bind_socket(
+    definition: &SyslogListener,
+) -> io::Result<(Socket, SocketAddr, Option<crate::udp_kernel::Kernel>)> {
+    let mut kernel = None;
+    let (socket, address) = match definition.transport {
+        SyslogTransport::Tcp => {
+            let socket = TcpListener::bind(definition.address).await?;
+            let address = socket.local_addr()?;
+            (Socket::Tcp(socket), address)
+        }
+        SyslogTransport::Udp => {
+            let socket = UdpSocket::bind(definition.address).await?;
+            let address = socket.local_addr()?;
+            let buffer = crate::udp_kernel::request_buffer(
+                &socket,
+                crate::udp_kernel::REQUESTED_RCVBUF_BYTES,
+            )
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("syslog listener {}: {error}", definition.id),
+                )
+            })?;
+            let rmem_max = crate::udp_kernel::rmem_max()
+                .map_or_else(|| "unreadable".to_owned(), |limit| limit.to_string());
+            // A refused enlarge does not stop the daemon taking syslog: it keeps the
+            // default buffer and says so, here and in status.
+            journal(&match &buffer.enlarge_error {
+                None => format!(
+                    "sparrowd: syslog listener {}: receive buffer requested {} bytes, kernel granted {} bytes (net.core.rmem_max {rmem_max})",
+                    definition.id, buffer.requested, buffer.granted,
+                ),
+                Some(error) => format!(
+                    "sparrowd: syslog listener {}: receive buffer enlarge failed: {error}; keeping the default buffer of {} bytes (requested {} bytes, net.core.rmem_max {rmem_max})",
+                    definition.id, buffer.granted, buffer.requested,
+                ),
+            });
+            kernel = Some(
+                crate::udp_kernel::Kernel::new(&socket, address, buffer).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("syslog listener {}: {error}", definition.id),
+                    )
+                })?,
+            );
+            (Socket::Udp(socket), address)
+        }
+    };
+    Ok((socket, address, kernel))
+}
+
 /// Owned listener group; shutdown joins admitted writes before the daemon's final WAL fence.
 pub struct SyslogWorker {
     stop: watch::Sender<bool>,
@@ -592,53 +660,7 @@ impl SyslogWorker {
         let mut sockets = Vec::new();
         let mut metrics = Vec::new();
         for definition in definitions {
-            let mut kernel = None;
-            let (socket, address) = match definition.transport {
-                SyslogTransport::Tcp => {
-                    let socket = TcpListener::bind(definition.address).await?;
-                    let address = socket.local_addr()?;
-                    (Socket::Tcp(socket), address)
-                }
-                SyslogTransport::Udp => {
-                    let socket = UdpSocket::bind(definition.address).await?;
-                    let address = socket.local_addr()?;
-                    let buffer = crate::udp_kernel::request_buffer(
-                        &socket,
-                        crate::udp_kernel::REQUESTED_RCVBUF_BYTES,
-                    )
-                    .map_err(|error| {
-                        io::Error::new(
-                            error.kind(),
-                            format!("syslog listener {}: {error}", definition.id),
-                        )
-                    })?;
-                    let rmem_max = crate::udp_kernel::rmem_max()
-                        .map_or_else(|| "unreadable".to_owned(), |limit| limit.to_string());
-                    // A refused enlarge does not stop the daemon taking syslog: it keeps the
-                    // default buffer and says so, here and in status.
-                    journal(&match &buffer.enlarge_error {
-                        None => format!(
-                            "sparrowd: syslog listener {}: receive buffer requested {} bytes, kernel granted {} bytes (net.core.rmem_max {rmem_max})",
-                            definition.id, buffer.requested, buffer.granted,
-                        ),
-                        Some(error) => format!(
-                            "sparrowd: syslog listener {}: receive buffer enlarge failed: {error}; keeping the default buffer of {} bytes (requested {} bytes, net.core.rmem_max {rmem_max})",
-                            definition.id, buffer.granted, buffer.requested,
-                        ),
-                    });
-                    kernel = Some(
-                        crate::udp_kernel::Kernel::new(&socket, address, buffer).map_err(
-                            |error| {
-                                io::Error::new(
-                                    error.kind(),
-                                    format!("syslog listener {}: {error}", definition.id),
-                                )
-                            },
-                        )?,
-                    );
-                    (Socket::Udp(socket), address)
-                }
-            };
+            let (socket, address, kernel) = bind_socket(definition).await?;
             let mut status = Status::new(
                 sparrow_core::SyslogReceiver::new(
                     &definition.id,
@@ -673,13 +695,12 @@ impl SyslogWorker {
             let _alive = alive;
             let mut listeners = JoinSet::new();
             for (socket, metrics, spill) in sockets {
-                listeners.spawn(listen(
+                listeners.spawn(supervise(
                     socket,
                     metrics,
                     store.clone(),
                     operations.clone(),
                     receiver.clone(),
-                    shutdown.clone(),
                     PressureHold::new(wake.clone(), spill),
                 ));
             }
@@ -737,6 +758,9 @@ enum Published {
     /// The store answered `STORAGE_PRESSURE` and the caller asked to keep the packet: nothing
     /// was counted, and the same bytes may be offered again.
     Pressured,
+    /// The store failed the write for a cause that is not pressure and not this packet's own:
+    /// the text names it. Nothing was counted; the caller keeps the packet and offers it again.
+    Failed(String),
 }
 
 /// Where a packet came from, and so what instant stamps it.
@@ -820,7 +844,8 @@ async fn publish_spilled(
         .await
         {
             Ok(Published::Stored) => next += 1,
-            Ok(Published::Pressured) => {
+            // `publish_held` returns `Failed` never: a stop turns it into `Pressured`.
+            Ok(Published::Pressured | Published::Failed(_)) => {
                 outcome = Ok(false);
                 break;
             }
@@ -940,6 +965,7 @@ async fn publish(
         Stored { failed: bool, stamped: Stamped },
         Refused { durable: bool },
         Pressured,
+        Failed(String),
     }
     let receiver = metrics.snapshot()?.receiver;
     let result = tokio::task::spawn_blocking(move || {
@@ -997,6 +1023,7 @@ async fn publish(
                 )
                 .map(|durable| Attempt::Refused { durable });
             }
+            Err(error) if store_wide(error.code) => return Ok(Attempt::Failed(error.to_string())),
             Err(error) => return Err(error),
         };
         let record = store.record(artifact.record_ids.first().ok_or_else(|| {
@@ -1017,8 +1044,12 @@ async fn publish(
         })
     })
     .await
-    .map_err(io::Error::other)?
     .map_err(io::Error::other)?;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) if store_wide(error.code) => return Ok(Published::Failed(error.to_string())),
+        Err(error) => return Err(io::Error::other(error)),
+    };
     match result {
         Attempt::Stored { failed, stamped } => {
             let mut line = None;
@@ -1044,6 +1075,13 @@ async fn publish(
                 if failed {
                     increment(&mut status.counts.interpretation_failures)?;
                 }
+                if status
+                    .failure
+                    .as_deref()
+                    .is_some_and(|text| text.starts_with(STORE_FAILURE_STATUS))
+                {
+                    status.failure = None;
+                }
                 Ok(())
             })?;
             if let Some(line) = line {
@@ -1064,8 +1102,27 @@ async fn publish(
             Ok(Published::Refused)
         }
         Attempt::Pressured => Ok(Published::Pressured),
+        Attempt::Failed(text) => Ok(Published::Failed(text)),
     }
 }
+
+/// Whether a store error code names a state of the whole store, not of one packet: a latched
+/// or uncertain store (`STORAGE_FAILURE`), a clock behind the archive watermark, a store that
+/// is stopping. The state clears when its cause does, so the packet is kept and offered
+/// again instead of ending the listener or being discarded.
+fn store_wide(code: &str) -> bool {
+    matches!(
+        code,
+        "STORAGE_FAILURE" | sparrow_core::ARCHIVE_WATERMARK | "SHUTTING_DOWN"
+    )
+}
+
+/// How long a frame refused for a store failure waits before it is offered again when no
+/// pressure wake arrives. A latched store clears only when the daemon reopens it or an operator
+/// acts, so a fast cadence gains nothing; a minute would leave senders stalled long after the
+/// cause is gone. Five seconds is one attempt (one blocking store call and, at most, one
+/// journal line per change of text) a few times a minute per held frame.
+const STORE_FAILURE_RETRY: Duration = Duration::from_secs(5);
 
 /// Store one frame read from a TCP connection, holding it while the store refuses it for
 /// pressure or no operation permit is free (#243). The caller reads no further frame until this
@@ -1130,17 +1187,80 @@ async fn publish_held(
         )
         .await?;
         drop(permit);
-        if published != Published::Pressured || stopping {
+        let reason = match &published {
+            Published::Pressured => HoldReason::StoragePressure,
+            Published::Failed(_) => HoldReason::StoreFailure,
+            _ => {
+                hold.leave()?;
+                return Ok(published);
+            }
+        };
+        if stopping {
+            // A stop ends the hold: the caller spills or counts the packet.
             hold.leave()?;
-            return Ok(published);
+            return Ok(Published::Pressured);
         }
         pressured.get_or_insert_with(|| wake.hold());
-        hold.enter(HoldReason::StoragePressure)?;
+        hold.enter(reason)?;
+        if let Published::Failed(text) = &published {
+            note_store_failure(metrics, text)?;
+        }
         tokio::select! {
             changed = stop.changed() => { changed.map_err(io::Error::other)?; },
             () = wake.woken() => {},
+            () = tokio::time::sleep(STORE_FAILURE_RETRY), if reason == HoldReason::StoreFailure => {},
         }
     }
+}
+
+/// Start of the status failure text while a store failure holds a packet.
+const STORE_FAILURE_STATUS: &str = "store failure holds intake: ";
+
+/// Count and journal an error the listener survives or restarts on, and show it in status.
+fn note_listener_error(metrics: &Metrics, what: &str, error: &dyn std::fmt::Display) {
+    let mut id = String::new();
+    let _ = metrics.update(|status| {
+        id.clone_from(&status.definition.id);
+        increment(&mut status.counts.listener_errors)?;
+        status.failure = Some(format!("{what}: {error}"));
+        Ok(())
+    });
+    journal(&format!("sparrowd: syslog listener {id}: {what}: {error}"));
+}
+
+/// Wait out the `failures`th consecutive failure of one listener operation, or a stop. The wait
+/// doubles from 10 ms to a 1 s ceiling. A descriptor shortage (EMFILE) or a rebind race clears
+/// within about a connection's life, so the ceiling bounds the retry rate to one a second,
+/// which also bounds the journal and the CPU a persistent fault costs; the floor keeps a
+/// transient fault from costing a second.
+async fn listener_backoff(failures: u32, stop: &mut watch::Receiver<bool>) {
+    let wait = Duration::from_millis(10)
+        .saturating_mul(1 << failures.saturating_sub(1).min(7))
+        .min(Duration::from_secs(1));
+    tokio::select! {
+        _ = stop.changed() => {}
+        () = tokio::time::sleep(wait) => {}
+    }
+}
+
+/// Show the store failure that holds a packet in the listener's status, and journal it once per
+/// change of its text.
+fn note_store_failure(metrics: &Metrics, text: &str) -> io::Result<()> {
+    let mut changed = false;
+    metrics.update(|status| {
+        let current = format!("{STORE_FAILURE_STATUS}{text}");
+        changed = status.failure.as_deref() != Some(current.as_str());
+        status.failure = Some(current);
+        Ok(())
+    })?;
+    if changed {
+        let id = metrics.snapshot()?.definition.id;
+        journal(&format!(
+            "sparrowd: syslog listener {id}: the store failed a write ({text}); the packet is held and offered again every {} s until it is taken",
+            STORE_FAILURE_RETRY.as_secs()
+        ));
+    }
+    Ok(())
 }
 
 const NOT_DURABLE: &str = "storage pressure refused the discard count; discards are counted in memory only until writes resume";
@@ -1238,15 +1358,40 @@ async fn listen(
             // at a frame boundary for it; it is never refused.
             let mut pending: Option<tokio::net::TcpStream> = None;
             let mut evicting = false;
+            let mut accept_failures = 0_u32;
             let serving = async {
             loop {
                 if *stop.borrow() { break; }
                 tokio::select! {
                     changed = stop.changed() => { changed.map_err(io::Error::other)?; if *stop.borrow() { break; } },
-                    result = tasks.join_next(), if !tasks.is_empty() => { if let Some(result) = result { result.map_err(io::Error::other)??; } },
+                    result = tasks.join_next(), if !tasks.is_empty() => {
+                        // One connection's failure ends that connection, not the listener.
+                        if let Some(result) = result
+                            && let Err(error) = result.map_err(io::Error::other)?
+                        {
+                            note_listener_error(&metrics, "a connection failed", &error);
+                        }
+                    },
                     accepted = listener.accept(), if pending.is_none() => {
-                        pending = Some(accepted?.0);
-                        evicting = false;
+                        match accepted {
+                            Ok((stream, _)) => {
+                                pending = Some(stream);
+                                evicting = false;
+                                if std::mem::take(&mut accept_failures) != 0 {
+                                    let _ = metrics.update(|status| {
+                                        if status.failure.as_deref().is_some_and(|text| text.starts_with("accept failed")) {
+                                            status.failure = None;
+                                        }
+                                        Ok(())
+                                    });
+                                }
+                            }
+                            Err(error) => {
+                                accept_failures = accept_failures.saturating_add(1);
+                                note_listener_error(&metrics, "accept failed", &error);
+                                listener_backoff(accept_failures, &mut stop).await;
+                            }
+                        }
                     }
                     _ = roster.idled.notified(), if pending.is_some() && !evicting && connections.available_permits() == 0 => {}
                     permit = connections.clone().acquire_owned(), if pending.is_some() => {
@@ -1283,6 +1428,104 @@ async fn listen(
                 udp_hold::wall_clock(),
             )
             .await
+        }
+    }
+}
+
+/// A listener that ran this long before failing was healthy, so its failure count starts over.
+/// One minute is longer than any backoff the listener waits (`listener_backoff` is at most a
+/// second) and than a bind race lasts, and short enough that a fault recurring every few
+/// minutes is not punished with a stale count.
+const HEALTHY_RUN: Duration = Duration::from_secs(60);
+
+/// Run one listener for the life of the daemon. An error that ends it (a failed bind, a failed
+/// receive, an unexpected store error, a failed connection setup) does not end the daemon or
+/// its sibling listeners: it is counted, journaled and shown in status, and the listener is
+/// bound again after a backoff, until a stop. Only a stop ends it, with the error the stopping
+/// listener reported, if any.
+async fn supervise(
+    first: Socket,
+    metrics: Metrics,
+    store: sparrow_core::Store,
+    operations: Arc<Semaphore>,
+    mut stop: watch::Receiver<bool>,
+    hold: PressureHold,
+) -> io::Result<()> {
+    let mut socket = Some(first);
+    let mut failures = 0_u32;
+    loop {
+        let bound = match socket.take() {
+            Some(bound) => bound,
+            None => {
+                let definition = metrics.snapshot()?.definition;
+                match bind_socket(&definition).await {
+                    Ok((bound, address, kernel)) => {
+                        metrics.update(|status| {
+                            status.address = address;
+                            status.kernel = kernel;
+                            Ok(())
+                        })?;
+                        journal(&format!(
+                            "sparrowd: syslog listener {}: bound again on {address}",
+                            definition.id
+                        ));
+                        bound
+                    }
+                    Err(error) => {
+                        failures = failures.saturating_add(1);
+                        note_listener_error(&metrics, "bind failed", &error);
+                        listener_backoff(failures, &mut stop).await;
+                        if *stop.borrow() {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+        // This incarnation's own stop: its failure stops its own connections and no sibling.
+        let (local, local_stop) = watch::channel(false);
+        let began = tokio::time::Instant::now();
+        let listening = listen(
+            bound,
+            metrics.clone(),
+            store.clone(),
+            operations.clone(),
+            local_stop,
+            local.clone(),
+            PressureHold::new(hold.wake.clone(), hold.spill.clone()),
+        );
+        tokio::pin!(listening);
+        let mut forwarded = false;
+        let result = loop {
+            tokio::select! {
+                result = &mut listening => break result,
+                changed = stop.changed(), if !forwarded => {
+                    changed.map_err(io::Error::other)?;
+                    if *stop.borrow() {
+                        forwarded = true;
+                        local.send_replace(true);
+                    }
+                }
+            }
+        };
+        if *stop.borrow() {
+            return result;
+        }
+        match result {
+            // A listener returns without an error only for a stop.
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if began.elapsed() >= HEALTHY_RUN {
+                    failures = 0;
+                }
+                failures = failures.saturating_add(1);
+                note_listener_error(&metrics, "listener ended and is bound again", &error);
+                listener_backoff(failures, &mut stop).await;
+                if *stop.borrow() {
+                    return Ok(());
+                }
+            }
         }
     }
 }
@@ -1720,6 +1963,8 @@ impl Status {
         out.set_held_frames(self.holding.len() as u32);
         out.set_holds_storage_pressure(self.counts.holds_storage_pressure);
         out.set_holds_no_permit(self.counts.holds_no_permit);
+        out.set_holds_store_failure(self.counts.holds_store_failure);
+        out.set_listener_errors(self.counts.listener_errors);
         out.set_longest_hold_ms(u64::try_from(self.longest_hold().as_millis()).unwrap_or(u64::MAX));
         self.encode_queue(out.reborrow());
         out.set_accepted_messages(self.counts.accepted);
@@ -3303,7 +3548,7 @@ mod tests {
         let at = |secs| t0 + Duration::from_secs(secs);
         let hold = |status: &mut Status, id: &mut Option<u64>, secs| {
             status
-                .hold(id, &mut [false; 2], HoldReason::StoragePressure, at(secs))
+                .hold(id, &mut [false; 3], HoldReason::StoragePressure, at(secs))
                 .unwrap()
         };
         let mut first = None;
@@ -3467,5 +3712,91 @@ mod tests {
         assert!(validate(&[datagram("a", Some(each)), datagram("b", Some(each + 1))]).is_err());
         let defaults: Vec<_> = (0..4).map(|n| datagram(&n.to_string(), None)).collect();
         validate(&defaults).unwrap();
+    }
+
+    /// Value (#445): a store answering `STORAGE_FAILURE` ended the listener, and with it the
+    /// daemon. Protects, on the real publication path: the packet is held (counted in
+    /// `holds_store_failure`), the listener's status and the journal name the failure, the packet
+    /// is offered again on its own clock with no pressure wake, and it is stored once the store
+    /// takes it, with the failure text cleared.
+    #[tokio::test(start_paused = true)]
+    async fn a_store_failure_holds_the_packet_and_stores_it_when_the_store_recovers() {
+        let fixture = listener(SyslogTransport::Udp, 1, 1000);
+        fixture
+            .store
+            .space_floor()
+            .refuse_next_write_for_tests("STORAGE_FAILURE");
+        let (_stop, mut stopped) = watch::channel(false);
+        let mut waiter = fixture.wake.subscribe();
+        let published = publish_held(
+            &fixture.store,
+            "source",
+            Packet {
+                bytes: Arc::from(&b"<34>held"[..]),
+                intake: Intake::Tcp,
+            },
+            &fixture.metrics,
+            &fixture.operations,
+            &mut stopped,
+            &mut waiter,
+        )
+        .await
+        .unwrap();
+        assert_eq!(published, Published::Stored);
+        let status = fixture.metrics.snapshot().unwrap();
+        assert_eq!(status.counts.holds_store_failure, 1);
+        assert_eq!(status.counts.accepted, 1);
+        assert_eq!(status.failure, None);
+        assert!(
+            printed::lines()
+                .iter()
+                .any(|line| line.contains("the store failed a write")),
+        );
+    }
+
+    /// Value (#445): any listener error ended every listener and the daemon. Protects: a TCP
+    /// listener whose spill cannot be read is counted and bound again with a backoff while the
+    /// daemon's group stays up, and once the cause is cleared the same supervisor serves a
+    /// connection on the new binding; a stop then ends it cleanly.
+    #[tokio::test]
+    async fn a_failed_listener_is_bound_again_and_serves_once_its_cause_clears() {
+        let fixture = listener(SyslogTransport::Tcp, 2, 1000);
+        // A directory where the spill file belongs: reading it fails until it is removed.
+        std::fs::create_dir_all(fixture.spill.path()).unwrap();
+        let socket = Socket::Tcp(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let (stop, stopped) = watch::channel(false);
+        let task = tokio::spawn(supervise(
+            socket,
+            fixture.metrics.clone(),
+            fixture.store.clone(),
+            fixture.operations.clone(),
+            stopped,
+            PressureHold::new(fixture.wake.clone(), fixture.spill.clone()),
+        ));
+        until(&fixture.metrics, |status| {
+            status.counts.listener_errors >= 2
+        })
+        .await;
+        assert!(
+            !task.is_finished(),
+            "the supervisor ended with its listener"
+        );
+        std::fs::remove_dir(fixture.spill.path()).unwrap();
+        let began = std::time::Instant::now();
+        while fixture.metrics.snapshot().unwrap().counts.accepted == 0 {
+            assert!(began.elapsed() < Duration::from_secs(30), "no frame stored");
+            let address = fixture.metrics.snapshot().unwrap().address;
+            if let Ok(mut connection) = tokio::net::TcpStream::connect(address).await {
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut connection, b"5 <34>a").await;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            printed::lines()
+                .iter()
+                .any(|line| line.contains("bound again")),
+        );
+        stop.send_replace(true);
+        task.await.unwrap().unwrap();
     }
 }

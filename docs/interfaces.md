@@ -388,6 +388,26 @@ A signal during startup remains pending until serving can request teardown.
 It does not interrupt an individual native operation or
 certify a shutdown latency bound.
 
+The accept loop never ends on an accept error. A failed accept (descriptor exhaustion, an
+aborted connection), a failed free-space measurement and a failed clock read are journaled
+(the accept line carries the running count) and retried: accepting pauses for a backoff that
+doubles from 10 ms to 1 second and starts over at the next successful accept.
+
+A completed-consumption worker error that belongs to no one claim or watch (the store
+refusing reads or writes, including a latched store) does not end the worker or the daemon. The
+worker journals it once per change, reports it as `worker: ...` in every watch's `failure`,
+answers any waiting watch command with the store's refusal, and runs again after a backoff that
+doubles from 5 seconds to 1 minute, so a store that becomes healthy again resumes the work with
+its claims and retry clocks intact. A failure of one claim (quarantine, recording an attempt,
+publishing), one tail drain, or one watch's root (missing, replaced, unreadable, over its
+directory limit) stops only that claim or watch: the cause is in that watch's `failure`, the other
+watches run, and the watch is rebuilt on the same backoff. A replacement root is never adopted
+and a pending claim stays bound to the original root and is kept; the exact root restored
+resumes the watch. A parked watch that holds no unfinished claim is opened again from its
+configured path on each retry, as a start opens it, so a root removed and recreated resumes
+without a restart. A root that cannot be opened at start leaves the watch reported with its
+reason and does not delay the daemon's start or the other watches.
+
 Socket-bind refusal, syslog-start refusal, terminal serving/worker failure and
 graceful shutdown route through one teardown owner. It attempts intake and maintenance joins
 and owned socket-name cleanup even when an earlier step fails; the final store
@@ -3458,14 +3478,23 @@ reader and a publisher joined by a first-in first-out queue bounded in bytes:
   the instant just past the watermark (the fence plus one millisecond), counted
   `restamped_past_watermark`, and journaled, at most one line a minute. Its `received_at` is
   then that fence-adjusted time and not the clock; the read instant and the clock appear in
-  the journal line. A log is never refused for its stamp. Any other `STORAGE_FAILURE` is not
-  retried.
-- A store error that is neither pressure nor a counted refusal returns from the
-  listener at once. The reader stops with it, the datagrams still queued are counted in
-  `lost_at_shutdown` (the datagram the reader holds while it waits for room is counted with
-  them, and its wait ends, so `reader_full_longest_ms` stops growing) and named in the error,
-  and the daemon's worker health gate stops the daemon, so a reader never fills a queue that
-  nobody drains. Datagrams still in the kernel buffer at this exit are lost and not counted.
+  the journal line. A log is never refused for its stamp.
+- A `STORAGE_FAILURE`, a `SHUTTING_DOWN` or, for a TCP frame, an `ARCHIVE_WATERMARK`
+  answer names a state of the whole store, not of the packet. The packet is held as for pressure,
+  counted once in `holds_store_failure`, shown in the listener's `failure` and journaled once per
+  change of its text, and offered again every 5 seconds and at each pressure wake until the store
+  takes it. A stop ends the hold as it ends a pressure hold.
+- Any other store error returns from the listener. The reader stops with it, the datagrams
+  still queued are counted in `lost_at_shutdown` (the datagram the reader holds while it waits
+  for room is counted with them, and its wait ends, so `reader_full_longest_ms` stops growing)
+  and named in the error, and the listener is bound again (next item). Datagrams still in the
+  kernel buffer at this exit are lost and not counted.
+- A listener's error never ends the daemon or a sibling listener. A failed bind, receive,
+  setup or connection, or an unexpected store error, is counted in `listener_errors`, journaled,
+  shown in the listener's `failure`, and the socket is bound again after a backoff that doubles
+  from 10 ms to 1 second and starts over after the listener has run 60 seconds. A failed accept
+  or a failed connection is counted and the listener keeps its socket, backing off the same
+  way. The listener stops only on the daemon's stop.
 - A socket or stamping error in the reader closes the queue: the publisher stores what is
   queued, and then the listener returns the reader's error. A datagram the reader had taken
   off the socket and not queued when it failed (including one it was holding in a full-queue
@@ -3510,8 +3539,8 @@ Status exposes configured and actual listener bindings, bounds, active TCP
 connections and observed successful publications, interpretation failures,
 refusals, cut packets (`truncated`), framing failures and timeouts. Connection
 refusals stay zero because an arrival at the ceiling is served. Held frames add
-`held_frames` (frames held now), `holds_storage_pressure` and `holds_no_permit`
-(frames held at least once for that reason, each counted once however often it
+`held_frames` (frames held now), `holds_storage_pressure`, `holds_no_permit` and
+`holds_store_failure` (frames held at least once for that reason, each counted once however often it
 is retried) and `longest_hold_ms` (the longest hold, finished or running). They
 were added without a schema bump, as were the UDP kernel fields described below.
 The daemon journals a line when a hold episode begins and, for every episode it
@@ -4863,11 +4892,10 @@ refusal and every refusal of an older daemon.
 
 `ARCHIVE_WATERMARK` is a publication at or behind the archive watermark: a clock
 regression, or a datagram stamped with its read instant that waited past the
-watermark. It is not retryable as sent. It was `STORAGE_FAILURE` before the UDP
-syslog publisher needed to tell it apart, and every other caller treats it exactly
-as it treated `STORAGE_FAILURE`: the watch worker, which stops on a storage
-failure, stops on it too. Only the UDP syslog publisher handles it, as described
-with the UDP hold. `STORAGE_FAILURE` also covers retirement reaching unarchived evidence.
+watermark. It is not retryable as sent. The UDP syslog publisher restamps a
+datagram it refuses, as described with the UDP hold; a TCP syslog frame it refuses is held
+and offered again, as a `STORAGE_FAILURE` is. The watch worker records either code against the
+claim or watch it hit and retries; neither ends the worker. `STORAGE_FAILURE` also covers retirement reaching unarchived evidence.
 `INVALID_ARGUMENT` covers opening an archiving store without its `[archive]`
 table.
 
