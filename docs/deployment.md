@@ -503,6 +503,42 @@ production slice, with `sparrow-ship.timer`.
 The timer runs five minutes after each completed run. Shipped data arrives when
 its producer finishes a file, not as it is written.
 
+### Deleting acknowledged spool files
+
+A source with `delete_acknowledged = true` is a spool the shipper owns, such as
+the Katamari journal spool below; never set it on a producer's own directory.
+At the end of each run the shipper deletes a finished file of that source once
+the store holds every byte of it, and nothing else ever deletes one. It hashes
+each part the file ships as (the whole file, or each line-bounded part, split
+exactly as when it was queued) with `b3sum` and asks the store
+`sparrow SOCKET payload STORE_ID blake3:HEX`. The file goes only when every part
+lists an artifact, which the store answers only while it holds all of that
+artifact's bytes ([Payload id index](interfaces.md#payload-id-index-store-format)).
+A file that is still queued, waiting in a consume root, refused under storage
+pressure, quarantined, or held once and since retired lists nothing and stays.
+The ledger keeps its entry either way.
+
+The source needs the top-level keys `sparrow` (the CLI) and `socket` (the store
+socket the CLI queries), and `b3sum` on the path; the configuration is refused
+at load without them. While the store does not answer, the run reports
+`store unreachable` and deletes nothing, however long the outage lasts, without
+failing.
+
+Deletion takes two runs, because a spool script opens a file by name and appends
+a line a moment later, so a line can land in a file the store already holds. In
+the run that finds every part of a file held, the shipper links the file to
+`.reaping-NAME` and unlinks NAME, which neither the shipper nor the spool scripts read; a script
+that opens NAME afterwards creates a new file under it. At its next run the
+shipper looks at each `.reaping-` file again and deletes it only if the store
+holds every part of its present content. A file that now holds a line the store
+lacks goes back under NAME (under `NAME-late-NS` when NAME exists again) and
+ships like any finished file, so those lines appear twice at most. A file whose
+parts the store held and has since retired goes back too and stays in the spool.
+The run reports how many files it deleted, set aside, and did not find
+acknowledged. The parts are cut with the shipper's current `max_chunk_bytes` and
+`max_chunk_lines`; after a change of either, a file queued earlier hashes
+differently, is reported as not acknowledged and stays.
+
 ## Katamari's journal in the spool
 
 Two interim user units on the operator's host spool `katamari-stored.service`
@@ -535,9 +571,13 @@ in the buckets it belongs to.
 
 The shipper reads both prefixes through one source, because both go to the same
 consume root and watch. `~/.config/sparrow/ship.toml` needs the pattern
-widened, with no new watch and no change to the ledger (it keys each file):
+widened and `delete_acknowledged` set, with no new watch and no change to the
+ledger (it keys each file):
 
 ```toml
+sparrow = "/home/paudley/.local/bin/sparrow"
+socket = "/SPARROW/store/rpc.sock"
+
 [[source]]
 name = "katamari.stored"
 dir = "/home/paudley/.local/state/sparrow/katamari-journal"
@@ -545,6 +585,7 @@ pattern = "katamari-*.jsonl"
 rule = "settled"
 format = "jsonl"
 settle_seconds = 120
+delete_acknowledged = true
 ```
 
 Deploy (the operator; nothing here restarts the node or the namespace forwarder):
@@ -939,10 +980,9 @@ changed. The walk takes the writer lock for each page, about 5,055 pages at the 
 (arithmetic from the walk's rate, below), so stop the shipper timer before it to keep the shipper's
 ingest out of the walk, and start the timer again right after it, whether the listing passed or
 failed. `deploy/user-unit-upgrade.sh` records at its start whether the timer is active and restores it
-on an abort only then (lines 336-337, `restore_ship_timer`), and the spool units delete files older than
-three days when they start, so a timer left stopped by a called-off window can become a loss after
-more than three days and a spool-unit restart. Ingest between the listing and
-the stop is expected: the comparison tolerates it. The walk has the stall limit of the rehearsal's
+on an abort only then (lines 336-337, `restore_ship_timer`). The spool units delete no spool file, so
+a timer left stopped by a called-off window delays shipping and loses nothing. Ingest between the
+listing and the stop is expected: the comparison tolerates it. The walk has the stall limit of the rehearsal's
 check, and the step records the walk's calls, wall time, the clock on both sides of the status read and the ingest figures
 `flush_lag_ms` and `pending_writes` before and after it, in `live-listing.tsv.counts`. The block's
 `list EXIT` is the listing's own status:
@@ -2184,11 +2224,11 @@ notice states this and gives the length only after the rehearsal has read `N`.
     (`deploy/libexec/`) and unit files (`deploy/systemd/user/`); the user manager runs the copies
     under `~/.local/libexec/sparrow/` with `Restart=always`. They never connect to Sparrow, so they
     keep writing from their own units while the daemon is down, and the shipper sends those files
-    after the start. Each unit deletes its own spool files (`katamari-stored-*.jsonl` and
-    `katamari-manager-*.jsonl`) when it starts: `ExecStartPre` runs `find ... -mtime +3 -delete`
-    (`systemctl --user cat` of both units, read on the host and saved in `.stage/416/host-reads.log`), which matches files last modified four
-    or more full days ago. A restart of either unit after an outage that long deletes the oldest files
-    the shipper has not sent. Both units and `sparrow-ship.timer` read `active` on the host
+    after the start. Neither unit deletes a spool file (`katamari-stored-*.jsonl` or
+    `katamari-manager-*.jsonl`); the shipper deletes one only once the store holds every part of it
+    ([Deleting acknowledged spool files](#deleting-acknowledged-spool-files)), so an outage of any
+    length loses no spooled line. The spool grows by about 4 MB a day (read for 17 to 19 November
+    2026) while the store is away. Both units and `sparrow-ship.timer` read `active` on the host
     (`systemctl --user is-active`, saved in `.stage/416/host-reads.log`).
   A producer that rotates or deletes its own file in the window is outside Sparrow's reach.
 - Her CLI and MCP tools (`lillith_decodes`) and every other client of the CLI and the MCP tools get

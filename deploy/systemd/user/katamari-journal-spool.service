@@ -9,7 +9,6 @@
 Description=Spool the katamari-stored journal as JSON Lines for sparrow-ship
 
 [Service]
-ExecStartPre=/usr/bin/find %S/sparrow/katamari-journal -name 'katamari-stored-*.jsonl' -mtime +3 -delete
 ExecStart=%h/.local/libexec/sparrow/katamari-journal-spool katamari-stored.service %S/sparrow/katamari-journal %S/sparrow/katamari-journal.cursor
 Restart=always
 RestartSec=10

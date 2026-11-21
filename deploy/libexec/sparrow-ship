@@ -35,11 +35,25 @@ queueing and recording the identity queues the file again; an identical item alr
 is recognized and dropped, and a different one waits until Sparrow consumes the
 earlier copy. A finished file that later changes has a new identity and is
 shipped again whole.
+
+A source with `delete_acknowledged = true` is a spool the shipper owns, and the
+shipper deletes one of its finished files once the store holds every byte of it.
+The acknowledgement is the store's payload-id index: each part the file ships as
+(the whole file, or each line-bounded part) is hashed with BLAKE3 and looked up
+with `sparrow SOCKET payload STORE blake3:HEX`. A file is deleted only when every
+part lists at least one artifact, which the store answers only while it holds all
+of that artifact's bytes. Nothing else removes a file. A file still queued,
+waiting in a consume root, refused under storage pressure or quarantined has no
+held artifact, so it stays. While the store is unreachable nothing is deleted,
+however long that lasts, and the run reports it without failing. A file whose
+parts the store once held but has since retired also stays.
 """
 
 import fcntl
 import filecmp
+import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -98,6 +112,22 @@ def load_config(path):
         refuse_overlap(path, source, config)
     if not names:
         fail(f"{path}: no [[source]] entries")
+    reaping = [source["name"] for source in config["source"]
+               if source.get("delete_acknowledged", False)]
+    for source in config["source"]:
+        if not isinstance(source.get("delete_acknowledged", False), bool):
+            fail(f"{path}: source {source['name']}: delete_acknowledged must be true or false")
+    if reaping:
+        for key in ("sparrow", "socket"):
+            if key not in config:
+                fail(f"{path}: sources {reaping} set delete_acknowledged, which needs the "
+                     f"top-level key `{key}` (the sparrow CLI and the store socket it queries)")
+        if not os.access(config["sparrow"], os.X_OK):
+            fail(f"{path}: sparrow {config['sparrow']} is not an executable file; "
+                 "set `sparrow` to the installed CLI")
+        if shutil.which("b3sum") is None:
+            fail(f"{path}: sources {reaping} set delete_acknowledged, which hashes parts with "
+                 "b3sum; install b3sum (package b3sum) or remove the key")
     return config
 
 
@@ -193,19 +223,26 @@ def chunks(path, max_bytes, max_lines):
         yield lines
 
 
+def pieces(source, path, stat, config):
+    """Return None when the file ships whole, else an iterator of its line-bounded parts."""
+    max_bytes, max_lines = config["max_chunk_bytes"], config["max_chunk_lines"]
+    if source["format"] not in LINE_FORMATS:
+        return None
+    if stat.st_size <= max_bytes:
+        with open(path, "rb") as handle:
+            if handle.read().count(b"\n") <= max_lines:
+                return None
+    return chunks(path, max_bytes, max_lines)
+
+
 def enqueue(source, path, stat, config, queue, staging):
     """Stage a complete copy of one finished file, verify it, then queue it durably.
 
     Queue names carry an order prefix; the name fed into the consume root drops it.
     """
     flat = str(path.relative_to(source["dir"])).replace("/", "__")
-    max_bytes, max_lines = config["max_chunk_bytes"], config["max_chunk_lines"]
-    whole = True
-    if source["format"] in LINE_FORMATS:
-        whole = stat.st_size <= max_bytes
-        if whole:
-            with open(path, "rb") as handle:
-                whole = handle.read().count(b"\n") <= max_lines
+    parts = pieces(source, path, stat, config)
+    whole = parts is None
     if whole and stat.st_size > MAX_IMPORT_BYTES:
         raise RuntimeError(f"{stat.st_size} bytes exceeds Sparrow's {MAX_IMPORT_BYTES}-byte "
                            "import bound (about 7.93 GiB); split the file and ship the parts")
@@ -219,7 +256,7 @@ def enqueue(source, path, stat, config, queue, staging):
         stem, dot, suffix = flat.rpartition(".")
         if not dot:
             stem, suffix = flat, source["format"]
-        for index, lines in enumerate(chunks(path, max_bytes, max_lines)):
+        for index, lines in enumerate(parts):
             staged.append(staging / f"{order}-{index:05d}-{stem}.part{index:05d}.{suffix}")
             with open(staged[-1], "wb") as handle:
                 handle.writelines(lines)
@@ -283,6 +320,109 @@ def feed(config, intake, queues):
     return fed
 
 
+class StoreUnreachable(Exception):
+    """The store did not answer; no file may be deleted on its behalf."""
+
+
+class Store:
+    """Payload-id lookups through the sparrow CLI against one store socket."""
+
+    def __init__(self, config):
+        self.command = [config["sparrow"], config["socket"]]
+        self.store_id = self.query(["discover"])["store_id"]
+
+    def query(self, arguments):
+        result = subprocess.run(self.command + arguments, capture_output=True)
+        if result.returncode != 0:
+            reason = result.stderr.decode(errors="replace").strip().splitlines()
+            raise StoreUnreachable(reason[-1] if reason else f"exit {result.returncode}")
+        return json.loads(result.stdout)
+
+    def holds(self, digest):
+        """Whether the store holds every byte of at least one artifact with this BLAKE3 digest."""
+        page = self.query(["payload", self.store_id, f"blake3:{digest}", "--page-size", "1"])
+        return bool(page["artifact_ids"])
+
+
+def blake3(data=None, path=None):
+    argv = ["b3sum", "--no-names"] + (["--", str(path)] if path else [])
+    result = subprocess.run(argv, input=data, capture_output=True, check=True)
+    return result.stdout.decode().strip()
+
+
+REAP_PREFIX = ".reaping-"
+
+
+def digests_of(source, path, stat, config):
+    """The BLAKE3 digest of each part the file ships as, cut exactly as the queue cuts it."""
+    parts = pieces(source, path, stat, config)
+    if parts is None:
+        return [blake3(path=path)]
+    return [blake3(data=b"".join(lines)) for lines in parts]
+
+
+def late_name(original):
+    """A name that matches the source pattern and no existing file: where lines go that were
+    appended to a file after the store acknowledged it, when its own name is in use again."""
+    stem, dot, suffix = original.name.rpartition(".")
+    return original.with_name(f"{stem}-late-{time.time_ns()}{dot}{suffix}")
+
+
+def settle_set_aside(source, config, store):
+    """Decide every file an earlier run set aside, by what it holds now.
+
+    A spool script opens a file by name and appends a line a moment later, so a line can land
+    in a file after it was acknowledged and set aside. The set-aside file is therefore deleted a
+    run later, and only if the store holds every part of its present content; otherwise it goes
+    back under its own name (or a `-late-` name when that is in use again); a file whose
+    content the store never held ships like any finished file, and one whose ledger identity is
+    unchanged (the store retired it) stays, counted as not acknowledged. Returns the number deleted.
+    """
+    deleted = 0
+    directory = Path(source["dir"])
+    for aside in sorted(directory.glob(f"**/{REAP_PREFIX}*")):
+        stat = aside.lstat()
+        if not all(store.holds(digest) for digest in digests_of(source, aside, stat, config)):
+            original = aside.with_name(aside.name[len(REAP_PREFIX):])
+            try:
+                os.link(aside, original)
+            except FileExistsError:
+                os.link(aside, late_name(original))
+            aside.unlink()
+        else:
+            aside.unlink()
+            deleted += 1
+        fsync_directory(aside.parent)
+    return deleted
+
+
+def reap(source, config, store, now):
+    """Set aside the finished files of a spool source whose every part the store holds.
+
+    Returns (deleted, set_aside, unacknowledged). No file is deleted in the run that finds a
+    file acknowledged: its bytes move to `.reaping-NAME` (a hard link; NAME is then unlinked), which the shipper and the spool scripts
+    ignore, and `settle_set_aside` decides it on the next run. A set-aside name that is already
+    taken is left alone.
+    """
+    deleted = settle_set_aside(source, config, store)
+    set_aside = unacknowledged = 0
+    for path, stat in finished(source, now):
+        if not all(store.holds(digest) for digest in digests_of(source, path, stat, config)):
+            unacknowledged += 1
+            continue
+        aside = path.with_name(REAP_PREFIX + path.name)
+        try:
+            os.link(path, aside)
+        except FileExistsError:
+            continue
+        except FileNotFoundError:
+            continue
+        os.unlink(path)
+        fsync_directory(path.parent)
+        set_aside += 1
+    return deleted, set_aside, unacknowledged
+
+
 def run(config):
     intake = Path(config["intake_root"])
     state = Path(config["state_dir"])
@@ -303,6 +443,7 @@ def run(config):
     queued = sum(size for queue in queues.values() for _, size in waiting(queue))
     now = time.time()
     failures = 0
+    reaped = [source for source in config["source"] if source.get("delete_acknowledged", False)]
     for source in config["source"]:
         ledger_path = state / f"{source['name']}.ledger"
         shipped = set()
@@ -334,6 +475,15 @@ def run(config):
         print(f"sparrow-ship: {source['name']}: queued {count}")
     for name, count in feed(config, intake, queues).items():
         print(f"sparrow-ship: {name}: fed {count}")
+    if reaped:
+        try:
+            store = Store(config)
+            for source in reaped:
+                deleted, set_aside, kept = reap(source, config, store, time.time())
+                print(f"sparrow-ship: {source['name']}: deleted {deleted} acknowledged, "
+                      f"set aside {set_aside}, not yet acknowledged {kept}")
+        except StoreUnreachable as error:
+            print(f"sparrow-ship: store unreachable ({error}); no further spool file deleted")
     if failures:
         fail(f"{failures} file(s) failed; originals are untouched and will be retried")
 
