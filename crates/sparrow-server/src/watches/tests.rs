@@ -188,7 +188,7 @@ fn kernel_overflow_and_directory_exhaustion_require_fresh_coverage() {
     assert!(detector.ready().unwrap().is_none());
     let registry = WatchRegistry::default();
     registry
-        .update(std::slice::from_ref(&detector), &[])
+        .update(std::slice::from_ref(&detector), &[], &[])
         .unwrap();
     let status = registry.snapshot().unwrap().pop().unwrap();
     assert!(!status.covered);
@@ -954,11 +954,14 @@ fn worker(
     let registry = WatchRegistry::default();
     let run = run(
         store.clone(),
-        detectors,
+        Roster {
+            detectors,
+            unopened: Vec::new(),
+        },
         data.join("rpc.sock"),
         stopped,
         registry.clone(),
-        catalog,
+        (catalog, Backoff::default()),
         Control {
             commands,
             operations,
@@ -1207,6 +1210,8 @@ async fn the_drain_before_a_wait_reports_and_wakes_for_what_it_found() {
     let waiting = Waiting {
         store: &store,
         registry: &registry,
+        unopened: &[],
+        backoffs: [&Backoff::default(), &Backoff::default()],
         stop: &mut stopped,
         control: &mut control,
         received: &mut None,
@@ -1258,86 +1263,188 @@ fn tail_detector() -> (tempfile::TempDir, Store, Detector) {
     (directory, store, detector)
 }
 
-/// Value (#255): `ARCHIVE_WATERMARK` is a new code for what was `STORAGE_FAILURE`, so that
-/// only the UDP listener restamps. Every watch site that stopped the worker for
-/// `STORAGE_FAILURE` must stop it for the new code too: a clock regression on a tail watch
-/// stops the daemon loudly, as before, and is not recorded as a retryable watch failure.
-/// A code that is not fatal (`RESOURCE_LIMIT`) is the control: it is recorded and the worker
-/// goes on. Covers the tail attach site and the tail drain site.
-#[test]
-fn the_archive_watermark_stops_a_tail_watch_as_a_storage_failure_does() {
-    for code in ["STORAGE_FAILURE", sparrow_core::ARCHIVE_WATERMARK] {
-        // Attach: the first write of the watch is refused.
-        let (_directory, store, mut detector) = tail_detector();
-        store.space_floor().refuse_next_write_for_tests(code);
-        let attach = detector.scan_step().and_then(|()| detector.drain());
-        assert!(
-            matches!(&attach, Err(Error::Storage(error)) if error.code == code),
-            "attach with {code}: {attach:?}"
-        );
-        // Drain: the attach succeeded, and the write that publishes the line is refused.
-        let (_directory, store, mut detector) = tail_detector();
-        detector.scan_step().unwrap();
-        detector.drain().unwrap();
-        let Owner::Tail(owner) = &mut detector.owner else {
-            unreachable!("an ActiveFilesRetain watch has a tail owner");
-        };
-        store.space_floor().refuse_next_write_for_tests(code);
-        let drain = tail_drain_outcome(owner.drain());
-        assert!(
-            matches!(&drain, Err(Error::Storage(error)) if error.code == code),
-            "drain with {code}: {drain:?}"
-        );
-    }
-    let (_directory, store, mut detector) = tail_detector();
-    store
-        .space_floor()
-        .refuse_next_write_for_tests("RESOURCE_LIMIT");
-    detector.scan_step().unwrap();
-    detector.drain().unwrap();
-    assert!(
-        detector.failure.is_some(),
-        "a non-fatal refusal is recorded"
+/// Value (#445): a refused catalog write that is not `STORAGE_PRESSURE` ended the worker and
+/// with it the daemon, and only a restart cleared it. Protects, through the real worker loop on a
+/// real store: a store that refuses the first catalog write with `STORAGE_FAILURE` leaves the
+/// worker running and the watch reported; the write is retried on the backoff and stored once
+/// the store accepts it, and a command sent while the failure stands is answered, not dropped.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_refused_catalog_write_is_retried_and_does_not_end_the_worker() {
+    let (worker, run) = worker(
+        crate::ProducerContract::FinishedFiles,
+        &[],
+        Arc::new(tokio::sync::Semaphore::new(2)),
     );
-    let recorded = tail_drain_outcome(Err(Error::Storage(sparrow_core::Error::new(
-        "RESOURCE_LIMIT",
-        "x",
-    ))));
-    assert!(matches!(recorded, Ok(Some(_))));
+    worker
+        .store
+        .space_floor()
+        .refuse_next_write_for_tests("STORAGE_FAILURE");
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let task = tokio::task::spawn_local(run);
+            tokio::time::sleep(SETTLED).await;
+            assert!(!task.is_finished(), "the worker ended on a refused write");
+            assert!(worker.store.watch_registry().unwrap().is_none());
+            // The write is retried once the first backoff has passed, and then stored.
+            tokio::time::sleep(RETRY_FIRST + SETTLED).await;
+            assert!(worker.store.watch_registry().unwrap().is_some());
+            worker.stop.send_replace(true);
+            task.await.unwrap().unwrap();
+        })
+        .await;
 }
 
-/// Value (#255): recording a claim's pending attempt stops the worker for `STORAGE_FAILURE`
-/// and for `ARCHIVE_WATERMARK` alike, and only reports any other error against the claim. This
-/// is the one site that no other test reaches, so it is pinned alone.
-#[test]
-fn the_archive_watermark_stops_the_worker_when_a_pending_attempt_cannot_be_recorded() {
-    for code in ["STORAGE_FAILURE", sparrow_core::ARCHIVE_WATERMARK] {
-        let outcome = pending_attempt_outcome::<()>(Err(sparrow_core::Error::new(code, "x")));
-        assert!(
-            matches!(&outcome, Err(Error::Storage(error)) if error.code == code),
-            "{code}: {outcome:?}"
-        );
-    }
-    let reported =
-        pending_attempt_outcome::<()>(Err(sparrow_core::Error::new("RESOURCE_LIMIT", "x")));
-    assert!(matches!(reported, Ok(Some(_))));
-    assert!(matches!(pending_attempt_outcome(Ok(())), Ok(None)));
+/// Value (#445): any pass error that names no claim or watch ended the worker (a latched or
+/// poisoned store returned `STORAGE_FAILURE` from the pass). Driven here by a closed operation
+/// budget, which fails the tail pass the same way. Protects: the worker outlives it, every watch
+/// reports the worker's failure in status so an operator sees it, a waiting command is
+/// answered with the store's refusal instead of hanging, and a stop still ends the worker
+/// cleanly.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_failed_pass_keeps_the_worker_alive_reports_it_and_answers_commands() {
+    let operations = Arc::new(tokio::sync::Semaphore::new(2));
+    let (worker, run) = worker(
+        crate::ProducerContract::ActiveFilesRetain,
+        &[("active.log", b"line\n")],
+        operations.clone(),
+    );
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let task = tokio::task::spawn_local(run);
+            tokio::time::sleep(SETTLED).await;
+            operations.close();
+            // New bytes wake the tail pass, which then finds its budget closed.
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(worker._directory.path().join("producer/active.log"))
+                .unwrap();
+            std::io::Write::write_all(&mut file, b"more\n").unwrap();
+            tokio::time::sleep(RETRY_FIRST + SETTLED).await;
+            assert!(!task.is_finished(), "the worker ended on a store failure");
+            let status = worker.registry.snapshot().unwrap();
+            let failure = status[0].failure.as_deref().unwrap_or_default();
+            assert!(failure.starts_with("worker: "), "{failure}");
+            let refused = worker
+                .controller
+                .retire_claim(watch_admin::ClaimRetirement {
+                    watch: "wake".into(),
+                    claim: "absent".into(),
+                    caller: "test".into(),
+                    reason: "failing".into(),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(refused.code, "STORAGE_FAILURE");
+            worker.stop.send_replace(true);
+            task.await.unwrap().unwrap();
+        })
+        .await;
 }
 
-/// Value (#255): the admin path classifies store errors the same way: `STORAGE_FAILURE` and
-/// `ARCHIVE_WATERMARK` end the worker (terminal), any other code is a refusal to the caller.
-#[test]
-fn the_archive_watermark_is_terminal_for_an_admin_command_as_a_storage_failure_is() {
-    for code in ["STORAGE_FAILURE", sparrow_core::ARCHIVE_WATERMARK] {
-        assert!(matches!(
-            storage_admission(sparrow_core::Error::new(code, "x")),
-            AdminFailure::Terminal(_)
-        ));
+/// Value (#445): a root renamed away and replaced ended the worker, and the daemon could not
+/// start again until a person restored the root. Protects the watch's own recovery: a failed
+/// root check parks that watch with the reason in its status, a replacement directory is never
+/// adopted however long the retries run, and the exact root restored resumes the watch with its
+/// failure cleared.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_replaced_root_parks_its_watch_and_the_exact_root_resumes_it() {
+    let (_directory, _store, mut detector) = held_fixture("parked");
+    let root = detector.config.root.clone();
+    assert!(detector.attempt(Detector::ready).is_some());
+    let moved = root.with_file_name("moved-aside");
+    std::fs::rename(&root, &moved).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    assert!(detector.attempt(Detector::ready).is_none());
+    assert!(!detector.live());
+    assert!(
+        detector
+            .status_failure()
+            .unwrap()
+            .contains("configured consume root changed"),
+    );
+    // The replacement is refused at each retry; the watch stays parked.
+    for _ in 0..3 {
+        tokio::time::advance(STORE_RETRY_CEILING).await;
+        assert!(!detector.resume());
+        assert!(!detector.live());
     }
-    assert!(matches!(
-        storage_admission(sparrow_core::Error::new("RESOURCE_LIMIT", "x")),
-        AdminFailure::Refused(_)
-    ));
+    std::fs::remove_dir(&root).unwrap();
+    std::fs::rename(&moved, &root).unwrap();
+    tokio::time::advance(STORE_RETRY_CEILING).await;
+    assert!(detector.resume());
+    assert!(detector.live());
+    assert!(detector.status_failure().is_none());
+}
+
+/// Value (#445): one watch root missing at start refused the daemon's start (and every later
+/// start). Protects: opening a roster whose one root is missing yields the other watch open
+/// and this one reported with its reason; the exact root restored opens it on the retry.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_root_missing_at_start_leaves_the_other_watches_open_and_resumes_when_restored() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("store");
+    let config_path =
+        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
+    let store = crate::ServerConfig::read(&config_path)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let definitions = ["present", "absent"]
+        .map(|id| {
+            let root = directory.path().join(id);
+            std::fs::create_dir(&root).unwrap();
+            ConsumeWatch {
+                id: id.into(),
+                root,
+                producer_contract: crate::ProducerContract::FinishedFiles,
+                source: id.into(),
+                format: "log".into(),
+                quiet_ms: 30_000,
+                max_directories: 2,
+                max_candidates: 2,
+                publish_hold: false,
+            }
+        })
+        .to_vec();
+    let catalog = Catalog::load(&store, &definitions).unwrap();
+    let missing = definitions[1].root.clone();
+    let parked = missing.with_file_name("parked-aside");
+    std::fs::rename(&missing, &parked).unwrap();
+    let (detectors, unopened) = open_detectors(&store, &catalog, RootBinding::Stored);
+    assert_eq!(detectors.len(), 1);
+    assert_eq!(unopened.len(), 1);
+    let registry = WatchRegistry::default();
+    registry.update(&detectors, &unopened, &[]).unwrap();
+    let status = registry.snapshot().unwrap();
+    assert_eq!(status.len(), 2);
+    assert!(status[1].failure.is_some(), "the missing root is reported");
+    let mut roster = Roster {
+        detectors,
+        unopened,
+    };
+    roster.reopen(&store, RootBinding::Stored);
+    assert_eq!(roster.detectors.len(), 1, "the retry is not yet due");
+    std::fs::rename(&parked, &missing).unwrap();
+    tokio::time::advance(STORE_RETRY_CEILING).await;
+    roster.reopen(&store, RootBinding::Stored);
+    assert_eq!(roster.detectors.len(), 2);
+    assert!(roster.unopened.is_empty());
+}
+
+/// A finished-file detector under a fresh store, for a root that tests rename and replace.
+fn held_fixture(id: &str) -> (tempfile::TempDir, Store, Detector) {
+    let directory = tempfile::tempdir().unwrap();
+    let producer = directory.path().join("producer");
+    std::fs::create_dir(&producer).unwrap();
+    let data = directory.path().join("store");
+    let config_path =
+        sparrow_test_support::write_server_config(directory.path(), &data, &data.join("rpc.sock"));
+    let store = crate::ServerConfig::read(&config_path)
+        .unwrap()
+        .open_store()
+        .unwrap();
+    let detector = held_detector(store.clone(), &producer, id, false);
+    (directory, store, detector)
 }
 
 /// A finished-file watch `id` under `producer`, held when `hold` is set, and its detector.
@@ -1461,7 +1568,7 @@ fn a_publish_hold_is_named_by_status_with_its_count_and_since_when() {
 
     let registry = WatchRegistry::default();
     registry
-        .update(std::slice::from_ref(&detector), &pending)
+        .update(std::slice::from_ref(&detector), &[], &pending)
         .unwrap();
     let status = registry.snapshot().unwrap();
     assert_eq!(status.len(), 1);
@@ -1473,7 +1580,7 @@ fn a_publish_hold_is_named_by_status_with_its_count_and_since_when() {
     // Clearing the hold names nothing: the held count returns to zero.
     detector.config.publish_hold = false;
     registry
-        .update(std::slice::from_ref(&detector), &pending)
+        .update(std::slice::from_ref(&detector), &[], &pending)
         .unwrap();
     let status = registry.snapshot().unwrap();
     assert!(!status[0].definition.publish_hold);
@@ -1504,13 +1611,13 @@ fn the_publish_hold_warning_is_written_by_the_update_that_decides_it_once_per_ho
     // A fresh registry is a daemon start: the hold is named once, with its count.
     let registry = WatchRegistry::default();
     let written = registry
-        .update(std::slice::from_ref(&detector), &pending)
+        .update(std::slice::from_ref(&detector), &[], &pending)
         .unwrap();
     assert_eq!(written.len(), 1);
     assert!(written[0].contains("watch=held-start") && written[0].contains("2 pending claims"));
     assert!(
         registry
-            .update(std::slice::from_ref(&detector), &pending)
+            .update(std::slice::from_ref(&detector), &[], &pending)
             .unwrap()
             .is_empty()
     );
@@ -1519,14 +1626,14 @@ fn the_publish_hold_warning_is_written_by_the_update_that_decides_it_once_per_ho
     detector.config.publish_hold = false;
     assert!(
         registry
-            .update(std::slice::from_ref(&detector), &pending)
+            .update(std::slice::from_ref(&detector), &[], &pending)
             .unwrap()
             .is_empty()
     );
     detector.config.publish_hold = true;
     assert_eq!(
         registry
-            .update(std::slice::from_ref(&detector), &pending)
+            .update(std::slice::from_ref(&detector), &[], &pending)
             .unwrap()
             .len(),
         1
@@ -1535,7 +1642,7 @@ fn the_publish_hold_warning_is_written_by_the_update_that_decides_it_once_per_ho
     // The next daemon start warns again, because nothing was announced before it.
     assert_eq!(
         WatchRegistry::default()
-            .update(std::slice::from_ref(&detector), &pending)
+            .update(std::slice::from_ref(&detector), &[], &pending)
             .unwrap()
             .len(),
         1

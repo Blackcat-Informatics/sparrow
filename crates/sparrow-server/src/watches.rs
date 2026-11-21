@@ -152,6 +152,69 @@ fn retry_delay(failures: u32) -> Duration {
         .min(RETRY_CEILING)
 }
 
+/// Longest wait between retries of a step that failed for a cause outside any one claim: a
+/// store refusal, a watch root that cannot be read or has been replaced. Such a cause clears
+/// by itself (space freed, a latch cleared, the exact root restored) or by an operator's
+/// action while the daemon runs. A claim's own retry ceiling (15 minutes) would leave the
+/// watch idle for a quarter of an hour after the cause is gone; one minute bounds that delay,
+/// and doubling from 5 seconds keeps a persistent cause to a handful of attempts and journal
+/// lines a minute at worst.
+const STORE_RETRY_CEILING: Duration = Duration::from_secs(60);
+
+/// Delay before retry number `failures` of a step that failed outside any one claim.
+fn step_delay(failures: u32) -> Duration {
+    retry_delay(failures).min(STORE_RETRY_CEILING)
+}
+
+/// Retry clock of one repeating step that must not end the worker when it fails. It keeps
+/// the step's last failure text so the journal says it once per change and again when the
+/// step recovers. It runs on the tokio clock, which is the clock the worker's waits use.
+#[derive(Debug, Default)]
+struct Backoff {
+    failures: u32,
+    at: Option<tokio::time::Instant>,
+    logged: Option<String>,
+}
+
+impl Backoff {
+    /// Whether the step may run now.
+    fn due(&self) -> bool {
+        self.at.is_none_or(|at| tokio::time::Instant::now() >= at)
+    }
+
+    /// Whether the step has failed and not yet recovered.
+    fn failing(&self) -> bool {
+        self.logged.is_some()
+    }
+
+    /// Record a failure of the step WHAT: schedule its retry and journal it once per change of
+    /// its text.
+    fn failed(&mut self, what: &str, text: String) {
+        self.failures = self.failures.saturating_add(1);
+        self.at = Some(tokio::time::Instant::now() + step_delay(self.failures));
+        if self.logged.as_ref() != Some(&text) {
+            eprintln!("sparrowd: {what} failed: {text}; retrying");
+            self.logged = Some(text);
+        }
+    }
+
+    /// Record that the step succeeded, and journal the recovery when it had failed.
+    fn recovered(&mut self, what: &str) {
+        self.failures = 0;
+        self.at = None;
+        if self.logged.take().is_some() {
+            eprintln!("sparrowd: {what} recovered");
+        }
+    }
+
+    /// Wake no later than the retry.
+    fn wake(&self, wake: &mut Wake) {
+        if let Some(at) = self.at {
+            wake.by(at.into_std());
+        }
+    }
+}
+
 /// Bounded operational state of an explicitly configured consumption root.
 #[derive(Clone)]
 pub struct WatchStatus {
@@ -209,7 +272,12 @@ fn publishable<'a>(
     due: impl Fn(&str) -> bool + 'a,
 ) -> impl Iterator<Item = &'a sparrow_core::ConsumptionJournal> + 'a {
     pending.iter().filter(move |journal| {
+        // A claim of a watch whose root is not open waits for that exact root; the claim stays
+        // journaled and bound to it.
         due(&journal.import_id)
+            && detectors
+                .iter()
+                .any(|detector| detector.config.id == journal.watch)
             && (journal.tail.is_some()
                 || !detectors.iter().any(|detector| {
                     detector.config.id == journal.watch && detector.config.publish_hold
@@ -273,19 +341,121 @@ fn held_summary(
         })
 }
 
+/// The status of a watch whose root is not open: no coverage and no worker counters, with
+/// FAILURE saying why when the worker could not open it.
+fn closed_status(
+    watch: &ManagedWatch,
+    pending: &[sparrow_core::ConsumptionJournal],
+    failure: Option<String>,
+) -> WatchStatus {
+    let (held_claims, oldest_held_first_seen) =
+        held_summary(watch.definition.publish_hold, &watch.definition.id, pending);
+    WatchStatus {
+        id: watch.definition.id.clone(),
+        root: watch.definition.root.to_string_lossy().into_owned(),
+        definition: watch.definition.clone(),
+        revision: watch.revision,
+        enabled: watch.enabled,
+        covered: false,
+        directories: 0,
+        candidates: 0,
+        deferred: false,
+        pending: pending
+            .iter()
+            .filter(|journal| journal.watch == watch.definition.id)
+            .count() as u32,
+        completed: 0,
+        reconciliations: 0,
+        coverage_losses: 0,
+        failure,
+        tail_generation_ids: Vec::new(),
+        tail_read_bytes: 0,
+        tail_descriptors: 0,
+        tail_checkpoint_records: 0,
+        tail_admission_waiting: false,
+        held_claims,
+        oldest_held_first_seen,
+    }
+}
+
+/// A configured watch whose root could not be opened. Its pending claims are kept, and the
+/// worker opens it again on the backoff, so the exact root restored resumes it; a replacement
+/// root is refused each time by the same checks as at start.
+struct Unopened {
+    watch: ManagedWatch,
+    retry: Backoff,
+}
+
+/// Open every watch of CATALOG. A watch whose root cannot be opened does not stop the others
+/// or the daemon: it is returned unopened with its failure recorded and journaled.
+fn open_detectors(
+    store: &Store,
+    catalog: &Catalog,
+    binding: RootBinding,
+) -> (Vec<Detector>, Vec<Unopened>) {
+    let mut detectors = Vec::new();
+    let mut unopened = Vec::new();
+    for watch in catalog.watches() {
+        match Detector::open(store.clone(), watch.clone(), binding) {
+            Ok(detector) => detectors.push(detector),
+            Err(error) => {
+                let mut retry = Backoff::default();
+                retry.failed(
+                    &format!("watch={} open", watch.definition.id),
+                    error.to_string().chars().take(FAILURE_CHARS).collect(),
+                );
+                unopened.push(Unopened {
+                    watch: watch.clone(),
+                    retry,
+                });
+            }
+        }
+    }
+    (detectors, unopened)
+}
+
 /// One shared bounded snapshot owner for worker updates and typed RPC status. The second
 /// field names the watches whose publish hold the last update announced, so a warning is
-/// written once per hold per daemon start (and again after the hold clears and is set).
+/// written once per hold per daemon start (and again after the hold clears and is set). The
+/// third names the failure of a worker pass that belongs to no one watch (a store refusal),
+/// which every watch reports until the pass succeeds again.
 #[derive(Clone, Default)]
-pub struct WatchRegistry(Arc<Mutex<Vec<WatchStatus>>>, Arc<Mutex<Vec<String>>>);
+pub struct WatchRegistry(
+    Arc<Mutex<Vec<WatchStatus>>>,
+    Arc<Mutex<Vec<String>>>,
+    Arc<Mutex<Option<String>>>,
+);
 
 impl WatchRegistry {
     /// Capture at most eight configured roots; poisoning is an actionable failure.
     pub fn snapshot(&self) -> Result<Vec<WatchStatus>, Error> {
-        self.0
+        let mut states = self
+            .0
             .lock()
             .map(|value| value.clone())
-            .map_err(|_| Error::State("consume status registry poisoned"))
+            .map_err(|_| Error::State("consume status registry poisoned"))?;
+        let worker = self
+            .2
+            .lock()
+            .map_err(|_| Error::State("consume status registry poisoned"))?
+            .clone();
+        if let Some(worker) = worker {
+            for state in &mut states {
+                let text = match state.failure.take() {
+                    Some(own) => format!("worker: {worker}; also: {own}"),
+                    None => format!("worker: {worker}"),
+                };
+                state.failure = Some(text.chars().take(FAILURE_CHARS).collect());
+            }
+        }
+        Ok(states)
+    }
+
+    /// Record, or with `None` clear, the failure of a worker pass that belongs to no one watch.
+    fn note_worker_failure(&self, failure: Option<String>) {
+        if let Ok(mut current) = self.2.lock() {
+            *current = failure;
+        }
     }
 
     /// The stored catalog's watches as a query-only daemon reports them: no root is opened or
@@ -296,43 +466,12 @@ impl WatchRegistry {
         let states = catalog
             .watches()
             .iter()
-            .map(|watch| {
-                let (held_claims, oldest_held_first_seen) = held_summary(
-                    watch.definition.publish_hold,
-                    &watch.definition.id,
-                    &pending,
-                );
-                WatchStatus {
-                    id: watch.definition.id.clone(),
-                    root: watch.definition.root.to_string_lossy().into_owned(),
-                    definition: watch.definition.clone(),
-                    revision: watch.revision,
-                    enabled: watch.enabled,
-                    covered: false,
-                    directories: 0,
-                    candidates: 0,
-                    deferred: false,
-                    pending: pending
-                        .iter()
-                        .filter(|journal| journal.watch == watch.definition.id)
-                        .count() as u32,
-                    completed: 0,
-                    reconciliations: 0,
-                    coverage_losses: 0,
-                    failure: None,
-                    tail_generation_ids: Vec::new(),
-                    tail_read_bytes: 0,
-                    tail_descriptors: 0,
-                    tail_checkpoint_records: 0,
-                    tail_admission_waiting: false,
-                    held_claims,
-                    oldest_held_first_seen,
-                }
-            })
+            .map(|watch| closed_status(watch, &pending, None))
             .collect();
         Ok(Self(
             Arc::new(Mutex::new(states)),
             Arc::new(Mutex::new(Vec::new())),
+            Arc::default(),
         ))
     }
 
@@ -341,6 +480,7 @@ impl WatchRegistry {
     fn update(
         &self,
         detectors: &[Detector],
+        unopened: &[Unopened],
         pending: &[sparrow_core::ConsumptionJournal],
     ) -> Result<Vec<String>, Error> {
         let states = detectors
@@ -385,6 +525,13 @@ impl WatchRegistry {
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
+        let states =
+            states
+                .into_iter()
+                .chain(unopened.iter().map(|closed| {
+                    closed_status(&closed.watch, pending, closed.retry.logged.clone())
+                }))
+                .collect::<Vec<_>>();
         let mut announced = self
             .1
             .lock()
@@ -494,6 +641,12 @@ struct Detector {
     /// The text of the last failed move of each held claim, so a move that fails the same way
     /// on every pass is recorded and logged once per change of its text.
     held_move_failures: BTreeMap<String, String>,
+    /// Set while this watch cannot work for a cause no claim owns: its root is unreadable or
+    /// replaced, a scan or drain failed, or the store refused a step. The worker skips the
+    /// watch, keeps every other watch running, and retries it on the backoff by rebuilding its
+    /// coverage; the root binding is checked again first, so a replacement root is never
+    /// adopted and the exact root restored resumes the watch.
+    broken: Backoff,
 }
 
 /// A watch failure caused by one claim's recovery.
@@ -533,9 +686,7 @@ impl Detector {
             "sparrowd: watch={} claim={id} held and not moved: {error}",
             self.config.id
         );
-        if let Some(record) =
-            pending_attempt_outcome(store.consumption_attempt_pending(id, &text, now))?
-        {
+        if let Some(record) = store.consumption_attempt_pending(id, &text, now).err() {
             self.fail_claim(
                 id,
                 format!("claim {id}: {error}; attempt not recorded: {record}"),
@@ -543,6 +694,54 @@ impl Detector {
         }
         self.held_move_failures.insert(id.to_owned(), text);
         Ok(())
+    }
+
+    /// Park the watch after `error`: report it in status and the journal, and retry on the
+    /// backoff (`resume`). Nothing else stops.
+    fn degrade(&mut self, error: &Error) {
+        let text: String = error.to_string().chars().take(FAILURE_CHARS).collect();
+        self.covered = false;
+        self.failure = Some(text.clone());
+        self.broken
+            .failed(&format!("watch={}", self.config.id), text);
+    }
+
+    /// Run STEP on this watch; a failure parks the watch (`degrade`) and yields `None`.
+    fn attempt<T>(&mut self, step: impl FnOnce(&mut Self) -> Result<T, Error>) -> Option<T> {
+        match step(self) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                self.degrade(&error);
+                None
+            }
+        }
+    }
+
+    /// Whether the watch may run now. A parked watch is rebuilt once its backoff is due: its
+    /// root binding is checked, coverage is re-established, and success clears the failure.
+    fn resume(&mut self) -> bool {
+        if !self.broken.failing() {
+            return true;
+        }
+        if !self.broken.due() {
+            return false;
+        }
+        match self.reconcile("recovery") {
+            Ok(()) => {
+                self.failure = None;
+                self.broken.recovered(&format!("watch={}", self.config.id));
+                true
+            }
+            Err(error) => {
+                self.degrade(&error);
+                false
+            }
+        }
+    }
+
+    /// Whether the watch takes events and claims: enabled and not parked.
+    fn live(&self) -> bool {
+        self.enabled && !self.broken.failing()
     }
 
     /// Record the failure of `claim`'s recovery. A failure that names no claim stays beside it.
@@ -623,6 +822,7 @@ impl Detector {
             tail_admission_waiting: false,
             claim_capped: false,
             held_move_failures: BTreeMap::new(),
+            broken: Backoff::default(),
         };
         detector.reconcile("startup")?;
         if !detector.enabled {
@@ -723,9 +923,6 @@ impl Detector {
         if let Owner::Tail(owner) = &mut self.owner {
             return match owner.attach(&path, &self.config, self.revision) {
                 Ok(()) => Ok(()),
-                Err(Error::Storage(error)) if fatal_storage(error.code) => {
-                    Err(Error::Storage(error))
-                }
                 Err(Error::FinishedGeneration(message)) => {
                     self.failure = Some(message.into());
                     Ok(())
@@ -977,7 +1174,7 @@ impl Detector {
     /// waiting for an event: a scan in progress or, with space to write, a tail backlog
     /// that holds a permit.
     fn busy(&self, space_ok: bool) -> bool {
-        self.enabled
+        self.live()
             && (!self.covered
                 || !self.todo.is_empty()
                 || self.scan.is_some()
@@ -988,7 +1185,7 @@ impl Detector {
 
     /// Whether a tail backlog waits for the shared operation budget.
     fn waits_for_permit(&self) -> bool {
-        self.enabled
+        self.live()
             && self.tail_admission_waiting
             && matches!(&self.owner, Owner::Tail(owner) if !owner.caught_up())
     }
@@ -997,6 +1194,9 @@ impl Detector {
     /// rescan and, when CLAIMS admits new reservations, the end of its first candidate's
     /// quiet interval, or now when candidate capacity freed for deferred inputs.
     fn due(&self, claims: bool) -> Option<Instant> {
+        if self.enabled && self.broken.failing() {
+            return self.broken.at.map(tokio::time::Instant::into_std);
+        }
         let claims = claims && !self.claim_capped;
         if !self.enabled || !self.covered || !self.todo.is_empty() || self.scan.is_some() {
             return None;
@@ -1090,14 +1290,10 @@ impl ConsumeWorker {
                 "configured watches omit an unfinished consumption journal; restore its watch before starting the consumer",
             ));
         }
-        let detectors = catalog
-            .watches()
-            .iter()
-            .cloned()
-            .map(|watch| Detector::open(store.clone(), watch, binding))
-            .collect::<Result<Vec<_>, _>>()?;
-        registry.update(&detectors, &pending)?;
-        commit_initial_catalog(&mut catalog, &store)?;
+        let (detectors, unopened) = open_detectors(&store, &catalog, binding);
+        registry.update(&detectors, &unopened, &pending)?;
+        let mut catalog_retry = Backoff::default();
+        commit_initial_catalog(&mut catalog, &store, &mut catalog_retry);
         let (controller, commands) = watch_admin::channel();
         let (stop, stopped) = tokio::sync::watch::channel(false);
         let (alive, ended) = tokio::sync::oneshot::channel();
@@ -1115,11 +1311,14 @@ impl ConsumeWorker {
                         &runtime,
                         run(
                             store,
-                            detectors,
+                            Roster {
+                                detectors,
+                                unopened,
+                            },
                             socket,
                             stopped,
                             registry,
-                            catalog,
+                            (catalog, catalog_retry),
                             Control {
                                 commands,
                                 operations,
@@ -1204,6 +1403,9 @@ impl Wake {
 struct Waiting<'a> {
     store: &'a Store,
     registry: &'a WatchRegistry,
+    unopened: &'a [Unopened],
+    /// The retries of the catalog writes, which wake the wait when due.
+    backoffs: [&'a Backoff; 2],
     stop: &'a mut tokio::sync::watch::Receiver<bool>,
     control: &'a mut Control,
     /// A command the wait received, handled first by the next pass.
@@ -1235,25 +1437,33 @@ async fn pause(
     }
     // The pass's own opens and reads below the roots queue events. Consume them now, so
     // they cannot end this wait and start a pass that queues more.
-    for detector in detectors.iter_mut().filter(|detector| detector.enabled) {
-        detector.drain()?;
+    for detector in detectors.iter_mut().filter(|detector| detector.live()) {
+        detector.attempt(Detector::drain);
     }
     // That drain may also have taken producer events from the pass: report what they
     // changed, and run again for any work they made due.
-    waiting
-        .registry
-        .update(detectors, &waiting.store.consumption_pending()?)?;
+    waiting.registry.update(
+        detectors,
+        waiting.unopened,
+        &waiting.store.consumption_pending()?,
+    )?;
     if detectors.iter().any(|detector| detector.busy(space_ok)) {
         tokio::task::yield_now().await;
         return Ok(());
     }
     wake.permit = wake.permit || (space_ok && detectors.iter().any(Detector::waits_for_permit));
+    for closed in waiting.unopened {
+        closed.retry.wake(&mut wake);
+    }
+    for backoff in waiting.backoffs {
+        backoff.wake(&mut wake);
+    }
     for at in detectors.iter().filter_map(|detector| detector.due(claims)) {
         wake.by(at);
     }
     let events = detectors
         .iter()
-        .filter(|detector| detector.enabled)
+        .filter(|detector| detector.live())
         .flat_map(Detector::descriptors)
         .map(|fd| tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE))
         .collect::<Result<Vec<_>, _>>()?;
@@ -1309,9 +1519,9 @@ fn admit(
         .map_or_else(|| operations.clone().try_acquire_owned(), Ok)
 }
 
+/// Why a command was refused; the caller receives the typed error and the worker goes on.
 enum AdminFailure {
     Refused(sparrow_core::Error),
-    Terminal(Error),
 }
 
 fn admit_handoff(
@@ -1322,7 +1532,7 @@ fn admit_handoff(
     let now = crate::now().map_err(AdminFailure::Refused)?;
     if let Some(original) = store
         .consumption_handoff_get(intent, now)
-        .map_err(storage_admission)?
+        .map_err(AdminFailure::Refused)?
     {
         return Ok(original);
     }
@@ -1362,51 +1572,12 @@ fn admit_handoff(
             now,
         )
         .map_err(|error| match error {
-            Error::Storage(error) => storage_admission(error),
+            Error::Storage(error) => AdminFailure::Refused(error),
             Error::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 AdminFailure::Refused(watch_admin::failure("NOT_FOUND", error))
             }
             error => AdminFailure::Refused(watch_admin::failure("CONFLICT", error)),
         })
-}
-
-/// Whether a store error code stops the watch worker and the daemon. A publication at or
-/// behind the archive watermark (a clock regression) was `STORAGE_FAILURE` before it had its own
-/// code for the UDP listener to restamp, and stays fatal here: only that listener handles it.
-fn fatal_storage(code: &str) -> bool {
-    matches!(code, "STORAGE_FAILURE" | sparrow_core::ARCHIVE_WATERMARK)
-}
-
-/// What recording a claim's pending attempt means for the worker: a fatal store error stops it,
-/// any other error is reported against the claim, and success reports nothing.
-fn pending_attempt_outcome<T>(
-    result: Result<T, sparrow_core::Error>,
-) -> Result<Option<sparrow_core::Error>, Error> {
-    match result {
-        Ok(_) => Ok(None),
-        Err(record) if fatal_storage(record.code) => Err(Error::Storage(record)),
-        Err(record) => Ok(Some(record)),
-    }
-}
-
-/// What one tail drain means for the worker: a fatal store error stops it, any other error is
-/// the watch's recorded failure, and success records nothing.
-fn tail_drain_outcome(result: Result<(), Error>) -> Result<Option<String>, Error> {
-    match result {
-        Ok(()) => Ok(None),
-        Err(Error::Storage(error)) if fatal_storage(error.code) => Err(Error::Storage(error)),
-        Err(error) => Ok(Some(
-            error.to_string().chars().take(FAILURE_CHARS).collect(),
-        )),
-    }
-}
-
-fn storage_admission(error: sparrow_core::Error) -> AdminFailure {
-    if fatal_storage(error.code) {
-        AdminFailure::Terminal(Error::Storage(error))
-    } else {
-        AdminFailure::Refused(error)
-    }
 }
 
 /// Retire one unrecoverable claim through the watch's own claim owner, which holds its
@@ -1436,7 +1607,7 @@ fn retire_claim(
             now,
         )
         .map_err(|error| match error {
-            Error::Storage(error) => storage_admission(error),
+            Error::Storage(error) => AdminFailure::Refused(error),
             Error::State(message) => {
                 AdminFailure::Refused(watch_admin::failure("CONFLICT", message))
             }
@@ -1461,12 +1632,15 @@ fn admit_tail_finish(
     detectors: &mut [Detector],
     intent: &sparrow_core::TailFinishIntent,
 ) -> Result<sparrow_core::TailGeneration, AdminFailure> {
-    if let Some(original) = store.tail_finish_get(intent).map_err(storage_admission)? {
+    if let Some(original) = store
+        .tail_finish_get(intent)
+        .map_err(AdminFailure::Refused)?
+    {
         return Ok(original);
     }
     let generation = store
         .tail_generation(&intent.generation_id)
-        .map_err(storage_admission)?;
+        .map_err(AdminFailure::Refused)?;
     let detector = detectors
         .iter_mut()
         .find(|watch| watch.config.id == generation.declaration.watch)
@@ -1493,7 +1667,7 @@ fn admit_tail_finish(
         )));
     };
     owner.finish(intent).map_err(|error| match error {
-        Error::Storage(error) => storage_admission(error),
+        Error::Storage(error) => AdminFailure::Refused(error),
         error => AdminFailure::Refused(watch_admin::failure("CONFLICT", error)),
     })
 }
@@ -1503,19 +1677,19 @@ fn acknowledge<T>(
     result: Result<T, AdminFailure>,
     store: &Store,
     registry: &WatchRegistry,
-    detectors: &[Detector],
+    roster: &Roster,
 ) -> Result<(), Error> {
     match result {
         Ok(value) => {
-            registry.update(detectors, &store.consumption_pending()?)?;
+            registry.update(
+                &roster.detectors,
+                &roster.unopened,
+                &store.consumption_pending()?,
+            )?;
             let _ = reply.send(Ok(value));
         }
         Err(AdminFailure::Refused(error)) => {
             let _ = reply.send(Err(error));
-        }
-        Err(AdminFailure::Terminal(error)) => {
-            let _ = reply.send(Err(watch_admin::failure("STORAGE_FAILURE", &error)));
-            return Err(error);
         }
     }
     Ok(())
@@ -1552,7 +1726,7 @@ fn administrate(
         && matches!(old.owner, Owner::Tail(_))
         && store
             .tail_generations(&old.config.id)
-            .map_err(storage_admission)?
+            .map_err(AdminFailure::Refused)?
             .iter()
             .any(|row| !row.complete && row.gap.is_none())
     {
@@ -1587,13 +1761,13 @@ fn administrate(
             );
         }
     }
-    // Catalog, stable receipt and old-writer fence share one durable DB batch.
-    // Any uncertain write is terminal: never keep admitting with stale authority.
+    // Catalog, stable receipt and old-writer fence share one durable DB batch. A refused write
+    // is the command's refusal: the in-memory catalog stays as stored, and a write whose
+    // outcome is uncertain fails the next compare-and-set instead of admitting with stale
+    // authority.
     next.persist(store).map_err(|error| match error {
-        Error::Storage(error) if matches!(error.code, "RESOURCE_LIMIT" | "STORAGE_PRESSURE") => {
-            AdminFailure::Refused(error)
-        }
-        error => AdminFailure::Terminal(error),
+        Error::Storage(error) => AdminFailure::Refused(error),
+        error => AdminFailure::Refused(watch_admin::failure("STORAGE_FAILURE", error)),
     })?;
     *catalog = next;
     if let Some(detector) = prepared {
@@ -1606,12 +1780,15 @@ fn administrate(
         detector.config = watch.definition.clone();
         detector.revision = watch.revision;
         detector.enabled = watch.enabled;
-        if watch.enabled {
-            detector
-                .reconcile("administrative update")
-                .map_err(AdminFailure::Terminal)?;
+        // The definition is stored; a root that cannot be read now parks this watch, which
+        // retries on its backoff, and does not undo the command.
+        let rebuilt = if watch.enabled {
+            detector.reconcile("administrative update")
         } else {
-            detector.pause().map_err(AdminFailure::Terminal)?;
+            detector.pause()
+        };
+        if let Err(error) = rebuilt {
+            detector.degrade(&error);
         }
     }
     detectors.retain(|detector| {
@@ -1630,163 +1807,368 @@ struct Control {
     outputs: crate::config::OutputPaths,
 }
 
-/// Store the catalog seeded from the configuration, once. A store over its maintenance reserve
-/// refuses the write with `STORAGE_PRESSURE`; that must not end the daemon, which has to come up
-/// to reclaim. The catalog stays unstored (`needs_initial_commit`) and the worker tries again on
-/// each pass; any other failure still ends the start.
-fn commit_initial_catalog(catalog: &mut Catalog, store: &Store) -> Result<(), Error> {
-    if !catalog.needs_initial_commit() {
-        return Ok(());
-    }
-    match catalog.persist(store) {
-        Err(Error::Storage(error)) if error.code == "STORAGE_PRESSURE" => {
-            eprintln!(
-                "sparrowd: watch catalog not stored yet: {}; retrying on each pass",
-                error.message
-            );
-            Ok(())
+/// Every watch the worker serves: those whose root is open, and those whose root could not
+/// be opened and is retried.
+struct Roster {
+    detectors: Vec<Detector>,
+    unopened: Vec<Unopened>,
+}
+
+impl Roster {
+    /// Align the roster with CATALOG after it changed: drop what the catalog no longer names,
+    /// and keep each unopened watch on its current definition.
+    fn sync(&mut self, catalog: &Catalog) {
+        let named = |id: &str| {
+            catalog
+                .watches()
+                .iter()
+                .any(|watch| watch.definition.id == id)
+        };
+        self.detectors.retain(|detector| named(&detector.config.id));
+        let detectors = &self.detectors;
+        self.unopened.retain(|closed| {
+            named(&closed.watch.definition.id)
+                && !detectors
+                    .iter()
+                    .any(|detector| detector.config.id == closed.watch.definition.id)
+        });
+        for closed in &mut self.unopened {
+            if let Some(current) = catalog
+                .watches()
+                .iter()
+                .find(|watch| watch.definition.id == closed.watch.definition.id)
+            {
+                closed.watch = current.clone();
+            }
         }
-        result => result,
+    }
+
+    /// Open again each unopened watch whose retry is due. A root that is still missing,
+    /// unreadable or replaced stays unopened (a replacement is refused by the same checks as
+    /// at start, and pending claims stay bound to the original root); the exact root restored
+    /// opens it and the watch resumes.
+    fn reopen(&mut self, store: &Store, binding: RootBinding) {
+        for closed in std::mem::take(&mut self.unopened) {
+            let mut closed = closed;
+            if !closed.retry.due() {
+                self.unopened.push(closed);
+                continue;
+            }
+            let what = format!("watch={} open", closed.watch.definition.id);
+            match Detector::open(store.clone(), closed.watch.clone(), binding) {
+                Ok(detector) => {
+                    closed.retry.recovered(&what);
+                    self.detectors.push(detector);
+                }
+                Err(error) => {
+                    closed.retry.failed(
+                        &what,
+                        error.to_string().chars().take(FAILURE_CHARS).collect(),
+                    );
+                    self.unopened.push(closed);
+                }
+            }
+        }
     }
 }
 
+/// Store the catalog seeded from the configuration, once. A refused write, `STORAGE_PRESSURE`
+/// from a store over its maintenance reserve included, must not end the daemon, which has to
+/// come up to reclaim. The catalog stays unstored (`needs_initial_commit`), the failure is
+/// journaled, and the worker tries again on the backoff until the write succeeds.
+fn commit_initial_catalog(catalog: &mut Catalog, store: &Store, retry: &mut Backoff) {
+    if !catalog.needs_initial_commit() || !retry.due() {
+        return;
+    }
+    match catalog.persist(store) {
+        Ok(()) => retry.recovered("watch catalog store"),
+        Err(error) => retry.failed("watch catalog store", error.to_string()),
+    }
+}
+
+/// What one worker pass asks the loop to do next.
+enum Flow {
+    Next,
+    Stop,
+}
+
+/// Run the worker until stop is requested. A failure the pass cannot attribute to one claim or
+/// one watch (the store refusing reads or writes, a latched store, a closed budget) does not
+/// end the worker: it is journaled, reported on every watch's status, answered to any waiting
+/// command, and the pass runs again on the backoff, so a store that becomes healthy again
+/// resumes the work with its claims and retry clocks intact.
 async fn run(
     store: Store,
-    mut detectors: Vec<Detector>,
+    mut roster: Roster,
     socket: PathBuf,
     mut stop: tokio::sync::watch::Receiver<bool>,
     registry: WatchRegistry,
-    mut catalog: Catalog,
+    (mut catalog, mut catalog_retry): (Catalog, Backoff),
     mut control: Control,
 ) -> Result<(), Error> {
-    // The consume connection and when it was opened; the daemon's lease runs from there.
-    let mut client: Option<(Client, Instant)> = None;
-    // Next attempt, consecutive failures, best progress and shared parts per pending claim.
-    let mut retry = BTreeMap::<String, ClaimRetry>::new();
-    let mut connect_after = Instant::now();
-    // How far the retired-claim record's fill was last logged this run (`note_retired`).
-    let mut retired_logged = RetiredFill::Below;
-    note_retired(&store, &mut retired_logged)?;
-    // A command or a permit the last wait received, for this pass.
+    let mut failing = Backoff::default();
+    // A command a failed pass left unanswered.
     let mut received = None;
-    let mut permit = None;
-    // The floor's resume edge wakes a paused worker; unsubscribed when the worker returns.
-    let resumed = Arc::new(tokio::sync::Notify::new());
-    let _resume = store.space_floor().subscribe_resume(Arc::new({
-        let resumed = Arc::clone(&resumed);
-        move || resumed.notify_one()
-    }));
+    let mut state = PassState::new(&store);
     while !*stop.borrow() {
-        #[cfg(test)]
-        tests::PASSES.with(|passes| passes.set(passes.get() + 1));
-        let mut wake = Wake::default();
-        // Below the free-space floor every write is refused: keep observing, write nothing.
-        // The worker observes through the floor's ledger, so the pause it sees is recorded and
-        // the edge that ends it is signalled to `resumed` by whichever duty sees it end (the
-        // daemon's one-second floor observation catches free space returning from outside).
-        // No timer waits for it.
-        let space_ok = store.space_floor().observe(crate::now()?)?.is_none();
-        wake.resume = !space_ok;
-        if space_ok {
-            commit_initial_catalog(&mut catalog, &store)?;
-        }
-        let pending = store.consumption_pending()?;
-        if space_ok {
-            match catalog.retire_and_store(&pending, |next| next.persist(&store))? {
-                Retirement::Nothing => {}
-                Retirement::Stored => detectors.retain(|detector| {
-                    catalog
-                        .watches()
-                        .iter()
-                        .any(|watch| watch.definition.id == detector.config.id)
-                }),
-                Retirement::Deferred(reason) => eprintln!(
-                    "sparrowd: watch retirement not stored yet: {reason}; retrying on each pass"
-                ),
+        let outcome = pass(
+            &store,
+            &mut roster,
+            &socket,
+            &mut stop,
+            &registry,
+            (&mut catalog, &mut catalog_retry),
+            &mut control,
+            &mut received,
+            &mut state,
+        )
+        .await;
+        match outcome {
+            Ok(Flow::Next) => {
+                if failing.failing() {
+                    failing.recovered("consume worker");
+                    registry.note_worker_failure(None);
+                }
+            }
+            Ok(Flow::Stop) => break,
+            Err(error) => {
+                let text: String = error.to_string().chars().take(FAILURE_CHARS).collect();
+                registry.note_worker_failure(Some(text.clone()));
+                failing.failed("consume worker pass", text);
+                // A command that waits for this pass is answered at once with the failure.
+                while let Ok(command) = control.commands.try_recv() {
+                    refuse_command(command, &error);
+                }
+                if let Some(command) = received.take() {
+                    refuse_command(command, &error);
+                }
+                let mut wake = Wake::default();
+                failing.wake(&mut wake);
+                let at = wake.at.map(tokio::time::Instant::from_std);
+                tokio::select! {
+                    () = stopped(&mut stop) => {}
+                    command = control.commands.recv() => match command {
+                        Some(command) => refuse_command(command, &error),
+                        None => return Err(Error::State(
+                            "watch administration channel closed unexpectedly",
+                        )),
+                    },
+                    () = async {
+                        match at {
+                            Some(at) => tokio::time::sleep_until(at).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {}
+                }
             }
         }
-        for _ in 0..watch_admin::MAX_WATCH_COMMANDS {
-            let command = match received
-                .take()
-                .map_or_else(|| control.commands.try_recv(), Ok)
-            {
-                Ok(command) => command,
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    return Err(Error::State(
-                        "watch administration channel closed unexpectedly",
-                    ));
-                }
-            };
-            match command {
-                watch_admin::Command::Mutation { mut action, reply } => {
-                    let pending = store.consumption_pending()?;
-                    let rebound = match (&control.private, &mut action) {
-                        (Some(intake), Action::Put { definition, .. }) => intake
-                            .rebind(definition)
-                            .map_err(|error| {
-                                AdminFailure::Refused(watch_admin::failure(
-                                    "INVALID_ARGUMENT",
-                                    error,
-                                ))
-                            })
-                            .and_then(|configured| {
-                                catalog
-                                    .admit_private_root(
-                                        &definition.id,
-                                        &definition.root,
-                                        &configured,
-                                    )
-                                    .map_err(AdminFailure::Refused)?;
-                                Ok(Some((definition.root.clone(), configured)))
-                            }),
-                        _ => Ok(None),
-                    };
-                    let result = rebound.and_then(|rebound| {
-                        // The put persists the root it was given, which a failed put forgets.
-                        let previous = rebound.map(|(private, configured)| {
-                            let prior = catalog.remember_root(private.clone(), configured);
-                            (private, prior)
-                        });
-                        administrate(
-                            &store,
-                            &mut catalog,
-                            &mut detectors,
-                            action,
-                            &pending,
-                            PrivateIntake::binding(control.private.as_ref()),
-                            &control.outputs,
-                        )
-                        .inspect_err(|_| {
-                            if let Some((private, previous)) = previous {
-                                catalog.restore_root(private, previous);
-                            }
-                        })
-                    });
-                    acknowledge(reply, result, &store, &registry, &detectors)?;
-                }
-                watch_admin::Command::Handoff { intent, reply } => {
-                    let result = admit_handoff(&store, &detectors, &intent);
-                    acknowledge(reply, result, &store, &registry, &detectors)?;
-                }
-                watch_admin::Command::TailFinish { intent, reply } => {
-                    let result = admit_tail_finish(&store, &mut detectors, &intent);
-                    acknowledge(reply, result, &store, &registry, &detectors)?;
-                }
-                watch_admin::Command::RetireClaim { retirement, reply } => {
-                    let result = retire_claim(&mut detectors, &retirement);
-                    if result.is_ok() {
-                        retry.remove(&retirement.claim);
-                        note_retired(&store, &mut retired_logged)?;
+    }
+    Ok(())
+}
+
+/// Answer COMMAND with ERROR: the worker is failing and cannot act on it now. A store error
+/// keeps its own code, so the caller sees what the store said.
+fn refuse_command(command: watch_admin::Command, error: &Error) {
+    let refusal = match error {
+        Error::Storage(error) => error.clone(),
+        error => watch_admin::failure("STORAGE_FAILURE", error),
+    };
+    match command {
+        watch_admin::Command::Mutation { reply, .. } => drop(reply.send(Err(refusal))),
+        watch_admin::Command::Handoff { reply, .. } => drop(reply.send(Err(refusal))),
+        watch_admin::Command::TailFinish { reply, .. } => drop(reply.send(Err(refusal))),
+        watch_admin::Command::RetireClaim { reply, .. } => drop(reply.send(Err(refusal))),
+    }
+}
+
+/// What the worker keeps across passes, failed ones included.
+struct PassState {
+    /// The consume connection and when it was opened; the daemon's lease runs from there.
+    client: Option<(Client, Instant)>,
+    /// Next attempt, consecutive failures, best progress and shared parts per pending claim.
+    retry: BTreeMap<String, ClaimRetry>,
+    connect_after: Instant,
+    /// How far the retired-claim record's fill was last logged this run (`note_retired`);
+    /// None until the first pass reads it.
+    retired_logged: Option<RetiredFill>,
+    /// A permit the last wait acquired, used by the next pass.
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// The floor's resume edge wakes a paused worker.
+    resumed: Arc<tokio::sync::Notify>,
+    /// Unsubscribes the resume edge when the worker returns.
+    _resume: sparrow_core::ResumeSubscription,
+    /// Retries of the catalog retirement write.
+    retirement: Backoff,
+}
+
+impl PassState {
+    fn new(store: &Store) -> Self {
+        let resumed = Arc::new(tokio::sync::Notify::new());
+        let resume = store.space_floor().subscribe_resume(Arc::new({
+            let resumed = Arc::clone(&resumed);
+            move || resumed.notify_one()
+        }));
+        Self {
+            client: None,
+            retry: BTreeMap::new(),
+            connect_after: Instant::now(),
+            retired_logged: None,
+            permit: None,
+            resumed,
+            _resume: resume,
+            retirement: Backoff::default(),
+        }
+    }
+}
+
+/// One pass of the worker. A returned error belongs to no one claim or watch.
+#[allow(clippy::too_many_arguments)]
+async fn pass(
+    store: &Store,
+    roster: &mut Roster,
+    socket: &Path,
+    stop: &mut tokio::sync::watch::Receiver<bool>,
+    registry: &WatchRegistry,
+    (catalog, catalog_retry): (&mut Catalog, &mut Backoff),
+    control: &mut Control,
+    received: &mut Option<watch_admin::Command>,
+    state: &mut PassState,
+) -> Result<Flow, Error> {
+    let PassState {
+        client,
+        retry,
+        connect_after,
+        retired_logged,
+        permit,
+        resumed,
+        retirement: retirement_retry,
+        ..
+    } = state;
+    let binding = PrivateIntake::binding(control.private.as_ref());
+    #[cfg(test)]
+    tests::PASSES.with(|passes| passes.set(passes.get() + 1));
+    let mut wake = Wake::default();
+    // Below the free-space floor every write is refused: keep observing, write nothing.
+    // The worker observes through the floor's ledger, so the pause it sees is recorded and
+    // the edge that ends it is signalled to `resumed` by whichever duty sees it end (the
+    // daemon's one-second floor observation catches free space returning from outside).
+    // No timer waits for it.
+    let space_ok = store.space_floor().observe(crate::now()?)?.is_none();
+    wake.resume = !space_ok;
+    if retired_logged.is_none() {
+        let mut fill = RetiredFill::Below;
+        note_retired(store, &mut fill)?;
+        *retired_logged = Some(fill);
+    }
+    roster.reopen(store, binding);
+    if space_ok {
+        commit_initial_catalog(catalog, store, catalog_retry);
+    }
+    catalog_retry.wake(&mut wake);
+    let pending = store.consumption_pending()?;
+    if space_ok && retirement_retry.due() {
+        match catalog.retire_and_store(&pending, |next| next.persist(store)) {
+            Ok(Retirement::Nothing) => retirement_retry.recovered("watch retirement store"),
+            Ok(Retirement::Stored) => {
+                retirement_retry.recovered("watch retirement store");
+                roster.sync(catalog);
+            }
+            Ok(Retirement::Deferred(reason)) => {
+                retirement_retry.failed("watch retirement store", reason);
+            }
+            Err(error) => retirement_retry.failed("watch retirement store", error.to_string()),
+        }
+    }
+    retirement_retry.wake(&mut wake);
+    for _ in 0..watch_admin::MAX_WATCH_COMMANDS {
+        let command = match received
+            .take()
+            .map_or_else(|| control.commands.try_recv(), Ok)
+        {
+            Ok(command) => command,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                return Err(Error::State(
+                    "watch administration channel closed unexpectedly",
+                ));
+            }
+        };
+        match command {
+            watch_admin::Command::Mutation { mut action, reply } => {
+                let pending = match store.consumption_pending() {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        let _ = reply.send(Err(error.clone()));
+                        return Err(error.into());
                     }
-                    acknowledge(reply, result, &store, &registry, &detectors)?;
+                };
+                let rebound = match (&control.private, &mut action) {
+                    (Some(intake), Action::Put { definition, .. }) => intake
+                        .rebind(definition)
+                        .map_err(|error| {
+                            AdminFailure::Refused(watch_admin::failure("INVALID_ARGUMENT", error))
+                        })
+                        .and_then(|configured| {
+                            catalog
+                                .admit_private_root(&definition.id, &definition.root, &configured)
+                                .map_err(AdminFailure::Refused)?;
+                            Ok(Some((definition.root.clone(), configured)))
+                        }),
+                    _ => Ok(None),
+                };
+                let result = rebound.and_then(|rebound| {
+                    // The put persists the root it was given, which a failed put forgets.
+                    let previous = rebound.map(|(private, configured)| {
+                        let prior = catalog.remember_root(private.clone(), configured);
+                        (private, prior)
+                    });
+                    administrate(
+                        store,
+                        catalog,
+                        &mut roster.detectors,
+                        action,
+                        &pending,
+                        PrivateIntake::binding(control.private.as_ref()),
+                        &control.outputs,
+                    )
+                    .inspect_err(|_| {
+                        if let Some((private, previous)) = previous {
+                            catalog.restore_root(private, previous);
+                        }
+                    })
+                });
+                if result.is_ok() {
+                    roster.sync(catalog);
                 }
+                acknowledge(reply, result, store, registry, roster)?;
+            }
+            watch_admin::Command::Handoff { intent, reply } => {
+                let result = admit_handoff(store, &roster.detectors, &intent);
+                acknowledge(reply, result, store, registry, roster)?;
+            }
+            watch_admin::Command::TailFinish { intent, reply } => {
+                let result = admit_tail_finish(store, &mut roster.detectors, &intent);
+                acknowledge(reply, result, store, registry, roster)?;
+            }
+            watch_admin::Command::RetireClaim { retirement, reply } => {
+                let result = retire_claim(&mut roster.detectors, &retirement);
+                if result.is_ok() {
+                    retry.remove(&retirement.claim);
+                    if let Some(fill) = retired_logged.as_mut() {
+                        note_retired(store, fill)?;
+                    }
+                }
+                acknowledge(reply, result, store, registry, roster)?;
             }
         }
-        for detector in &mut detectors {
-            if !detector.enabled {
-                continue;
-            }
+    }
+    for detector in &mut roster.detectors {
+        // A parked watch is rebuilt when its backoff is due, and skipped until then: its
+        // failure never stops another watch.
+        if !detector.enabled || !detector.resume() {
+            continue;
+        }
+        let swept = detector.attempt(|detector| {
             detector.drain()?;
             if detector.covered
                 && detector.todo.is_empty()
@@ -1796,360 +2178,376 @@ async fn run(
                 detector.rescan("periodic scan")?;
             }
             detector.scan_step()?;
-            detector.drain()?;
-            if !space_ok {
-                continue;
-            }
-            if let Owner::Tail(owner) = &mut detector.owner {
-                // A caught-up owner has nothing to capture until an event, so needs no permit.
-                if owner.caught_up() {
-                    detector.tail_admission_waiting = false;
-                    continue;
-                }
-                let _permit = match admit(&control.operations, &mut permit) {
-                    Ok(permit) => {
-                        detector.tail_admission_waiting = false;
-                        permit
-                    }
-                    Err(tokio::sync::TryAcquireError::NoPermits) => {
-                        detector.tail_admission_waiting = true;
-                        continue;
-                    }
-                    Err(tokio::sync::TryAcquireError::Closed) => {
-                        return Err(Error::State("tail operation budget closed unexpectedly"));
-                    }
-                };
-                if let Some(failure) = tail_drain_outcome(owner.drain())? {
-                    detector.failure = Some(failure);
-                }
-            }
-        }
-        let pending = store.consumption_pending()?;
-        registry.update(&detectors, &pending)?;
-        let busy = detectors.iter().any(|detector| detector.busy(space_ok));
-        let waiting = Waiting {
-            store: &store,
-            registry: &registry,
-            stop: &mut stop,
-            control: &mut control,
-            received: &mut received,
-            permit: &mut permit,
-            resumed: &resumed,
-        };
-        if !space_ok
-            || detectors.is_empty()
-            || (pending.is_empty()
-                && detectors
-                    .iter()
-                    .all(|detector| matches!(detector.owner, Owner::Tail(_))))
-        {
-            pause(waiting, &mut detectors, space_ok, busy, false, wake).await?;
+            detector.drain()
+        });
+        if swept.is_none() || !space_ok {
             continue;
         }
-        retry.retain(|id, _| pending.iter().any(|journal| journal.import_id == *id));
-        // Claims that a publish hold holds are kept in flight, as an interrupted claim is; the
-        // publish pick below skips them until the hold clears.
-        for detector in detectors
-            .iter_mut()
-            .filter(|detector| detector.config.publish_hold)
-        {
-            let held = pending
-                .iter()
-                .filter(|journal| journal.watch == detector.config.id && journal.tail.is_none())
-                .map(|journal| journal.import_id.clone())
-                .collect::<Vec<_>>();
-            detector
-                .held_move_failures
-                .retain(|id, _| held.contains(id));
-            for id in held {
-                detector.move_held_claim(&store, &id)?;
+        let mut drained: Option<Error> = None;
+        if let Owner::Tail(owner) = &mut detector.owner {
+            // A caught-up owner has nothing to capture until an event, so needs no permit.
+            if owner.caught_up() {
+                detector.tail_admission_waiting = false;
+                continue;
             }
+            let _permit = match admit(&control.operations, permit) {
+                Ok(permit) => {
+                    detector.tail_admission_waiting = false;
+                    permit
+                }
+                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                    detector.tail_admission_waiting = true;
+                    continue;
+                }
+                Err(tokio::sync::TryAcquireError::Closed) => {
+                    return Err(Error::State("tail operation budget closed unexpectedly"));
+                }
+            };
+            drained = owner.drain().err();
         }
-        let mut work = publishable(&pending, &detectors, |id| {
-            retry.get(id).is_none_or(|entry| entry.at <= Instant::now())
-        })
-        // A failed ordinary upload connection must not block checkpoint
-        // acknowledgement, which has no transport dependency.
-        .min_by_key(|journal| journal.tail.is_none())
-        .map(|journal| {
-            (
-                journal.watch.clone(),
-                journal.import_id.clone(),
-                journal.tail.is_some(),
-            )
-        });
-        let claims = work.is_none() && pending.len() < sparrow_core::MAX_CONSUMPTION_JOURNALS;
-        let (mut floor_wait, mut floor_ended) = (false, false);
-        if claims {
-            for detector in &mut detectors {
-                if !detector.enabled {
-                    continue;
+        // The next pass drains again once the watch is rebuilt on its backoff.
+        if let Some(error) = drained {
+            detector.degrade(&error);
+        }
+    }
+    let detectors = &mut roster.detectors;
+    let pending = store.consumption_pending()?;
+    registry.update(detectors, &roster.unopened, &pending)?;
+    let busy = detectors.iter().any(|detector| detector.busy(space_ok));
+    let waiting = Waiting {
+        store,
+        registry,
+        unopened: &roster.unopened,
+        backoffs: [&*catalog_retry, &*retirement_retry],
+        stop: &mut *stop,
+        control: &mut *control,
+        received: &mut *received,
+        permit: &mut *permit,
+        resumed,
+    };
+    if !space_ok
+        || detectors.is_empty()
+        || (pending.is_empty()
+            && detectors
+                .iter()
+                .all(|detector| matches!(detector.owner, Owner::Tail(_))))
+    {
+        pause(waiting, detectors, space_ok, busy, false, wake).await?;
+        return Ok(Flow::Next);
+    }
+    retry.retain(|id, _| pending.iter().any(|journal| journal.import_id == *id));
+    // Claims that a publish hold holds are kept in flight, as an interrupted claim is; the
+    // publish pick below skips them until the hold clears.
+    for detector in detectors
+        .iter_mut()
+        .filter(|detector| detector.config.publish_hold)
+    {
+        let held = pending
+            .iter()
+            .filter(|journal| journal.watch == detector.config.id && journal.tail.is_none())
+            .map(|journal| journal.import_id.clone())
+            .collect::<Vec<_>>();
+        detector
+            .held_move_failures
+            .retain(|id, _| held.contains(id));
+        for id in held {
+            let _ = detector.attempt(|detector| detector.move_held_claim(store, &id));
+        }
+    }
+    let mut work = publishable(&pending, detectors, |id| {
+        retry.get(id).is_none_or(|entry| entry.at <= Instant::now())
+    })
+    // A failed ordinary upload connection must not block checkpoint
+    // acknowledgement, which has no transport dependency.
+    .min_by_key(|journal| journal.tail.is_none())
+    .map(|journal| {
+        (
+            journal.watch.clone(),
+            journal.import_id.clone(),
+            journal.tail.is_some(),
+        )
+    });
+    let claims = work.is_none() && pending.len() < sparrow_core::MAX_CONSUMPTION_JOURNALS;
+    let (mut floor_wait, mut floor_ended) = (false, false);
+    if claims {
+        for detector in detectors.iter_mut() {
+            if !detector.live() {
+                continue;
+            }
+            // A held watch past its share stays unclaimed, and the next watch is tried:
+            // one watch's pause never stops another watch or a tail generation.
+            detector.claim_capped =
+                detector.config.publish_hold && !held_may_claim(&detector.config.id, &pending);
+            if detector.claim_capped {
+                continue;
+            }
+            let Some(ready) = detector.attempt(Detector::ready) else {
+                continue;
+            };
+            if let Some((path, identity)) = ready {
+                if *waiting.stop.borrow() {
+                    break;
                 }
-                // A held watch past its share stays unclaimed, and the next watch is tried:
-                // one watch's pause never stops another watch or a tail generation.
-                detector.claim_capped =
-                    detector.config.publish_hold && !held_may_claim(&detector.config.id, &pending);
-                if detector.claim_capped {
-                    continue;
-                }
-                if let Some((path, identity)) = detector.ready()? {
-                    if *waiting.stop.borrow() {
-                        break;
-                    }
-                    match detector.owner.claim()?.reserve(
+                let reserved = detector.owner.claim().and_then(|owner| {
+                    owner.reserve(
                         &path,
                         identity,
                         &detector.config.source,
                         &detector.config.format,
-                    ) {
-                        Ok(journal) => {
-                            detector.candidates.remove(&path);
-                            // Under a publish hold the claim is moved in flight now and not published.
-                            if detector.config.publish_hold {
-                                detector.move_held_claim(&store, &journal.import_id)?;
-                            } else {
-                                work = Some((detector.config.id.clone(), journal.import_id, false));
-                            }
-                        }
-                        Err(error) => {
-                            // A floor refusal records the pause now, so this pass waits on its
-                            // resume edge; an edge that already fired runs the next pass at once.
-                            if let crate::consumption::Error::Storage(storage) = &error
-                                && storage.is_free_space_floor()
-                            {
-                                match store.space_floor().observe(crate::now()?)? {
-                                    Some(_) => floor_wait = true,
-                                    None => floor_ended = true,
-                                }
-                            }
-                            detector.failure =
-                                Some(error.to_string().chars().take(FAILURE_CHARS).collect());
-                            eprintln!(
-                                "sparrowd: watch={} reservation refused for {:?}: {error}",
-                                detector.config.id, path
-                            );
-                            detector.candidate(path, true)?;
+                    )
+                });
+                match reserved {
+                    Ok(journal) => {
+                        detector.candidates.remove(&path);
+                        // Under a publish hold the claim is moved in flight now and not published.
+                        if detector.config.publish_hold {
+                            let _ = detector.attempt(|detector| {
+                                detector.move_held_claim(store, &journal.import_id)
+                            });
+                        } else {
+                            work = Some((detector.config.id.clone(), journal.import_id, false));
                         }
                     }
-                    break;
+                    Err(error) => {
+                        // A floor refusal records the pause now, so this pass waits on its
+                        // resume edge; an edge that already fired runs the next pass at once.
+                        if let crate::consumption::Error::Storage(storage) = &error
+                            && storage.is_free_space_floor()
+                        {
+                            match store.space_floor().observe(crate::now()?)? {
+                                Some(_) => floor_wait = true,
+                                None => floor_ended = true,
+                            }
+                        }
+                        detector.failure =
+                            Some(error.to_string().chars().take(FAILURE_CHARS).collect());
+                        eprintln!(
+                            "sparrowd: watch={} reservation refused for {:?}: {error}",
+                            detector.config.id, path
+                        );
+                        let _ = detector.attempt(|detector| detector.candidate(path, true));
+                    }
                 }
-                // A tail watch never fills `candidates`, so capacity is never what a refused
-                // attach waits for; its periodic reconcile is the retry.
-                if detector.covered
-                    && detector.deferred
-                    && !matches!(detector.owner, Owner::Tail(_))
-                    && detector.todo.is_empty()
-                    && detector.scan.is_none()
-                    && detector.candidates.len() < detector.config.max_candidates
-                {
-                    detector.rescan("deferred candidate capacity available")?;
-                }
+                break;
+            }
+            // A tail watch never fills `candidates`, so capacity is never what a refused
+            // attach waits for; its periodic reconcile is the retry.
+            if detector.covered
+                && detector.deferred
+                && !matches!(detector.owner, Owner::Tail(_))
+                && detector.todo.is_empty()
+                && detector.scan.is_none()
+                && detector.candidates.len() < detector.config.max_candidates
+            {
+                let _ = detector
+                    .attempt(|detector| detector.rescan("deferred candidate capacity available"));
             }
         }
-        if let Some((watch, id, is_tail)) = work {
-            let roots = detectors
-                .iter()
-                .map(|detector| detector.config.root.clone())
-                .collect::<Vec<_>>();
-            // The entry exists before the first attempt, so the attempt has a cache and a mark.
-            let attempt = Arc::clone(
-                &retry
-                    .entry(id.clone())
-                    .or_insert_with(ClaimRetry::due)
-                    .attempt,
-            );
-            attempt.progress.restart();
-            if !is_tail && retry.get(&id).is_some_and(|entry| entry.refusal.is_some()) {
-                let detector = detectors
-                    .iter_mut()
-                    .find(|detector| detector.config.id == watch)
-                    .ok_or(Error::State(
-                        "pending consumption journal has no configured watch owner",
-                    ))?;
-                let refusal = retry
-                    .get(&id)
-                    .and_then(|entry| entry.refusal.clone())
-                    .ok_or(Error::State("refused claim lost its refusal"))?;
-                if quarantine_claim(detector, &roots, &id, &refusal)? {
-                    note_retired(&store, &mut retired_logged)?;
-                    retry.remove(&id);
-                } else {
-                    retry
-                        .entry(id)
-                        .or_insert_with(ClaimRetry::due)
-                        .failed(ProgressMark::default(), false);
-                }
-                tokio::task::yield_now().await;
-                continue;
-            }
-            if !is_tail {
-                // A permit the last wait acquired for a tail drain is not held through an
-                // ordinary connection or publication.
-                *waiting.permit = None;
-                // Replace a connection the lease would cut during this publication.
-                if client.as_ref().is_some_and(|(_, opened)| {
-                    opened.elapsed() + PUBLICATION_DEADLINE > crate::transport::CONNECTION_LEASE
-                }) {
-                    client = None;
-                }
-                if client.is_none() && Instant::now() >= connect_after {
-                    let opened = Instant::now();
-                    tokio::select! {
-                        () = stopped(waiting.stop) => break,
-                        result = tokio::time::timeout(Duration::from_secs(10), Client::connect(&socket)) => {
-                            match result {
-                                Ok(Ok(connected)) => client = Some((connected, opened)),
-                                Ok(Err(error)) => eprintln!("sparrowd: consume RPC discovery failed: {error}"),
-                                Err(_) => eprintln!("sparrowd: consume RPC discovery timed out; sources remain owned"),
-                            }
-                            connect_after = Instant::now() + CONNECT_RETRY;
-                        }
-                    }
-                }
-                if client.is_none() {
-                    // Every other due claim waits behind this one, so only later retries
-                    // and the next connection attempt can bring new work.
-                    wake.by(connect_after);
-                    blocked(&retry, &mut wake);
-                    pause(waiting, &mut detectors, space_ok, busy, false, wake).await?;
-                    continue;
-                }
-            }
-            let _permit = if is_tail {
-                match admit(&waiting.control.operations, waiting.permit) {
-                    Ok(permit) => Some(permit),
-                    Err(tokio::sync::TryAcquireError::NoPermits) => {
-                        wake.permit = true;
-                        blocked(&retry, &mut wake);
-                        pause(waiting, &mut detectors, space_ok, busy, false, wake).await?;
-                        continue;
-                    }
-                    Err(tokio::sync::TryAcquireError::Closed) => {
-                        return Err(Error::State(
-                            "tail claim operation budget closed unexpectedly",
-                        ));
-                    }
-                }
-            } else {
-                None
-            };
+    }
+    if let Some((watch, id, is_tail)) = work {
+        let roots = detectors
+            .iter()
+            .map(|detector| detector.config.root.clone())
+            .collect::<Vec<_>>();
+        // The entry exists before the first attempt, so the attempt has a cache and a mark.
+        let attempt = Arc::clone(
+            &retry
+                .entry(id.clone())
+                .or_insert_with(ClaimRetry::due)
+                .attempt,
+        );
+        attempt.progress.restart();
+        if !is_tail && retry.get(&id).is_some_and(|entry| entry.refusal.is_some()) {
             let detector = detectors
                 .iter_mut()
                 .find(|detector| detector.config.id == watch)
                 .ok_or(Error::State(
                     "pending consumption journal has no configured watch owner",
                 ))?;
-            let operation = async {
-                if let Recovery::Claimed(mut claimed) =
-                    detector.owner.claim()?.recover(&id, crate::now()?)?
-                {
-                    if is_tail {
-                        detector.owner.claim()?.publish_tail(&mut claimed)?;
-                    } else {
-                        detector
-                            .owner
-                            .claim()?
-                            .publish(
-                                &client
-                                    .as_ref()
-                                    .ok_or(Error::State("consume RPC connection absent"))?
-                                    .0,
-                                &mut claimed,
-                                &attempt,
-                            )
-                            .await?;
-                    }
-                    detector.owner.claim()?.remove(&claimed, crate::now()?)?;
+            let refusal = retry
+                .get(&id)
+                .and_then(|entry| entry.refusal.clone())
+                .ok_or(Error::State("refused claim lost its refusal"))?;
+            if quarantine_claim(detector, &roots, &id, &refusal)? {
+                if let Some(fill) = retired_logged.as_mut() {
+                    note_retired(store, fill)?;
                 }
-                Ok::<_, Error>(())
-            };
-            let result = tokio::select! {
-                () = stopped(waiting.stop) => break,
-                result = tokio::time::timeout(PUBLICATION_DEADLINE, operation) => result.unwrap_or(Err(Error::State("consume publication deadline expired; retain the original journal and retry"))),
-            };
-            if let Err(error) = result {
-                // The counts lead the text, which the journal keeps by prefix; the deadline
-                // text cannot carry them, because the dropped attempt cannot add them.
-                let text = if is_tail {
-                    error.to_string()
-                } else {
-                    format!("{}: {error}", attempt.progress.summary())
-                };
-                // Name the claim, so an operator can act on it (retire-claim takes its ID).
-                detector.fail_claim(&id, format!("claim {id}: {text}"));
-                eprintln!("sparrowd: watch={watch} claim={id} pending: {text}");
-                // The claim's durable history answers `watch claims` after any restart.
-                if let Some(record) = pending_attempt_outcome(store.consumption_attempt_pending(
-                    &id,
-                    &text,
-                    crate::now()?,
-                ))? {
-                    eprintln!(
-                        "sparrowd: watch={watch} claim={id} pending attempt not recorded: {record}"
-                    );
-                    detector.fail_claim(
-                        &id,
-                        format!("claim {id}: {text}; attempt not recorded: {record}"),
-                    );
-                }
-                let floor =
-                    floor_class(&error) && store.space_floor().observe(crate::now()?)?.is_some();
-                let refusal = if is_tail {
-                    None
-                } else {
-                    match Refusal::of(&error) {
-                        Some(refusal) => Some(refusal),
-                        // An earlier run may have moved the source and stopped before it
-                        // retired the claim; its refusal is on file beside the source.
-                        None => match detector.owner.claim()?.interrupted_quarantine(
-                            &detector.config.root,
-                            &roots,
-                            &id,
-                        ) {
-                            Ok(found) => found,
-                            Err(error) => {
-                                eprintln!(
-                                    "sparrowd: watch={watch} claim={id} quarantine record unreadable: {error}"
-                                );
-                                None
-                            }
-                        },
-                    }
-                };
-                let entry = retry.entry(id).or_insert_with(ClaimRetry::due);
-                entry.failed(attempt.progress.mark(), floor);
-                if refusal.is_some() {
-                    // Settle it on the next pass: no further upload of this claim.
-                    entry.at = Instant::now();
-                    entry.refusal = refusal;
-                }
-                if !is_tail {
-                    client = None;
-                }
+                retry.remove(&id);
             } else {
-                detector.record_claim_success(&id);
+                retry
+                    .entry(id)
+                    .or_insert_with(ClaimRetry::due)
+                    .failed(ProgressMark::default(), false);
             }
-            if let Some(index) = detectors
-                .iter()
-                .position(|detector| detector.config.id == watch)
-            {
-                detectors.rotate_left(index + 1);
-            }
-            // Re-evaluate at once after a claim.
             tokio::task::yield_now().await;
-            continue;
+            return Ok(Flow::Next);
         }
-        if floor_ended {
-            // The floor ended between the refusal and its observation: run again at once.
-            continue;
+        if !is_tail {
+            // A permit the last wait acquired for a tail drain is not held through an
+            // ordinary connection or publication.
+            *waiting.permit = None;
+            // Replace a connection the lease would cut during this publication.
+            if client.as_ref().is_some_and(|(_, opened)| {
+                opened.elapsed() + PUBLICATION_DEADLINE > crate::transport::CONNECTION_LEASE
+            }) {
+                *client = None;
+            }
+            if client.is_none() && Instant::now() >= *connect_after {
+                let opened = Instant::now();
+                tokio::select! {
+                    () = stopped(waiting.stop) => return Ok(Flow::Stop),
+                    result = tokio::time::timeout(Duration::from_secs(10), Client::connect(socket)) => {
+                        match result {
+                            Ok(Ok(connected)) => *client = Some((connected, opened)),
+                            Ok(Err(error)) => eprintln!("sparrowd: consume RPC discovery failed: {error}"),
+                            Err(_) => eprintln!("sparrowd: consume RPC discovery timed out; sources remain owned"),
+                        }
+                        *connect_after = Instant::now() + CONNECT_RETRY;
+                    }
+                }
+            }
+            if client.is_none() {
+                // Every other due claim waits behind this one, so only later retries
+                // and the next connection attempt can bring new work.
+                wake.by(*connect_after);
+                blocked(retry, &mut wake);
+                pause(waiting, detectors, space_ok, busy, false, wake).await?;
+                return Ok(Flow::Next);
+            }
         }
-        wake.resume |= floor_wait;
-        for entry in retry.values() {
-            wake.by(entry.at);
+        let _permit = if is_tail {
+            match admit(&waiting.control.operations, waiting.permit) {
+                Ok(permit) => Some(permit),
+                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                    wake.permit = true;
+                    blocked(retry, &mut wake);
+                    pause(waiting, detectors, space_ok, busy, false, wake).await?;
+                    return Ok(Flow::Next);
+                }
+                Err(tokio::sync::TryAcquireError::Closed) => {
+                    return Err(Error::State(
+                        "tail claim operation budget closed unexpectedly",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let detector = detectors
+            .iter_mut()
+            .find(|detector| detector.config.id == watch)
+            .ok_or(Error::State(
+                "pending consumption journal has no configured watch owner",
+            ))?;
+        let operation = async {
+            if let Recovery::Claimed(mut claimed) =
+                detector.owner.claim()?.recover(&id, crate::now()?)?
+            {
+                if is_tail {
+                    detector.owner.claim()?.publish_tail(&mut claimed)?;
+                } else {
+                    detector
+                        .owner
+                        .claim()?
+                        .publish(
+                            &client
+                                .as_ref()
+                                .ok_or(Error::State("consume RPC connection absent"))?
+                                .0,
+                            &mut claimed,
+                            &attempt,
+                        )
+                        .await?;
+                }
+                detector.owner.claim()?.remove(&claimed, crate::now()?)?;
+            }
+            Ok::<_, Error>(())
+        };
+        let result = tokio::select! {
+            () = stopped(waiting.stop) => return Ok(Flow::Stop),
+            result = tokio::time::timeout(PUBLICATION_DEADLINE, operation) => result.unwrap_or(Err(Error::State("consume publication deadline expired; retain the original journal and retry"))),
+        };
+        if let Err(error) = result {
+            // The counts lead the text, which the journal keeps by prefix; the deadline
+            // text cannot carry them, because the dropped attempt cannot add them.
+            let text = if is_tail {
+                error.to_string()
+            } else {
+                format!("{}: {error}", attempt.progress.summary())
+            };
+            // Name the claim, so an operator can act on it (retire-claim takes its ID).
+            detector.fail_claim(&id, format!("claim {id}: {text}"));
+            eprintln!("sparrowd: watch={watch} claim={id} pending: {text}");
+            // The claim's durable history answers `watch claims` after any restart.
+            if let Some(record) = store
+                .consumption_attempt_pending(&id, &text, crate::now()?)
+                .err()
+            {
+                eprintln!(
+                    "sparrowd: watch={watch} claim={id} pending attempt not recorded: {record}"
+                );
+                detector.fail_claim(
+                    &id,
+                    format!("claim {id}: {text}; attempt not recorded: {record}"),
+                );
+            }
+            let floor =
+                floor_class(&error) && store.space_floor().observe(crate::now()?)?.is_some();
+            let refusal = if is_tail {
+                None
+            } else {
+                match Refusal::of(&error) {
+                    Some(refusal) => Some(refusal),
+                    // An earlier run may have moved the source and stopped before it
+                    // retired the claim; its refusal is on file beside the source.
+                    None => match detector.owner.claim()?.interrupted_quarantine(
+                        &detector.config.root,
+                        &roots,
+                        &id,
+                    ) {
+                        Ok(found) => found,
+                        Err(error) => {
+                            eprintln!(
+                                "sparrowd: watch={watch} claim={id} quarantine record unreadable: {error}"
+                            );
+                            None
+                        }
+                    },
+                }
+            };
+            let entry = retry.entry(id).or_insert_with(ClaimRetry::due);
+            entry.failed(attempt.progress.mark(), floor);
+            if refusal.is_some() {
+                // Settle it on the next pass: no further upload of this claim.
+                entry.at = Instant::now();
+                entry.refusal = refusal;
+            }
+            if !is_tail {
+                *client = None;
+            }
+        } else {
+            detector.record_claim_success(&id);
         }
-        pause(waiting, &mut detectors, space_ok, busy, claims, wake).await?;
+        if let Some(index) = detectors
+            .iter()
+            .position(|detector| detector.config.id == watch)
+        {
+            detectors.rotate_left(index + 1);
+        }
+        // Re-evaluate at once after a claim.
+        tokio::task::yield_now().await;
+        return Ok(Flow::Next);
     }
-    Ok(())
+    if floor_ended {
+        // The floor ended between the refusal and its observation: run again at once.
+        return Ok(Flow::Next);
+    }
+    wake.resume |= floor_wait;
+    for entry in retry.values() {
+        wake.by(entry.at);
+    }
+    pause(waiting, detectors, space_ok, busy, claims, wake).await?;
+    Ok(Flow::Next)
 }
 
 /// How full the store's retired-claim record is, as the worker logs it.
@@ -2198,8 +2596,7 @@ fn note_retired(store: &Store, logged: &mut RetiredFill) -> Result<(), Error> {
 }
 
 /// Move the refused source of claim `id` into quarantine and retire the claim. True when the
-/// claim is retired. A failure that is not fatal to the store stays on the claim and the watch's
-/// status, is logged once per change of its text, and leaves the source where it is.
+/// claim is retired. Any failure stays on the claim and the watch's status, is logged once per change of its text, and leaves the source where it is.
 fn quarantine_claim(
     detector: &mut Detector,
     roots: &[PathBuf],
@@ -2224,7 +2621,6 @@ fn quarantine_claim(
             );
             Ok(true)
         }
-        Err(Error::Storage(error)) if fatal_storage(error.code) => Err(Error::Storage(error)),
         Err(error) => {
             let text = refusal.failure(&error.to_string());
             detector.fail_claim(id, format!("claim {id}: {text}"));

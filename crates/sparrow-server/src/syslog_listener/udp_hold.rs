@@ -869,9 +869,9 @@ mod tests {
         udp.finish().await.unwrap();
     }
 
-    /// Value (#255): a store error that is not pressure ends `listen` at once, with the queued
+    /// Value (#255): a store error that is neither pressure nor a store-wide state ends `listen` at once, with the queued
     /// datagrams counted and named, so the reader stops filling a queue nobody drains and the
-    /// daemon's worker health gate stops loudly. No stop is sent: a listen that waited for its
+    /// supervisor binds the listener again. No stop is sent: a listen that waited for its
     /// reader would never return.
     #[tokio::test(start_paused = true)]
     async fn a_publisher_error_ends_the_listener_and_names_the_queued_datagrams() {
@@ -883,7 +883,7 @@ mod tests {
         udp.until_queued(3).await;
         let floor = udp.fixture.store.space_floor();
         floor.refuse_writes_for_tests(false);
-        floor.refuse_next_write_for_tests("STORAGE_FAILURE");
+        floor.refuse_next_write_for_tests("INVALID_ARGUMENT");
         udp.fixture.wake.wake();
         yield_until("listen returns without a stop", || udp.task.is_finished()).await;
         let error = udp.joined().await.unwrap_err();
@@ -1110,7 +1110,7 @@ mod tests {
         let lengths = fill_queue(&udp, 0).await;
         let floor = udp.fixture.store.space_floor();
         floor.refuse_writes_for_tests(false);
-        floor.refuse_next_write_for_tests("STORAGE_FAILURE");
+        floor.refuse_next_write_for_tests("INVALID_ARGUMENT");
         udp.fixture.wake.wake();
         yield_until("listen returns without a stop", || udp.task.is_finished()).await;
         let error = udp.joined().await.unwrap_err();

@@ -173,6 +173,12 @@ struct SyslogListenerStatus {
   # (the clock stepped back): stored with the instant just past the watermark, so their
   # received_at is that fence-adjusted time and not the clock.
   restampedPastWatermark @39 :UInt64;
+  # Frames held because the store failed the write for a cause that is not pressure (a latched
+  # store, a clock behind the archive watermark); each is offered again until the store takes it.
+  holdsStoreFailure @40 :UInt64;
+  # Errors the listener survived (a failed accept or connection) or was bound again after (a
+  # failed bind or receive, an unexpected store error); the last is in `failure`.
+  listenerErrors @41 :UInt64;
 }
 enum KernelCounterState { notApplicable @0; available @1; unavailable @2; }
 struct SyslogListenerQuery { storeId @0 :Text; schemaVersion @1 :UInt32; source @2 :Text; id @3 :Text; }
