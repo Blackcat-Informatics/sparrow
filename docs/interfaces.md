@@ -578,9 +578,17 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
   they observe and claim nothing), the daemon's maintenance that writes more than it
   frees (import reclamation and online migration; ageing out, the lease purge and the
   pressure pass run, under the maintenance reserve). A daemon that starts below the floor opens its store and serves
-  reads. Only free space below the maintenance reserve plus the bytes of write-ahead log an unclean stop left in `data_dir`
-  (or below `min_free_bytes` when that is smaller), which an open writes its manifest, new WAL and replayed level-0 files into,
-  keeps it waiting (`sparrowd: waiting to open the store`, nothing can answer then), and a write of the watch catalog that
+  reads. Only free space below the maintenance reserve (capped at `min_free_bytes`) plus every byte of write-ahead log an
+  unclean stop left in `data_dir`, which an open writes its manifest, new WAL and replayed level-0 files into,
+  keeps it waiting (`sparrowd: waiting to open the store`, nothing can answer then); the replay part is never capped.
+  Every start condition that will pass is waited for, never exited on, so the unit does not spend its start limit: an open
+  that fails for lack of space, an open the write allowance of a pending upgrade refuses (`STORAGE_PRESSURE`; the wait reads
+  the three storage limits from the configuration file again before each attempt, so a raised `disk_budget` is noticed
+  without a restart), and a TCP port, Unix socket name or syslog port a departing owner still holds. Each wait journals
+  `sparrowd: waiting to ...` with its reason, checks again (one second for space and addresses, 30 seconds for a refused
+  open), repeats the line each minute while its reason stands, ends at once on SIGINT and journals when it proceeds.
+  Configuration errors, a format, identity, analyzer or archive mismatch and corruption still end the start at once.
+  A write of the watch catalog that
   pressure refuses (the first store of the configured catalog, and the retirement of a disabled watch) is retried on each worker pass. A paused
   watch worker owns no timer: it observes the floor through the floor's ledger and
   blocks on the floor's resume edge, which any number of duties subscribe to. The edge

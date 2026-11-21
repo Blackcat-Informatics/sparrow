@@ -55,7 +55,7 @@ every watch in `consume_watches` names a root that exists.
   watches keep their files); it logs a line when the pause begins, one a minute
   while it lasts and one when it ends. A write that still fails with durability uncertain makes the
   daemon exit, and `Restart=on-failure` reopens the store; at startup it waits
-  only for the maintenance reserve plus any write-ahead log an unclean stop left (the open replays it), so a full disk does not spend
+  for the maintenance reserve plus every byte of write-ahead log an unclean stop left (the open replays it), so a full disk does not spend
   the start limit, and below the floor alone the store opens and serves reads.
 - `/SPARROW` is on the same btrfs device as `/home`, so the move to `/SPARROW`
   did not isolate Sparrow from a full `/home`.
@@ -79,8 +79,8 @@ every watch in `consume_watches` names a root that exists.
   below `min_free_bytes`; connections are still accepted and reads served),
   write clients get `STORAGE_PRESSURE` with the floor class and hold, `status`
   shows a nonzero `floorPause.pausedSince`, or, only when free space is below
-  the maintenance reserve plus the write-ahead log a stop left behind (capped
-  at `min_free_bytes`), the unit waits at startup with
+  the maintenance reserve (capped at `min_free_bytes`) plus every byte of the
+  write-ahead log a stop left behind, the unit waits at startup with
   `waiting to open the store` (nothing can answer then, so `check.sh` cannot
   connect). Above that amount a restart opens the store and serves reads.
 - Diagnose: `df -h /SPARROW /home`, then find what grew:
@@ -91,6 +91,36 @@ every watch in `consume_watches` names a root that exists.
   restart. Do not lower `min_free_bytes` to get past it.
 - Reversible: yes, unless the space came from deleting something.
 
+## Start waiting
+
+- Symptom: the unit is `active (running)` but nothing answers, and the journal
+  holds a line `sparrowd: waiting to <what>: <reason>; checking again every N s`,
+  repeated each minute while the reason stands. The daemon waits, and does not
+  exit, on every start condition that will pass, so the unit does not spend its
+  start limit on it:
+  - `open the store`: free space below the maintenance reserve plus the
+    write-ahead log left in `data_dir` (checked each second); an open that
+    failed with no space left on the device, or with `STORAGE_PRESSURE` because
+    a pending upgrade (the owned RDF metadata backfill) needs more data-write
+    allowance than `disk_budget` leaves (attempted again every 30 s).
+  - `bind the public TCP address`, `bind the local endpoint`, `bind the ingest
+    socket`, `bind the syslog listeners`: a departing owner still holds the
+    address or socket name (tried each second). Find it with
+    `sudo ss -ltnp 'sport = :518'`.
+- Recover: free the space, or raise `disk_budget` in `/etc/sparrow/server.toml`
+  (the wait reads `disk_budget`, `maintenance_reserve` and `min_free_bytes` from
+  the file again before each open attempt and journals the change), or stop the
+  process that holds the address. The daemon proceeds by itself and journals
+  `the condition cleared after N s; proceeding`. No restart is needed.
+- Stop: `systemctl stop` sends SIGINT, which ends the wait at once. The
+  unit stays `active (running)` through a wait because it is `Type=exec`: a
+  readiness notification would hold the unit in `activating` and its start
+  timeout would kill a wait that is meant to last as long as the condition.
+- Configuration errors, a store format, identity, lexicon or archive mismatch
+  and corruption are not waits: the start ends at once and spends a start
+  (next section).
+- Reversible: yes.
+
 ## Unit start-limit hit
 
 - Symptom: `systemctl status sparrow.service` shows `start-limit-hit`; five
@@ -98,9 +128,10 @@ every watch in `consume_watches` names a root that exists.
 - Diagnose: the cause is in the failed starts' output:
   `journalctl -u sparrow.service -b --no-pager | tail -100`. Common causes are
   a refused open (below), an AppArmor denial, a missing lexicon bundle or
-  credential, a watch root that does not exist, a `socket_path` longer than
-  107 bytes (`path must be shorter than SUN_LEN`; `start.sh` refuses one), or
-  port 518 taken by another process (`sudo ss -ltnp 'sport = :518'`).
+  credential, a watch root that does not exist, or a `socket_path` longer than
+  107 bytes (`path must be shorter than SUN_LEN`; `start.sh` refuses one). Free
+  space, a pending upgrade's allowance and a held port or socket name are waited
+  for and do not reach the limit (see "Start waiting").
 - Recover: fix the cause, then
   `sudo systemctl reset-failed sparrow.service && sudo deploy/start.sh`.
 - Reversible: yes.

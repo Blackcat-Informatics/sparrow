@@ -13,6 +13,7 @@ pub mod floor_pause;
 pub mod journal_log;
 mod source_file;
 pub mod staging_refusal;
+pub mod start_wait;
 pub mod syslog_listener;
 mod syslog_spill;
 mod syslog_wire;

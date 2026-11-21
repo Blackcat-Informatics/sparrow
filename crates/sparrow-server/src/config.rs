@@ -524,9 +524,11 @@ impl ServerConfig {
 
     /// The free space the daemon needs to open the store: the maintenance reserve, which is
     /// kept for an open's manifest and new WAL, plus the bytes of write-ahead log an unclean
-    /// stop left in `data_dir`, which the open replays into new level-0 files. It never
-    /// exceeds the floor. Below it the daemon waits to open; between it and `min_free_bytes`
-    /// the daemon opens and the floor pauses writes, so reads are served and reclaim can run.
+    /// stop left in `data_dir`, which the open replays into new level-0 files. The reserve
+    /// is capped at `min_free_bytes`; the replay never is, because a replay that finds no room
+    /// fails the open. Below the floor the daemon waits to open; between it and
+    /// `min_free_bytes` the daemon opens and the floor pauses writes, so reads are served and
+    /// reclaim can run.
     pub fn open_floor(&self) -> std::io::Result<sparrow_core::SpaceFloor> {
         let named = |step: &str, error: std::io::Error| {
             std::io::Error::new(
@@ -558,9 +560,46 @@ impl ServerConfig {
         Ok(sparrow_core::SpaceFloor::new(
             &self.data_dir,
             self.maintenance_reserve
-                .saturating_add(replay)
-                .min(self.min_free_bytes),
+                .min(self.min_free_bytes)
+                .saturating_add(replay),
         ))
+    }
+
+    /// Take `disk_budget`, `maintenance_reserve` and `min_free_bytes` from the configuration
+    /// file again, so a daemon waiting to open for space or for a pending upgrade's write
+    /// allowance sees the limits an operator raised. Nothing else is taken from the file. The
+    /// result describes a change, or is `None` when the limits are the same.
+    pub fn reload_storage_limits(
+        &mut self,
+        path: &Path,
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let fresh = Self::read(path)?;
+        let before = (
+            self.disk_budget,
+            self.maintenance_reserve,
+            self.min_free_bytes,
+        );
+        self.disk_budget = fresh.disk_budget;
+        self.maintenance_reserve = fresh.maintenance_reserve;
+        self.min_free_bytes = fresh.min_free_bytes;
+        Ok((before
+            != (
+                self.disk_budget,
+                self.maintenance_reserve,
+                self.min_free_bytes,
+            ))
+        .then(|| {
+            format!(
+                "storage limits read again from {}: disk_budget {} -> {}, maintenance_reserve {} -> {}, min_free_bytes {} -> {}",
+                path.display(),
+                before.0,
+                self.disk_budget,
+                before.1,
+                self.maintenance_reserve,
+                before.2,
+                self.min_free_bytes,
+            )
+        }))
     }
 
     /// Open the one storage owner with native analyzer artifacts and private permissions.
@@ -696,6 +735,58 @@ mod tests {
         )
         .unwrap();
         assert!(both.tcp_secret().unwrap().is_some());
+    }
+
+    /// Value: a WAL left above `min_free_bytes` opened without replay room, and a replay that
+    /// found none failed the open and spent the unit's start limit (#446). Protects: the
+    /// open floor holds the reserve plus every left WAL byte even where that exceeds
+    /// `min_free_bytes`, and counts only `*.log` files.
+    #[test]
+    fn open_floor_holds_replay_room_for_a_left_wal_above_min_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        std::fs::create_dir(&data).unwrap();
+        let path =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let config = ServerConfig::read(&path).unwrap();
+        // The helper's min_free_bytes is 1 MiB and its reserve 8 MiB; the reserve is capped at
+        // the floor, so a 4 MiB WAL makes 5 MiB, above min_free_bytes.
+        let wal = std::fs::File::create(data.join("000012.log")).unwrap();
+        wal.set_len(4 << 20).unwrap();
+        std::fs::File::create(data.join("000013.sst"))
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        let floor = config.open_floor().unwrap();
+        floor.set_free_for_tests(Some(3 << 20));
+        assert!(floor.shortfall().unwrap().is_some());
+        floor.set_free_for_tests(Some(5 << 20));
+        assert!(floor.shortfall().unwrap().is_none());
+    }
+
+    /// Value: a daemon waiting on a pending upgrade's write allowance never saw the budget an
+    /// operator raised (#446). Protects: a re-read takes only the three storage limits and
+    /// names the change; an unchanged file reports none.
+    #[test]
+    fn reloading_storage_limits_takes_the_budget_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let path =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let mut config = ServerConfig::read(&path).unwrap();
+        assert!(config.reload_storage_limits(&path).unwrap().is_none());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let edited = text
+            .replace("disk_budget = 134217728", "disk_budget = 268435456")
+            .replace("max_records = 10000", "max_records = 20000");
+        std::fs::write(&path, edited).unwrap();
+        let change = config.reload_storage_limits(&path).unwrap().unwrap();
+        assert!(
+            change.contains("disk_budget 134217728 -> 268435456"),
+            "{change}"
+        );
+        assert_eq!(config.disk_budget, 268_435_456);
+        assert_eq!(config.max_records, 10_000);
     }
 
     /// INVARIANT: the removed `max_artifact_bytes` knob refuses startup with an
