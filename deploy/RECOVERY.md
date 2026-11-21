@@ -102,17 +102,19 @@ every watch in `consume_watches` names a root that exists.
     write-ahead log left in `data_dir` (checked each second); an open that
     failed with no space left on the device, or with `STORAGE_PRESSURE` because
     a pending upgrade (the owned RDF metadata backfill) needs more data-write
-    allowance than `disk_budget` leaves (attempted again every 30 s).
+    allowance than `disk_budget` leaves (attempted again every 30 s); or
+    another process (an offline `sparrow` command, a daemon still stopping)
+    holds the store's `LOCK` file (attempted again each second). Find the
+    holder with `sudo fuser -v <data_dir>/LOCK`.
   - `bind the public TCP address`, `bind the local endpoint`, `bind the ingest
     socket`, `bind the syslog listeners`: a departing owner still holds the
-    address or socket name (tried each second), or another process (an offline
-    `sparrow` command, a daemon still stopping) holds the store's lock. Find it with
+    address or socket name (tried each second). Find it with
     `sudo ss -ltnp 'sport = :518'`.
 - Recover: free the space, or raise `disk_budget` in `/etc/sparrow/server.toml`
   (the wait reads `disk_budget`, `maintenance_reserve` and `min_free_bytes` from
   the file again before each attempt that follows a refused open and journals
   the change), or stop the
-  process that holds the address. The daemon proceeds by itself and journals
+  process that holds the address or the store's lock. The daemon proceeds by itself and journals
   `the condition cleared after N s; proceeding`. No restart is needed.
 - Where it shows: the journal lines above, and `systemctl show -p StatusText
   sparrow.service` (`waiting to open the store: only N bytes free ...`; the

@@ -584,9 +584,10 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
   Every start condition that will pass is waited for, never exited on, so the unit does not spend its start limit: an open
   that fails for lack of space, an open the write allowance of a pending upgrade refuses (`STORAGE_PRESSURE`; the wait reads
   the three storage limits from the configuration file again before each attempt that follows a refused open, so a raised `disk_budget` is noticed
-  without a restart), and a TCP port, Unix socket name or syslog port a departing owner still holds. Each wait journals
-  `sparrowd: waiting to ...` with its reason, checks again (one second for space and addresses, 30 seconds for a refused
-  open), repeats the line each minute while its reason stands, ends at once on SIGINT and journals when it proceeds.
+  without a restart), the store's `LOCK` file while another process holds it, and a TCP port, Unix socket name or syslog
+  port a departing owner still holds. Each wait journals
+  `sparrowd: waiting to ...` with its reason, checks again (one second for space, a held lock and addresses, 30 seconds
+  for an open refused for space or allowance), repeats the line each minute while its reason stands, ends at once on SIGINT and journals when it proceeds.
   A start condition that cannot pass without a change of configuration, image, store or watch root (configuration,
   a format, identity, analyzer or archive mismatch, a missing `[archive]` table after the archive fence, corruption, a
   watch root that must be restored) is not waited for: the daemon journals `sparrowd: refused to start: ...` and exits

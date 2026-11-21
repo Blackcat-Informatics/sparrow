@@ -7,7 +7,8 @@
 //! (`deploy/systemd/sparrow.service`), so an exit on a condition another process or the
 //! operator clears spends that limit and leaves the unit failed until `reset-failed`. The
 //! conditions that pass are free space for the open and the WAL replay, a pending upgrade's
-//! write allowance, and a TCP port or socket name a departing owner still holds. Every other
+//! write allowance, the store's lock while another process holds it, and a TCP port or socket
+//! name a departing owner still holds. Every other
 //! start failure (configuration, format, identity, lexicon) is deterministic: a restart repeats
 //! it, so it still ends the start at once with its message.
 //!
