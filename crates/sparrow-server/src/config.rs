@@ -522,16 +522,45 @@ impl ServerConfig {
         sparrow_core::SpaceFloor::new(&self.data_dir, self.min_free_bytes)
     }
 
-    /// The free space the daemon needs to open the store (a manifest and a WAL): the
-    /// maintenance reserve, which is kept for exactly such writes, and never more than the
-    /// floor. Below it the daemon waits to open; between it and `min_free_bytes` the daemon
-    /// opens and the floor pauses writes, so reads are served and reclaim can run.
-    #[must_use]
-    pub fn open_floor(&self) -> sparrow_core::SpaceFloor {
-        sparrow_core::SpaceFloor::new(
+    /// The free space the daemon needs to open the store: the maintenance reserve, which is
+    /// kept for an open's manifest and new WAL, plus the bytes of write-ahead log an unclean
+    /// stop left in `data_dir`, which the open replays into new level-0 files. It never
+    /// exceeds the floor. Below it the daemon waits to open; between it and `min_free_bytes`
+    /// the daemon opens and the floor pauses writes, so reads are served and reclaim can run.
+    pub fn open_floor(&self) -> std::io::Result<sparrow_core::SpaceFloor> {
+        let named = |step: &str, error: std::io::Error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot {step} in data_dir {} to size the write-ahead log the open must replay: {error}",
+                    self.data_dir.display()
+                ),
+            )
+        };
+        let replay = match std::fs::read_dir(&self.data_dir) {
+            Ok(entries) => {
+                let mut bytes = 0_u64;
+                for entry in entries {
+                    let entry = entry.map_err(|error| named("read an entry", error))?;
+                    let wal = entry.path().extension().is_some_and(|ext| ext == "log");
+                    let metadata = entry
+                        .metadata()
+                        .map_err(|error| named("stat an entry", error))?;
+                    if wal && metadata.is_file() {
+                        bytes = bytes.saturating_add(metadata.len());
+                    }
+                }
+                bytes
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(named("list the directory", error)),
+        };
+        Ok(sparrow_core::SpaceFloor::new(
             &self.data_dir,
-            self.maintenance_reserve.min(self.min_free_bytes),
-        )
+            self.maintenance_reserve
+                .saturating_add(replay)
+                .min(self.min_free_bytes),
+        ))
     }
 
     /// Open the one storage owner with native analyzer artifacts and private permissions.

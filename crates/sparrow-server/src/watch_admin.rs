@@ -43,6 +43,15 @@ struct State {
     receipts: Vec<Receipt>,
 }
 
+/// What [`Catalog::retire_and_store`] did.
+pub(crate) enum Retirement {
+    Nothing,
+    Stored,
+    /// Pressure refused the write; the catalog is unchanged and the work stays due.
+    Deferred(String),
+}
+
+#[derive(Clone)]
 pub(crate) struct Catalog {
     state: State,
     raw: Option<Vec<u8>>,
@@ -623,6 +632,30 @@ impl Catalog {
         ))
     }
 
+    /// Drop the disabled watches that hold no unfinished journal and store the result with
+    /// `persist`. The drop is made on a copy, so a write that pressure refuses leaves this
+    /// catalog as stored and the next call finds the same work again.
+    pub(crate) fn retire_and_store(
+        &mut self,
+        pending: &[sparrow_core::ConsumptionJournal],
+        persist: impl FnOnce(&mut Self) -> Result<(), Error>,
+    ) -> Result<Retirement, Error> {
+        let mut next = self.clone();
+        if !next.retire(pending) {
+            return Ok(Retirement::Nothing);
+        }
+        match persist(&mut next) {
+            Ok(()) => {
+                *self = next;
+                Ok(Retirement::Stored)
+            }
+            Err(Error::Storage(error)) if error.code == "STORAGE_PRESSURE" => {
+                Ok(Retirement::Deferred(error.message))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn retire(&mut self, pending: &[sparrow_core::ConsumptionJournal]) -> bool {
         let before = self.state.watches.len();
         self.state.watches.retain(|watch| {
@@ -689,6 +722,7 @@ pub(crate) fn encode_claims(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sparrow_core::Config;
 
     /// The stored watch shape an older build reads: the same fields, without `publish_hold`.
     #[derive(Deserialize, Serialize)]
@@ -765,5 +799,44 @@ mod tests {
             .expect("an older shape refuses a held catalog")
             .to_string();
         assert!(refused.contains("publish_hold"), "{refused}");
+    }
+
+    /// INVARIANT (#440): a retirement that the real store refuses under pressure leaves the
+    /// stored registry and the catalog as they were and the work due, so the next pass stores
+    /// it; the refusal does not end the worker or lose the work.
+    #[test]
+    fn a_retirement_refused_by_the_store_stays_due_and_is_stored_by_the_next_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), sparrow_test_support::storage_config!(Config)).unwrap();
+        let mut disabled = managed(false);
+        disabled.enabled = false;
+        let mut catalog = Catalog {
+            state: State {
+                version: 1,
+                store_id: "store:test".into(),
+                revision: 3,
+                watches: vec![disabled],
+                receipts: Vec::new(),
+            },
+            raw: store.watch_registry().unwrap(),
+            configured: std::collections::BTreeMap::new(),
+        };
+        let before = store.watch_registry().unwrap();
+        store.space_floor().refuse_writes_for_tests(true);
+        let refused = catalog.retire_and_store(&[], |next| next.persist(&store));
+        assert!(matches!(refused, Ok(Retirement::Deferred(_))));
+        assert_eq!(
+            catalog.watches().len(),
+            1,
+            "a refused write changed the catalog"
+        );
+        assert_eq!(store.watch_registry().unwrap(), before);
+        store.space_floor().refuse_writes_for_tests(false);
+        let stored = catalog.retire_and_store(&[], |next| next.persist(&store));
+        assert!(matches!(stored, Ok(Retirement::Stored)));
+        assert!(catalog.watches().is_empty());
+        assert_ne!(store.watch_registry().unwrap(), before);
+        let none = catalog.retire_and_store(&[], |next| next.persist(&store));
+        assert!(matches!(none, Ok(Retirement::Nothing)));
     }
 }

@@ -145,11 +145,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(listener) = &tcp_listener {
         eprintln!("sparrowd: capnp_tcp={}", listener.local_addr()?);
     }
-    // Opening writes a manifest and WAL; on a full filesystem it would fail and spend
-    // systemd's bounded restarts. Wait for the maintenance reserve's worth of space instead.
+    // Opening writes a manifest and WAL and replays any WAL an unclean stop left; on a full
+    // filesystem it would fail and spend systemd's bounded restarts. Wait for the maintenance
+    // reserve plus that replay instead.
     // Between that and `min_free_bytes` the store opens and the floor pauses writes, so a
     // restart on a nearly full filesystem still serves reads and can reclaim.
-    let floor = config.open_floor();
+    let floor = config.open_floor()?;
     if let Some(shortfall) = floor.shortfall()? {
         eprintln!("sparrowd: waiting to open the store: {shortfall}");
         let mut space = tokio::time::interval(SPACE_CHECK_INTERVAL);
