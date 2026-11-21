@@ -65,6 +65,8 @@ profile sparrow flags=(attach_disconnected) {
   # The journal.
   unix (create, connect, send) type=dgram,
   /run/systemd/journal/socket w,
+  # The service manager's notification socket: the start wait is reported as StatusText.
+  /run/systemd/notify w,
 
   # The public Cap'n Proto listener and the syslog listeners the configuration declares.
   network inet stream,

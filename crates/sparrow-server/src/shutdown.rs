@@ -40,6 +40,11 @@ pub(super) async fn finish(
     slots: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut errors = Vec::with_capacity(6);
+    // The teardown reports its errors as one text; the class of the start refusal survives it.
+    let refused = initial
+        .as_ref()
+        .err()
+        .is_some_and(|error| sparrow_server::start_wait::is_permanent(error.as_ref()));
     record_failure(&mut errors, "daemon", initial);
     if let Some(worker) = workers.consumer {
         record_failure(&mut errors, "consume shutdown", worker.shutdown().await);
@@ -90,7 +95,12 @@ pub(super) async fn finish(
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(errors.join("; ").into())
+        let error: Box<dyn std::error::Error> = errors.join("; ").into();
+        Err(if refused {
+            sparrow_server::start_wait::permanent(error)
+        } else {
+            error
+        })
     }
 }
 

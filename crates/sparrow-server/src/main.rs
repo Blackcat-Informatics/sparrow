@@ -3,7 +3,10 @@
 
 //! One database owner, serving typed Cap'n Proto RPC over Unix and configured TCP sockets.
 
-use sparrow_server::{Rpc, ServerConfig, local_endpoint};
+use sparrow_server::{
+    Rpc, ServerConfig, local_endpoint,
+    start_wait::{self, Wait},
+};
 use std::{path::Path, sync::Arc};
 use tokio::sync::Semaphore;
 
@@ -11,8 +14,6 @@ mod maintenance;
 mod pressure_duty;
 mod shutdown;
 
-/// How often the daemon compares filesystem free space with its floor while it waits to open.
-const SPACE_CHECK_INTERVAL: std::time::Duration = sparrow_server::serving::SPACE_CHECK_INTERVAL;
 /// Also the contract the deploy scripts read to tell an image with query-only mode and, for
 /// migration measurements, an image with `--no-intake` or `--private-intake`.
 const USAGE: &str =
@@ -107,28 +108,70 @@ async fn worker_health(
     }
 }
 
+/// Set once the daemon serves. A failure before it is a refused start; one after it is a run
+/// that failed, which the supervisor restarts.
+static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        // A start failure not named as deterministic keeps the ordinary failure status.
+        Err(error)
+            if !SERVING.load(std::sync::atomic::Ordering::Relaxed)
+                && !start_wait::is_permanent(error.as_ref()) =>
+        {
+            // Not named as deterministic (a transient I/O error, descriptor exhaustion, a mount
+            // that has not come up): the ordinary failure status, so the unit restarts it
+            // within its start limit.
+            eprintln!(
+                "sparrowd: start failed: {error}; not classified as permanent, so the exit status is 1 and the unit restarts it"
+            );
+            std::process::ExitCode::FAILURE
+        }
+        // A refusal named as deterministic repeats on a restart: end it with the status the
+        // unit does not restart.
+        Err(error) if !SERVING.load(std::sync::atomic::Ordering::Relaxed) => {
+            eprintln!(
+                "sparrowd: refused to start: {error}; a restart repeats it, so the exit status is {} and the unit does not restart it. Correct the configuration, image, store or watch root, then start the unit",
+                start_wait::REFUSED_EXIT_STATUS
+            );
+            start_wait::notify(&format!("STATUS=refused to start: {error}"));
+            std::process::ExitCode::from(start_wait::REFUSED_EXIT_STATUS)
+        }
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     sparrow_server::journal_log::install()?;
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let (path, mode) = arguments(&args)?;
-    let mut config = ServerConfig::read(Path::new(path))?;
+    let (path, mode) = arguments(&args).map_err(start_wait::permanent)?;
+    let mut config = ServerConfig::read(Path::new(path)).map_err(start_wait::config_failure)?;
     // A no-intake daemon writes and runs maintenance but, like a query-only one, opens no
     // stored watch root, so a copy of a store never consumes the intake its catalog names.
     // A private-intake daemon opens every watch at a private root instead.
     let intake = !matches!(mode, Mode::NoIntake);
     let private = match &mode {
         Mode::QueryOnly => {
-            config = config.into_query_only()?;
+            config = config.into_query_only().map_err(start_wait::permanent)?;
             None
         }
         Mode::NoIntake => {
-            config.check_no_intake()?;
+            config.check_no_intake().map_err(start_wait::permanent)?;
             None
         }
         Mode::PrivateIntake(dir) => {
-            config.check_private_intake()?;
-            Some(sparrow_server::watches::PrivateIntake::new(dir)?)
+            config
+                .check_private_intake()
+                .map_err(start_wait::permanent)?;
+            Some(
+                sparrow_server::watches::PrivateIntake::new(dir)
+                    .map_err(start_wait::consume_start_failure)?,
+            )
         }
         Mode::Normal => None,
     };
@@ -137,42 +180,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (None, true) => "true",
         (None, false) => "false",
     };
-    let tcp_secret = config.tcp_secret()?;
+    let tcp_secret = config.tcp_secret().map_err(start_wait::config_failure)?;
     // Keep the subscription alive through startup and awaited maintenance work.
     // Recreating ctrl_c() inside select drops its listener when another branch wins.
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     // Refuse an unavailable public port before opening/migrating the store or Unix endpoint.
+    // A departing owner of the address is waited for, not exited on (start_wait).
     let tcp_listener = match config.rpc_tcp_address {
-        Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
+        Some(address) => match start_wait::until(
+            &mut interrupt,
+            &format!("bind the public TCP address {address}"),
+            async || tokio::net::TcpListener::bind(address).await,
+            start_wait::bind_hold,
+        )
+        .await
+        .map_err(start_wait::bind_failure)?
+        {
+            Wait::Ready(listener) => Some(listener),
+            Wait::Interrupted => return Ok(()),
+        },
         None => None,
     };
     if let Some(listener) = &tcp_listener {
         eprintln!("sparrowd: capnp_tcp={}", listener.local_addr()?);
     }
-    // Opening writes a manifest and WAL and replays any WAL an unclean stop left; on a full
-    // filesystem it would fail and spend systemd's bounded restarts. Wait for the maintenance
-    // reserve plus that replay instead.
-    // Between that and `min_free_bytes` the store opens and the floor pauses writes, so a
-    // restart on a nearly full filesystem still serves reads and can reclaim.
-    let floor = config.open_floor()?;
-    if let Some(shortfall) = floor.shortfall()? {
-        eprintln!("sparrowd: waiting to open the store: {shortfall}");
-        let mut space = tokio::time::interval(SPACE_CHECK_INTERVAL);
-        loop {
-            tokio::select! {
-                signal = interrupt.recv() => {
-                    signal.ok_or("daemon interrupt subscription terminated unexpectedly")?;
-                    return Ok(());
-                }
-                _ = space.tick() => {
-                    if floor.shortfall()?.is_none() {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    let store = config.open_store()?;
+    // Opening writes a manifest and WAL and replays any WAL an unclean stop left; a filesystem
+    // without room for that, or a pending upgrade the write allowance refuses, would fail the
+    // open and spend systemd's bounded restarts. Wait for them instead (start_wait::open_store).
+    // Between the open floor and `min_free_bytes` the store opens and the floor pauses writes,
+    // so a restart on a nearly full filesystem still serves reads and can reclaim.
+    let store = match start_wait::open_store(&mut interrupt, &mut config, Path::new(path)).await? {
+        Wait::Ready(store) => store,
+        Wait::Interrupted => return Ok(()),
+    };
     let phases = store.open_phases();
     eprintln!(
         "sparrowd: store_open_ms {} total={}",
@@ -214,15 +254,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             operations.clone(),
             private,
             config.output_paths(),
-        )?;
+        )
+        .map_err(start_wait::consume_start_failure)?;
         (watches, Some(consumer))
     };
     // Validate the catalog first; recover only a refused socket under exclusive store ownership.
-    let endpoint = match local_endpoint::LocalEndpoint::bind(&config.socket_path, &store).await {
-        Ok(endpoint) => endpoint,
-        Err(error) => {
+    // A name a departing owner still holds is waited for (start_wait).
+    let bound = start_wait::until(
+        &mut interrupt,
+        "bind the local endpoint",
+        async || local_endpoint::LocalEndpoint::bind(&config.socket_path, &store).await,
+        start_wait::bind_hold,
+    )
+    .await;
+    let endpoint = match bound {
+        Ok(Wait::Ready(endpoint)) => endpoint,
+        stopped => {
             return shutdown::finish(
-                Err(error.into()),
+                stopped.map(|_| ()).map_err(start_wait::bind_failure),
                 shutdown::Workers {
                     consumer: consumer.take(),
                     ..Default::default()
@@ -237,8 +286,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let ingest = match (&config.ingest_socket_path, config.ingest_socket_gid) {
         (Some(path), Some(gid)) => {
-            match local_endpoint::LocalEndpoint::bind_ingest(path, gid).await {
-                Ok(endpoint) => Some((
+            let bound = start_wait::until(
+                &mut interrupt,
+                "bind the ingest socket",
+                async || local_endpoint::LocalEndpoint::bind_ingest(path, gid).await,
+                start_wait::bind_hold,
+            )
+            .await;
+            match bound {
+                Ok(Wait::Ready(endpoint)) => Some((
                     endpoint,
                     sparrow_server::ingest_socket::IngestSocket::new(
                         path.clone(),
@@ -246,9 +302,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         config.max_ingest_connections,
                     ),
                 )),
-                Err(error) => {
+                stopped => {
                     return shutdown::finish(
-                        Err(error.into()),
+                        stopped.map(|_| ()).map_err(start_wait::bind_failure),
                         shutdown::Workers {
                             consumer: consumer.take(),
                             ..Default::default()
@@ -278,7 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &config.syslog,
     ) {
         return shutdown::finish(
-            Err(error.into()),
+            Err(start_wait::bind_failure(error)),
             shutdown::Workers {
                 consumer: consumer.take(),
                 ..Default::default()
@@ -293,20 +349,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut syslog = if config.syslog.is_empty() {
         None
     } else {
-        match sparrow_server::syslog_listener::SyslogWorker::start(
-            store.clone(),
-            &config.syslog,
-            operations.clone(),
-            syslog_registry.clone(),
-            pressure_wake.clone(),
-            &config.syslog_spill_dir(),
+        // A port a departing owner still holds is waited for (start_wait).
+        let started = start_wait::until(
+            &mut interrupt,
+            "bind the syslog listeners",
+            async || {
+                sparrow_server::syslog_listener::SyslogWorker::start(
+                    store.clone(),
+                    &config.syslog,
+                    operations.clone(),
+                    syslog_registry.clone(),
+                    pressure_wake.clone(),
+                    &config.syslog_spill_dir(),
+                )
+                .await
+            },
+            start_wait::bind_hold,
         )
-        .await
-        {
-            Ok(worker) => Some(worker),
-            Err(error) => {
+        .await;
+        match started {
+            Ok(Wait::Ready(worker)) => Some(worker),
+            stopped => {
                 return shutdown::finish(
-                    Err(error.into()),
+                    stopped.map(|_| ()).map_err(start_wait::bind_failure),
                     shutdown::Workers {
                         consumer: consumer.take(),
                         ..Default::default()
@@ -355,6 +420,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.max_ingest_connections
         );
     }
+    SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
+    start_wait::notify_serving();
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
