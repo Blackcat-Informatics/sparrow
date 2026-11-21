@@ -6124,12 +6124,12 @@ fn shipper_refuses_a_source_overlapping_its_intake_or_state_tree() {
 }
 
 /// INVARIANT (#437): a spool file leaves the spool only once the store holds every part of
-/// it. With the store away longer than any age rule (files six days old) repeated shipper
-/// runs delete nothing and keep every ledger entry; neither spool unit runs anything at start
-/// besides the spool itself, so a unit restart deletes nothing; a file an interrupted run set
-/// aside for deletion is put back and shipped; once the consume watch publishes every part
-/// the shipper deletes the files and keeps their ledger entries, while a file whose
-/// publication storage pressure refuses stays until the store holds it.
+/// its present content. With the store away longer than any age rule (files six days old)
+/// repeated shipper runs delete nothing and keep every ledger entry; neither spool unit runs
+/// anything at start besides the spool itself, so a unit restart deletes nothing; a file whose
+/// publication storage pressure refuses stays; an acknowledged file is set aside for a run
+/// and deleted only if it still holds nothing the store lacks, so a line a spool script
+/// appends after the acknowledgement is shipped, under a new name when the old one is in use.
 #[tokio::test(flavor = "current_thread")]
 async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
     tokio::task::LocalSet::new()
@@ -6158,10 +6158,10 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
                     .set_modified(six_days_ago)
                     .unwrap();
             }
-            // An interrupted run left a file set aside; the next run puts it back and ships it.
-            let restored = spool.join("katamari-stored-c.jsonl");
-            let restored_bytes = b"{\"c\":3}\n".to_vec();
-            std::fs::write(spool.join(".reaping-katamari-stored-c.jsonl"), &restored_bytes).unwrap();
+            // An interrupted run left a file set aside whose lines the store never held.
+            let leftover = spool.join(".reaping-katamari-stored-c.jsonl");
+            let leftover_bytes = b"{\"c\":3}\n".to_vec();
+            std::fs::write(&leftover, &leftover_bytes).unwrap();
             let ship_config = dir.path().join("ship.toml");
             std::fs::write(
                 &ship_config,
@@ -6185,24 +6185,19 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
                 assert!(output.status.success(), "{output:?}");
                 String::from_utf8_lossy(&output.stdout).into_owned()
             };
-            let kept = || {
-                assert_eq!(std::fs::read(&whole).unwrap(), whole_bytes);
-                assert_eq!(std::fs::read(&split).unwrap(), split_bytes);
-                assert_eq!(std::fs::read(&restored).unwrap(), restored_bytes);
-                assert!(!spool.join(".reaping-katamari-stored-c.jsonl").exists());
-            };
             let ledger = dir.path().join("ship/spool.ledger");
             let ledger_lines = || std::fs::read_to_string(&ledger).unwrap().lines().count();
-            // The store is away: every run reports it and deletes nothing.
+            // The store is away: every run reports it and deletes or moves nothing.
             for _ in 0..2 {
                 let shipped = report(ship(&ship_config));
                 assert!(shipped.contains("store unreachable"), "{shipped}");
-                kept();
-                assert_eq!(ledger_lines(), 3);
+                assert_eq!(std::fs::read(&whole).unwrap(), whole_bytes);
+                assert_eq!(std::fs::read(&split).unwrap(), split_bytes);
+                assert_eq!(std::fs::read(&leftover).unwrap(), leftover_bytes);
+                assert_eq!(ledger_lines(), 2);
             }
-            // The copies wait in the consume root; the split file waits as several parts.
             let fed = std::fs::read_dir(intake.join("spool")).unwrap().count() as u64;
-            assert!(fed > 3, "the split file ships as several parts: {fed}");
+            assert!(fed > 2, "the split file ships as several parts: {fed}");
             // A unit restart runs only the spool: no start-time command can delete a file.
             for unit in ["katamari-journal-spool", "katamari-manager-spool"] {
                 let text = std::fs::read_to_string(format!(
@@ -6233,8 +6228,53 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
                 watch.get_completed_claims() == fed && watch.get_pending_claims() == 0
             })
             .await;
-            // Storage pressure refuses a new file's publication: the store holds none of it,
-            // so the same run deletes the three acknowledged files and keeps the new one.
+            // Run 1: the leftover holds lines the store lacks and returns under its name; the
+            // two acknowledged files are set aside, not deleted.
+            let shipped = report(ship(&ship_config));
+            assert!(
+                shipped.contains("deleted 0 acknowledged, set aside 2, not yet acknowledged 1"),
+                "{shipped}"
+            );
+            let restored = spool.join("katamari-stored-c.jsonl");
+            assert_eq!(std::fs::read(&restored).unwrap(), leftover_bytes);
+            assert!(!leftover.exists() && !whole.exists() && !split.exists());
+            let whole_aside = spool.join(".reaping-katamari-stored-a.jsonl");
+            let split_aside = spool.join(".reaping-katamari-stored-b.jsonl");
+            assert_eq!(std::fs::read(&split_aside).unwrap(), split_bytes);
+            // A spool script's late write: one line lands in the set-aside file, and the
+            // script reopens the old name for the next one.
+            {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&whole_aside)
+                    .unwrap()
+                    .write_all(b"{\"late\":1}\n")
+                    .unwrap();
+            }
+            std::fs::write(&whole, b"{\"again\":2}\n").unwrap();
+            // Run 2: the untouched set-aside file is deleted; the one with a late line returns
+            // under a new name because its own name is in use again, and ships.
+            let shipped = report(ship(&ship_config));
+            assert!(shipped.contains("deleted 1 acknowledged"), "{shipped}");
+            assert!(!split_aside.exists(), "{shipped}");
+            // The name `.reaping-...-a` may be taken again by the new file, set aside once the
+            // store holds it; the old file with its late line is gone from it.
+            assert!(
+                !whole_aside.exists() || std::fs::read(&whole_aside).unwrap() == b"{\"again\":2}\n"
+            );
+            let late: Vec<_> = std::fs::read_dir(&spool)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .filter(|name| name.starts_with("katamari-stored-a-late-"))
+                .collect();
+            assert_eq!(late.len(), 1, "{late:?}");
+            assert_eq!(
+                std::fs::read(spool.join(&late[0])).unwrap(),
+                b"{\"a\":1}\n{\"late\":1}\n"
+            );
+            // Storage pressure refuses publication: the store holds none of the new files, so
+            // nothing is set aside while it lasts.
             let ballast = data.join("test-owned-pressure-ballast");
             std::fs::write(&ballast, vec![0_u8; 13 * 1024 * 1024]).unwrap();
             let refused = producer
@@ -6246,24 +6286,10 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
                 "{refused:?}"
             );
             let pressed = spool.join("katamari-stored-d.jsonl");
-            let pressed_bytes = b"{\"d\":4}\n".to_vec();
-            std::fs::write(&pressed, &pressed_bytes).unwrap();
+            std::fs::write(&pressed, b"{\"d\":4}\n").unwrap();
             let shipped = report(ship(&ship_config));
-            assert!(shipped.contains("spool: fed 1"), "{shipped}");
-            assert!(shipped.contains("spool: deleted 3 acknowledged"), "{shipped}");
-            assert!(!whole.exists() && !split.exists() && !restored.exists());
-            assert_eq!(std::fs::read(&pressed).unwrap(), pressed_bytes);
-            assert_eq!(ledger_lines(), 4);
-            // Pressure ends: once the watch publishes the new file, it is deleted too.
-            std::fs::remove_file(&ballast).unwrap();
-            watch_until(producer.capability(), |watch| {
-                watch.get_completed_claims() == fed + 1 && watch.get_pending_claims() == 0
-            })
-            .await;
-            let shipped = report(ship(&ship_config));
-            assert!(shipped.contains("spool: deleted 1 acknowledged"), "{shipped}");
-            assert!(!pressed.exists());
-            assert_eq!(ledger_lines(), 4);
+            assert!(shipped.contains("set aside 0"), "{shipped}");
+            assert!(pressed.exists());
         })
         .await;
 }

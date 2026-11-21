@@ -522,12 +522,22 @@ The source needs the top-level keys `sparrow` (the CLI) and `socket` (the store
 socket the CLI queries), and `b3sum` on the path; the configuration is refused
 at load without them. While the store does not answer, the run reports
 `store unreachable` and deletes nothing, however long the outage lasts, without
-failing. A producer may append to a file by name at any time, so the shipper
-renames the file to `.reaping-NAME` before its last identity check and deletes it
-only if the identity is unchanged; otherwise it puts the file back. A run puts
-back any `.reaping-` file an interrupted run left before it ships. A file that
-cannot be put back because its name exists again is reported as a failure and
-both files are kept.
+failing.
+
+Deletion takes two runs, because a spool script opens a file by name and appends
+a line a moment later, so a line can land in a file the store already holds. In
+the run that finds every part of a file held, the shipper renames the file to
+`.reaping-NAME`, which neither the shipper nor the spool scripts read; a script
+that opens NAME afterwards creates a new file under it. At its next run the
+shipper looks at each `.reaping-` file again and deletes it only if the store
+holds every part of its present content. A file that now holds a line the store
+lacks goes back under NAME (under `NAME-late-NS` when NAME exists again) and
+ships like any finished file, so those lines appear twice at most. A file whose
+parts the store held and has since retired goes back too and stays in the spool.
+The run reports how many files it deleted, set aside, and did not find
+acknowledged. The parts are cut with the shipper's current `max_chunk_bytes` and
+`max_chunk_lines`; after a change of either, a file queued earlier hashes
+differently, is reported as not acknowledged and stays.
 
 ## Katamari's journal in the spool
 
