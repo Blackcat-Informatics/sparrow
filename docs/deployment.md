@@ -939,10 +939,9 @@ changed. The walk takes the writer lock for each page, about 5,055 pages at the 
 (arithmetic from the walk's rate, below), so stop the shipper timer before it to keep the shipper's
 ingest out of the walk, and start the timer again right after it, whether the listing passed or
 failed. `deploy/user-unit-upgrade.sh` records at its start whether the timer is active and restores it
-on an abort only then (lines 336-337, `restore_ship_timer`), and the spool units delete files older than
-three days when they start, so a timer left stopped by a called-off window can become a loss after
-more than three days and a spool-unit restart. Ingest between the listing and
-the stop is expected: the comparison tolerates it. The walk has the stall limit of the rehearsal's
+on an abort only then (lines 336-337, `restore_ship_timer`). The spool units delete no spool file, so
+a timer left stopped by a called-off window delays shipping and loses nothing. Ingest between the
+listing and the stop is expected: the comparison tolerates it. The walk has the stall limit of the rehearsal's
 check, and the step records the walk's calls, wall time, the clock on both sides of the status read and the ingest figures
 `flush_lag_ms` and `pending_writes` before and after it, in `live-listing.tsv.counts`. The block's
 `list EXIT` is the listing's own status:
@@ -2184,11 +2183,9 @@ notice states this and gives the length only after the rehearsal has read `N`.
     (`deploy/libexec/`) and unit files (`deploy/systemd/user/`); the user manager runs the copies
     under `~/.local/libexec/sparrow/` with `Restart=always`. They never connect to Sparrow, so they
     keep writing from their own units while the daemon is down, and the shipper sends those files
-    after the start. Each unit deletes its own spool files (`katamari-stored-*.jsonl` and
-    `katamari-manager-*.jsonl`) when it starts: `ExecStartPre` runs `find ... -mtime +3 -delete`
-    (`systemctl --user cat` of both units, read on the host and saved in `.stage/416/host-reads.log`), which matches files last modified four
-    or more full days ago. A restart of either unit after an outage that long deletes the oldest files
-    the shipper has not sent. Both units and `sparrow-ship.timer` read `active` on the host
+    after the start. Neither unit deletes a spool file (`katamari-stored-*.jsonl` or
+    `katamari-manager-*.jsonl`), so an outage of any length loses no spooled line; the spool grows by
+    about 4 MB a day (read for 17 to 19 November 2026) while nothing removes files. Both units and `sparrow-ship.timer` read `active` on the host
     (`systemctl --user is-active`, saved in `.stage/416/host-reads.log`).
   A producer that rotates or deletes its own file in the window is outside Sparrow's reach.
 - Her CLI and MCP tools (`lillith_decodes`) and every other client of the CLI and the MCP tools get

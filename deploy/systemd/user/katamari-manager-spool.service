@@ -14,7 +14,6 @@ Description=Spool systemd's lines about katamari-stored as JSON Lines for sparro
 
 [Service]
 Environment="KATAMARI_MANAGER_SINCE=2026-11-09 16:12:47"
-ExecStartPre=/usr/bin/find %S/sparrow/katamari-journal -name 'katamari-manager-*.jsonl' -mtime +3 -delete
 ExecStart=%h/.local/libexec/sparrow/katamari-manager-spool katamari-stored.service %S/sparrow/katamari-journal %S/sparrow/katamari-manager.cursor
 Restart=always
 RestartSec=10
