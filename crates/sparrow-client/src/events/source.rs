@@ -10,17 +10,24 @@ use purrdf_lex::json::{self, Number, Object, Value};
 impl EventBatch {
     /// Encode the canonical bounded source bytes once for daemon publication and producer receipt verification.
     pub fn source_bytes(&self) -> Result<Vec<u8>, Error> {
+        self.source_bytes_with_limits(super::BatchLimits::NATIVE)
+    }
+
+    pub(crate) fn source_bytes_with_limits(
+        &self,
+        limits: super::BatchLimits,
+    ) -> Result<Vec<u8>, Error> {
         let batch = self;
-        batch.validate()?;
+        batch.validate_with_limits(limits)?;
         let instance = purrdf_hash::hex::encode(&batch.client_instance);
         let mut bytes = String::new();
         for event in &batch.events {
             let value = event_value(&instance, event);
             json::write_into(&mut bytes, &value, json::Format::COMPACT);
             bytes.push('\n');
-            if bytes.len() > crate::MAX_EVENT_BATCH_BYTES {
+            if bytes.len() > limits.payload_bytes {
                 return Err(Error::InvalidArgument(
-                    "event batch expansion exceeded its admitted JSONL bound",
+                    "canonical event lines exceed the admitted inline artifact byte ceiling",
                 ));
             }
         }

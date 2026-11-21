@@ -37,6 +37,14 @@ async fn capability_documents_share_cli_mcp_and_typed_transport_contracts() {
             assert_eq!(mode(&socket), 0o660);
             let baseline = cli(&socket, &["capabilities"]);
             assert_eq!(baseline["transport"].as_str(), Some("capnp"));
+            assert_eq!(
+                baseline["status"]["producer_profiles"],
+                Value::array([sparrow_client::PRODUCER_PROFILE])
+            );
+            assert_eq!(
+                baseline["producer_profiles"],
+                baseline["status"]["producer_profiles"]
+            );
             assert_eq!(baseline["transports"], Value::array(["unix", "tcp"]));
             assert_eq!(
                 baseline["formats"],
@@ -1942,9 +1950,13 @@ async fn public_tcp_requires_chap_for_reads_and_administration_but_not_ingestion
             };
 
             let anonymous =
-                sparrow_client::Client::connect_endpoint(&sparrow_client::Endpoint::Tcp(address))
+                sparrow_client::Client::connect_producer(&sparrow_client::Endpoint::Tcp(address))
                     .await
                     .unwrap();
+            assert_eq!(
+                anonymous.discovery().producer_profiles,
+                [sparrow_client::PRODUCER_PROFILE]
+            );
             let receipt = anonymous
                 .ingest(
                     "anonymous-ingest",
@@ -2024,12 +2036,13 @@ async fn public_tcp_requires_chap_for_reads_and_administration_but_not_ingestion
                 session.bytes(&receipt.id, 0, 9).await.unwrap(),
                 b"accepted\n"
             );
+            let status = sparrow_server::run_cli(&session, &["status".into()])
+                .await
+                .unwrap();
+            assert_eq!(status["store_id"].as_str(), Some(receipt.store_id.as_str()));
             assert_eq!(
-                sparrow_server::run_cli(&session, &["status".into()])
-                    .await
-                    .unwrap()["store_id"]
-                    .as_str(),
-                Some(receipt.store_id.as_str())
+                status["producer_profiles"],
+                purrdf_lex::json::Value::array([sparrow_client::PRODUCER_PROFILE])
             );
             let created = sparrow_server::run_cli(&session, &put).await.unwrap();
             assert_eq!(created["watch"]["revision"].as_str(), Some("1"));
@@ -7784,6 +7797,11 @@ fn reached_delivery(
 
 struct EventRelayState {
     backend: std::cell::RefCell<wire::sparrow::Client>,
+    /// A simulated newer daemon, advertising this producer profile and event-count ceiling.
+    profile: std::cell::Cell<Option<(bool, u32)>>,
+    /// Artifact record and inline-byte ceilings independent of the dedicated event limits.
+    artifact_limits: std::cell::Cell<Option<(u64, u64)>>,
+    refuse_discovery: std::cell::Cell<bool>,
     calls: std::cell::RefCell<Vec<sparrow_client::EventBatch>>,
     accepted: std::cell::RefCell<Option<sparrow_client::ArtifactReceipt>>,
     drop_first: std::cell::Cell<bool>,
@@ -7819,10 +7837,32 @@ impl wire::sparrow::Server for EventRelay {
         _: wire::sparrow::DiscoverParams,
         mut results: wire::sparrow::DiscoverResults,
     ) -> capnp::Result<()> {
+        if self.0.refuse_discovery.get() {
+            let mut refusal = results.get().init_result().init_error();
+            refusal.set_code("INVALID_ARGUMENT");
+            refusal.set_message("discovery refused before submission");
+            self.0.discovered.notify_one();
+            return Ok(());
+        }
         let backend = self.0.backend.borrow().clone();
         let response = backend.discover_request().send().promise.await?;
+        results.get().set_result(response.get()?.get_result()?)?;
+        if let Some((supports, ceiling)) = self.0.profile.get()
+            && let wire::result::Ok(value) = results.get().get_result()?.which()?
+        {
+            let mut discovery = value?;
+            discovery.set_schema_version(sparrow_client::SCHEMA_VERSION + 1);
+            discovery.set_max_event_batch_events(ceiling);
+            if let Some((records, bytes)) = self.0.artifact_limits.get() {
+                discovery.set_max_records_per_artifact(records);
+                discovery.set_max_inline_artifact_bytes(bytes);
+            }
+            if !supports {
+                discovery.init_producer_profiles(0);
+            }
+        }
         self.0.discovered.notify_one();
-        results.get().set_result(response.get()?.get_result()?)
+        Ok(())
     }
     async fn ingest(
         self: std::rc::Rc<Self>,
@@ -8379,6 +8419,9 @@ fn relay(
     let listener = tokio::net::UnixListener::bind(socket).unwrap();
     let state = std::rc::Rc::new(EventRelayState {
         backend: std::cell::RefCell::new(backend),
+        profile: std::cell::Cell::new(None),
+        artifact_limits: std::cell::Cell::new(None),
+        refuse_discovery: std::cell::Cell::new(false),
         calls: std::cell::RefCell::new(Vec::new()),
         accepted: std::cell::RefCell::new(None),
         drop_first: std::cell::Cell::new(true),
@@ -8406,6 +8449,127 @@ fn relay(
         }
     });
     (state, task)
+}
+
+/// A newer daemon can acquire the producer profile while a worker is running. Limits apply
+/// before first dispatch and a lost durable reply keeps its exact request across lower limits.
+#[tokio::test(flavor = "current_thread")]
+async fn missing_producer_profile_resumes_with_negotiated_limits_and_immutable_retries() {
+    use sparrow_client::{
+        Client, Delivery, DeliveryConfig, Endpoint, Error, FlushError, PRODUCER_PROFILE,
+    };
+    let test = async {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("store");
+        let socket = store_path.join("rpc.sock");
+        let config = write_server_config(dir.path(), &store_path, &socket);
+        let _daemon = start(&config, &socket).await;
+        let backend = connect(&socket).await.unwrap();
+        let proxy_socket = dir.path().join("relay.sock");
+        let endpoint = Endpoint::Unix(proxy_socket.clone());
+        let (state, proxy) = relay(&proxy_socket, backend.client.clone());
+        state.profile.set(Some((false, 2)));
+        state.refuse_discovery.set(true);
+        state.drop_first.set(false);
+        let mut config = DeliveryConfig::new(&proxy_socket, "profile-upgrade")
+            .with_quarantine_dir(dir.path().join("quarantine"));
+        config.batch_events = 4;
+        config.rpc_timeout = Duration::from_millis(250);
+        let config = config.with_test_timing(
+            Duration::from_millis(20),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+        );
+        let delivery = Delivery::start(config.clone()).unwrap();
+        for _ in 0..5 {
+            admit(&delivery, delivery_event("queued across upgrade"));
+        }
+        let deadline = Duration::from_secs(5);
+        tokio::time::timeout(deadline, state.discovered.notified())
+            .await
+            .unwrap();
+        let held = delivery.flush_async(Duration::from_millis(250)).await;
+        assert!(matches!(held, Err(FlushError::TimedOut(_))));
+        let stats = delivery.stats().unwrap();
+        assert!(matches!(stats.last_transient_failure.as_deref(),
+            Some(Error::Domain { code, .. }) if code == "INVALID_ARGUMENT"));
+        assert_eq!(stats.quarantined_events, 0);
+        assert!(state.calls.borrow().is_empty());
+        state.refuse_discovery.set(false);
+        let timeout = delivery.flush_async(Duration::from_millis(250)).await;
+        assert!(matches!(timeout, Err(FlushError::TimedOut(_))));
+        let stats = delivery.stats().unwrap();
+        assert!(matches!(
+            stats.last_transient_failure.as_deref(),
+            Some(Error::Unsupported(PRODUCER_PROFILE))
+        ));
+        assert!(stats.terminal_failure.is_none());
+        assert!(state.calls.borrow().is_empty());
+
+        state.profile.set(Some((true, 2)));
+        let strict = Client::connect_endpoint(&endpoint).await;
+        assert!(matches!(strict, Err(Error::Unsupported(_))));
+        let watermark = delivery.flush_async(deadline).await.unwrap();
+        assert_eq!(watermark.durable_events, 5);
+        let sizes: Vec<_> = state
+            .calls
+            .borrow()
+            .iter()
+            .map(|call| call.events.len())
+            .collect();
+        assert_eq!(sizes, [1, 2, 2]);
+        let direct = Client::connect_producer(&endpoint).await.unwrap();
+        let mut oversized = state.calls.borrow()[1].clone();
+        let mut extra = oversized.events[1].clone();
+        extra.sequence += 1;
+        oversized.events.push(extra);
+        assert!(matches!(
+            direct.events(&oversized).await,
+            Err(Error::InvalidArgument(_))
+        ));
+        let read = direct.bytes("artifact:example", 0, 1).await;
+        assert!(matches!(read, Err(Error::Unsupported(_))));
+        assert_eq!(state.calls.borrow().len(), 3);
+
+        state.drop_first.set(true);
+        for _ in 0..2 {
+            admit(&delivery, delivery_event("unknown durable reply"));
+        }
+        tokio::time::timeout(deadline, state.first_accepted.notified())
+            .await
+            .unwrap();
+        // The record cap lowers the effective count while the event cap remains two.
+        state.artifact_limits.set(Some((1, u64::MAX)));
+        let held = delivery.flush_async(Duration::from_secs(1)).await;
+        assert!(matches!(held, Err(FlushError::TimedOut(_))));
+        let stats = delivery.stats().unwrap();
+        assert!(matches!(
+            stats.last_transient_failure.as_deref(),
+            Some(Error::Unsupported(message)) if message.contains("immutable batch")
+        ));
+        assert_eq!(stats.quarantined_events, 0);
+        assert_eq!(state.calls.borrow().len(), 4);
+        state.artifact_limits.set(None);
+        let watermark = delivery.shutdown_async(deadline).await.unwrap();
+        assert_eq!(watermark.durable_events, 7);
+        assert_eq!(state.calls.borrow().len(), 5);
+        assert_eq!(state.calls.borrow()[3], state.calls.borrow()[4]);
+        // A pristine event whose actual JSONL exceeds the independently lowered inline
+        // byte ceiling is rejected locally and saved, without an RPC.
+        state.artifact_limits.set(Some((256, 1)));
+        let delivery = Delivery::start(config).unwrap();
+        admit(
+            &delivery,
+            delivery_event("larger than the artifact ceiling"),
+        );
+        let settled = delivery.shutdown_async(deadline).await;
+        assert!(
+            matches!(settled, Err(FlushError::Dropped(value)) if value.quarantined_before_fence == 1)
+        );
+        assert_eq!(state.calls.borrow().len(), 5);
+        proxy.abort();
+    };
+    tokio::task::LocalSet::new().run_until(test).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -15620,6 +15784,10 @@ async fn the_ingest_socket_discover_reports_the_instance_role_and_store() {
                 let discovered = cli(&ingest, &["discover"]);
                 assert_eq!(discovered["instance_role"].as_str(), Some(expected));
                 assert_eq!(discovered["store_id"], store);
+                assert_eq!(
+                    discovered["producer_profiles"],
+                    purrdf_lex::json::Value::array([sparrow_client::PRODUCER_PROFILE])
+                );
             }
         })
         .await;

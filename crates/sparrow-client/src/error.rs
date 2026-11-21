@@ -102,6 +102,11 @@ impl std::fmt::Display for Error {
                 retryable,
                 ..
             } => write!(f, "{code}: {message}; retryable={retryable}"),
+            Self::Unsupported(crate::PRODUCER_PROFILE) => write!(
+                f,
+                "daemon must advertise the {} producer profile",
+                crate::PRODUCER_PROFILE
+            ),
             Self::Unsupported(message) => write!(f, "unsupported discovery: {message}"),
             Self::Protocol(message) => write!(f, "invalid daemon response: {message}"),
             Self::InvalidArgument(message) => write!(f, "invalid input: {message}"),

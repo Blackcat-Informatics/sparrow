@@ -2324,8 +2324,8 @@ names = ['^(render_staging_progress|encode_upload_progress)$']
 [[job]]
 id = "typed-producer-discovery"
 summary = "Decode and validate the dedicated bounded typed daemon discovery before CLI/MCP queries and SDK mutations; never scan status for admission."
-home = "sparrow_client::receipt::Discovery::decode"
-entry_points = []
+home = "sparrow_client::receipt::Discovery::decode_for"
+entry_points = ["sparrow_client::receipt::Discovery::decode", "sparrow_client::receipt::Discovery::decode_producer", "sparrow_client::receipt::Contract::discover"]
 spec = "docs/development-runtime.md: standalone typed Rust producer client."
 vectors = ["crates/sparrow-client/src/receipt.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -2444,8 +2444,8 @@ names = ['^(decode_record_layout_page|decode_raw_chunk_page)$']
 [[job]]
 id = "typed-event-admission"
 summary = "Validate immutable producer batches, ordered nonzero sequences, relationships and conservative per-event/batch quotas before mutation."
-home = "sparrow_client::events::EventBatch::validate"
-entry_points = []
+home = "sparrow_client::events::EventBatch::validate_with_limits"
+entry_points = ["sparrow_client::events::EventBatch::validate"]
 spec = "docs/development-runtime.md: schema-11 typed producer event batches."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -2504,8 +2504,8 @@ names = ['^(decode_rpc_event_batch|decode_mcp_event_batch)$']
 [[job]]
 id = "typed-event-source-representation"
 summary = "Normalize typed producer observations once with the native JSON writer into queryable complete JSONL source records."
-home = "sparrow_client::events::EventBatch::source_bytes"
-entry_points = []
+home = "sparrow_client::events::EventBatch::source_bytes_with_limits"
+entry_points = ["sparrow_client::events::EventBatch::source_bytes"]
 spec = "docs/development-runtime.md: schema-11 canonical sparrow.events/1 source representation."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []

@@ -22,6 +22,7 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(Object::new()
+        .with("producer_profiles", status["producer_profiles"].clone())
         .with("status", status)
         .with("tools", tool::definitions())
         .with("formats", Value::array(formats))

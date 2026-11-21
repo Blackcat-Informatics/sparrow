@@ -3,7 +3,7 @@
 
 //! Certified durable upload checkpoints, distinct from evidence receipts.
 
-use crate::{Discovery, Error, sparrow_capnp as wire};
+use crate::{Error, sparrow_capnp as wire};
 
 /// A committed upload checkpoint. Reading it neither publishes nor renews it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,7 +92,7 @@ pub async fn get_import_progress(
             "require a bounded store ID and opaque import ID",
         ));
     }
-    Discovery::fetch(client).await?;
+    crate::receipt::Contract::Producer.discover(client).await?;
     let mut call = client.import_get_request();
     let mut query = call.get().init_import();
     query.set_store_id(store_id);

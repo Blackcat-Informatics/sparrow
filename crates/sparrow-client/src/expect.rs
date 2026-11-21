@@ -85,9 +85,9 @@ impl Expect {
     /// Refuse a connection whose discovery reports another role or store id. The error names
     /// what was required and what was reported.
     pub fn require(&self, discovery: &Discovery) -> Result<(), Error> {
-        let role_ok = self
-            .role
-            .is_none_or(|role| discovery.instance_role == role.wire());
+        let role_ok = self.role.is_none_or(|role| {
+            discovery.unknown_instance_role.is_none() && discovery.instance_role == role.wire()
+        });
         let store_ok = self
             .store_id
             .as_deref()
@@ -96,13 +96,17 @@ impl Expect {
             return Ok(());
         }
         let required_store = self.store_id.as_deref().unwrap_or("any");
+        let reported_role = discovery.unknown_instance_role.map_or_else(
+            || instance_role_label(discovery.instance_role).to_owned(),
+            |ordinal| format!("unknown role ordinal {ordinal}"),
+        );
         Err(Error::Domain {
             code: "INSTANCE_MISMATCH".into(),
             message: format!(
                 "required instance_role {} on store {required_store}, but the daemon reports instance_role {} on store {}; refusing before any import call",
                 self.role
                     .map_or("any", |role| instance_role_label(role.wire())),
-                instance_role_label(discovery.instance_role),
+                reported_role,
                 discovery.store_id,
             ),
             retryable: false,

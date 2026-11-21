@@ -1238,6 +1238,8 @@ mod tests {
             flush_interval_ms: 1,
             store_id: "store:1".into(),
             schema_version: crate::SCHEMA_VERSION,
+            producer_profiles: vec![crate::PRODUCER_PROFILE.into()],
+            producer_limits: crate::ProducerLimits::default(),
             max_inline_artifact_bytes: 1,
             max_records_per_artifact: 1,
             text_analyzer: "a".into(),
@@ -1251,6 +1253,7 @@ mod tests {
             retire_chunk_charge: 0,
             retire_record_charge: 0,
             instance_role: crate::sparrow_capnp::InstanceRole::Unspecified,
+            unknown_instance_role: None,
         };
         // A daemon at the previous release sends the import bound and none of the rest.
         let missing = PartLimits::from_discovery(&discovery, 65_536).unwrap_err();

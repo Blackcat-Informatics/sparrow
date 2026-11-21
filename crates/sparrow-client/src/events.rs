@@ -16,6 +16,31 @@ pub const MAX_EVENT_FIELDS: usize = 128;
 /// Maximum captured ancestors/current spans on an event.
 pub const MAX_EVENT_SPANS: usize = 32;
 
+#[derive(Clone, Copy)]
+pub(crate) struct BatchLimits {
+    pub(crate) events: usize,
+    /// Conservative expansion budget, including the request envelope.
+    pub(crate) bytes: usize,
+    /// Exact canonical JSONL byte ceiling for the underlying inline artifact.
+    pub(crate) payload_bytes: usize,
+}
+
+impl BatchLimits {
+    pub(crate) const NATIVE: Self = Self {
+        events: MAX_EVENT_BATCH_EVENTS,
+        bytes: MAX_EVENT_BATCH_BYTES,
+        payload_bytes: MAX_EVENT_BATCH_BYTES,
+    };
+
+    pub(crate) fn bounded(self, events: usize, bytes: usize) -> Self {
+        Self {
+            events: self.events.min(events),
+            bytes: self.bytes.min(bytes),
+            payload_bytes: self.payload_bytes.min(bytes),
+        }
+    }
+}
+
 /// A captured Rust field type. Float bits retain NaN payloads and signed zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldValue {
@@ -155,6 +180,10 @@ impl Budget {
 impl EventBatch {
     /// Validate labels, ordering, typed relationships, and conservative byte quotas.
     pub fn validate(&self) -> Result<(), Error> {
+        self.validate_with_limits(BatchLimits::NATIVE)
+    }
+
+    fn validate_with_limits(&self, limits: BatchLimits) -> Result<(), Error> {
         if self.request_id.is_empty()
             || self.request_id.len() > 128
             || self.source.is_empty()
@@ -165,7 +194,12 @@ impl EventBatch {
             ));
         }
         check_count(self.events.len())?;
-        let mut batch = Budget::new(MAX_EVENT_BATCH_BYTES);
+        if self.events.len() > limits.events {
+            return Err(Error::InvalidArgument(
+                "event count exceeds the advertised producer batch ceiling",
+            ));
+        }
+        let mut batch = Budget::new(limits.bytes);
         batch.charge(1024)?;
         batch.text(&self.request_id)?;
         batch.text(&self.source)?;

@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::task::LocalSet::new()
         .run_until(async {
             let client =
-                Client::connect_endpoint(&sparrow_client::Endpoint::parse(&args[0])?).await?;
+                Client::connect_producer(&sparrow_client::Endpoint::parse(&args[0])?).await?;
             let receipt = client.events_with_durability(&batch, durability).await?;
             println!(
                 "{} {:?} records={} bytes={}",

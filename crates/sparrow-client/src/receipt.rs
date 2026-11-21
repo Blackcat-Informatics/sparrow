@@ -47,6 +47,10 @@ pub struct Discovery {
     pub store_id: String,
     /// Generated wire contract version.
     pub schema_version: u32,
+    /// Named ingestion contracts the daemon advertises.
+    pub producer_profiles: Vec<String>,
+    /// Server limits for tracking producer evidence. These describe the server's windows.
+    pub producer_limits: ProducerLimits,
     /// Largest artifact carried in one inline ingest message. Larger artifacts
     /// stream through the staged import, up to its fixed publication bound.
     pub max_inline_artifact_bytes: u64,
@@ -74,15 +78,62 @@ pub struct Discovery {
     pub retire_chunk_charge: u64,
     /// Charge of one record against `retire_row_budget`.
     pub retire_record_charge: u64,
-    /// The store's role fixed at creation; `Unspecified` for a store with none and from a
-    /// daemon that does not advertise it.
+    /// The known store role. `Unspecified` means no known role. For a newer role the
+    /// daemon's actual ordinal is preserved in [`Self::unknown_instance_role`].
     pub instance_role: crate::sparrow_capnp::InstanceRole,
+    /// The actual wire ordinal when this SDK does not recognize the advertised store role.
+    /// Strict query discovery refuses such a role. A producer may still pin the store id.
+    pub unknown_instance_role: Option<u16>,
+}
+
+/// Limits on the server's producer-window registry, as advertised at discovery.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProducerLimits {
+    /// Maximum number of tracked producer windows.
+    pub max_streams: u32,
+    /// Maximum retained gap intervals per window.
+    pub max_gap_intervals: u32,
+    /// Maximum encoded registry size.
+    pub max_registry_bytes: u64,
+    /// Retention of producer-window metadata in seconds.
+    pub metadata_retention_seconds: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Contract {
+    Query,
+    Producer,
 }
 
 impl Discovery {
     /// Decode and enforce the current typed discovery contract.
     pub fn decode(value: wire::discovery::Reader<'_>) -> Result<Self, Error> {
+        Self::decode_for(value, Contract::Query)
+    }
+
+    /// Require the producer profile, independently of the daemon's query schema version.
+    pub fn decode_producer(value: wire::discovery::Reader<'_>) -> Result<Self, Error> {
+        Self::decode_for(value, Contract::Producer)
+    }
+
+    fn decode_for(value: wire::discovery::Reader<'_>, contract: Contract) -> Result<Self, Error> {
+        let raw_profiles = value.get_producer_profiles()?;
+        if raw_profiles.len() > 128 {
+            return Err(Error::Protocol("discovery exceeds 128 producer profiles"));
+        }
+        let mut producer_profiles = Vec::with_capacity(raw_profiles.len() as usize);
+        for profile in raw_profiles.iter() {
+            let profile = profile?.to_str()?;
+            if profile.is_empty() || profile.len() > 128 {
+                return Err(Error::Protocol(
+                    "producer profile names must contain 1..128 bytes",
+                ));
+            }
+            producer_profiles.push(profile.to_owned());
+        }
         let durability = value.get_durability_status()?;
+        let limits = value.get_producer_limits()?;
+        let role = value.get_instance_role();
         let discovery = Self {
             durability_session: durability.get_session_id()?.to_str()?.to_owned(),
             max_buffered_writes: durability.get_max_pending_writes(),
@@ -90,6 +141,13 @@ impl Discovery {
             flush_interval_ms: durability.get_flush_interval_ms(),
             store_id: value.get_store_id()?.to_str()?.to_owned(),
             schema_version: value.get_schema_version(),
+            producer_profiles,
+            producer_limits: ProducerLimits {
+                max_streams: limits.get_max_streams(),
+                max_gap_intervals: limits.get_max_gap_intervals(),
+                max_registry_bytes: limits.get_max_registry_bytes(),
+                metadata_retention_seconds: limits.get_metadata_retention_seconds(),
+            },
             max_inline_artifact_bytes: value.get_max_inline_artifact_bytes(),
             max_records_per_artifact: value.get_max_records_per_artifact(),
             text_analyzer: value.get_text_analyzer()?.to_str()?.to_owned(),
@@ -103,32 +161,85 @@ impl Discovery {
             retire_row_budget: value.get_retire_row_budget(),
             retire_chunk_charge: value.get_retire_chunk_charge(),
             retire_record_charge: value.get_retire_record_charge(),
-            instance_role: value.get_instance_role()?,
+            instance_role: role.unwrap_or(wire::InstanceRole::Unspecified),
+            unknown_instance_role: role.err().map(|ordinal| ordinal.0),
         };
-        if discovery.schema_version != crate::SCHEMA_VERSION
-            || !valid_store_id(&discovery.store_id)
+        discovery.require(contract)?;
+        if !valid_store_id(&discovery.store_id)
             || discovery.max_inline_artifact_bytes == 0
             || discovery.max_records_per_artifact == 0
-            || discovery.text_analyzer.is_empty()
-            || discovery.text_profile.is_empty()
-            || discovery.rdf_profile.is_empty()
             || discovery.durability_session.is_empty()
             || discovery.durability_session.len() > 128
             || discovery.max_buffered_writes == 0
             || discovery.max_buffered_bytes == 0
             || !(1..=60000).contains(&discovery.flush_interval_ms)
-            || discovery.max_event_batch_bytes != crate::MAX_EVENT_BATCH_BYTES as u32
-            || discovery.max_event_batch_events != crate::MAX_EVENT_BATCH_EVENTS as u32
         {
             return Err(Error::Unsupported(
-                "requires the current schema version, matching event batch limits, bounded durability discovery and nonempty store, text and RDF identities; use a matching daemon executable",
+                "requires bounded durability discovery, artifact limits and a persistent store identity",
             ));
         }
         Ok(discovery)
     }
 
+    /// Check the contract of an operation using this connection's cached discovery.
+    pub(crate) fn require(&self, contract: Contract) -> Result<(), Error> {
+        if matches!(contract, Contract::Query)
+            && let Some(role) = self.unknown_instance_role
+        {
+            return Err(capnp::NotInSchema(role).into());
+        }
+        match contract {
+            Contract::Query
+                if self.schema_version != crate::SCHEMA_VERSION
+                    || self.max_event_batch_bytes != crate::MAX_EVENT_BATCH_BYTES as u32
+                    || self.max_event_batch_events != crate::MAX_EVENT_BATCH_EVENTS as u32
+                    || self.text_analyzer.is_empty()
+                    || self.text_profile.is_empty()
+                    || self.rdf_profile.is_empty() =>
+            {
+                return Err(Error::Unsupported(
+                    "requires the current schema version, matching event batch limits and nonempty text and RDF identities; use a matching daemon executable",
+                ));
+            }
+            Contract::Producer
+                if !self
+                    .producer_profiles
+                    .iter()
+                    .any(|p| p == crate::PRODUCER_PROFILE) =>
+            {
+                return Err(Error::Unsupported(crate::PRODUCER_PROFILE));
+            }
+            Contract::Producer
+                if self.max_event_batch_events == 0
+                    || self.max_event_batch_bytes < crate::MAX_EVENT_BYTES as u32 =>
+            {
+                return Err(Error::Unsupported(
+                    "producer event batch ceilings must admit at least one event and 64 KiB",
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn event_limits(&self) -> crate::events::BatchLimits {
+        let mut limits = crate::events::BatchLimits::NATIVE.bounded(
+            self.max_records_per_artifact
+                .min(u64::from(self.max_event_batch_events)) as usize,
+            self.max_event_batch_bytes as usize,
+        );
+        limits.payload_bytes = self.max_inline_artifact_bytes.min(limits.bytes as u64) as usize;
+        limits
+    }
+
     /// Request and validate discovery on a generated capability.
     pub async fn fetch(client: &wire::sparrow::Client) -> Result<Self, Error> {
+        Contract::Query.discover(client).await
+    }
+}
+
+impl Contract {
+    pub(crate) async fn discover(self, client: &wire::sparrow::Client) -> Result<Discovery, Error> {
         let response = client
             .discover_request()
             .send()
@@ -136,13 +247,18 @@ impl Discovery {
             .await
             .map_err(|error| {
                 if error.kind == capnp::ErrorKind::Unimplemented {
-                    Error::Unsupported("requires typed discovery; use a matching daemon executable")
+                    match self {
+                        Self::Query => Error::Unsupported(
+                            "requires typed discovery; use a matching daemon executable",
+                        ),
+                        Self::Producer => Error::Unsupported(crate::PRODUCER_PROFILE),
+                    }
                 } else {
                     Error::from(error)
                 }
             })?;
         match response.get()?.get_result()?.which()? {
-            wire::result::Ok(value) => Self::decode(value?),
+            wire::result::Ok(value) => Discovery::decode_for(value?, self),
             wire::result::Error(error) => Err(Error::domain(error?)),
         }
     }
@@ -460,15 +576,26 @@ mod tests {
         assert!(matches!(buffered.certify(receipt), Err(Error::Protocol(_))));
     }
 
+    /// Query clients require matching schema and index identities. Producers continue across
+    /// additive schema changes, including unknown trailing fields, if their profile is present.
     #[test]
-    fn discovery_refuses_old_schema_or_missing_profile_identity() {
+    fn producer_discovery_accepts_a_newer_schema_that_advertises_its_profile() {
         for (version, rdf) in [
             (22, "rdf"),
+            (crate::SCHEMA_VERSION + 1, ""),
             (crate::SCHEMA_VERSION, ""),
             (crate::SCHEMA_VERSION, "rdf"),
         ] {
             let mut message = capnp::message::Builder::new_default();
-            let mut status = message.init_root::<super::wire::discovery::Builder<'_>>();
+            // Allocate a real wire struct with a larger pointer section. Its last pointer
+            // survives the discovery writes and represents a field unknown to this reader.
+            message
+                .init_root::<super::wire::status::Builder<'_>>()
+                .init_producer_profiles(1)
+                .set(0, "unknown trailing field");
+            let mut status = message
+                .get_root::<super::wire::discovery::Builder<'_>>()
+                .unwrap();
             status.set_schema_version(version);
             status.set_store_id("store:test");
             status.set_text_analyzer("analyzer");
@@ -483,14 +610,79 @@ mod tests {
             durability.set_max_pending_writes(256);
             durability.set_max_pending_bytes(64 * 1024 * 1024);
             durability.set_flush_interval_ms(2000);
-            let decoded = super::Discovery::decode(status.into_reader());
+            assert!(matches!(
+                super::Discovery::decode_producer(status.reborrow_as_reader()),
+                Err(super::Error::Unsupported(crate::PRODUCER_PROFILE))
+            ));
+            let mut profiles = status.reborrow().init_producer_profiles(2);
+            profiles.set(0, "future-profile/1");
+            profiles.set(1, crate::PRODUCER_PROFILE);
+            assert!(super::Discovery::decode_producer(status.reborrow_as_reader()).is_ok());
+            let decoded = super::Discovery::decode(status.reborrow_as_reader());
             if version == crate::SCHEMA_VERSION && !rdf.is_empty() {
                 let value = decoded.unwrap();
                 assert_eq!(value.store_id, "store:test");
                 assert_eq!(value.durability_session, "session:test");
+                // A future enum member must survive discovery but can never satisfy a
+                // required known role. Set its raw ordinal through the schema descriptor.
+                use capnp::introspect::{Introspect, TypeVariant};
+                let TypeVariant::Enum(schema) = super::wire::InstanceRole::introspect().which()
+                else {
+                    panic!("instance role descriptor");
+                };
+                let capnp::dynamic_value::Builder::Struct(mut dynamic) = status.reborrow().into()
+                else {
+                    panic!("discovery descriptor");
+                };
+                let future =
+                    capnp::dynamic_value::Enum::new(42, capnp::schema::EnumSchema::new(schema));
+                dynamic.set_named("instanceRole", future.into()).unwrap();
+                let discovery =
+                    super::Discovery::decode_producer(status.reborrow_as_reader()).unwrap();
+                assert_eq!(discovery.unknown_instance_role, Some(42));
+                crate::Expect::store("store:test")
+                    .require(&discovery)
+                    .unwrap();
+                let mismatch = crate::Expect::new(crate::RequiredRole::Scratch)
+                    .require(&discovery)
+                    .unwrap_err();
+                assert!(
+                    matches!(mismatch, super::Error::Domain { code, message, .. } if code == "INSTANCE_MISMATCH" && message.contains("ordinal 42"))
+                );
+                assert!(super::Discovery::decode(status.reborrow_as_reader()).is_err());
             } else {
                 assert!(matches!(decoded, Err(super::Error::Unsupported(_))));
             }
+            for (events, bytes, compatible) in [
+                (0, crate::MAX_EVENT_BYTES, false),
+                (1, crate::MAX_EVENT_BYTES - 1, false),
+                (128, crate::MAX_EVENT_BYTES, true),
+                (u32::MAX, u32::MAX as usize, true),
+            ] {
+                status.set_max_event_batch_events(events);
+                status.set_max_event_batch_bytes(bytes as u32);
+                let decoded = super::Discovery::decode_producer(status.reborrow_as_reader());
+                if compatible {
+                    let limits = decoded.unwrap().event_limits();
+                    assert_eq!(limits.events, (events as usize).min(100));
+                    assert_eq!(limits.bytes, bytes.min(crate::MAX_EVENT_BATCH_BYTES));
+                    assert_eq!(limits.payload_bytes, 1024);
+                } else {
+                    assert!(matches!(decoded, Err(super::Error::Unsupported(_))));
+                }
+            }
+            assert_eq!(
+                message
+                    .get_root_as_reader::<super::wire::status::Reader<'_>>()
+                    .unwrap()
+                    .get_producer_profiles()
+                    .unwrap()
+                    .get(0)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "unknown trailing field"
+            );
         }
     }
 }

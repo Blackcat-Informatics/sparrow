@@ -3023,6 +3023,41 @@ days does not shorten a record that would ordinarily remain for another twenty.
 
 ## 5. Cap'n Proto ingestion, queries, and administration
 
+### Producer contract `sparrow-producer/1`
+
+`Discovery.producerProfiles` names the ingestion contracts the daemon serves.
+The same list appears in `Status.producerProfiles`. Discovery admits at most
+128 names, each 1 to 128 UTF-8 bytes. A producer can use any
+schema version advertising `sparrow-producer/1`. Its operations are `discover`,
+`ingest`, `eventsIngest`, `flush`, and the staged upload methods `importBegin`,
+`importAppend`, `importGet`, `importSeal`, `importLayout`, `importPrepare`,
+`importPublish` and `importCancel`. The private Unix socket, producer-only
+Unix socket and anonymous TCP endpoint admit these operations. Read `status`
+over the private socket or an authenticated TCP connection.
+
+Read `maxInlineArtifactBytes`, `maxRecordsPerArtifact`, `maxEventBatchBytes`,
+`maxEventBatchEvents` and `producerLimits` from discovery. The last struct
+describes the server's tracking windows and metadata retention. The event
+worker uses the smallest of the configured, advertised and native limits.
+Discovery requires at least one event per batch and at least 64 KiB of batch
+space. The event and its request envelope must both fit the byte ceiling.
+Each event becomes one record, so `maxRecordsPerArtifact` also limits the
+count. The canonical JSONL must fit `maxInlineArtifactBytes`. The worker
+groups events using a conservative byte estimate and checks the actual
+encoded length before sending a singleton.
+
+Keep the request identity across transport failures, timeouts, overload and
+retryable daemon refusals such as `STORAGE_PRESSURE`, `SHUTTING_DOWN` and a
+busy `RESOURCE_LIMIT`. Retry an unknown outcome with the same data. If the
+new ceiling cannot admit a possibly committed batch, delivery holds it
+until a compatible daemon returns. A permanent input refusal or store
+replacement ends retries for that batch after quarantine, as described in
+section 7.
+
+Extend the profile with trailing Cap'n Proto fields or new operations.
+Removing a field or operation, or changing its meaning, requires a new
+profile name. Advertise every profile still served.
+
 ### File-generation checkpoints and active tail watches
 
 The core has `tail_start`, `tail_append`, `tail_generation` and
@@ -4648,6 +4683,16 @@ Cancelling a wait releases the slot and preserves its unreported gaps.
 Starting shutdown closes admission even if the wait is cancelled. Another
 shutdown can finish draining. The worker owns its RPC runtime.
 
+For direct ingestion, open `Client::connect_producer(&endpoint)` and use
+`ingest`, `events`, `import_file` or `flush` on the connected client.
+The delivery worker retains its pending event on a daemon that lacks
+`sparrow-producer/1`. It exposes the missing profile as
+`last_transient_failure` and retries discovery every 30 seconds.
+An explicit flush or shutdown can wake the retry early. Admission stays
+bounded while the daemon upgrades. The worker prepares a singleton before
+its first successful discovery and batches subsequent events within the
+advertised ceilings.
+
 `DeliveryConfig::local(source)` selects `/run/sparrow-ingest/ingest.sock`.
 Supply a Unix path or TCP endpoint in Rust, or load a producer TOML file with
 `DeliveryConfig::from_file(path).await?`. A file requires `source`; omitting
@@ -4665,7 +4710,10 @@ secret_file = "tcp.secret"
 `expected_role` accepts `production` or `scratch`. `expected_store` takes the
 store id from discovery. Either or both can be set. Discovery checks them on
 every connection before sending events. A mismatch holds the pending batch
-until the required daemon returns. `secret_file` selects authenticated TCP
+until the required daemon returns. An unrecognized future role can satisfy
+a store-id-only expectation. It fails a role expectation with the actual
+wire ordinal in the diagnostic. `Discovery.unknown_instance_role` preserves
+that ordinal for SDK callers. `secret_file` selects authenticated TCP
 and uses the same private-file rules as the CLI. Other optional keys are
 `quarantine_dir`, `max_queued_events`, `max_queued_bytes`, `batch_events`,
 `batch_bytes`, `flush_interval_ms`, `rpc_timeout_ms`, `retry_interval_ms`,
@@ -4984,6 +5032,12 @@ recovered data before starting a fresh session. These fences certify storage
 durability, not retention extension, producer drops or power-loss qualification.
 
 ## 8. Errors and compatibility
+
+Producer discovery checks the named ingestion profile. An absent or empty
+`producerProfiles` list gives `UNSUPPORTED` naming `sparrow-producer/1`.
+The access CLI and MCP open connections with the exact query schema. This
+includes the CLI's `ingest` command. Cross-schema ingest is available to SDK
+callers that select the producer connection, including the delivery worker.
 
 Typed errors carry `code`, a concise `message`, `retryable`, `request_id` when
 applicable, and bounded `details`. An error does not include a successful query
