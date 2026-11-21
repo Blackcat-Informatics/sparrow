@@ -1403,7 +1403,7 @@ names = ['^(allocate_tracing_span_id|allocate_direct_span_id)$']
 
 [[job]]
 id = "producer-tracing-field-admission"
-summary = "One typed visitor owner applies field-count and captured-byte bounds before admitting owned fields."
+summary = "Tracing and log facade visitors share one field-count and captured-byte bound before admitting owned fields."
 home = "sparrow_client::logging::Fields::push"
 entry_points = []
 spec = "docs/interfaces.md: bounded Rust field capture."
@@ -1428,6 +1428,34 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(capture_direct_tracing_event|capture_alternate_span_context)$']
+
+[[job]]
+id = "developer-console-display"
+summary = "Structured producers share one human-readable severity, message and field formatter on the bounded console output thread."
+home = "sparrow_client::console::render::line"
+entry_points = ["sparrow_client::Console::layer"]
+spec = "docs/interfaces.md: Developer console."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(render_alternate_console_event|format_separate_log_record)$']
+
+[[job]]
+id = "explicit-console-streams"
+summary = "Explicit writers and piped child output share the same raw fragment, stream label and optional producer observation."
+home = "sparrow_client::console::stream::Fragment::forward"
+entry_points = ["sparrow_client::Console::writer", "sparrow_client::Console::tee"]
+spec = "docs/interfaces.md: Developer console."
+vectors = ["crates/sparrow-client/src/console/tests.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(make_second_console_fragment|recapture_child_log_line)$']
 
 [[job]]
 id = "producer-span-charge"

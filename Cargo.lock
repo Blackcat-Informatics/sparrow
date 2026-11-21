@@ -580,6 +580,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "log"
+version = "0.4.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
+
+[[package]]
 name = "lz4-sys"
 version = "1.11.1+lz4-1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1378,6 +1384,7 @@ dependencies = [
  "capnpc",
  "futures",
  "getrandom 0.3.4",
+ "log",
  "purrdf-ed25519",
  "purrdf-hash",
  "purrdf-lex",
@@ -1424,6 +1431,7 @@ dependencies = [
  "capnp-rpc",
  "futures",
  "getrandom 0.3.4",
+ "log",
  "purrdf",
  "purrdf-hash",
  "purrdf-lex",

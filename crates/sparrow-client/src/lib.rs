@@ -3,7 +3,21 @@
 
 //! Typed Sparrow producer access over Unix or public TCP, without a database dependency.
 //!
-//! Run the client inside a Tokio `LocalSet`; Cap'n Proto capabilities stay on its
+//! A Rust application can start with a local console and configure delivery by passing
+//! `Some(delivery)` to [`Console::install`]. An application composing its own subscriber
+//! can attach [`Console::layer`] instead.
+//!
+//! ```no_run
+//! # async fn example() -> std::io::Result<()> {
+//! let console = sparrow_client::Console::install(None)?;
+//! let files = 12;
+//! sparrow_client::sparrow_eprintln!("Read {files} files");
+//! console.flush().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Run the low-level [`Client`] inside a Tokio `LocalSet`; Cap'n Proto capabilities stay on its
 //! owning task. A retry must reuse the original request ID, source, format and bytes.
 //!
 //! ```no_run
@@ -67,14 +81,29 @@ pub use events::{
     MAX_EVENT_BYTES, MAX_EVENT_FIELDS, MAX_EVENT_SPANS, ProducerEvent,
     read_wide as decode_wide_integer, wide as encode_wide_integer,
 };
+mod console;
 mod delivery;
 mod logging;
 mod quarantine;
 mod replay;
+pub use console::{Console, ConsoleStats, ConsoleStream, ConsoleWriter};
 pub use delivery::{
     Admission, Delivery, DeliveryConfig, DeliveryStats, DeliveryWatermark, DropReason, FlushError,
 };
 pub use logging::TracingLayer;
+
+#[doc(hidden)]
+pub use tracing as __tracing;
+
+/// Emit a stderr-labelled, INFO-level structured event through the current subscriber.
+/// Accepts the same formatting arguments and captured identifiers as `eprintln!`.
+#[macro_export]
+macro_rules! sparrow_eprintln {
+    () => { $crate::sparrow_eprintln!("") };
+    ($($arg:tt)*) => {
+        $crate::__tracing::info!(stream = "stderr", message = %format_args!($($arg)*))
+    };
+}
 pub use replay::{ReplayReceipt, replay_quarantine};
 
 pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
