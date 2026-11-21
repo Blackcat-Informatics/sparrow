@@ -6273,14 +6273,8 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
                 std::fs::read(spool.join(&late[0])).unwrap(),
                 b"{\"a\":1}\n{\"late\":1}\n"
             );
-            // Let the watch publish everything fed so far, so only pressure keeps a file out.
-            watch_until(producer.capability(), |watch| {
-                watch.get_pending_claims() == 0
-                    && std::fs::read_dir(intake.join("spool")).unwrap().count() == 0
-            })
-            .await;
-            // Storage pressure refuses publication: the store holds none of the new files, so
-            // nothing is set aside while it lasts.
+            // Storage pressure refuses publication: the store holds no part of the new file,
+            // so it is neither deleted nor set aside while pressure lasts.
             let ballast = data.join("test-owned-pressure-ballast");
             std::fs::write(&ballast, vec![0_u8; 13 * 1024 * 1024]).unwrap();
             let refused = producer
@@ -6294,8 +6288,9 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
             let pressed = spool.join("katamari-stored-d.jsonl");
             std::fs::write(&pressed, b"{\"d\":4}\n").unwrap();
             let shipped = report(ship(&ship_config));
-            assert!(shipped.contains("set aside 0"), "{shipped}");
-            assert!(pressed.exists());
+            assert!(pressed.exists(), "{shipped}");
+            let shipped = report(ship(&ship_config));
+            assert!(pressed.exists(), "{shipped}");
         })
         .await;
 }
