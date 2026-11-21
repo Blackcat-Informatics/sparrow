@@ -11,7 +11,7 @@ use std::{
     collections::VecDeque,
     path::PathBuf,
     sync::{
-        Arc, Condvar, Mutex, TryLockError,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -22,6 +22,8 @@ use std::{
 pub struct DeliveryConfig {
     /// Explicit Unix or public TCP daemon destination.
     pub endpoint: crate::Endpoint,
+    /// Optional store identity or role required at discovery on every connection.
+    pub expect: Option<crate::Expect>,
     /// Immutable logical event source.
     pub source: String,
     /// Queued plus in-flight event limit.
@@ -59,6 +61,11 @@ pub struct DeliveryConfig {
 const MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 impl DeliveryConfig {
+    /// Send to the local group-accessible producer socket.
+    pub fn local(source: impl Into<String>) -> Self {
+        Self::new("/run/sparrow-ingest/ingest.sock", source)
+    }
+
     /// Default bounded queue, two-second batching, and finite RPC/retry deadlines.
     pub fn new(socket: impl Into<PathBuf>, source: impl Into<String>) -> Self {
         Self::for_endpoint(crate::Endpoint::Unix(socket.into()), source)
@@ -73,6 +80,7 @@ impl DeliveryConfig {
     pub fn for_endpoint(endpoint: crate::Endpoint, source: impl Into<String>) -> Self {
         Self {
             endpoint,
+            expect: None,
             source: source.into(),
             max_queued_events: 1024,
             max_queued_bytes: 4 * 1024 * 1024,
@@ -112,34 +120,60 @@ impl DeliveryConfig {
         self.quarantine_dir = dir.into();
         self
     }
-    fn validate(&self) -> Result<(), Error> {
+    pub(crate) fn validate(&self) -> Result<(), Error> {
         self.endpoint.validate()?;
+        if let Some(expect) = &self.expect {
+            expect.validate()?;
+        }
         if !self.quarantine_dir.is_absolute() {
             return Err(Error::InvalidArgument(
                 "quarantine_dir must be an absolute directory: set DeliveryConfig::quarantine_dir, or provide an absolute XDG_STATE_HOME or HOME for the default",
             ));
         }
-        if self.source.is_empty()
-            || self.source.len() > 512
-            || !(1..=16_384).contains(&self.max_queued_events)
-            || !(MAX_EVENT_BYTES..=64 * 1024 * 1024).contains(&self.max_queued_bytes)
-            || !(1..=MAX_EVENT_BATCH_EVENTS).contains(&self.batch_events)
-            || !(MAX_EVENT_BYTES + 8192..=MAX_EVENT_BATCH_BYTES).contains(&self.batch_bytes)
-            || self.retry_max_interval < self.retry_interval
-            || [
-                self.flush_interval,
-                self.rpc_timeout,
-                self.retry_interval,
-                self.retry_max_interval,
-            ]
-            .iter()
-            .any(|duration| duration.is_zero() || *duration > Duration::from_secs(60))
-            || self.flush_interval < self.interval_floor
-            || self.retry_interval < self.interval_floor
-        {
-            return Err(Error::InvalidArgument(
-                "invalid delivery labels, queue/batch limits or timing bounds; durations require (0,60s], flush_interval and retry_interval at least 1s, and retry_max_interval >= retry_interval",
-            ));
+        let upper = Duration::from_secs(60);
+        for (valid, diagnostic) in [
+            (
+                (1..=512).contains(&self.source.len()),
+                "source must contain 1..512 bytes",
+            ),
+            (
+                (1..=16_384).contains(&self.max_queued_events),
+                "max_queued_events must be 1..16384",
+            ),
+            (
+                (MAX_EVENT_BYTES..=64 * 1024 * 1024).contains(&self.max_queued_bytes),
+                "max_queued_bytes must be 64 KiB..64 MiB",
+            ),
+            (
+                (1..=MAX_EVENT_BATCH_EVENTS).contains(&self.batch_events),
+                "batch_events must be 1..256",
+            ),
+            (
+                (MAX_EVENT_BYTES + 8192..=MAX_EVENT_BATCH_BYTES).contains(&self.batch_bytes),
+                "batch_bytes must be 72 KiB..1 MiB",
+            ),
+            (
+                !self.rpc_timeout.is_zero() && self.rpc_timeout <= upper,
+                "rpc_timeout must be positive and at most 60s",
+            ),
+            (
+                !self.flush_interval.is_zero()
+                    && (self.interval_floor..=upper).contains(&self.flush_interval),
+                "flush_interval must be 1s..60s in production",
+            ),
+            (
+                !self.retry_interval.is_zero()
+                    && (self.interval_floor..=upper).contains(&self.retry_interval),
+                "retry_interval must be 1s..60s in production",
+            ),
+            (
+                (self.retry_interval..=upper).contains(&self.retry_max_interval),
+                "retry_max_interval must be at least retry_interval and at most 60s",
+            ),
+        ] {
+            if !valid {
+                return Err(Error::InvalidArgument(diagnostic));
+            }
         }
         Ok(())
     }
@@ -361,8 +395,8 @@ struct Shared {
     config: DeliveryConfig,
     instance: [u8; 16],
     state: Mutex<State>,
-    control: Mutex<()>,
     changed: Condvar,
+    async_changed: tokio::sync::Notify,
     wake: tokio::sync::Notify,
     /// Signalled by every flush or shutdown so a waiting retry delay ends at once. Kept apart
     /// from `wake`, which each admitted event signals and would otherwise cut the backoff short.
@@ -370,7 +404,7 @@ struct Shared {
     /// Flush and shutdown calls currently waiting. A `retry_wake` signal ends a retry delay only
     /// while this is nonzero, so a signal left by a barrier that already returned cannot shorten
     /// the first delay of a later outage.
-    barriers_waiting: AtomicUsize,
+    barrier_active: AtomicBool,
     abort_wake: tokio::sync::Notify,
     owners: AtomicUsize,
     offered: AtomicU64,
@@ -404,6 +438,13 @@ impl Drop for Delivery {
 }
 
 impl Delivery {
+    /// Start a producer from typed configuration on the Tokio blocking pool.
+    pub async fn start_async(config: DeliveryConfig) -> Result<Self, Error> {
+        tokio::task::spawn_blocking(move || Self::start(config))
+            .await
+            .map_err(std::io::Error::other)?
+    }
+
     /// Start only an owned producer worker. This does not synchronously connect.
     pub fn start(mut config: DeliveryConfig) -> Result<Self, Error> {
         config.validate()?;
@@ -549,95 +590,151 @@ impl Delivery {
         self.barrier(timeout, true)
     }
 
+    /// Wait asynchronously for admitted events to reach remote durability.
+    /// Cancelling the wait releases the control slot and leaves gap reporting to the next fence.
+    pub async fn flush_async(&self, timeout: Duration) -> Result<DeliveryWatermark, FlushError> {
+        self.barrier_async(timeout, false).await
+    }
+
+    /// Close admission and asynchronously wait for the worker to drain and stop.
+    /// Cancellation or timeout leaves admission closed. A later shutdown can finish the wait.
+    pub async fn shutdown_async(&self, timeout: Duration) -> Result<DeliveryWatermark, FlushError> {
+        self.barrier_async(timeout, true).await
+    }
+
     fn barrier(&self, timeout: Duration, closing: bool) -> Result<DeliveryWatermark, FlushError> {
-        let _control = match self.shared.control.try_lock() {
-            Ok(control) => control,
-            Err(TryLockError::WouldBlock) => return Err(FlushError::Busy),
-            Err(TryLockError::Poisoned(_)) => {
-                return Err(FlushError::Unavailable("producer barrier state poisoned"));
-            }
-        };
-        let _waiting = BarrierWaiting::enter(&self.shared.barriers_waiting);
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or(FlushError::Unavailable(
-                "producer barrier deadline out of range",
-            ))?;
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .map_err(|_| FlushError::Unavailable("producer queue state poisoned"))?;
-        state.closing |= closing;
-        let target = state.admitted_sequence;
-        let dropped = self.shared.drop_total();
-        // Drops and quarantines count against the barrier that first sees them: a fence that
-        // reported them is clean again for later input, while the totals stay in `stats`.
-        let new_drops = dropped.saturating_sub(state.reported_drops);
-        state.force_through = state.force_through.max(target);
-        self.shared.wake.notify_one();
-        // A flush or shutdown asks for delivery now: end any retry delay so the pending batch
-        // is attempted at once instead of after up to `retry_max_interval`.
-        self.shared.retry_wake.notify_one();
+        let deadline = Instant::now().checked_add(timeout).ok_or(DEADLINE_RANGE)?;
+        let fence = self.shared.fence(closing)?;
+        let mut state = self.shared.barrier_state()?;
         loop {
-            if self.shared.exhausted.load(Ordering::SeqCst) {
-                return Err(FlushError::Unavailable(
-                    "producer sequence/diagnostic counters exhausted",
-                ));
-            }
-            if let Some(error) = &state.failure {
-                return Err(FlushError::Delivery(error.clone()));
-            }
-            if state.durable_sequence.max(state.quarantined_sequence) >= target
-                && (!closing || self.shared.stopped.load(Ordering::SeqCst))
-            {
-                let new_quarantined = state.quarantined.saturating_sub(state.reported_quarantined);
-                state.reported_drops = state.reported_drops.max(dropped);
-                state.reported_quarantined = state.quarantined;
-                let watermark = DeliveryWatermark {
-                    client_instance: self.shared.instance,
-                    required_sequence: target,
-                    durable_sequence: state.durable_sequence,
-                    durable_events: state.durable,
-                    dropped_before_fence: new_drops.saturating_add(new_quarantined),
-                    quarantined_before_fence: new_quarantined,
-                    last_receipt: state.receipt.clone(),
-                };
-                return if watermark.dropped_before_fence == 0 {
-                    Ok(watermark)
-                } else {
-                    Err(FlushError::Dropped(Box::new(watermark)))
-                };
-            }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(FlushError::TimedOut(Box::new(self.shared.stats(&state))));
+            if let Some(result) = fence.result(&mut state, remaining.is_zero()) {
+                return result;
             }
-            let (next, _) = self
+            (state, _) = self
                 .shared
                 .changed
                 .wait_timeout(state, remaining)
                 .map_err(|_| FlushError::Unavailable("producer barrier wait poisoned"))?;
-            state = next;
+        }
+    }
+
+    async fn barrier_async(
+        &self,
+        timeout: Duration,
+        closing: bool,
+    ) -> Result<DeliveryWatermark, FlushError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or(DEADLINE_RANGE)?;
+        let fence = self.shared.fence(closing)?;
+        loop {
+            // Exactly one barrier owns the slot. notify_one retains a permit if the
+            // worker settles the batch between inspecting the state and awaiting the signal.
+            {
+                let mut state = self.shared.barrier_state()?;
+                if let Some(result) =
+                    fence.result(&mut state, tokio::time::Instant::now() >= deadline)
+                {
+                    return result;
+                }
+            }
+            let _ = tokio::time::timeout_at(deadline, self.shared.async_changed.notified()).await;
         }
     }
 }
 
-/// Counts a flush or shutdown for as long as it waits, on every return path.
-struct BarrierWaiting<'a>(&'a AtomicUsize);
-impl<'a> BarrierWaiting<'a> {
-    fn enter(count: &'a AtomicUsize) -> Self {
-        count.fetch_add(1, Ordering::SeqCst);
-        Self(count)
+const DEADLINE_RANGE: FlushError =
+    FlushError::Unavailable("producer barrier deadline out of range");
+
+/// The sole synchronous or asynchronous observer of the captured delivery prefix.
+struct Fence<'a> {
+    shared: &'a Shared,
+    target: u64,
+    dropped: u64,
+    closing: bool,
+}
+
+impl Drop for Fence<'_> {
+    fn drop(&mut self) {
+        self.shared.barrier_active.store(false, Ordering::SeqCst);
     }
 }
-impl Drop for BarrierWaiting<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+
+impl Fence<'_> {
+    fn result(
+        &self,
+        state: &mut State,
+        expired: bool,
+    ) -> Option<Result<DeliveryWatermark, FlushError>> {
+        if self.shared.exhausted.load(Ordering::SeqCst) {
+            return Some(Err(FlushError::Unavailable(
+                "producer sequence/diagnostic counters exhausted",
+            )));
+        }
+        if let Some(error) = &state.failure {
+            return Some(Err(FlushError::Delivery(error.clone())));
+        }
+        if state.durable_sequence.max(state.quarantined_sequence) < self.target
+            || (self.closing && !self.shared.stopped.load(Ordering::SeqCst))
+        {
+            return expired.then(|| Err(FlushError::TimedOut(Box::new(self.shared.stats(state)))));
+        }
+        let new_quarantined = state.quarantined.saturating_sub(state.reported_quarantined);
+        let watermark = DeliveryWatermark {
+            client_instance: self.shared.instance,
+            required_sequence: self.target,
+            durable_sequence: state.durable_sequence,
+            durable_events: state.durable,
+            dropped_before_fence: self
+                .dropped
+                .saturating_sub(state.reported_drops)
+                .saturating_add(new_quarantined),
+            quarantined_before_fence: new_quarantined,
+            last_receipt: state.receipt.clone(),
+        };
+        state.reported_drops = state.reported_drops.max(self.dropped);
+        state.reported_quarantined = state.quarantined;
+        Some(if watermark.dropped_before_fence == 0 {
+            Ok(watermark)
+        } else {
+            Err(FlushError::Dropped(Box::new(watermark)))
+        })
     }
 }
 
 impl Shared {
+    fn barrier_state(&self) -> Result<std::sync::MutexGuard<'_, State>, FlushError> {
+        self.state
+            .lock()
+            .map_err(|_| FlushError::Unavailable("producer queue state poisoned"))
+    }
+
+    fn fence(&self, closing: bool) -> Result<Fence<'_>, FlushError> {
+        let mut state = self.barrier_state()?;
+        if self.barrier_active.swap(true, Ordering::SeqCst) {
+            return Err(FlushError::Busy);
+        }
+        let fence = Fence {
+            shared: self,
+            target: state.admitted_sequence,
+            dropped: self.drop_total(),
+            closing,
+        };
+        state.closing |= closing;
+        state.force_through = state.force_through.max(fence.target);
+        drop(state);
+        self.wake.notify_one();
+        self.retry_wake.notify_one();
+        Ok(fence)
+    }
+
+    fn notify_barrier(&self) {
+        if self.barrier_active.load(Ordering::SeqCst) {
+            self.changed.notify_all();
+            self.async_changed.notify_one();
+        }
+    }
     fn new(config: DeliveryConfig, instance: [u8; 16]) -> Arc<Self> {
         Arc::new(Self {
             config,
@@ -671,11 +768,11 @@ impl Shared {
                 reported_quarantined: 0,
                 held_unsaved_events: 0,
             }),
-            control: Mutex::new(()),
             changed: Condvar::new(),
+            async_changed: tokio::sync::Notify::new(),
             wake: tokio::sync::Notify::new(),
             retry_wake: tokio::sync::Notify::new(),
-            barriers_waiting: AtomicUsize::new(0),
+            barrier_active: AtomicBool::new(false),
             abort_wake: tokio::sync::Notify::new(),
             owners: AtomicUsize::new(1),
             offered: AtomicU64::new(0),
@@ -691,7 +788,7 @@ impl Shared {
         let guard = self.state.lock();
         self.stopped.store(true, Ordering::SeqCst);
         drop(guard);
-        self.changed.notify_all();
+        self.notify_barrier();
     }
     fn bump(&self, counter: &AtomicU64) -> bool {
         let ok = counter
@@ -702,7 +799,7 @@ impl Shared {
         if !ok {
             self.exhausted.store(true, Ordering::SeqCst);
             self.wake.notify_one();
-            self.changed.notify_all();
+            self.notify_barrier();
         }
         ok
     }
@@ -760,7 +857,7 @@ impl Shared {
         if let Ok(mut state) = self.state.lock() {
             state.failure = Some(Arc::new(error));
         }
-        self.changed.notify_all();
+        self.notify_barrier();
     }
     fn next(&self) -> Result<Action, Error> {
         let mut state = self
@@ -915,7 +1012,7 @@ impl Shared {
         state.transient = None;
         state.pending = None;
         drop(state);
-        self.changed.notify_all();
+        self.notify_barrier();
         Ok(())
     }
     /// Write one batch to the quarantine directory, counting the file or the failure. An
@@ -961,7 +1058,7 @@ impl Shared {
                 }
                 state.quarantine_failures = state.quarantine_failures.saturating_add(1);
                 drop(state);
-                self.changed.notify_all();
+                self.notify_barrier();
                 // The source error rides inside, so its OS error number and cause stay
                 // reachable through the error chain.
                 Err(Error::Io(std::io::Error::new(
@@ -1049,7 +1146,7 @@ impl Shared {
                     let aborted = runtime.block_on(wait_out_retry_delay(
                         &self.abort_wake,
                         &self.retry_wake,
-                        &self.barriers_waiting,
+                        &self.barrier_active,
                         backoff.take(),
                     ));
                     if aborted || self.aborted.load(Ordering::SeqCst) {
@@ -1103,7 +1200,7 @@ impl Shared {
         state.transient = None;
         state.pending = None;
         drop(state);
-        self.changed.notify_all();
+        self.notify_barrier();
         Ok(())
     }
     fn retry(&self, error: Error) -> Result<(), Error> {
@@ -1120,7 +1217,7 @@ impl Shared {
         }
         state.transient = Some(Arc::new(error));
         drop(state);
-        self.changed.notify_all();
+        self.notify_barrier();
         Ok(())
     }
 }
@@ -1161,7 +1258,7 @@ impl Backoff {
 async fn wait_out_retry_delay(
     abort: &tokio::sync::Notify,
     barrier: &tokio::sync::Notify,
-    waiting: &AtomicUsize,
+    waiting: &AtomicBool,
     delay: Duration,
 ) -> bool {
     let sleep = tokio::time::sleep(delay);
@@ -1171,7 +1268,7 @@ async fn wait_out_retry_delay(
             _ = abort.notified() => return true,
             _ = &mut sleep => return false,
             _ = barrier.notified() => {
-                if waiting.load(Ordering::SeqCst) > 0 {
+                if waiting.load(Ordering::SeqCst) {
                     return false;
                 }
             }
@@ -1216,7 +1313,9 @@ async fn run(shared: &Shared) -> Result<(), Error> {
             Action::Send(batch) => {
                 let attempt = async {
                     if connection.is_none() {
-                        let client = Client::connect_endpoint(&shared.config.endpoint).await?;
+                        let client =
+                            Client::open(&shared.config.endpoint, shared.config.expect.as_ref())
+                                .await?;
                         shared.bind_store(&client.discovery().store_id)?;
                         connection = Some(client);
                     }
@@ -1277,7 +1376,7 @@ async fn run(shared: &Shared) -> Result<(), Error> {
                         if wait_out_retry_delay(
                             &shared.abort_wake,
                             &shared.retry_wake,
-                            &shared.barriers_waiting,
+                            &shared.barrier_active,
                             backoff.take(),
                         )
                         .await
@@ -1338,11 +1437,10 @@ pub(crate) fn disposition(error: &Error) -> Disposition {
         } => Disposition::Hold,
         Error::Domain { code, .. } => match code.as_str() {
             STORE_MISMATCH => Disposition::SetAside,
-            "READ_ONLY" | "PERMISSION_DENIED" | "UNAUTHENTICATED" | "UNSUPPORTED"
-            | "STORAGE_FAILURE" | "STORAGE_PRESSURE" | "SHUTTING_DOWN" | "CANCELLED"
-            | "RPC_FAILURE" | "RPC_TIMEOUT" | "PROTOCOL_FAILURE" | "FILE_IO_FAILURE" => {
-                Disposition::Hold
-            }
+            "INSTANCE_MISMATCH" | "READ_ONLY" | "PERMISSION_DENIED" | "UNAUTHENTICATED"
+            | "UNSUPPORTED" | "STORAGE_FAILURE" | "STORAGE_PRESSURE" | "SHUTTING_DOWN"
+            | "CANCELLED" | "RPC_FAILURE" | "RPC_TIMEOUT" | "PROTOCOL_FAILURE"
+            | "FILE_IO_FAILURE" => Disposition::Hold,
             _ => Disposition::SetAside,
         },
         _ => Disposition::Hold,
@@ -1462,7 +1560,7 @@ mod tests {
     async fn a_waiting_barrier_ends_the_retry_delay_at_once_and_a_leftover_signal_does_not() {
         let abort = tokio::sync::Notify::new();
         let barrier = tokio::sync::Notify::new();
-        let waiting = AtomicUsize::new(0);
+        let waiting = AtomicBool::new(false);
         let delay = Duration::from_secs(30);
 
         let started = tokio::time::Instant::now();
@@ -1482,7 +1580,7 @@ mod tests {
             "a leftover signal must not skip the delay"
         );
 
-        let _barrier_waiting = BarrierWaiting::enter(&waiting);
+        waiting.store(true, Ordering::SeqCst);
         barrier.notify_one();
         let started = tokio::time::Instant::now();
         assert!(!wait_out_retry_delay(&abort, &barrier, &waiting, delay).await);

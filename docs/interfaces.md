@@ -4640,6 +4640,37 @@ query text and optional scope/bindings/limits; its path is a local client input.
 
 ## 7. Rust client and logging integration
 
+Tokio producers start with `Delivery::start_async(config).await?`. Clone the
+handle across tasks, offer events with `try_send`, and await
+`flush_async(timeout)` or `shutdown_async(timeout)` for a remote durability
+watermark. These methods share the synchronous barriers' single control slot.
+Cancelling a wait releases the slot and preserves its unreported gaps.
+Starting shutdown closes admission even if the wait is cancelled. Another
+shutdown can finish draining. The worker owns its RPC runtime.
+
+`DeliveryConfig::local(source)` selects `/run/sparrow-ingest/ingest.sock`.
+Supply a Unix path or TCP endpoint in Rust, or load a producer TOML file with
+`DeliveryConfig::from_file(path).await?`. A file requires `source`; omitting
+`endpoint` selects the local ingest socket. Relative paths resolve beside the
+file. Unknown keys fail at load. This example targets a production daemon
+over authenticated TCP.
+
+```toml
+source = "example.worker"
+endpoint = "tcp://192.0.2.10:518"
+expected_role = "production"
+secret_file = "tcp.secret"
+```
+
+`expected_role` accepts `production` or `scratch`. `expected_store` takes the
+store id from discovery. Either or both can be set. Discovery checks them on
+every connection before sending events. A mismatch holds the pending batch
+until the required daemon returns. `secret_file` selects authenticated TCP
+and uses the same private-file rules as the CLI. Other optional keys are
+`quarantine_dir`, `max_queued_events`, `max_queued_bytes`, `batch_events`,
+`batch_bytes`, `flush_interval_ms`, `rpc_timeout_ms`, `retry_interval_ms`,
+and `retry_max_interval_ms`. All bounds and defaults come from `DeliveryConfig`.
+
 The separate `sparrow-client` crate keeps producers independent of the database
 or semantic engine. The public surface includes:
 

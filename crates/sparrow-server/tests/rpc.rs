@@ -7759,16 +7759,11 @@ async fn delivery_barrier(
     shutdown: bool,
     timeout: Duration,
 ) -> Result<sparrow_client::DeliveryWatermark, sparrow_client::FlushError> {
-    let handle = delivery.clone();
-    tokio::task::spawn_blocking(move || {
-        if shutdown {
-            handle.shutdown(timeout)
-        } else {
-            handle.flush(timeout)
-        }
-    })
-    .await
-    .unwrap()
+    if shutdown {
+        delivery.shutdown_async(timeout).await
+    } else {
+        delivery.flush_async(timeout).await
+    }
 }
 
 fn reached_delivery(
@@ -7808,6 +7803,7 @@ struct EventRelayState {
     mutate_file: std::cell::RefCell<Option<std::path::PathBuf>>,
     mutate_published_file: std::cell::RefCell<Option<std::path::PathBuf>>,
     first_accepted: tokio::sync::Notify,
+    discovered: tokio::sync::Notify,
 }
 struct EventRelay(std::rc::Rc<EventRelayState>);
 impl EventRelayState {
@@ -7825,6 +7821,7 @@ impl wire::sparrow::Server for EventRelay {
     ) -> capnp::Result<()> {
         let backend = self.0.backend.borrow().clone();
         let response = backend.discover_request().send().promise.await?;
+        self.0.discovered.notify_one();
         results.get().set_result(response.get()?.get_result()?)
     }
     async fn ingest(
@@ -8395,6 +8392,7 @@ fn relay(
         mutate_file: std::cell::RefCell::new(None),
         mutate_published_file: std::cell::RefCell::new(None),
         first_accepted: tokio::sync::Notify::new(),
+        discovered: tokio::sync::Notify::new(),
     });
     let capability: wire::sparrow::Client = capnp_rpc::new_client(EventRelay(state.clone()));
     let state_for_task = state.clone();
@@ -9296,6 +9294,9 @@ async fn producer_delivery_bounds_outage_backlog_and_reports_drops_after_recover
         .await;
 }
 
+/// Replacing a discovered store preserves the unknown batch in quarantine. With an explicit
+/// store pin, the producer holds it and a cancelled async fence leaves the next fence's
+/// drop report intact while the configured store is restored.
 #[tokio::test(flavor = "current_thread")]
 async fn producer_delivery_refuses_store_replacement_and_retains_unknown_pending_input() {
     tokio::task::LocalSet::new()
@@ -9328,7 +9329,7 @@ async fn producer_delivery_refuses_store_replacement_and_retains_unknown_pending
                 Duration::from_millis(100),
                 Duration::from_millis(100),
             );
-            let delivery = sparrow_client::Delivery::start(config).unwrap();
+            let delivery = sparrow_client::Delivery::start(config.clone()).unwrap();
             admit(&delivery, delivery_event("unknown accepted delivery"));
             admit(&delivery, delivery_event("queued behind the pending batch"));
             tokio::time::timeout(Duration::from_secs(3), state.first_accepted.notified())
@@ -9391,6 +9392,33 @@ async fn producer_delivery_refuses_store_replacement_and_retains_unknown_pending
                 state.accepted.borrow().clone().unwrap().store_id,
                 replayed.receipt.store_id
             );
+            let mut pinned_config = config;
+            pinned_config.expect = Some(sparrow_client::Expect::store(first_client.discovery().store_id.clone()));
+            pinned_config.max_queued_events = 1;
+            let pinned = sparrow_client::Delivery::start_async(pinned_config).await.unwrap();
+            let before = state.calls.borrow().len();
+            admit(&pinned, delivery_event("only to the first store"));
+            assert!(matches!(pinned.try_send(delivery_event("full")), sparrow_client::Admission::Dropped {
+                reason: sparrow_client::DropReason::Full, ..
+            }));
+            let mut flushing = Box::pin(pinned.flush_async(Duration::from_secs(5)));
+            assert!(futures::poll!(&mut flushing).is_pending());
+            assert!(matches!(pinned.flush(Duration::ZERO), Err(sparrow_client::FlushError::Busy)));
+            drop(flushing);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while pinned.stats().unwrap().retries == 0 {
+                    state.discovered.notified().await;
+                }
+            }).await.unwrap();
+            let held = pinned.stats().unwrap();
+            assert!(matches!(held.last_transient_failure.as_deref(), Some(sparrow_client::Error::Domain {code, ..}) if code == "INSTANCE_MISMATCH"));
+            assert_eq!(state.calls.borrow().len(), before, "a mismatched daemon received the batch");
+            *state.backend.borrow_mut() = first_backend.client.clone();
+            let Err(sparrow_client::FlushError::Dropped(report)) = pinned.shutdown_async(Duration::from_secs(5)).await else {
+                panic!("the restored store must receive the held batch and report the earlier drop");
+            };
+            assert_eq!((report.durable_events, report.dropped_before_fence, report.quarantined_before_fence), (1, 1, 0));
+            pinned.flush(Duration::ZERO).unwrap();
             proxy.abort();
             assert!(proxy.await.unwrap_err().is_cancelled());
             drop(delivery);

@@ -83,6 +83,8 @@ pub use events::{
 };
 mod console;
 mod delivery;
+mod producer_config;
+pub use producer_config::ConfigError;
 mod logging;
 mod quarantine;
 mod replay;

@@ -6,7 +6,8 @@ use crate::{Discovery, Error, sparrow_capnp::InstanceRole};
 /// An instance role a caller can require. `unspecified`, the role of a store with none, is
 /// not representable: a caller that requires a role never requires "no role" by mistake, and a
 /// store that reports `unspecified` satisfies neither variant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RequiredRole {
     /// The live store.
     Production,
@@ -33,12 +34,12 @@ pub fn instance_role_label(role: InstanceRole) -> &'static str {
     }
 }
 
-/// What a caller requires of every daemon connection the crate makes for it: an instance role
-/// and, optionally, a store id. The crate checks it against `Discovery` on each connection
+/// The instance role, store id, or both that a caller requires. The crate checks the
+/// expectation against `Discovery` on each connection
 /// before any import call and fails closed with the non-retryable `INSTANCE_MISMATCH`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Expect {
-    role: RequiredRole,
+    role: Option<RequiredRole>,
     store_id: Option<String>,
 }
 
@@ -47,8 +48,17 @@ impl Expect {
     #[must_use]
     pub fn new(role: RequiredRole) -> Self {
         Self {
-            role,
+            role: Some(role),
             store_id: None,
+        }
+    }
+
+    /// Require this persistent store id, independently of its role.
+    #[must_use]
+    pub fn store(store_id: impl Into<String>) -> Self {
+        Self {
+            role: None,
+            store_id: Some(store_id.into()),
         }
     }
 
@@ -59,10 +69,25 @@ impl Expect {
         self
     }
 
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        if self
+            .store_id
+            .as_deref()
+            .is_some_and(|id| !crate::receipt::valid_store_id(id))
+        {
+            return Err(Error::InvalidArgument(
+                "expected store id must begin with store: followed by an identity, up to 128 bytes total",
+            ));
+        }
+        Ok(())
+    }
+
     /// Refuse a connection whose discovery reports another role or store id. The error names
     /// what was required and what was reported.
     pub fn require(&self, discovery: &Discovery) -> Result<(), Error> {
-        let role_ok = discovery.instance_role == self.role.wire();
+        let role_ok = self
+            .role
+            .is_none_or(|role| discovery.instance_role == role.wire());
         let store_ok = self
             .store_id
             .as_deref()
@@ -75,7 +100,8 @@ impl Expect {
             code: "INSTANCE_MISMATCH".into(),
             message: format!(
                 "required instance_role {} on store {required_store}, but the daemon reports instance_role {} on store {}; refusing before any import call",
-                instance_role_label(self.role.wire()),
+                self.role
+                    .map_or("any", |role| instance_role_label(role.wire())),
                 instance_role_label(discovery.instance_role),
                 discovery.store_id,
             ),

@@ -2605,8 +2605,8 @@ names = ['^(release_delivered_queue_charge|release_inflight_queue_charge)$']
 [[job]]
 id = "producer-delivery-barrier"
 summary = "Flush and shutdown share a single finite control slot, admitted-sequence fence and explicit timeout/failure/drop outcomes."
-home = "sparrow_client::delivery::Delivery::barrier"
-entry_points = []
+home = "sparrow_client::delivery::Fence::result"
+entry_points = ["sparrow_client::delivery::Delivery::flush", "sparrow_client::delivery::Delivery::flush_async", "sparrow_client::delivery::Delivery::shutdown", "sparrow_client::delivery::Delivery::shutdown_async"]
 spec = "docs/development-runtime.md: producer delivery fences."
 vectors = ["crates/sparrow-client/src/delivery.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -3469,7 +3469,7 @@ names = []
 [[job]]
 id = "producer-endpoint-selection"
 summary = "Direct clients, CLI, MCP calls and logging workers select one explicit Unix or TCP endpoint and validate discovery through the same client constructor."
-home = "sparrow_client::Client::connect_endpoint"
+home = "sparrow_client::Client::open"
 entry_points = ["sparrow_client::Client::connect", "sparrow_client::Client::connect_tcp", "sparrow_client::delivery::run", "sparrow_server::mcp::serve"]
 spec = "docs/interfaces.md: public TCP logging."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
@@ -3479,6 +3479,20 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(connect_tcp_logging_client|discover_tcp_logging_client)$']
+
+[[job]]
+id = "producer-configuration"
+summary = "File-backed and Rust producer setup share endpoint, identity, timing and resource validation."
+home = "sparrow_client::delivery::DeliveryConfig::validate"
+entry_points = ["sparrow_client::producer_config::FileConfig::read", "sparrow_client::delivery::Delivery::start"]
+spec = "docs/interfaces.md: Rust client and logging integration."
+vectors = ["crates/sparrow-client/src/producer_config.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(validate_toml_producer_limits|validate_compiled_producer_limits)$']
 
 [[job]]
 id = "producer-endpoint-spelling"
