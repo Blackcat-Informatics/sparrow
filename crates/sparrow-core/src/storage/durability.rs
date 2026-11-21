@@ -111,10 +111,6 @@ impl State {
             failure: None,
         }
     }
-    /// Whether durability is latched uncertain.
-    pub(super) fn latched(&self) -> bool {
-        self.failure.is_some()
-    }
     fn check(&self) -> Result<(), Error> {
         if let Some(failure) = &self.failure {
             return Err(Error::new(

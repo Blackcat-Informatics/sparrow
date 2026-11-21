@@ -1531,7 +1531,7 @@ fn a_latched_source_context_rebuild_clears_once_its_corrupt_record_is_retired() 
 
 /// INVARIANT (#158): temporal reads never load a record outside their half-open interval,
 /// so corrupt metadata outside it does not fail them; the source timeline rebuild that
-/// meets that metadata latches a durable failure and stops paging, and context keeps
+/// meets that metadata latches a durable failure and keeps failing its retries, and context keeps
 /// answering from the primary time index, stopping at the interval before the corrupt
 /// neighbors.
 #[test]

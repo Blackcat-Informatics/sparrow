@@ -735,7 +735,7 @@ struct Writer {
 /// the state the panicked writer left; the next operation tries again.
 fn writer_unrecovered(cause: &Error) -> Error {
     Error::new(
-        "STORAGE_FAILURE",
+        "STORAGE_PRESSURE",
         format!("catalog writer poisoned and not yet recovered: {cause}"),
     )
 }
@@ -1187,9 +1187,8 @@ impl Writer {
     /// only the writer's working state may be half updated. Each part that derives from the
     /// database is loaded again, as an open loads it: the pressure, table rewrite and archive
     /// states, and the session-local eviction and expiry cursors. The durability ledger may
-    /// lack a write that reached the WAL, so a WAL sync certifies everything accepted; a sync
-    /// that fails latches durability uncertain instead, which keeps writes refused on its own
-    /// terms and is cleared by [`Writer::reestablish`].
+    /// lack a write that reached the WAL, so a WAL sync certifies everything accepted; when that
+    /// sync fails the writer is not recovered and the lock stays poisoned.
     fn revalidate(&self) -> Result<(), Error> {
         *self.pressure.borrow_mut() = pressure::State::load(&self.db)?;
         *self.recompression.borrow_mut() = recompression::State::load(&self.db)?;
@@ -1203,12 +1202,9 @@ impl Writer {
         *self.eviction.borrow_mut() = eviction::Cursor::default();
         *self.expiry.borrow_mut() = expiry::Cursor::default();
         self.reclaiming.set(false);
-        if !self.durability.borrow().latched() {
-            // A failed sync latches durability uncertain, which status reports and which
-            // refuses writes; the writer itself is re-validated either way, so the result
-            // is not returned.
-            drop(self.synchronize());
-        }
+        // A writer that cannot prove what it accepted is not recovered: a sync that fails (or a
+        // standing durability latch) leaves the lock poisoned and the next operation tries again.
+        self.synchronize()?;
         Ok(())
     }
 
@@ -3217,7 +3213,7 @@ impl Store {
 
     /// Report measured database bytes, the store counters and active pins. It never takes
     /// the writer lock: every count comes from one snapshot, so a migration page or a write
-    /// in progress does not delay it, and it refuses once that lock is poisoned. `counts` is
+    /// in progress does not delay it, and it first recovers a poisoned writer lock. `counts` is
     /// `pending` while the store counters seed;
     /// `live_records`, `unique_payload_chunks` and `unique_json_projections` are then exact
     /// only through the seeding watermark, not totals. Its cost does not grow with the store.

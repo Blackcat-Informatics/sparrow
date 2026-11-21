@@ -1532,8 +1532,9 @@ it, status and the three observed-status reads included: the writer reloads the
 state it derives from the store (pressure, table rewrite and archive state, the
 eviction and expiry cursors) as an open does, and syncs the WAL so the durability
 ledger certifies every accepted write. `durability.writerRecoveries` counts the
-recoveries. A re-validation that fails refuses with `STORAGE_FAILURE` ("catalog writer
-poisoned and not yet recovered") and the next operation tries again.
+recoveries. A re-validation that fails (including a WAL sync that fails) leaves the lock poisoned and
+refuses with the retryable `STORAGE_PRESSURE` ("catalog writer poisoned and not yet
+recovered"); the next operation tries again.
 
 One owner, `store_counters::apply`, runs on every write batch after the
 per-source counters and adds its row changes to the same batch. A key the batch

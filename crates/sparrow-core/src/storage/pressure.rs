@@ -1144,7 +1144,7 @@ impl Writer {
 
 impl Store {
     /// Session-local pressure observations; reads do not request retirement.
-    /// Reads the observed state without the writer lock, and refuses once it is poisoned.
+    /// Reads the observed state without the writer lock, and recovers a poisoned writer first.
     pub fn pressure_status(&self) -> Result<PressureStatus, Error> {
         self.recover_poisoned()?;
         let mut status = self.unlocked.pressure.read();
