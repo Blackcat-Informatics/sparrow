@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/461-render-structured-developer-logs-and",
+  "branch": "paudley/461-render-structured-developer-logs-and",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "dd03d182c240ae09b6ade490f229e3dd74a68a5d",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/461-render-structured-developer-logs-and/.stage/render-structured-developer-logs-and/sync/20261121T231614-419e6be24564442c8cb1965e3d02edf8",
+  "conflicts": [],
+  "status": "completed",
+  "base": "cc938dd8b5ba3e544056c78d32b96fd31e09914d",
+  "merge_bases": [
+    "73ebdb9ed3a3be3e25df9f15da9a73b6ba438525"
+  ],
+  "merge_index": "68a8c3785ce1a33d88098a5928122aa667624e4f0c9ec6dd53bf9aecc1c8891c",
+  "candidate_tree": "9a0b2c9b90fa11f03c50208ca04dce310c8eb55c",
+  "candidate_patch": "candidate-254a3b8434e8429a960b0972d1c6354a.patch",
+  "stdout_log": "commit-254a3b8434e8429a960b0972d1c6354a.stdout.log",
+  "stderr_log": "commit-254a3b8434e8429a960b0972d1c6354a.stderr.log",
+  "validation_records": [],
+  "commit_duration_seconds": 43.868403561995365,
+  "commit": "c472c572092ce0d0994645b4610076b199b47e4f",
+  "tree": "9a0b2c9b90fa11f03c50208ca04dce310c8eb55c",
+  "exit_code": 0
+}

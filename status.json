@@ -1,0 +1,79 @@
+{
+  "issue": 461,
+  "pr_number": 468,
+  "branch": "paudley/461-render-structured-developer-logs-and",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/461-render-structured-developer-logs-and/.stage/render-structured-developer-logs-and",
+  "observed_at": "2026-11-21T23:38:38.553151+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/461-render-structured-developer-logs-and/.stage/render-structured-developer-logs-and/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/461-render-structured-developer-logs-and/.stage/render-structured-developer-logs-and/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/461-render-structured-developer-logs-and/.stage/render-structured-developer-logs-and/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/461-render-structured-developer-logs-and/.stage/render-structured-developer-logs-and/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/461-render-structured-developer-logs-and/.stage/render-structured-developer-logs-and/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 468,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Render structured developer logs and captured console streams",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/468",
+    "baseRefName": "main",
+    "baseRefOid": "cc938dd8b5ba3e544056c78d32b96fd31e09914d",
+    "headRefName": "paudley/461-render-structured-developer-logs-and",
+    "headRefOid": "1000cc5d3bc42a29a75ebdf536931ad9635fb412",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/445/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "1000cc5d3bc42a29a75ebdf536931ad9635fb412",
+    "branch": "paudley/461-render-structured-developer-logs-and",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 468,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #468 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}

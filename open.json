@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 461,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/461-render-structured-developer-logs-and",
+  "branch": "paudley/461-render-structured-developer-logs-and",
+  "slug": "render-structured-developer-logs-and",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/461-render-structured-developer-logs-and/.stage/render-structured-developer-logs-and",
+  "stage_tracked": true,
+  "base": "refs/remotes/origin/main",
+  "base_oid": "73ebdb9ed3a3be3e25df9f15da9a73b6ba438525",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/461-render-structured-developer-logs-and",
+    "branch:paudley/461-render-structured-developer-logs-and",
+    "ignored:3 files (3 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow/.worktrees/460-configure-a-sparrow-producer-and-await caches into /home/paudley/Active/sparrow/.worktrees/461-render-structured-developer-logs-and plus 0 dependency units from 0 other checkouts in 2.9s; 326 unchanged files keep their built mtimes; 0 other files take the seed time and rebuild; 3 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/461-render-structured-developer-logs-and/.stage/render-structured-developer-logs-and",
+    "issue:/home/paudley/Active/sparrow/.worktrees/461-render-structured-developer-logs-and/.stage/render-structured-developer-logs-and/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-21T16:33:38-0600",
+  "seed_error": ""
+}
