@@ -70,6 +70,8 @@ fn encode_durability(
     state.set_max_pending_bytes(sparrow_core::MAX_BUFFERED_BYTES as u64);
     state.set_flush_interval_ms(durability.flush_interval_ms);
     state.set_flush_lag_ms(durability.flush_lag_ms);
+    state.set_latches(durability.latches);
+    state.set_recoveries(durability.recoveries);
     state.set_writer_recoveries(durability.writer_recoveries);
     sparrow_client::encode_optional(
         state.init_failure(),

@@ -1202,8 +1202,11 @@ impl Writer {
         *self.eviction.borrow_mut() = eviction::Cursor::default();
         *self.expiry.borrow_mut() = expiry::Cursor::default();
         self.reclaiming.set(false);
-        // A writer that cannot prove what it accepted is not recovered: a sync that fails (or a
-        // standing durability latch) leaves the lock poisoned and the next operation tries again.
+        // A latched durability is re-established first (the proof the maintenance worker would
+        // otherwise run), so a poisoned writer and a latch clear together. A writer that cannot
+        // prove what it accepted is not recovered: a failed proof or sync leaves the lock
+        // poisoned and the next operation tries again.
+        self.reestablish()?;
         self.synchronize()?;
         Ok(())
     }

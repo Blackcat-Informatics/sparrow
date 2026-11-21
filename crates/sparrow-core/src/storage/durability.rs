@@ -58,8 +58,13 @@ pub struct DurabilityStatus {
     pub pending_bytes: usize,
     /// Oldest buffered acceptance age in milliseconds; zero when empty.
     pub oldest_pending_ms: u64,
-    /// Latched storage uncertainty; reopening is required before receipt certification.
+    /// Latched storage uncertainty: writes and receipt certification are refused, retryably,
+    /// until [`Store::reestablish_durability`] proves everything accepted durable.
     pub failure: Option<String>,
+    /// Times durability latched uncertain since the store opened.
+    pub latches: u64,
+    /// Times a latch cleared in place since the store opened.
+    pub recoveries: u64,
     /// Times the catalog writer was recovered after a writer panicked holding it.
     pub writer_recoveries: u64,
 }
@@ -74,6 +79,8 @@ pub(super) struct State {
     pending: BTreeMap<String, Pending>,
     bytes: usize,
     failure: Option<String>,
+    latches: u64,
+    recoveries: u64,
 }
 /// What durability status reads (#146): the ledger's counts and oldest acceptance, not the
 /// ledger itself.
@@ -85,6 +92,8 @@ pub(super) struct View {
     pending_bytes: usize,
     oldest: Option<Instant>,
     failure: Option<String>,
+    latches: u64,
+    recoveries: u64,
 }
 
 impl super::writer_queue::Observe for State {
@@ -97,8 +106,25 @@ impl super::writer_queue::Observe for State {
             pending_bytes: self.bytes,
             oldest: self.pending.values().map(|pending| pending.at).min(),
             failure: self.failure.clone(),
+            latches: self.latches,
+            recoveries: self.recoveries,
         }
     }
+}
+
+/// The free space RocksDB's file manager requires before it resumes a stopped handle (its
+/// default reserved disk buffer).
+const ROCKSDB_RECOVERY_BUFFER_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The refusal while durability is latched uncertain by `failure`. It is the retryable
+/// `STORAGE_PRESSURE`, the code every writer already holds and retries on: the latch clears in
+/// place once [`Writer::reestablish`] succeeds, and otherwise the daemon reopens the store, so
+/// a retry of the same request can succeed either way.
+fn uncertain(failure: &str) -> Error {
+    Error::new(
+        "STORAGE_PRESSURE",
+        format!("durability uncertain; writes resume once the store re-establishes it: {failure}"),
+    )
 }
 
 impl State {
@@ -109,16 +135,25 @@ impl State {
             pending: BTreeMap::new(),
             bytes: 0,
             failure: None,
+            latches: 0,
+            recoveries: 0,
         }
     }
+    /// Refuse while durability is latched uncertain (see [`uncertain`]).
     fn check(&self) -> Result<(), Error> {
-        if let Some(failure) = &self.failure {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                format!("durability uncertain; reopen and inspect the store: {failure}"),
-            ));
+        match &self.failure {
+            Some(failure) => Err(uncertain(failure)),
+            None => Ok(()),
         }
-        Ok(())
+    }
+    /// Latch a failed write or synchronization and return the refusal it now causes.
+    fn latch(&mut self, cause: String) -> Error {
+        if self.failure.is_none() {
+            self.latches += 1;
+        }
+        let refusal = uncertain(&cause);
+        self.failure = Some(cause);
+        refusal
     }
     fn reached(&mut self, sequence: u64) {
         self.durable_through = sequence;
@@ -273,8 +308,7 @@ impl Writer {
         options.disable_wal(false);
         options.set_sync(buffered_id.is_none());
         if let Err(error) = self.db.write_opt(batch, &options) {
-            self.durability.borrow_mut().failure = Some(error.to_string());
-            return Err(Error::from(error).into());
+            return Err(self.durability.borrow_mut().latch(error.to_string()).into());
         }
         if let Some(earliest) = publication.earliest {
             self.eviction.borrow_mut().published(&earliest);
@@ -301,12 +335,45 @@ impl Writer {
     pub(super) fn synchronize(&self) -> Result<DurabilityWatermark, Error> {
         self.durability.borrow().check()?;
         if let Err(error) = self.db.flush_wal(true) {
-            self.durability.borrow_mut().failure = Some(error.to_string());
-            return Err(error.into());
+            return Err(self.durability.borrow_mut().latch(error.to_string()));
         }
         let sequence = self.db.latest_sequence_number();
         self.durability.borrow_mut().reached(sequence);
         Ok(self.watermark(sequence))
+    }
+
+    /// Clear a durability latch in place once everything accepted is proven durable; `None`
+    /// when nothing was latched, otherwise the cause that cleared.
+    ///
+    /// Every write that returned success is in a memtable or an earlier table file. A WAL
+    /// write or sync that failed may have lost WAL bytes the page cache held, so a later WAL
+    /// sync alone certifies nothing. Writing every memtable to a synchronized table file does
+    /// not depend on the WAL, and the WAL sync after it proves the log accepts writes again.
+    /// Both succeed only when RocksDB itself still accepts writes on this handle; a handle
+    /// RocksDB stopped (a hard or fatal background error) fails here, and the latch stands.
+    pub(super) fn reestablish(&self) -> Result<Option<String>, Error> {
+        let Some(cause) = self.durability.borrow().failure.clone() else {
+            return Ok(None);
+        };
+        let proven = self
+            .db
+            .flush_cfs_opt(
+                &super::family_handles(&self.db)?,
+                &rocksdb::FlushOptions::default(),
+            )
+            .and_then(|()| self.db.flush_wal(true));
+        if let Err(error) = proven {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                format!("durability not re-established: {error}; latched by: {cause}"),
+            ));
+        }
+        let sequence = self.db.latest_sequence_number();
+        let mut state = self.durability.borrow_mut();
+        state.reached(sequence);
+        state.failure = None;
+        state.recoveries += 1;
+        Ok(Some(cause))
     }
 }
 
@@ -339,11 +406,40 @@ impl Store {
         writer.synchronize()
     }
 
-    /// Dev-only: latch durability uncertain with `cause`, as a failed write or WAL sync does.
+    /// Clear a durability latch in the running store once every accepted write is proven
+    /// durable (see [`Writer::reestablish`]); `Ok(None)` when nothing was latched,
+    /// `Ok(Some(cause))` when the latch cleared.
+    ///
+    /// # Errors
+    /// `STORAGE_FAILURE` when RocksDB still refuses the proof: the handle is stopped and only
+    /// reopening the store clears the latch.
+    pub fn reestablish_durability(&self) -> Result<Option<String>, Error> {
+        self.lock()?.reestablish()
+    }
+
+    /// Whether free space on the filesystem holding the store is below what RocksDB needs to
+    /// resume a handle a full disk stopped: its 32 MiB recovery buffer, the maintenance
+    /// reserve or the free-space floor, whichever is largest. Measured, not read from an
+    /// error message.
+    ///
+    /// # Errors
+    /// A failed free-space measurement.
+    pub fn free_space_is_low(&self) -> Result<bool, Error> {
+        let needed = self
+            .unlocked
+            .config
+            .maintenance_reserve
+            .max(self.unlocked.config.min_free_bytes)
+            .max(ROCKSDB_RECOVERY_BUFFER_BYTES);
+        Ok(self.space_floor().shortfall_below(needed)?.is_some())
+    }
+
+    /// Dev-only: latch durability uncertain with `cause`, as a failed write or WAL sync does,
+    /// while RocksDB itself still accepts writes on this handle.
     #[cfg(feature = "test-support")]
     pub fn latch_durability_for_tests(&self, cause: &str) -> Result<(), Error> {
         let writer = self.lock()?;
-        writer.durability.borrow_mut().failure = Some(cause.to_owned());
+        drop(writer.durability.borrow_mut().latch(cause.to_owned()));
         Ok(())
     }
 
@@ -379,6 +475,8 @@ impl Store {
             pending_bytes: state.pending_bytes,
             oldest_pending_ms,
             failure: state.failure,
+            latches: state.latches,
+            recoveries: state.recoveries,
             writer_recoveries: self.writer_recoveries(),
         })
     }

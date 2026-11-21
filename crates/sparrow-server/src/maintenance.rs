@@ -57,13 +57,23 @@ impl Worker {
         flush: Duration,
         held: sparrow_server::pressure_wake::PressureWake,
     ) -> Self {
+        Self::start_paced(store, flush, held, Pace::DAEMON)
+    }
+
+    /// [`Worker::start`] with the pacing of a standing durability latch named.
+    pub(super) fn start_paced(
+        store: Store,
+        flush: Duration,
+        held: sparrow_server::pressure_wake::PressureWake,
+        pace: Pace,
+    ) -> Self {
         let (stop, stopped) = watch::channel(false);
         let (alive, ended) = tokio::sync::oneshot::channel::<()>();
         Self {
             stop,
             task: Some(tokio::spawn(async move {
                 let _alive = alive;
-                let result = run(&store, stopped, flush, held).await;
+                let result = run(&store, stopped, flush, held, pace).await;
                 store.set_retention_waker(None);
                 store.set_pressure_request_waker(None);
                 store.set_import_reclaim_waker(None);
@@ -130,6 +140,10 @@ impl Job {
     /// crossed: expiry then runs under the maintenance reserve and without import
     /// reclamation (#267).
     fn execute(self, store: &Store, paused: bool) -> Result<Outcome, Error> {
+        #[cfg(test)]
+        if matches!(self, Self::Expiry) {
+            inject::expiry(store);
+        }
         let done = Outcome::Continue;
         match self {
             Self::Flush => store.flush_buffered().map(|_| done),
@@ -352,6 +366,218 @@ fn observe_floor(
     Ok(paused)
 }
 
+/// When the worker proves a standing durability latch, and when it gives up and exits.
+///
+/// A proof writes every memtable to a table file, which competes with the background work
+/// RocksDB runs to resume a handle a full disk stopped; repeated proofs through that window
+/// were observed to keep it from resuming. The worker therefore leaves the store alone while
+/// free space is below RocksDB's recovery buffer, then waits a few of RocksDB's 5 s polls,
+/// proves once, and spaces further proofs by a growing interval.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Pace {
+    /// How long free space must stay adequate before the first proof: three polls of
+    /// RocksDB's 5 s file manager.
+    pub(super) grace: Duration,
+    /// The wait after the first failed proof; it doubles after each failure.
+    pub(super) first: Duration,
+    /// The longest wait between proofs.
+    pub(super) longest: Duration,
+    /// How long the latch may stand with free space adequate before the daemon exits so the
+    /// store is reopened. A resume takes one to two polls once space is back, so 120 s (twenty
+    /// four polls, with the proofs at 15 s, 45 s and 105 s) leaves a working resume ample time,
+    /// and a handle that does not resume by then never will.
+    pub(super) bound: Duration,
+}
+
+impl Pace {
+    /// The daemon's pacing.
+    pub(super) const DAEMON: Self = Self {
+        grace: Duration::from_secs(15),
+        first: Duration::from_secs(30),
+        longest: Duration::from_secs(60),
+        bound: Duration::from_secs(120),
+    };
+
+    /// The wait after the `failures`-th failed proof.
+    fn after(&self, failures: u32) -> Duration {
+        self.first
+            .saturating_mul(1_u32 << failures.saturating_sub(1).min(16))
+            .min(self.longest)
+    }
+}
+
+/// What the worker does next about a standing durability latch.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// Leave the store alone.
+    Wait,
+    /// Prove every accepted write durable now.
+    Prove,
+    /// End the daemon so its supervisor reopens the store.
+    Exit,
+}
+
+/// The schedule of proofs of one standing latch.
+#[derive(Default)]
+struct Proofs {
+    /// When free space last became adequate, `None` while it is low.
+    adequate_since: Option<tokio::time::Instant>,
+    failures: u32,
+    last: Option<tokio::time::Instant>,
+    /// Whether a latch has been seen standing, so every later duty reads it again.
+    active: bool,
+}
+
+impl Proofs {
+    /// Whether the latch must be read after a duty. A failed duty may have met a new latch,
+    /// and while one stands every duty reads it again: a successful duty says nothing about
+    /// it, and taking it for a cleared latch would restart the schedule of proofs on every
+    /// success.
+    fn must_read(&self, duty_failed: bool) -> bool {
+        duty_failed || self.active
+    }
+
+    /// Record what reading the latch found. Not latched forgets the schedule.
+    fn read(&mut self, latched: bool) {
+        if latched {
+            self.active = true;
+        } else {
+            *self = Self::default();
+        }
+    }
+
+    /// The step at `now`, given whether measured free space is below RocksDB's recovery
+    /// buffer. Free space falling low again restarts the wait.
+    fn step(&mut self, pace: &Pace, now: tokio::time::Instant, space_low: bool) -> Step {
+        if space_low {
+            *self = Self::default();
+            return Step::Wait;
+        }
+        let elapsed = now.saturating_duration_since(*self.adequate_since.get_or_insert(now));
+        if elapsed >= pace.bound {
+            return Step::Exit;
+        }
+        if elapsed < pace.grace {
+            return Step::Wait;
+        }
+        match self.last {
+            Some(last) if now.saturating_duration_since(last) < pace.after(self.failures) => {
+                Step::Wait
+            }
+            _ => Step::Prove,
+        }
+    }
+
+    /// Record a proof that failed at `now`.
+    fn failed(&mut self, now: tokio::time::Instant) {
+        self.failures += 1;
+        self.last = Some(now);
+    }
+}
+
+/// Why a proof of durability fails, named for the journal and the exit line.
+#[derive(Debug, PartialEq, Eq)]
+enum Cause {
+    /// The filesystem is out of space.
+    NoSpace,
+    /// Any other failure.
+    Other,
+}
+
+impl Cause {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::NoSpace => "no space left on the store's filesystem",
+            Self::Other => "an I/O error",
+        }
+    }
+}
+
+/// Name the cause of a latch. Measured free space below RocksDB's recovery buffer is
+/// no-space whatever RocksDB's message says; a message naming ENOSPC (either wording) is
+/// no-space as well. The name only labels the journal and the exit line.
+fn cause(message: &str, space_low: bool) -> Cause {
+    let lower = message.to_ascii_lowercase();
+    if space_low || lower.contains("no space") || lower.contains("enospc") {
+        Cause::NoSpace
+    } else {
+        Cause::Other
+    }
+}
+
+/// Whether durability is latched, read without taking the writer.
+fn latched(store: &Store) -> Result<bool, String> {
+    store
+        .durability_status()
+        .map(|status| status.failure.is_some())
+        .map_err(|error| error.to_string())
+}
+
+/// The first wait before a duty that panicked runs again.
+const PANIC_RETRY_FIRST: Duration = Duration::from_secs(1);
+
+/// The longest wait before a duty that panicked runs again.
+const PANIC_RETRY_LONGEST: Duration = Duration::from_secs(30);
+
+/// The wait before a duty that keeps panicking runs again: 1 s, doubling to 30 s, the same
+/// bounds as a failing pressure pass (see [`pressure_failed`]). A panic that was a one-off is
+/// retried at once and a recurring one settles at two attempts a minute, so it neither spins
+/// the worker nor goes quiet, and its other duties keep their own clocks. A duty that completes
+/// resets the streak.
+#[derive(Default)]
+struct PanicBackoff {
+    streak: u32,
+}
+
+impl PanicBackoff {
+    /// Record a panic and return the wait before the duty runs again.
+    fn panicked(&mut self) -> Duration {
+        self.streak = self.streak.saturating_add(1);
+        PANIC_RETRY_FIRST
+            .saturating_mul(1_u32 << (self.streak - 1).min(16))
+            .min(PANIC_RETRY_LONGEST)
+    }
+
+    /// Record a duty that completed.
+    fn recovered(&mut self) {
+        self.streak = 0;
+    }
+}
+
+/// A panic injected into the retention duty of one store, so a test drives the worker's panic
+/// arm. The store's identity keeps other tests' workers out of it.
+#[cfg(test)]
+mod inject {
+    use super::Store;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static TARGET: Mutex<Option<String>> = Mutex::new(None);
+    static ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+    /// Panics are injected only for this many attempts, so a worker that retries without a
+    /// delay finishes its run instead of spinning for the whole test.
+    const LIMIT: u32 = 200;
+
+    /// Panic the retention duty of `store` on each of its next attempts.
+    pub(super) fn arm(store: &Store) {
+        *TARGET.lock().unwrap() = Some(store.store_id().unwrap());
+        ATTEMPTS.store(0, Ordering::SeqCst);
+    }
+
+    /// Attempts the retention duty has made since [`arm`].
+    pub(super) fn attempts() -> u32 {
+        ATTEMPTS.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn expiry(store: &Store) {
+        let armed = TARGET.lock().unwrap().clone();
+        if armed.is_some() && armed == store.store_id().ok() {
+            let attempt = ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+            assert!(attempt >= LIMIT, "injected duty panic");
+        }
+    }
+}
+
 /// Skipped-duty counts of the test running on this thread, so a test waits for the skip it
 /// exercises as an event instead of sleeping.
 /// One structured line for an expiry pass that retired or held evidence. The counts are the
@@ -525,6 +751,7 @@ async fn run(
     mut stopped: watch::Receiver<bool>,
     flush_interval: Duration,
     held: sparrow_server::pressure_wake::PressureWake,
+    pace: Pace,
 ) -> Result<(), String> {
     // A pin release or commit and an archive commit change what expiry may retire; the store
     // notifies this wake without blocking, and a pending wake survives a busy duty.
@@ -612,6 +839,12 @@ async fn run(
     let mut migrating = false;
     let mut deferral: Option<tokio::task::JoinHandle<std::time::Duration>> = None;
     let mut stale = false;
+    // How long a duty that keeps panicking waits; the other duties run on their own clocks.
+    let mut pressure_panics = PanicBackoff::default();
+    let mut expiry_panics = PanicBackoff::default();
+    // The proofs of the standing latch and the last failure they met.
+    let mut proofs = Proofs::default();
+    let mut proof_failure: Option<String> = None;
     let mut journal = MigrationJournal::default();
     loop {
         let job = tokio::select! {
@@ -672,24 +905,100 @@ async fn run(
         }
         let owner = store.clone();
         // Await this complete bounded native job before admitting another duty.
-        let (result, latched) = tokio::task::spawn_blocking(move || {
-            let result = job.execute(&owner, paused);
-            let latched = match &result {
-                Ok(_) => Ok(None),
-                Err(_) => owner.durability_status().map(|status| status.failure),
-            };
-            (result, latched)
-        })
-        .await
-        .map_err(|error| format!("{} join failed: {error}", job.name()))?;
-        // A failed write leaves durability uncertain until the store is reopened.
-        // Ending the daemon lets its supervisor reopen it instead of refusing every write.
-        if let Some(failure) =
-            latched.map_err(|error| format!("{} status failed: {error}", job.name()))?
-        {
-            return Err(format!(
-                "store durability uncertain; exiting so it is reopened: {failure}"
-            ));
+        let joined = tokio::task::spawn_blocking(move || job.execute(&owner, paused)).await;
+        // A duty that panicked ends only itself: a writer it held is recovered by the next
+        // operation that takes the writer, and the duty runs again at its next turn.
+        let result = match joined {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // The duties on a deadline (pressure and expiry) are due again at once, so a
+                // panic that recurs waits on a growing delay; the interval duties keep their
+                // own clocks.
+                let delay = match job {
+                    Job::Pressure => {
+                        let delay = pressure_panics.panicked();
+                        pressure_at = tokio::time::Instant::now() + delay;
+                        Some(delay)
+                    }
+                    Job::Expiry => {
+                        let delay = expiry_panics.panicked();
+                        expiry_at = tokio::time::Instant::now() + delay;
+                        Some(delay)
+                    }
+                    Job::Migrate { .. } => {
+                        migrate.reset();
+                        None
+                    }
+                    _ => None,
+                };
+                eprintln!(
+                    "sparrowd: {} panicked; the next duty recovers the writer and it runs again after {delay:?}: {error}",
+                    job.name()
+                );
+                continuation = false;
+                migrating = false;
+                deferral = None;
+                continue;
+            }
+        };
+        let latched = if proofs.must_read(result.is_err()) {
+            let owner = store.clone();
+            tokio::task::spawn_blocking(move || latched(&owner))
+                .await
+                .map_err(|error| format!("{} latch read join failed: {error}", job.name()))?
+                .map_err(|error| format!("{}: {error}", job.name()))?
+        } else {
+            false
+        };
+        let first_sight = latched && !proofs.active;
+        proofs.read(latched);
+        if !latched {
+            proof_failure = None;
+        } else {
+            let space_low = store.free_space_is_low().unwrap_or(false);
+            let named = cause(proof_failure.as_deref().unwrap_or_default(), space_low);
+            if first_sight {
+                eprintln!(
+                    "sparrowd: store durability latched ({}); writes are refused, the store is left alone until free space is adequate and RocksDB has had time to resume, then the proof runs",
+                    named.name()
+                );
+            }
+            match proofs.step(&pace, tokio::time::Instant::now(), space_low) {
+                Step::Wait => {}
+                Step::Exit => {
+                    return Err(format!(
+                        "store durability uncertain and not re-established within {:?} of adequate free space ({}); RocksDB clears this only by reopening, so exiting for the supervisor to reopen it: {}",
+                        pace.bound,
+                        named.name(),
+                        proof_failure.as_deref().unwrap_or("no proof ran")
+                    ));
+                }
+                Step::Prove => {
+                    let owner = store.clone();
+                    let proof = tokio::task::spawn_blocking(move || owner.reestablish_durability())
+                        .await
+                        .map_err(|error| format!("durability proof join failed: {error}"))?;
+                    match proof {
+                        Ok(Some(cleared)) => {
+                            proofs.read(false);
+                            proof_failure = None;
+                            eprintln!(
+                                "sparrowd: store durability re-established in place after: {cleared}"
+                            );
+                            // Writers held on the latch's retryable refusal evaluate again now.
+                            held.wake();
+                            wake.notify_one();
+                            pressure_wake.notify_one();
+                            migrate_wake.notify_one();
+                        }
+                        Ok(None) => proofs.read(false),
+                        Err(error) => {
+                            proofs.failed(tokio::time::Instant::now());
+                            proof_failure = Some(error.message);
+                        }
+                    }
+                }
+            }
         }
         // A deferral that finished while this duty ran no longer reflects the writers
         // waiting now; the page it admits waits again first.
@@ -711,6 +1020,7 @@ async fn run(
                         report.anomalies
                     );
                 }
+                expiry_panics.recovered();
                 continuation = report.continuation;
                 expiry_at = tokio::time::Instant::now()
                     + if continuation {
@@ -736,6 +1046,7 @@ async fn run(
             Ok(Outcome::Pressured(status)) => {
                 held.wake();
                 journal_eviction(&status, &mut journaled_eviction_passes);
+                pressure_panics.recovered();
                 let verdict = pressure_duty.observe(&status);
                 for line in &verdict.lines {
                     eprintln!("{line}");
@@ -1059,6 +1370,303 @@ mod tests {
         );
         assert_eq!(store.bytes(&fresh.id, 0, 8, now).unwrap(), b"buffered");
         assert_eq!(store.artifact(&artifact.id).unwrap_err().code, "NOT_FOUND");
+    }
+
+    /// INVARIANT (#447): a standing latch is left alone while free space is below RocksDB's
+    /// recovery buffer, however long, and the free space returning restarts the wait; once
+    /// space is adequate the first proof waits out the grace, further proofs are spaced by a
+    /// doubling interval that stops at the longest, and the daemon exits only when the latch
+    /// has stood the whole bound with space adequate. The cause is named by measured free
+    /// space first and by either ENOSPC wording second, never by free text alone.
+    #[test]
+    fn a_standing_latch_is_proved_sparingly_and_exits_only_after_the_bound() {
+        let pace = Pace::DAEMON;
+        let origin = tokio::time::Instant::now();
+        let at = |seconds: u64| origin + Duration::from_secs(seconds);
+        let mut proofs = Proofs::default();
+        // Low free space waits indefinitely, far past the bound.
+        for seconds in [0, 10, 300, 3600] {
+            assert_eq!(proofs.step(&pace, at(seconds), true), Step::Wait);
+        }
+        // Space returns at 4000 s: wait out the grace, then prove once.
+        assert_eq!(proofs.step(&pace, at(4000), false), Step::Wait);
+        assert_eq!(proofs.step(&pace, at(4014), false), Step::Wait);
+        assert_eq!(proofs.step(&pace, at(4015), false), Step::Prove);
+        // A failed proof is followed by 30 s, then 60 s, then 60 s of silence.
+        proofs.failed(at(4015));
+        assert_eq!(proofs.step(&pace, at(4044), false), Step::Wait);
+        assert_eq!(proofs.step(&pace, at(4045), false), Step::Prove);
+        proofs.failed(at(4045));
+        assert_eq!(proofs.step(&pace, at(4104), false), Step::Wait);
+        assert_eq!(proofs.step(&pace, at(4105), false), Step::Prove);
+        proofs.failed(at(4105));
+        // The bound counts from when space became adequate.
+        assert_eq!(proofs.step(&pace, at(4119), false), Step::Wait);
+        assert_eq!(proofs.step(&pace, at(4120), false), Step::Exit);
+        // Space falling low again restarts the whole wait.
+        assert_eq!(proofs.step(&pace, at(4121), true), Step::Wait);
+        assert_eq!(proofs.step(&pace, at(4200), false), Step::Wait);
+
+        for (message, space_low, expected) in [
+            ("Input/output error", true, Cause::NoSpace),
+            ("garbled text", true, Cause::NoSpace),
+            ("IO error: No space left on device", false, Cause::NoSpace),
+            ("IO error: no space left", false, Cause::NoSpace),
+            ("write failed: ENOSPC", false, Cause::NoSpace),
+            ("IO error: Input/output error", false, Cause::Other),
+            ("something unforeseen", false, Cause::Other),
+        ] {
+            assert_eq!(cause(message, space_low), expected, "{message} {space_low}");
+        }
+    }
+
+    /// INVARIANT (#447): other duties succeeding while a latch stands do not restart its
+    /// schedule of proofs. A new latch is read only after a failed duty, a standing one after
+    /// every duty, and a duty that succeeds with the latch still standing leaves the grace
+    /// running, so the first proof comes when the grace ends instead of never. Fails on a
+    /// worker that takes a successful duty for a cleared latch: its schedule restarts every
+    /// second and no proof ever runs.
+    #[test]
+    fn a_successful_duty_does_not_restart_the_proofs_of_a_standing_latch() {
+        let pace = Pace::DAEMON;
+        let origin = tokio::time::Instant::now();
+        let mut proofs = Proofs::default();
+        assert!(!proofs.must_read(false), "no latch was seen");
+        assert!(proofs.must_read(true), "a failed duty may have met one");
+        proofs.read(true);
+        let mut proved_at = None;
+        for second in 0..=20_u64 {
+            // Every second a different duty succeeds and the latch is read again.
+            assert!(
+                proofs.must_read(false),
+                "a standing latch is read after every duty"
+            );
+            proofs.read(true);
+            if proofs.step(&pace, origin + Duration::from_secs(second), false) == Step::Prove {
+                proved_at = Some(second);
+                break;
+            }
+        }
+        assert_eq!(proved_at, Some(15));
+        proofs.read(false);
+        assert!(!proofs.must_read(false), "a cleared latch is forgotten");
+    }
+
+    /// INVARIANT (#447): a durability latch the store can clear no longer ends the daemon.
+    /// The worker's next failed duty proves every accepted write durable in place: the latch
+    /// clears, the buffered write it left uncertain is certified, writes are accepted again,
+    /// and the worker is still running to shut down cleanly. Fails on the worker that exits on
+    /// every latch: the latch never clears and the worker has ended.
+    #[tokio::test]
+    async fn a_durability_latch_clears_in_place_and_the_worker_keeps_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let path =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let store = sparrow_server::ServerConfig::read(&path)
+            .unwrap()
+            .open_store()
+            .unwrap();
+        let now = sparrow_server::now().unwrap();
+        store
+            .ingest_with_durability(
+                "buffered",
+                "source",
+                "opaque",
+                b"buffered",
+                now,
+                sparrow_core::Durability::Buffered,
+            )
+            .unwrap();
+        store
+            .latch_durability_for_tests("injected WAL sync failure")
+            .unwrap();
+        let worker = Worker::start_paced(
+            store.clone(),
+            Duration::from_millis(1),
+            Default::default(),
+            Pace {
+                grace: Duration::ZERO,
+                first: Duration::from_millis(10),
+                longest: Duration::from_millis(10),
+                bound: Duration::from_secs(25),
+            },
+        );
+        until("the latch to clear", || {
+            let status = store.durability_status().unwrap();
+            status.failure.is_none() && status.pending_writes == 0
+        })
+        .await;
+        store
+            .ingest("after", "source", "log", b"accepted\n", now)
+            .unwrap();
+        worker.shutdown().await.unwrap();
+    }
+
+    /// INVARIANT (#447): under a real full filesystem the daemon's own maintenance worker
+    /// leaves a latched store alone while free space is low, proves durability after space
+    /// returns and RocksDB has had time to resume, clears the latch in place, and is still
+    /// running. The count of manual flushes in RocksDB's own LOG shows whether the store was
+    /// touched while space was low.
+    ///
+    /// Needs real time (the worker waits out RocksDB's 5 s polls) and a filesystem it can fill,
+    /// so it is ignored in the gate: run `tools/enospc-check.sh LOG worker`, which mounts a
+    /// 160 MiB tmpfs in a user and mount namespace (`unshare -rm`) and names it in
+    /// `SPARROW_ENOSPC_DIR`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "runs under tools/enospc-check.sh on a 160 MiB tmpfs and needs about two minutes"]
+    async fn a_full_disk_latch_is_proved_once_by_the_worker_after_space_returns() {
+        use sparrow_core::Config;
+        use std::io::Write;
+        let dir = std::path::PathBuf::from(
+            std::env::var_os("SPARROW_ENOSPC_DIR")
+                .expect("SPARROW_ENOSPC_DIR names the small filesystem; run tools/enospc-check.sh"),
+        );
+        let data = dir.join("store");
+        let store = Store::open(
+            &data,
+            Config {
+                disk_budget: 4 * 1024 * 1024 * 1024,
+                maintenance_reserve: 1024 * 1024,
+                min_free_bytes: 4 * 1024,
+                ..sparrow_test_support::storage_config!(Config)
+            },
+        )
+        .unwrap();
+        let flushes = || {
+            std::fs::read_to_string(data.join("LOG"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.contains("Manual flush start"))
+                .count()
+        };
+        let worker = Worker::start_paced(
+            store.clone(),
+            Duration::from_secs(1),
+            Default::default(),
+            Pace::DAEMON,
+        );
+        store
+            .ingest("before", "source", "log", b"kept\n", 1)
+            .unwrap();
+        let filler = dir.join("filler");
+        let mut file = std::fs::File::create(&filler).unwrap();
+        let chunk = vec![0_u8; 64 * 1024];
+        while file.write_all(&chunk).is_ok() {}
+        drop(file);
+        let length = std::fs::metadata(&filler).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&filler)
+            .unwrap()
+            .set_len(length - 16 * 1024)
+            .unwrap();
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut failed = None;
+        for attempt in 0..480 {
+            let payload: Vec<u8> = (0..256 * 1024)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed.to_le_bytes()[0]
+                })
+                .collect();
+            if let Err(error) = store.ingest_with_durability(
+                &format!("full-{attempt}"),
+                "source",
+                "opaque",
+                &payload,
+                2,
+                sparrow_core::Durability::Durable,
+            ) {
+                failed = Some(error);
+                break;
+            }
+        }
+        eprintln!("first failure: {failed:?}");
+        assert!(store.durability_status().unwrap().failure.is_some());
+
+        // Space stays low: the worker must leave the store alone.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let at_latch = flushes();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        eprintln!(
+            "manual flushes: {at_latch} at the latch, {} after 30 s with space low",
+            flushes()
+        );
+        assert_eq!(
+            flushes(),
+            at_latch,
+            "the worker touched the store while space was low"
+        );
+        assert!(store.durability_status().unwrap().failure.is_some());
+
+        std::fs::remove_file(&filler).unwrap();
+        let freed = std::time::Instant::now();
+        let cleared = loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if store.durability_status().unwrap().failure.is_none() {
+                break freed.elapsed();
+            }
+            assert!(
+                freed.elapsed() < Duration::from_secs(150),
+                "the latch did not clear"
+            );
+        };
+        eprintln!("RESULT cleared_after={cleared:?}");
+        store
+            .ingest("after", "source", "log", b"after\n", 3)
+            .unwrap();
+        worker
+            .shutdown()
+            .await
+            .expect("the worker was still running");
+    }
+
+    /// INVARIANT (#447): a duty that keeps panicking is retried on a growing delay (1 s
+    /// doubling to 30 s) and never in a busy loop, and the worker keeps serving its other
+    /// duties and shuts down cleanly. Time is the runtime's paused clock, so the test does not
+    /// sleep. Fails on a worker whose panic arm leaves the duty due at once: it retries
+    /// without a pause, hundreds of times in no time.
+    #[tokio::test(start_paused = true)]
+    async fn a_duty_that_keeps_panicking_is_retried_on_a_growing_delay_not_in_a_busy_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let path =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let store = sparrow_server::ServerConfig::read(&path)
+            .unwrap()
+            .open_store()
+            .unwrap();
+        let now = sparrow_server::now().unwrap();
+        store
+            .ingest_with_durability(
+                "buffered",
+                "source",
+                "opaque",
+                b"buffered",
+                now,
+                sparrow_core::Durability::Buffered,
+            )
+            .unwrap();
+        inject::arm(&store);
+        let worker = Worker::start_paced(
+            store.clone(),
+            Duration::from_secs(1),
+            Default::default(),
+            Pace::DAEMON,
+        );
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        // Attempts at about 0, 1, 3, 7, 15 and 31 s.
+        let attempts = inject::attempts();
+        assert!(
+            (4..=7).contains(&attempts),
+            "{attempts} attempts in 40 s of a duty that panics every time"
+        );
+        // The flush duty ran beside it.
+        assert_eq!(store.durability_status().unwrap().pending_writes, 0);
+        worker.shutdown().await.unwrap();
     }
 
     /// INVARIANT (#183, #249): an import's slot is freed by an event, not by the one-second
