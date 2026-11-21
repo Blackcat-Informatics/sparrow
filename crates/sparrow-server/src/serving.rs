@@ -12,6 +12,7 @@
 
 use crate::{
     Access, Rpc, admission::Ceiling, floor_pause::PauseJournal, ingest_socket::IngestSocket,
+    local_endpoint::LocalEndpoint,
 };
 use std::{error::Error, future::Future, sync::Arc, time::Duration};
 
@@ -23,9 +24,9 @@ pub const SPACE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// The listeners the loop accepts on.
 pub struct Sockets<'a> {
     /// The private Unix socket.
-    pub private: &'a tokio::net::UnixListener,
+    pub private: &'a LocalEndpoint,
     /// The group-accessible ingest socket and its counters, when configured.
-    pub ingest: Option<(&'a tokio::net::UnixListener, &'a IngestSocket)>,
+    pub ingest: Option<(&'a LocalEndpoint, &'a IngestSocket)>,
     /// Public TCP and the secret its sessions authenticate with, when configured.
     pub tcp: Option<(&'a tokio::net::TcpListener, sparrow_client::TcpSecret)>,
 }
@@ -92,6 +93,12 @@ pub async fn serve(
                 if let Some(line) = pause_journal.observe(shortfall.as_deref(), now, rpc.floor_pause()) {
                     journal(&line);
                 }
+                // A socket name removed while the daemon runs is bound again (#447).
+                for endpoint in std::iter::once(sockets.private).chain(ingest.map(|(endpoint, _)| endpoint)) {
+                    if let Some(line) = endpoint.restore_name().await {
+                        journal(&line);
+                    }
+                }
             }
             accepted = sockets.private.accept(), if rpc_slot.is_some() => {
                 let (stream, _) = accepted?;
@@ -141,7 +148,7 @@ mod tests {
     }
 
     /// Start the accept loop over a fresh store on the current `LocalSet`.
-    fn fixture() -> Fixture {
+    async fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("store");
         let socket = data.join("rpc.sock");
@@ -153,7 +160,7 @@ mod tests {
         let connections = Ceiling::new("RPC connection ceiling", 8);
         let rpc = Rpc::new(store.clone(), Arc::new(Semaphore::new(8)), 100)
             .with_connections(connections.clone());
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let listener = LocalEndpoint::bind(&socket, &store).await.unwrap();
         let (stop, stopped) = oneshot::channel::<()>();
         let lines = Rc::new(RefCell::new(Vec::new()));
         let served = tokio::task::spawn_local({
@@ -267,7 +274,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_paused_floor_accepts_serves_reads_and_refuses_writes_with_the_floor_label() {
         guarded(async {
-            let mut fixture = fixture();
+            let mut fixture = fixture().await;
             // Stored directly and paused before the loop first runs, so the loop sees the pause
             // from its first turn, as it does a pause that began long before a connection.
             let stored = fixture
@@ -324,7 +331,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_while_paused_ends_the_accept_loop_with_connections_open() {
         guarded(async {
-            let mut fixture = fixture();
+            let mut fixture = fixture().await;
             fixture.pause();
             // The loop's first observation journals the pause: from here it is in force there.
             reached(&fixture, 1).await;
@@ -345,7 +352,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_observer_tick_journals_the_start_and_end_of_a_pause() {
         on_local_set(async {
-            let mut fixture = fixture();
+            let mut fixture = fixture().await;
             // The loop's first tick is immediate and sees no pause.
             for _ in 0..20 {
                 tokio::task::yield_now().await;
@@ -360,6 +367,32 @@ mod tests {
             tokio::time::advance(SPACE_CHECK_INTERVAL).await;
             reached(&fixture, 2).await;
             assert!(fixture.lines.borrow()[1].contains("free space restored"));
+            fixture.stop.take().unwrap().send(()).unwrap();
+            fixture.served.await.unwrap().unwrap();
+        })
+        .await;
+    }
+
+    /// Value (#447): a removed socket name left the daemon healthy by every internal check
+    /// while no local client could connect, until a restart. Protects, on the real accept loop:
+    /// the loop's one-second observation binds the removed name again and journals it, and a
+    /// client then connects and is served. Fails on the loop that never rebinds: no line is
+    /// journaled and the connect finds no socket.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_removed_socket_name_is_bound_again_by_the_accept_loop() {
+        guarded(async {
+            let mut fixture = fixture().await;
+            std::fs::remove_file(&fixture.socket).unwrap();
+            reached(&fixture, 1).await;
+            assert!(
+                fixture.lines.borrow()[0].contains("was removed; bound it again"),
+                "{:?}",
+                fixture.lines.borrow()
+            );
+            let client = sparrow_client::Client::connect(&fixture.socket)
+                .await
+                .unwrap();
+            fixture.wire_counts(&client).await;
             fixture.stop.take().unwrap().send(()).unwrap();
             fixture.served.await.unwrap().unwrap();
         })
@@ -387,7 +420,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_producer_holds_floor_refusals_and_delivers_when_space_returns() {
         guarded(async {
-            let mut fixture = fixture();
+            let mut fixture = fixture().await;
             fixture.pause();
             // The loop's first observation journals the pause: from here it is in force there.
             reached(&fixture, 1).await;

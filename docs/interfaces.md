@@ -1027,17 +1027,19 @@ hung mount still reports where it stopped.
 | `through` | 1 | The durable `archive:through` watermark; empty before the first commit. The worker reads it, with `intentInFlight`, from the store when it starts and at the top of every pass, so status is right after a restart and on passes that fail before they choose a segment. |
 | `intentInFlight` | 2 | A prepared segment is recorded and not yet committed. |
 | `failure` | 3 | `OptionalArchiveFailure`: absent, or the last failed pass. |
+| `restarts` | 4 | Passes that panicked since the daemon started. The worker journals each, records it as the `ARCHIVE_PANIC` failure with the panic message, and starts the next pass from the store's durable watermark. |
 
 `ArchiveFailure` carries `code` (ordinal 0: `ARCHIVE_VERIFY`, `ARCHIVE_IO`, `ARCHIVE_ROOT`,
-`ARCHIVE_NOT_ON_MOUNT`, `ARCHIVE_OVERRAN`, `INVALID_ARGUMENT`, or the store's own code such as
+`ARCHIVE_NOT_ON_MOUNT`, `ARCHIVE_OVERRAN`, `ARCHIVE_PANIC`, `INVALID_ARGUMENT`, or the store's own code such as
 `STORAGE_PRESSURE`), `segment` (1: the segment file name, empty when the failure came before a
 segment was chosen), `reason` (2: the cause, cut to 512 characters; the journal line holds it
 whole) and `since` (3: an `OptionalInstant`, when the failure began, kept while the same code and
 segment keep failing; absent while the clock could not be read, and filled in on the first pass
 that reads it). A pass that ends without error clears
 the failure and returns the phase to `idle`. CLI and MCP status render the field as
-`archive_worker` with `phase`, `through`, `intent_in_flight` and `failure` (`code`, `segment`,
-`reason`, `since` as an instant or null, or the whole failure null).
+`archive_worker` with `phase`, `through`, `intent_in_flight`, `failure` (`code`, `segment`,
+`reason`, `since` as an instant or null, or the whole failure null) and `restarts` as a decimal
+string.
 
 ### Instance role (#371)
 
@@ -1281,7 +1283,13 @@ through the pending read paths and its `status` reports each migration's
 progress where the copy left it. A store that still owes the
 table rewrite reports `recompression` as `running`, but the rewrite never runs.
 The daemon sets `data_dir` to mode 0710, creates its socket name and removes it
-at shutdown. Every daemon, query-only or not, logs
+at shutdown. The accept loop checks its Unix socket names once a second: a name removed
+while the daemon runs is bound again at once with its mode (and, for the ingest socket,
+its directory, group and mode checks), and journaled as `sparrowd: local endpoint PATH
+was removed; bound it again`. The start's liveness rules hold: a name another live
+listener answers on, or that is not a socket, is preserved and journaled once while it
+lasts, and a socket left on the name is replaced only after a refused connection proves
+it dead. Every daemon, query-only or not, logs
 `sparrowd: closed store=ID unique_payload_chunks=N` once its workers have stopped
 and its final flush has succeeded. A later shutdown error can still follow it. Query captures use anonymous temporary files that leave no name
 behind.
@@ -1534,8 +1542,14 @@ across commits; when a change ends the writer publishes a small copy, and status
 reads only that copy. A status reply therefore waits for no migration page,
 write, pressure pass or rewrite step, at most for one short copy. It still
 checks, without waiting, whether a writer panicked while holding the writer
-lock, and then refuses with `STORAGE_FAILURE` ("catalog writer poisoned") as
-every locked operation does, as do the three observed-status reads.
+lock. A lock a panicked writer left is recovered by the next operation that takes
+it, status and the three observed-status reads included: the writer reloads the
+state it derives from the store (pressure, table rewrite and archive state, the
+eviction and expiry cursors) as an open does, and syncs the WAL so the durability
+ledger certifies every accepted write. `durability.writerRecoveries` counts the
+recoveries. A re-validation that fails (including a WAL sync that fails) leaves the lock poisoned and
+refuses with the retryable `STORAGE_PRESSURE` ("catalog writer poisoned and not yet
+recovered"); the next operation tries again.
 
 One owner, `store_counters::apply`, runs on every write batch after the
 per-source counters and adds its row changes to the same batch. A key the batch
@@ -2500,9 +2514,12 @@ stale cache its context reads keep using the time index until a writable daemon
 completes the rebuild. Selected entries must agree with the primary time index and the
 record's source; disagreement refuses the capture without a global scan fallback.
 Corrupt record metadata found during reconstruction latches a durable failure:
-the migration stops paging, `Status.migrations` reports the failure, and
-context keeps walking the primary `time:` index until catalog repair and a
-reopen, which resets the cache and rebuilds it. A context read that reaches the
+`Status.migrations` reports the failure, and context keeps walking the primary
+`time:` index. The latched rebuild re-verifies on the maintenance worker's migration
+retry interval (60 s): the page runs again from its checkpoint, commits nothing and
+fails while the metadata is still corrupt, and once the row is repaired the page succeeds, clears the latch in the same batch and
+the rebuild continues. The rebuild runs last of the migrations, so a latched one
+holds back no other. A reopen also resets the cache and rebuilds it. A context read that reaches the
 corrupt record itself refuses with a storage failure. The failure does not
 publish a partial timeline or prevent unrelated evidence reads. Other page failures, such
 as storage I/O or admission, are retried like any migration page. The daemon
@@ -4604,39 +4621,66 @@ or semantic engine. The public surface includes:
   lifecycle/context becomes typed relationships with source evidence.
 - Bounded batching/retry queues and visible delivery/drop counters. The default
   logging path is nonblocking and drops new events when full; it never silently
-  allocates an unlimited queue or stalls a production thread on network I/O. A
-  briefly held queue lock makes admission wait, never drop. A permanent daemon
-  refusal of a batch (a non-retryable `INVALID_ARGUMENT` or `CONFLICT`, or a batch that can
-  never be accepted) is never reduced to a number: the
-  client writes the batch's canonical event lines, the refusal code and reason and the event
-  count to one file in `quarantine_dir`, and only then settles the batch. The events are
-  counted (`quarantined_events`, with `last_quarantine` naming the refusal), reported by the
-  next flush as not delivered (`FlushError::Dropped`, whose `quarantined_before_fence` counts
-  those kept in files), and later events proceed. Status exposes `quarantine_dir`,
-  `quarantine_files`, `last_quarantine_file` and `quarantine_write_failures`. The client never
-  deletes or rewrites a quarantine file; its size is bounded only by the disk (a source whose
-  time mapping conflicts refuses every later batch, so each becomes one file until the operator
-  fixes the source). If the file cannot be written, the batch stays pending, the failure is
-  counted and reported as the transient failure, which names the refusal code and reason, the
-  directory and the I/O error, and the write is retried, so that batch is not dropped; later
-  events wait behind it and are refused as `Full` once the queue is full. Any other
-  non-retryable refusal (a replaced store, a read-only daemon) ends delivery as a terminal
-  failure, and the pending batch and queued events are first written to quarantine files.
-  A batch the client itself cannot encode takes this terminal route too: the client validates
-  every batch before it is sent, so the failure ends delivery and the batch is saved by the
-  terminal save under the code `CLIENT_REFUSED`, not by the per-batch route above. The
-  daemon storing a refused batch as a malformed record with its reason is the preferred form
-  and is not yet implemented (issue 216). A busy refusal (a retryable `RESOURCE_LIMIT`) is never quarantined:
-  the client holds the batch, bounded by the queue limits, with overflow counted
-  as `Full`. A full producer registry is not a refusal any more (#215): the daemon
-  stores the batch and counts the lost gap evidence, so the client no longer holds
-  a batch for it. A source past the 1024-mapping ceiling and an over-bound
-  batch are no longer retryable refusals either (#227): the daemon takes the
-  first and answers the second `INVALID_ARGUMENT`, which is quarantined. An
-  older daemon still answers these with `RESOURCE_LIMIT`, which the client
-  holds as before: held bytes are never lost, and the client cannot tell the
-  case from a busy daemon. A busy (retryable) refusal retries the same
-  batch on the same connection; only a transport failure reconnects.
+  allocates an unlimited queue or stalls a production thread on network I/O. The queue
+  holds at most 1024 events and 4 MiB by default (`max_queued_events`, `max_queued_bytes`); an event past either bound is refused as `Full` and
+  counted. A briefly held queue lock makes admission wait, never drop. The worker never
+  stops for good: every failed attempt is either set aside or held, and a hold clears when
+  its cause goes.
+  - Set aside. A refusal about the batch itself (a non-retryable `INVALID_ARGUMENT`,
+    `CONFLICT`, or input-bound `RESOURCE_LIMIT`, the client's own `INVALID_ARGUMENT`,
+    `STORE_MISMATCH`, or any non-retryable code this client does not know) is never reduced to a number: the client
+    writes the batch's canonical event lines, the refusal code and reason and the event
+    count to one file in `quarantine_dir`, and only then settles the batch. The events are
+    counted (`quarantined_events`, with `last_quarantine` naming the refusal), reported by
+    the next barrier as not delivered (`FlushError::Dropped`, whose `quarantined_before_fence`
+    counts those kept in files), and later events proceed. Status exposes `quarantine_dir`,
+    `quarantine_files`, `last_quarantine_file` and `quarantine_write_failures`. The worker never
+    deletes a quarantine file; its size is bounded only by the disk (a source whose time
+    mapping conflicts refuses every later batch, so each becomes one file until the operator
+    fixes the source). If the file cannot be written, the batch stays pending, the failure
+    is counted and reported as the transient failure, which names the refusal code and
+    reason, the directory and the I/O error, and the write is retried, so that batch is not
+    dropped; later events wait behind it and are refused as `Full` once the queue is full.
+  - Hold. Everything else keeps the immutable pending batch and retries it on the backoff
+    (1 s doubling to 30 s, restarted by an acknowledged or set-aside batch): a retryable
+    refusal (a busy `RESOURCE_LIMIT`, `STORAGE_PRESSURE` including the free-space floor,
+    `SHUTTING_DOWN`), a lost or refused connection, any transport, I/O, protocol or discovery
+    failure, and a refusal about the daemon rather than the batch: `READ_ONLY`,
+    `PERMISSION_DENIED`, `UNAUTHENTICATED`, `UNSUPPORTED` and `STORAGE_FAILURE`. A hold is visible as
+    `retries` and `last_transient_failure`, which clears when a batch is acknowledged or set
+    aside; the queue behind it is bounded as above. A busy refusal is never quarantined and
+    a full producer registry is not a refusal (#215).
+  - Replaced store. `STORE_MISMATCH` (the store behind the socket changed) is set aside, not
+    held: whether the old store holds the pending batch is unknown, and the batch must not
+    reach another store unrecorded, so it goes to a quarantine file with the refusal. The
+    worker then adopts the store now behind the socket and later batches are delivered there;
+    nothing stays in memory only and no restart is needed. Replaying the file into the
+    original store stores a batch that the original store may already hold a second time.
+  - Local failure. Only a local invariant failure (a poisoned lock, an exhausted counter, a
+    worker panic) ends the worker: `terminal_failure` is set, later events are refused as
+    `Failed`, and the pending batch and queued events are written to quarantine files. While
+    such a write fails, `held_unsaved_events` counts the events held only in memory and the
+    worker retries the write on the backoff until it succeeds; they are never counted
+    delivered.
+  - Replay. `sparrow_client::replay_quarantine(client, path)` and the CLI command
+    `sparrow $ENDPOINT quarantine-replay FILE` resend the batch in a quarantine file under
+    a replay identity derived from the file's request identity and producer instance: the
+    store refuses batches that lie behind positions it already accepted from the original
+    instance, so a live producer's later batches must not block replay. Retrying one replay
+    repeats the identity and is answered idempotently. A file larger than one batch (the
+    queued events saved at a local failure) is sent as several batches within the batch
+    limits, in order, each with its own stable identity. The file is removed only after the
+    store acknowledges every batch durably. A daemon refusal returns the error and keeps the file, recording the refusal in
+    its header (`replay_attempts`, `last_replay_code`, `last_replay_reason`); a transport
+    failure changes nothing. A file that does not parse back into exactly the stored event
+    lines is refused.
+  - Barriers. `flush` and `shutdown` report the drops and quarantines first seen since the
+    previous barrier that returned a watermark or `Dropped`, so a fence that reported them is
+    clean for later input without a restart. `DeliveryStats` keeps the running totals
+    (`dropped_by_reason`, `quarantined_events`).
+  - Tracing layer. The layer does not return admission results to the subscriber, which has
+    no caller to tell; every refusal is nevertheless visible in `DeliveryStats` and at the
+    next barrier.
 - Explicit buffered/durable delivery selection for direct ingestion and
   `flush(durable)`/shutdown that returns the reached receipt watermark or a typed
   error. Durable flush cannot certify events already dropped before enqueue.
@@ -4799,7 +4843,9 @@ with retryable `STORAGE_PRESSURE` before publication. Default intended WAL sync 
 sequences, pending count/bytes, age, interval, lag and latched storage uncertainty.
 Any synchronized control write covers earlier WAL writes; empty control batches
 use explicit synchronization. Write/WAL-sync failure latches uncertainty and
-refuses further receipt certification until reopening. Opening synchronizes
+refuses further receipt certification until reopening; reads are served, and an artifact
+read reports its still-pending fence. Status counts writer-lock recoveries
+(`writerRecoveries`). Opening synchronizes
 recovered data before starting a fresh session. These fences certify storage
 durability, not retention extension, producer drops or power-loss qualification.
 

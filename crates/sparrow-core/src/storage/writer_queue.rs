@@ -122,7 +122,7 @@ impl<V> Clone for Published<V> {
 
 impl<V: Clone> Published<V> {
     /// A copy of the last published view. A poisoned lock is recovered: a panic while the
-    /// writer published already poisoned the writer lock, which refuses every later write.
+    /// writer published already poisoned the writer lock, which the next writer recovers.
     pub(super) fn read(&self) -> V {
         self.0
             .read()

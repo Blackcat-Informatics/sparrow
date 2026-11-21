@@ -794,7 +794,7 @@ impl Worker {
             .spawn(move || watch(&watched, &watch_stopped))?;
         thread::Builder::new()
             .name("sparrow-archive".into())
-            .spawn(move || run(&flight, &store, &root, every, &stopped))?;
+            .spawn(move || run(&flight, every, &stopped, || pass(&flight, &store, &root)))?;
         Ok(Self {
             _stop: stop,
             _watch_stop: watch_stop,
@@ -845,9 +845,15 @@ fn pass(flight: &Flight, store: &Store, root: &Path) -> Result<u64, String> {
     drain(flight, store, root, &id, now).map_err(|error| error.to_string())
 }
 
-fn run(flight: &Flight, store: &Store, root: &Path, every: Duration, stopped: &mpsc::Receiver<()>) {
+/// Run `pass` until the worker is dropped, `every` apart.
+fn run(
+    flight: &Flight,
+    every: Duration,
+    stopped: &mpsc::Receiver<()>,
+    mut pass: impl FnMut() -> Result<u64, String>,
+) {
     loop {
-        let outcome = pass(flight, store, root);
+        let outcome = guarded_pass(flight, &mut pass);
         if let Err(cause) = outcome {
             eprintln!("sparrowd: archive pass failed; the watermark did not move: {cause}");
             tracing::error!(%cause, "archive pass failed; the watermark did not move");
@@ -862,11 +868,76 @@ fn run(flight: &Flight, store: &Store, root: &Path, every: Duration, stopped: &m
     }
 }
 
+/// Run one pass, restarting the worker from a clean flight when the pass panics. A panic in a
+/// pass would otherwise end the archive thread, and nothing would archive again while the
+/// daemon ran. The panic hook has already journaled the panic itself; this adds the restart
+/// line, records the failure as `ARCHIVE_PANIC` in status and counts the restart there. The
+/// steps of the cut-short pass left the flight as their guards dropped, and every pass starts
+/// again from the store's durable watermark and intent, so a pass cut short by a panic is
+/// redone the way a pass cut short by a crash is.
+fn guarded_pass(
+    flight: &Flight,
+    pass: impl FnOnce() -> Result<u64, String>,
+) -> Result<u64, String> {
+    let panic = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(pass)) {
+        Ok(outcome) => return outcome,
+        Err(panic) => panic,
+    };
+    let cause = panic
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a pass panicked with a non-text payload".to_owned());
+    let restarts = flight.status().restarted();
+    eprintln!(
+        "sparrowd: archive pass panicked; restarting the archive worker restarts={restarts}: {cause}"
+    );
+    tracing::error!(%cause, restarts, "archive pass panicked; restarting the archive worker");
+    Err(fail_pass(
+        flight,
+        "ARCHIVE_PANIC",
+        format!("pass panicked: {cause}"),
+        crate::now().ok(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sparrow_core::Config;
     use std::os::unix::fs::MetadataExt;
+
+    /// INVARIANT (#447): a pass that panics no longer ends the archive thread unnoticed. The
+    /// worker keeps running and runs the next pass; status reports the panic as the standing
+    /// `ARCHIVE_PANIC` failure with its message and counts the restart.
+    #[test]
+    fn a_panicking_pass_is_recorded_and_the_worker_runs_the_next_pass() {
+        let status = ArchiveStatus::new();
+        let flight = Flight::new(Duration::from_secs(60), Duration::from_secs(60))
+            .publishing_to(status.clone());
+        let (stop, stopped) = mpsc::channel::<()>();
+        let mut passes = 0;
+        let mut seen = None;
+        run(&flight, Duration::ZERO, &stopped, || {
+            passes += 1;
+            if passes == 1 {
+                panic!("an injected archive panic");
+            }
+            seen = Some(status.snapshot());
+            stop.send(()).unwrap();
+            Ok(0)
+        });
+        assert_eq!(passes, 2);
+        let snapshot = seen.unwrap();
+        assert_eq!(snapshot.restarts, 1);
+        assert_eq!(snapshot.phase, Phase::Holding);
+        let failure = snapshot.failure.unwrap();
+        assert_eq!(failure.code, "ARCHIVE_PANIC");
+        assert!(
+            failure.reason.contains("an injected archive panic"),
+            "{failure:?}"
+        );
+    }
 
     /// A time after every window and horizon, so the store reports its backlog due.
     const LATER: u64 = 4_000_000_000;

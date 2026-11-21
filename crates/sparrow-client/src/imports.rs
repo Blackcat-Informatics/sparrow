@@ -298,7 +298,8 @@ async fn reconnect(endpoint: &Endpoint, expect: Option<&Expect>) -> Result<Clien
         };
         match connected {
             Err(error)
-                if crate::delivery::retryable(&error) && tokio::time::Instant::now() < deadline =>
+                if crate::delivery::reconnectable(&error)
+                    && tokio::time::Instant::now() < deadline =>
             {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }

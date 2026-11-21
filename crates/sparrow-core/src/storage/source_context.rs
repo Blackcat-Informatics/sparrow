@@ -141,30 +141,41 @@ pub(super) fn fence(db: &DB, batch: &mut WriteBatch) -> Result<(), Error> {
 }
 
 /// Stage one rebuild page with its checkpoint, and whether the rebuild is complete after
-/// it; `None` when it was already complete or latched a failure. A page that finds corrupt
-/// record metadata latches the failure durably instead, so the worker stops retrying and
-/// readers keep reading the primary time index until a reopen resets the cache.
+/// it; `None` when it was already complete. A page that finds corrupt record metadata latches
+/// the failure durably instead, and readers keep reading the primary time index.
+///
+/// A latched rebuild re-verifies: the next page runs again from the same checkpoint. When the
+/// corrupt metadata is gone (its record retired or rewritten), the page succeeds and clears
+/// the latch in its own batch, and the rebuild continues. While the metadata is still corrupt
+/// it commits nothing and fails, so the worker retries it on its migration retry interval
+/// rather than paging back to back.
 pub(super) fn page(db: &DB) -> Result<Option<(WriteBatch, bool)>, Error> {
-    if db.get_pinned(FAILURE)?.is_some() {
-        return Ok(None);
-    }
+    let latched = db.get_pinned(FAILURE)?.is_some();
     let progress = catalog_upgrade::progress(db, &JOB)?;
     if progress.complete {
         return Ok(None);
     }
     match catalog_upgrade::page(db, &JOB, progress, JOB.page_entries) {
+        Err(error) if error.code == "CONTEXT_CATALOG_INVALID" && latched => Err(error),
         Err(error) if error.code == "CONTEXT_CATALOG_INVALID" => {
             let mut batch = WriteBatch::default();
             batch.put(FAILURE, error.message.as_bytes());
             Ok(Some((batch, false)))
         }
-        result => result.map(Some),
+        Ok((mut batch, complete)) => {
+            if latched {
+                batch.delete(FAILURE);
+            }
+            Ok(Some((batch, complete)))
+        }
+        Err(error) => Err(error),
     }
 }
 
-/// Whether the rebuild still has pages to run: incomplete and no latched failure.
+/// Whether the rebuild still has pages to run, a latched one included: it re-verifies (see
+/// [`page`]). The rebuild runs last of the migrations, so a latched one delays no other.
 pub(super) fn pending(db: &DB) -> Result<bool, Error> {
-    Ok(db.get_pinned(FAILURE)?.is_none() && !catalog_upgrade::progress(db, &JOB)?.complete)
+    Ok(!catalog_upgrade::progress(db, &JOB)?.complete)
 }
 
 /// The rebuild's status watermark, absent once complete, from any reader.
