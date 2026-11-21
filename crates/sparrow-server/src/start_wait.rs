@@ -156,15 +156,14 @@ pub fn open_failure(error: Box<dyn Error>) -> Box<dyn Error> {
 
 /// A consume worker that cannot start: a contradictory or unsupported watch state (a watch
 /// configuration that omits an unfinished journal, two roots sharing a private root) and the
-/// store's own `UNSUPPORTED` or `INVALID_ARGUMENT` are permanent. I/O failures, including a
-/// root that does not resolve (a mount may not be up yet), and transport failures are not
-/// classified.
+/// store's own `UNSUPPORTED` or `INVALID_ARGUMENT` are permanent. I/O and transport failures are not classified. A watch root that does not
+/// resolve never reaches this: the watch is reported and retried, and the start proceeds.
 #[must_use]
 pub fn consume_start_failure(error: crate::consumption::Error) -> Box<dyn Error> {
     use crate::consumption::Error as Start;
     let refused = match &error {
         Start::State(_) | Start::FinishedGeneration(_) | Start::PrivateRootShared { .. } => true,
-        // A root that does not resolve may be a mount that is not up yet; it is not named.
+        // An I/O error is not named as deterministic.
         Start::Io(_) => false,
         Start::Storage(error) => matches!(error.code, "UNSUPPORTED" | "INVALID_ARGUMENT"),
         Start::Upload(_) => false,
@@ -559,7 +558,7 @@ mod tests {
                 false,
             ),
             (
-                "root does not resolve (may be a mount not yet up)",
+                "an I/O error is not named as deterministic",
                 consume_start_failure(crate::consumption::Error::Io(io::Error::from(NotFound))),
                 false,
             ),

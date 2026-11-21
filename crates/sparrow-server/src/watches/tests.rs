@@ -1376,9 +1376,9 @@ async fn a_replaced_root_parks_its_watch_and_the_exact_root_resumes_it() {
     assert!(detector.status_failure().is_none());
 }
 
-/// Value (#445): one watch root missing at start refused the daemon's start (and every later
-/// start). Protects: opening a roster whose one root is missing yields the other watch open
-/// and this one reported with its reason; the exact root restored opens it on the retry.
+/// Value (#445): one watch root missing at start must not stop the other watches. Protects:
+/// opening a roster whose one root is missing yields the other watch open and this one reported with its
+/// reason; the exact root restored opens it on the retry.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_root_missing_at_start_leaves_the_other_watches_open_and_resumes_when_restored() {
     let directory = tempfile::tempdir().unwrap();
@@ -2047,7 +2047,7 @@ fn a_root_missing_at_worker_start_does_not_refuse_the_start() {
 }
 
 /// Value (#455): deferring the filesystem resolution must not defer the structural checks.
-/// Protects: overlapping roots, one of them missing, and a relative root remain refusals.
+/// Protects: overlapping roots that both do not exist, and a relative root, remain refusals.
 #[test]
 fn unresolved_roots_still_fail_the_structural_checks() {
     let directory = tempfile::tempdir().unwrap();
