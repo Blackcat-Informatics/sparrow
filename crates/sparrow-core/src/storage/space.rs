@@ -150,8 +150,8 @@ pub struct FloorStatus {
 ///
 /// The physical `disk_budget` bounds the store's own bytes; it cannot see other
 /// writers filling the same filesystem. A write that fails with no space left
-/// latches durability uncertainty until the store is reopened, so writes stop
-/// here first with a retriable refusal.
+/// latches durability uncertainty until the maintenance worker proves durability or the store
+/// is reopened, so writes stop here first with a retriable refusal.
 #[derive(Clone, Debug)]
 pub struct SpaceFloor {
     /// One allocation for the directory and the ledger, so the floor stays two words wide

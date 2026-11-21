@@ -153,8 +153,8 @@ names the key.
 `min_free_bytes` (default 4 GiB) is a floor on free space in the filesystem
 that holds `data_dir`. `disk_budget` bounds only the store's own bytes, while
 other programs on the host can fill the same disk. A write that fails because
-the disk is full latches durability uncertain, and RocksDB accepts no further write on
-that handle until the store is reopened. To avoid that, every write is checked first: below the floor it is refused with a
+the disk is full latches durability uncertain, and writes are refused until the proof of
+durability succeeds or the store is reopened. To avoid that, every write is checked first: below the floor it is refused with a
 retriable `STORAGE_PRESSURE`, and buffered writes that were already accepted
 are still synchronized. The daemon checks free space every second. Below the
 floor it keeps accepting Unix, ingest and TCP connections, including syslog TCP

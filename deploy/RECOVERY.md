@@ -66,9 +66,9 @@ every watch in `consume_watches` names a root that exists.
 - Symptom: writes refused with the retryable `STORAGE_PRESSURE` and `durability
   uncertain; writes resume once the store re-establishes it`, `durability.failure`
   set in status, and then either the journal line `store durability re-established
-  in place after: ...` or, for the fatal class only, the line `store durability uncertain after a fatal WAL
-  error, which RocksDB clears only by reopening; exiting so it is reopened` followed by a
-  restart.
+  in place after: ...` or, when the latch has stood 120 s with adequate free space, the line `store durability
+  uncertain and not re-established within 120s of adequate free space (...); RocksDB clears
+  this only by reopening, so exiting for the supervisor to reopen it` followed by a restart.
 - Cause: a RocksDB write or WAL sync failed. The maintenance worker proves every accepted
   write durable: it writes every memtable to a synchronized table file and syncs the WAL.
   It leaves the store alone while free space is below RocksDB's 32 MiB recovery buffer,
