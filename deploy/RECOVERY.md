@@ -105,7 +105,8 @@ every watch in `consume_watches` names a root that exists.
     allowance than `disk_budget` leaves (attempted again every 30 s).
   - `bind the public TCP address`, `bind the local endpoint`, `bind the ingest
     socket`, `bind the syslog listeners`: a departing owner still holds the
-    address or socket name (tried each second). Find it with
+    address or socket name (tried each second), or another process (an offline
+    `sparrow` command, a daemon still stopping) holds the store's lock. Find it with
     `sudo ss -ltnp 'sport = :518'`.
 - Recover: free the space, or raise `disk_budget` in `/etc/sparrow/server.toml`
   (the wait reads `disk_budget`, `maintenance_reserve` and `min_free_bytes` from
@@ -116,8 +117,9 @@ every watch in `consume_watches` names a root that exists.
 - Where it shows: the journal lines above, and `systemctl show -p StatusText
   sparrow.service` (`waiting to open the store: only N bytes free ...`; the
   daemon sets it through `NotifyAccess=main`, and it reads `serving` once the
-  daemon serves). No socket exists during a wait: the Unix socket needs the
-  store's lock, which the open takes. `deploy/user-unit-upgrade.sh` names the
+  daemon serves). Nothing answers during a wait: the Unix socket needs the
+  store's lock, which the open takes, and the sockets a later bind wait holds
+  accept nothing until the daemon serves. `deploy/user-unit-upgrade.sh` names the
   wait when its status gate times out.
 - Stop: `systemctl stop` sends SIGINT, which ends the wait at once. The
   unit stays `active (running)` through a wait because it is `Type=exec`: a

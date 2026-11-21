@@ -251,7 +251,8 @@ wait_first_status() {
             fi
             die "sparrow.service is $state before its first status answer"
         fi
-        if out=$("$CLI_LINK" "$SOCKET" status 2>/dev/null); then break; fi
+        # The probe is bounded: a daemon in a late start wait has bound its socket but accepts nothing.
+        if out=$(timeout 10 "$CLI_LINK" "$SOCKET" status 2>/dev/null); then break; fi
         if ((SECONDS >= deadline)); then
             waiting=$(start_condition 'waiting to')
             if [[ -n $waiting ]]; then

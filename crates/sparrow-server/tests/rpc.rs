@@ -9578,8 +9578,8 @@ async fn shutdown_syslog_bind_refusal_cleans_owned_endpoint_and_allows_retry() {
                 "tcp",
                 Some("lf"),
             );
-            // The held port is a departing owner: the start waits for it, says so, keeps no
-            // endpoint of its own while it waits, and proceeds when the holder leaves.
+            // The held port is a departing owner: the start waits for it, says so, and
+            // proceeds when the holder leaves.
             let mut daemon = Watched::spawn(&config, None);
             let waiting = daemon.until("waiting to bind the syslog listeners").await;
             assert!(

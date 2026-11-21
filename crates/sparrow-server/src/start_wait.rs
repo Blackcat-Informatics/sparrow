@@ -15,9 +15,11 @@
 //! `RestartPreventExitStatus=`: a restart would repeat it, so the unit neither loops on it nor
 //! spends its start limit, and the journal names the refusal.
 //!
-//! While it waits the daemon holds no socket (the endpoint needs the store's lock, which the open
-//! takes), so the wait is reported where a person and the upgrade script can read it: the
-//! journal lines below, and the unit's `StatusText` through `sd_notify` `STATUS=` ([`notify`]).
+//! While it waits the daemon serves nothing: before the store opens it holds no socket (the
+//! endpoint needs the store's lock, which the open takes), and in a later bind wait its sockets
+//! accept no connection. The wait is reported where a person and the upgrade script can read
+//! it: the journal lines below, and the unit's `StatusText` through `sd_notify` `STATUS=`
+//! ([`notify`]).
 //!
 //! Each wait journals what it waits for on its first observation, again when the reason
 //! changes and as a reminder every [`REMINDER`], re-checks on an interval chosen per condition,
@@ -192,6 +194,11 @@ fn is_out_of_space(message: &str) -> bool {
     message.contains("no space left on device") || message.contains("disk quota exceeded")
 }
 
+/// The text of RocksDB's refusal to take the store's `LOCK` file while another process holds it.
+fn is_lock_held(message: &str) -> bool {
+    message.contains("lock file") || message.contains("lock hold")
+}
+
 /// The hold for a refused open. Space and write allowance pass; everything else the open
 /// checks (format, identity, analyzer, profile, archive fence, corruption, descriptors) is
 /// deterministic.
@@ -207,6 +214,13 @@ pub fn open_hold(error: &(dyn Error + 'static)) -> Option<Hold> {
         "STORAGE_FAILURE" if is_out_of_space(&error.message) => Some(Hold {
             key: "no space",
             interval: OPEN_RETRY,
+        }),
+        // Another process holds the store's lock: an offline command, or a daemon on its way
+        // out (the old unit while this one starts). It passes when that process ends, and
+        // the refused attempt is as cheap as a bind, so it is tried as often.
+        "STORAGE_FAILURE" if is_lock_held(&error.message) => Some(Hold {
+            key: "store lock held",
+            interval: BIND_RETRY,
         }),
         _ => None,
     }
@@ -332,6 +346,20 @@ mod tests {
             .is_some()
         );
         assert!(wait("STORAGE_FAILURE", "IO error: Disk quota exceeded").is_some());
+        assert!(
+            wait(
+                "STORAGE_FAILURE",
+                "IO error: lock hold by current process: /SPARROW/store/LOCK"
+            )
+            .is_some()
+        );
+        assert!(
+            wait(
+                "STORAGE_FAILURE",
+                "IO error: While lock file: /SPARROW/store/LOCK: Resource temporarily unavailable"
+            )
+            .is_some()
+        );
         assert!(wait("STORAGE_FAILURE", "Corruption: bad block in 000009.sst").is_none());
         assert!(wait("UNSUPPORTED", "store format 3 is newer than this image").is_none());
         assert!(wait("INVALID_ARGUMENT", "analyzer fingerprint differs").is_none());
