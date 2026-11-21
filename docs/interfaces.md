@@ -4590,13 +4590,13 @@ or semantic engine. The public surface includes:
 - Bounded batching/retry queues and visible delivery/drop counters. The default
   logging path is nonblocking and drops new events when full; it never silently
   allocates an unlimited queue or stalls a production thread on network I/O. The queue
-  holds at most 1024 events and 4 MiB; an event past either bound is refused as `Full` and
+  holds at most 1024 events and 4 MiB by default (`max_queued_events`, `max_queued_bytes`); an event past either bound is refused as `Full` and
   counted. A briefly held queue lock makes admission wait, never drop. The worker never
   stops for good: every failed attempt is either set aside or held, and a hold clears when
   its cause goes.
   - Set aside. A refusal about the batch itself (a non-retryable `INVALID_ARGUMENT`,
-    `CONFLICT`, or input-bound `RESOURCE_LIMIT`, the client's own `INVALID_ARGUMENT`, or any
-    non-retryable code this client does not know) is never reduced to a number: the client
+    `CONFLICT`, or input-bound `RESOURCE_LIMIT`, the client's own `INVALID_ARGUMENT`,
+    `STORE_MISMATCH`, or any non-retryable code this client does not know) is never reduced to a number: the client
     writes the batch's canonical event lines, the refusal code and reason and the event
     count to one file in `quarantine_dir`, and only then settles the batch. The events are
     counted (`quarantined_events`, with `last_quarantine` naming the refusal), reported by
@@ -4613,14 +4613,17 @@ or semantic engine. The public surface includes:
     (1 s doubling to 30 s, restarted by an acknowledged or set-aside batch): a retryable
     refusal (a busy `RESOURCE_LIMIT`, `STORAGE_PRESSURE` including the free-space floor,
     `SHUTTING_DOWN`), a lost or refused connection, any transport, I/O, protocol or discovery
-    failure, and a refusal about the daemon or store rather than the batch: `STORE_MISMATCH`,
-    `READ_ONLY`, `PERMISSION_DENIED`, `UNAUTHENTICATED`, `UNSUPPORTED` and `STORAGE_FAILURE`.
-    `STORE_MISMATCH` (the store behind the socket was replaced) holds because sending later
-    batches to a different store is wrong and the old store may already hold the pending
-    batch; delivery resumes when the original store answers again. A hold is visible as
+    failure, and a refusal about the daemon rather than the batch: `READ_ONLY`,
+    `PERMISSION_DENIED`, `UNAUTHENTICATED`, `UNSUPPORTED` and `STORAGE_FAILURE`. A hold is visible as
     `retries` and `last_transient_failure`, which clears when a batch is acknowledged or set
     aside; the queue behind it is bounded as above. A busy refusal is never quarantined and
     a full producer registry is not a refusal (#215).
+  - Replaced store. `STORE_MISMATCH` (the store behind the socket changed) is set aside, not
+    held: whether the old store holds the pending batch is unknown, and the batch must not
+    reach another store unrecorded, so it goes to a quarantine file with the refusal. The
+    worker then adopts the store now behind the socket and later batches are delivered there;
+    nothing stays in memory only and no restart is needed. Replaying the file into the
+    original store stores a batch that the original store may already hold a second time.
   - Local failure. Only a local invariant failure (a poisoned lock, an exhausted counter, a
     worker panic) ends the worker: `terminal_failure` is set, later events are refused as
     `Failed`, and the pending batch and queued events are written to quarantine files. While
@@ -4632,8 +4635,10 @@ or semantic engine. The public surface includes:
     a replay identity derived from the file's request identity and producer instance: the
     store refuses batches that lie behind positions it already accepted from the original
     instance, so a live producer's later batches must not block replay. Retrying one replay
-    repeats the identity and is answered idempotently. The file is removed only after the
-    store acknowledges the batch durably. A daemon refusal returns the error and keeps the file, recording the refusal in
+    repeats the identity and is answered idempotently. A file larger than one batch (the
+    queued events saved at a local failure) is sent as several batches within the batch
+    limits, in order, each with its own stable identity. The file is removed only after the
+    store acknowledges every batch durably. A daemon refusal returns the error and keeps the file, recording the refusal in
     its header (`replay_attempts`, `last_replay_code`, `last_replay_reason`); a transport
     failure changes nothing. A file that does not parse back into exactly the stored event
     lines is refused.

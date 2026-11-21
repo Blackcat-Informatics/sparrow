@@ -18,8 +18,9 @@ use std::{
 };
 
 /// Largest quarantine file replay reads. A producer batch is bounded well below this by the
-/// delivery limits; a larger file is not one this client wrote.
-const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// delivery limits (a full queue at the largest configuration is under this); a larger file
+/// is not one this client wrote.
+const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// The outcome of a replay the store acknowledged.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,8 +54,19 @@ pub struct ReplayReceipt {
 pub async fn replay_quarantine(client: &Client, path: &Path) -> Result<ReplayReceipt, Error> {
     let file = read_file(path)?;
     let parsed = parse(&file)?;
-    match client.events(&replay_batch(&parsed.batch)).await {
-        Ok(receipt) => {
+    let mut last = None;
+    let mut failed = None;
+    for part in replay_parts(&parsed.batch)? {
+        match client.events(&part).await {
+            Ok(receipt) => last = Some(receipt),
+            Err(error) => {
+                failed = Some(error);
+                break;
+            }
+        }
+    }
+    match (failed, last) {
+        (None, Some(receipt)) => {
             remove(path)?;
             Ok(ReplayReceipt {
                 path: path.to_owned(),
@@ -62,7 +74,8 @@ pub async fn replay_quarantine(client: &Client, path: &Path) -> Result<ReplayRec
                 receipt,
             })
         }
-        Err(error) => {
+        (None, None) => Err(corrupt("no events")),
+        (Some(error), _) => {
             if let Error::Domain { code, message, .. } = &error {
                 // The refusal is the answer; failing to write it down must not mask it, but it
                 // must not vanish either, so a write failure is appended to the error text.
@@ -78,20 +91,42 @@ pub async fn replay_quarantine(client: &Client, path: &Path) -> Result<ReplayRec
     }
 }
 
-/// The batch as replayed: its events unchanged, under a request identity and producer instance
-/// derived from the original's.
-fn replay_batch(batch: &EventBatch) -> EventBatch {
+/// The batches as replayed, in order: the events unchanged, under a request identity and
+/// producer instance derived from the original's. A file may hold more than one batch's worth
+/// (the queued events saved at a local failure are one file), so it is cut with the limits the
+/// worker applies to a batch; the identity of each part is its index, so a retry of one part
+/// repeats it.
+fn replay_parts(batch: &EventBatch) -> Result<Vec<EventBatch>, Error> {
     let mut material = batch.client_instance.to_vec();
     material.extend_from_slice(batch.request_id.as_bytes());
     let key = purrdf_hash::blake3::derive_key("sparrow.client.quarantine.replay/1", &material);
     let mut client_instance = [0; 16];
     client_instance.copy_from_slice(&key[..16]);
-    EventBatch {
-        request_id: format!("replay:{}", batch.request_id),
+    let part = |index: usize, events: Vec<ProducerEvent>| EventBatch {
+        request_id: format!("replay:{}:{index}", batch.request_id),
         source: batch.source.clone(),
         client_instance,
-        events: batch.events.clone(),
+        events,
+    };
+    let overhead = 1024 + 6 * (batch.request_id.len() + 16 + batch.source.len());
+    let mut parts = Vec::new();
+    let (mut events, mut bytes) = (Vec::new(), 0_usize);
+    for event in &batch.events {
+        let charge = event.admission_bytes()?;
+        if !events.is_empty()
+            && (events.len() == MAX_EVENT_BATCH_EVENTS
+                || bytes + charge + overhead > crate::MAX_EVENT_BATCH_BYTES)
+        {
+            parts.push(part(parts.len(), std::mem::take(&mut events)));
+            bytes = 0;
+        }
+        bytes += charge;
+        events.push(event.clone());
     }
+    if !events.is_empty() {
+        parts.push(part(parts.len(), events));
+    }
+    Ok(parts)
 }
 
 fn corrupt(message: impl std::fmt::Display) -> Error {
@@ -155,7 +190,7 @@ fn parse(file: &[u8]) -> Result<Parsed, Error> {
         .ok_or_else(|| corrupt("client_instance is not 16 hex bytes"))?;
     let mut events = Vec::new();
     for line in payload.split_inclusive(|byte| *byte == b'\n') {
-        if events.len() == MAX_EVENT_BATCH_EVENTS * 64 {
+        if events.len() == 16384 {
             return Err(corrupt("too many event lines"));
         }
         let value = json::read_slice(line, limits).map_err(corrupt)?;
@@ -446,5 +481,38 @@ mod tests {
             .replace("\"sequence\":4", "\"sequence\":5");
         assert!(parse(altered.as_bytes()).is_err());
         assert!(parse(b"not a quarantine file").is_err());
+    }
+
+    /// INVARIANT: a file larger than one batch (the queued events saved when a local failure
+    /// ended the worker are one file of up to the whole queue) replays as several batches that
+    /// each pass the daemon's batch limits, in order, none repeated or lost; each part keeps a
+    /// stable identity. Before, the whole file went out as one batch the daemon would refuse.
+    #[test]
+    fn a_file_over_one_batch_is_replayed_in_parts_that_each_fit_the_batch_limits() {
+        let base = rich_batch();
+        let template = base.events[0].clone();
+        let big = EventBatch {
+            events: (1..=700)
+                .map(|sequence| ProducerEvent {
+                    sequence,
+                    ..template.clone()
+                })
+                .collect(),
+            ..base
+        };
+        let parts = replay_parts(&big).unwrap();
+        assert!(parts.len() > 2);
+        let mut next = 1;
+        for (index, part) in parts.iter().enumerate() {
+            part.validate().unwrap();
+            assert!(part.events.len() <= MAX_EVENT_BATCH_EVENTS);
+            assert!(part.request_id.ends_with(&format!(":{index}")));
+            for event in &part.events {
+                assert_eq!(event.sequence, next);
+                next += 1;
+            }
+        }
+        assert_eq!(next, 701);
+        assert_eq!(replay_parts(&big).unwrap(), parts);
     }
 }

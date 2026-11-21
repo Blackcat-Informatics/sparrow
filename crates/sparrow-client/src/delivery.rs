@@ -286,12 +286,12 @@ pub struct DeliveryStats {
     /// are in quarantine files. Never set by a refusal or a transport failure.
     pub terminal_failure: Option<Arc<Error>>,
     /// Last failure that held the pending batch for a retry (a busy or paused daemon, a lost
-    /// connection, or a refusal about the connection or store such as `STORE_MISMATCH`),
+    /// connection, or a refusal about the daemon such as `READ_ONLY`),
     /// cleared when a batch is acknowledged or set aside.
     pub last_transient_failure: Option<Arc<Error>>,
     /// Admitted events whose batch was set aside: the daemon refused it with a non-retryable
     /// refusal about the request (`INVALID_ARGUMENT`, `CONFLICT`, an input-bound
-    /// `RESOURCE_LIMIT`, or a code this client does not know), or the client cannot send it: an answer
+    /// `RESOURCE_LIMIT`, `STORE_MISMATCH` or a code this client does not know), or the client cannot send it: an answer
     /// retrying the same batch can never change. Their bytes are in quarantine files, not
     /// lost. They kept their sequence; the daemon sees a gap only if it later accepts a
     /// higher sequence of an instance it already recorded, so this counter and the fence are
@@ -861,6 +861,16 @@ impl Shared {
         state.store = Some(store.to_owned());
         Ok(())
     }
+    /// Adopt whichever store answers next. Called once the batch that met a replaced store is in
+    /// a quarantine file: the producer's destination is its socket, so later batches go to the
+    /// store now behind it.
+    fn forget_store(&self) -> Result<(), Error> {
+        self.state
+            .lock()
+            .map_err(|_| Error::Protocol("producer queue state poisoned"))?
+            .store = None;
+        Ok(())
+    }
     fn accepted(&self, batch: &EventBatch, receipt: ArtifactReceipt) -> Result<(), Error> {
         // Client::events certifies the exact canonical payload and durable record count.
         // This queue additionally preserves its binding across reconnects.
@@ -1247,10 +1257,15 @@ async fn run(shared: &Shared) -> Result<(), Error> {
                         // failure is counted and reported as the transient failure whatever
                         // its kind, and the next attempt tries again: that batch is not
                         // dropped. Every other failure holds the batch and retries it.
+                        let mismatch =
+                            matches!(&error, Error::Domain { code, .. } if code == STORE_MISMATCH);
                         let error = match disposition(&error) {
                             Disposition::SetAside => match shared.save(&batch, &error) {
                                 Ok(_) => {
                                     shared.quarantine(&batch, error)?;
+                                    if mismatch {
+                                        shared.forget_store()?;
+                                    }
                                     backoff.reset();
                                     continue;
                                 }
@@ -1294,7 +1309,12 @@ pub(crate) enum Disposition {
 ///
 /// Set aside: a non-retryable daemon refusal about the request itself (`INVALID_ARGUMENT`,
 /// `CONFLICT`, a `RESOURCE_LIMIT` the daemon marks input-bound, #397) and the client's own
-/// `Error::InvalidArgument`. A non-retryable refusal with a code this client does not know is
+/// `Error::InvalidArgument`. `STORE_MISMATCH` is set aside too: the store behind the socket was
+/// replaced, so whether the old store holds the pending batch is unknown and it must reach no
+/// other store unrecorded. The batch is written to a quarantine file with the refusal, the worker
+/// adopts the store now behind the socket (`forget_store`) and later batches go there, so a
+/// replaced store neither stops delivery nor holds events in memory only. A non-retryable
+/// refusal with a code this client does not know is
 /// set aside as well: the daemon says a retry cannot change it, the bytes are preserved in a
 /// replayable file, and delivery of later batches continues. The daemon's own flag decides
 /// retryability for every code, so a new code is never terminal here.
@@ -1302,11 +1322,9 @@ pub(crate) enum Disposition {
 /// Hold: everything that is not about the batch. A retryable daemon refusal (busy
 /// `RESOURCE_LIMIT`, `STORAGE_PRESSURE`, `SHUTTING_DOWN`), the free-space floor, a client-built
 /// refusal (`FailureClass::Local`), and the codes that name the daemon or store state:
-/// `STORE_MISMATCH` (the store behind the socket was replaced; later batches must not go to a
-/// different store, and the batch the old store may have accepted stays held until the
-/// original store is back), `READ_ONLY`, `PERMISSION_DENIED`, `UNAUTHENTICATED`,
-/// `UNSUPPORTED` (a daemon image that cannot take this client), `STORAGE_FAILURE` and the
-/// daemon's transport, protocol and file failures. Every transport, I/O, protocol and
+/// `READ_ONLY`, `PERMISSION_DENIED`, `UNAUTHENTICATED` (a daemon that does not admit this
+/// producer until it is configured to), `UNSUPPORTED` (a daemon image that cannot take this
+/// client), `STORAGE_FAILURE` and the daemon's transport, protocol and file failures. Every transport, I/O, protocol and
 /// discovery error of the client is a hold as well: none says anything about the batch.
 pub(crate) fn disposition(error: &Error) -> Disposition {
     match error {
@@ -1319,10 +1337,12 @@ pub(crate) fn disposition(error: &Error) -> Disposition {
             retryable: true, ..
         } => Disposition::Hold,
         Error::Domain { code, .. } => match code.as_str() {
-            STORE_MISMATCH | "READ_ONLY" | "PERMISSION_DENIED" | "UNAUTHENTICATED"
-            | "UNSUPPORTED" | "STORAGE_FAILURE" | "STORAGE_PRESSURE" | "SHUTTING_DOWN"
-            | "CANCELLED" | "RPC_FAILURE" | "RPC_TIMEOUT" | "PROTOCOL_FAILURE"
-            | "FILE_IO_FAILURE" => Disposition::Hold,
+            STORE_MISMATCH => Disposition::SetAside,
+            "READ_ONLY" | "PERMISSION_DENIED" | "UNAUTHENTICATED" | "UNSUPPORTED"
+            | "STORAGE_FAILURE" | "STORAGE_PRESSURE" | "SHUTTING_DOWN" | "CANCELLED"
+            | "RPC_FAILURE" | "RPC_TIMEOUT" | "PROTOCOL_FAILURE" | "FILE_IO_FAILURE" => {
+                Disposition::Hold
+            }
             _ => Disposition::SetAside,
         },
         _ => Disposition::Hold,
@@ -1815,9 +1835,14 @@ mod tests {
         });
         // Wait for the first failed write, then repair the directory.
         let mut state = shared.state.lock().unwrap();
-        while state.quarantine_failures == 0 {
-            state = shared.changed.wait(state).unwrap();
+        while state.held_unsaved_events == 0 {
+            state = shared
+                .changed
+                .wait_timeout(state, Duration::from_millis(5))
+                .unwrap()
+                .0;
         }
+        assert!(state.quarantine_failures >= 1);
         assert_eq!(state.held_unsaved_events, 1);
         drop(state);
         std::fs::remove_file(&blocker).unwrap();
@@ -1912,7 +1937,10 @@ mod tests {
                 domain("INVALID_ARGUMENT", false, crate::FailureClass::Local),
                 Disposition::Hold,
             ),
-            (domain("STORE_MISMATCH", false, plain), Disposition::Hold),
+            (
+                domain("STORE_MISMATCH", false, plain),
+                Disposition::SetAside,
+            ),
             (domain("READ_ONLY", false, plain), Disposition::Hold),
             (domain("PERMISSION_DENIED", false, plain), Disposition::Hold),
             (domain("UNSUPPORTED", false, plain), Disposition::Hold),

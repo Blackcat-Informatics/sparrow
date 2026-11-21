@@ -9129,57 +9129,109 @@ async fn producer_delivery_bounds_outage_backlog_and_reports_drops_after_recover
 
 #[tokio::test(flavor = "current_thread")]
 async fn producer_delivery_refuses_store_replacement_and_retains_unknown_pending_input() {
-    tokio::task::LocalSet::new().run_until(async {
-        let dir = tempfile::tempdir().unwrap();
-        let first = dir.path().join("first"); let second = dir.path().join("second");
-        std::fs::create_dir(&first).unwrap(); std::fs::create_dir(&second).unwrap();
-        let first_store = first.join("store"); let first_socket = first_store.join("rpc.sock");
-        let second_store = second.join("store"); let second_socket = second_store.join("rpc.sock");
-        let first_config = write_server_config(&first, &first_store, &first_socket);
-        let second_config = write_server_config(&second, &second_store, &second_socket);
-        let first_daemon = start(&first_config, &first_socket).await; let second_daemon = start(&second_config, &second_socket).await;
-        let first_backend = connect(&first_socket).await.unwrap(); let second_backend = connect(&second_socket).await.unwrap();
-        let proxy_socket = dir.path().join("relay.sock");
-        let (state, proxy) = relay(&proxy_socket, first_backend.client.clone());
-        let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "store-bound-delivery").with_quarantine_dir(dir.path().join("quarantine"));
-        config.batch_events = 1; config.rpc_timeout = Duration::from_millis(150);
-        // Production refuses sub-second intervals; this test needs fast retries.
-        let config = config.with_test_timing(Duration::from_secs(2), Duration::from_millis(100), Duration::from_millis(100));
-        let delivery = sparrow_client::Delivery::start(config).unwrap();
-        admit(&delivery, delivery_event("unknown accepted delivery"));
-        admit(&delivery, delivery_event("queued behind the pending batch"));
-        tokio::time::timeout(Duration::from_secs(3), state.first_accepted.notified()).await.unwrap();
-        *state.backend.borrow_mut() = second_backend.client.clone();
-        // INVARIANT (#448): a store replaced behind the socket is a hold, never the end of
-        // delivery: the worker keeps the pending batch, retries it, shows STORE_MISMATCH as the
-        // latest failure and sends nothing to the other store. Before, the worker stopped for
-        // good and every later event was dropped as Failed.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let first = dir.path().join("first");
+            let second = dir.path().join("second");
+            std::fs::create_dir(&first).unwrap();
+            std::fs::create_dir(&second).unwrap();
+            let first_store = first.join("store");
+            let first_socket = first_store.join("rpc.sock");
+            let second_store = second.join("store");
+            let second_socket = second_store.join("rpc.sock");
+            let first_config = write_server_config(&first, &first_store, &first_socket);
+            let second_config = write_server_config(&second, &second_store, &second_socket);
+            let first_daemon = start(&first_config, &first_socket).await;
+            let second_daemon = start(&second_config, &second_socket).await;
+            let first_backend = connect(&first_socket).await.unwrap();
+            let second_backend = connect(&second_socket).await.unwrap();
+            let proxy_socket = dir.path().join("relay.sock");
+            let (state, proxy) = relay(&proxy_socket, first_backend.client.clone());
+            let mut config =
+                sparrow_client::DeliveryConfig::new(&proxy_socket, "store-bound-delivery")
+                    .with_quarantine_dir(dir.path().join("quarantine"));
+            config.batch_events = 1;
+            config.rpc_timeout = Duration::from_millis(150);
+            // Production refuses sub-second intervals; this test needs fast retries.
+            let config = config.with_test_timing(
+                Duration::from_secs(2),
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+            );
+            let delivery = sparrow_client::Delivery::start(config).unwrap();
+            admit(&delivery, delivery_event("unknown accepted delivery"));
+            admit(&delivery, delivery_event("queued behind the pending batch"));
+            tokio::time::timeout(Duration::from_secs(3), state.first_accepted.notified())
+                .await
+                .unwrap();
+            *state.backend.borrow_mut() = second_backend.client.clone();
+            // INVARIANT (#448): a store replaced behind the socket never ends delivery. The batch
+            // that met it, whose acceptance by the old store is unknown, is set aside in a
+            // quarantine file under STORE_MISMATCH and the worker adopts the store now behind the
+            // socket, so later events are delivered there. Before, the worker stopped for good and
+            // every later event was dropped as Failed.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let stats = delivery.stats().unwrap();
+                if stats.quarantined_events == 1 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "store replacement must set the pending batch aside"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let watermark = match delivery_barrier(&delivery, true, Duration::from_secs(5)).await {
+                Err(sparrow_client::FlushError::Dropped(value)) => *value,
+                result => panic!("the set-aside batch is reported once: {result:?}"),
+            };
             let stats = delivery.stats().unwrap();
-            if matches!(stats.last_transient_failure.as_deref(), Some(sparrow_client::Error::Domain { code, .. }) if code == "STORE_MISMATCH") && stats.retries >= 2 { break; }
-            assert!(Instant::now() < deadline, "store replacement must be a visible hold");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let stats = delivery.stats().unwrap();
-        assert!(stats.terminal_failure.is_none() && stats.running);
-        assert_eq!(stats.durable_events, 0);
-        let pending = delivery.pending_batch().unwrap().unwrap(); assert_eq!(pending.as_ref(), &state.calls.borrow()[0]);
-        assert!(matches!(delivery.try_send(delivery_event("admitted during the hold")), sparrow_client::Admission::Queued { .. }));
-        let response = second_backend.client.status_request().send().promise.await.unwrap();
-        assert_eq!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(), 0);
-        // The cause goes: the original store is behind the socket again and the held batch,
-        // answered idempotently, and everything queued behind it are delivered.
-        *state.backend.borrow_mut() = first_backend.client.clone();
-        let watermark = delivery_barrier(&delivery, true, Duration::from_secs(5)).await.expect("delivery resumes when the store returns");
-        assert_eq!(watermark.durable_events, 3);
-        let original = state.accepted.borrow().clone().unwrap();
-        assert_eq!(watermark.durable_events, delivery.stats().unwrap().durable_events);
-        let first_client = sparrow_client::Client::connect(&first_socket).await.unwrap();
-        assert_eq!(first_client.events(&pending).await.unwrap(), original);
-        proxy.abort(); assert!(proxy.await.unwrap_err().is_cancelled());
-        drop(delivery); drop(first_client); drop(first_backend); drop(second_backend); drop(first_daemon); drop(second_daemon);
-    }).await;
+            assert!(stats.terminal_failure.is_none());
+            assert_eq!((stats.quarantined_events, watermark.durable_events), (1, 1));
+            let file = stats.last_quarantine_file.clone().unwrap();
+            let saved = std::fs::read_to_string(&file).unwrap();
+            assert!(
+                saved.contains("STORE_MISMATCH") && saved.contains("unknown accepted delivery"),
+                "{saved}"
+            );
+            let response = second_backend
+                .client
+                .status_request()
+                .send()
+                .promise
+                .await
+                .unwrap();
+            assert_eq!(
+                rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(),
+                1,
+                "the queued event reaches the store now behind the socket"
+            );
+            // The file replays into the original store, which answers the old identity's
+            // sequences as already accepted and takes the replay under its own identity.
+            let first_client = sparrow_client::Client::connect(&first_socket)
+                .await
+                .unwrap();
+            let replayed = sparrow_client::replay_quarantine(&first_client, &file)
+                .await
+                .unwrap();
+            assert_eq!(replayed.events, 1);
+            assert!(!file.exists());
+            assert_eq!(
+                state.accepted.borrow().clone().unwrap().store_id,
+                replayed.receipt.store_id
+            );
+            proxy.abort();
+            assert!(proxy.await.unwrap_err().is_cancelled());
+            drop(delivery);
+            drop(first_client);
+            drop(first_backend);
+            drop(second_backend);
+            drop(first_daemon);
+            drop(second_daemon);
+        })
+        .await;
 }
 
 /// INVARIANT (#448): a refusal with a code the client does not know, marked non-retryable, is
