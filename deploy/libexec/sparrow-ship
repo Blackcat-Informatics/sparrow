@@ -52,6 +52,7 @@ parts the store once held but has since retired also stays.
 import fcntl
 import filecmp
 import json
+import locale
 import os
 import shutil
 import subprocess
@@ -143,9 +144,14 @@ def identity(stat):
 def ledger_keys(ledger_path):
     """Return the identities a ledger records, reading legacy `dev:` lines as the same entry."""
     keys = set()
+    encoding = locale.getpreferredencoding(False)
     # Only LF terminates a ledger entry. A carriage return can be part of its filename.
-    with open(ledger_path, newline="\n") as handle:
-        for number, line in enumerate(handle, 1):
+    with open(ledger_path, "rb") as handle:
+        for number, raw in enumerate(handle, 1):
+            try:
+                line = raw.decode(encoding)
+            except UnicodeDecodeError as error:
+                raise ValueError(f"line {number}: {error}") from error
             key, separator, filename = line.removesuffix("\n").partition("\t")
             fields = key.split(":")
             numbers = fields[:-1] + [fields[-1].removeprefix("-")]
