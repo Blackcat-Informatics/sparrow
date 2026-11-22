@@ -6489,8 +6489,6 @@ fn shipper_keeps_feeding_when_one_source_ledger_is_corrupt() {
     )
     .unwrap();
     let ledger = state.join("blocked.ledger");
-    let malformed = b"torn-key\tstaged.log\n";
-    std::fs::write(&ledger, malformed).unwrap();
     let mut settings = format!(
         "intake_root = {intake:?}\nstate_dir = {state:?}\nmax_chunk_bytes = 1048576\n\
          max_chunk_lines = 32768\nmax_files_per_run = 64\n\
@@ -6511,27 +6509,34 @@ fn shipper_keeps_feeding_when_one_source_ledger_is_corrupt() {
     }
     let config = dir.path().join("ship.toml");
     std::fs::write(&config, settings).unwrap();
-    let partial = ship(&config);
-    assert!(!partial.status.success(), "{partial:?}");
-    let error = String::from_utf8_lossy(&partial.stderr);
-    assert!(
-        error.contains("blocked.ledger: line 1") && error.contains("Restore a valid ledger"),
-        "{error}"
-    );
-    assert_eq!(std::fs::read(&ledger).unwrap(), malformed);
-    assert_eq!(
-        std::fs::read(intake.join("blocked/staged.log")).unwrap(),
-        b"previously staged\n"
-    );
-    assert!(!intake.join("blocked/new.log").exists());
-    assert_eq!(
-        std::fs::read(intake.join("healthy/new.log")).unwrap(),
-        b"healthy\n"
-    );
-    assert_eq!(
-        std::fs::read(dir.path().join("blocked/new.log")).unwrap(),
-        b"blocked\n"
-    );
+    for malformed in [
+        b"not:an:identity\tstaged.log\n".as_slice(),
+        b"1:2:3\n",
+        b"1:2:3\tstaged.log",
+    ] {
+        std::fs::write(&ledger, malformed).unwrap();
+        let partial = ship(&config);
+        assert!(!partial.status.success(), "{partial:?}");
+        let error = String::from_utf8_lossy(&partial.stderr);
+        assert!(
+            error.contains("blocked.ledger: line 1") && error.contains("Restore a valid ledger"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&ledger).unwrap(), malformed);
+        assert_eq!(
+            std::fs::read(intake.join("blocked/staged.log")).unwrap(),
+            b"previously staged\n"
+        );
+        assert!(!intake.join("blocked/new.log").exists());
+        assert_eq!(
+            std::fs::read(intake.join("healthy/new.log")).unwrap(),
+            b"healthy\n"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("blocked/new.log")).unwrap(),
+            b"blocked\n"
+        );
+    }
 
     // Supply a valid empty ledger for the blocked source. The healthy ledger is
     // already committed, so the next run queues only the repaired source's file.

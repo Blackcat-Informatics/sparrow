@@ -143,23 +143,24 @@ def identity(stat):
 def ledger_keys(ledger_path):
     """Return the identities a ledger records, reading legacy `dev:` lines as the same entry."""
     keys = set()
-    # The writer ends lines with "\n" only. Neither splitlines() nor universal-newline
-    # reading may split a file name that holds a carriage return or another separator.
-    with open(ledger_path, newline="") as handle:
-        lines = handle.read().split("\n")
-    if lines[-1] == "":
-        lines.pop()
-    for number, line in enumerate(lines, 1):
-        key = line.split("\t", 1)[0]
-        fields = key.split(":")
-        if len(fields) == 4:
-            fields = fields[1:]
-        elif len(fields) != 3:
-            raise ValueError(
-                f"line {number}: ledger key {key!r} must be inode:size:mtime_ns "
-                "or the older dev:inode:size:mtime_ns"
-            )
-        keys.add(":".join(fields))
+    # Only LF terminates a ledger entry. A carriage return can be part of its filename.
+    with open(ledger_path, newline="\n") as handle:
+        for number, line in enumerate(handle, 1):
+            key, separator, filename = line.removesuffix("\n").partition("\t")
+            fields = key.split(":")
+            numbers = fields[:-1] + [fields[-1].removeprefix("-")]
+            if (
+                not line.endswith("\n")
+                or not separator
+                or not filename
+                or len(fields) not in (3, 4)
+                or not all(field.isascii() and field.isdecimal() for field in numbers)
+            ):
+                raise ValueError(
+                    f"line {number}: expected a complete inode:size:mtime_ns entry "
+                    "or legacy dev:inode:size:mtime_ns entry followed by a tab and a filename"
+                )
+            keys.add(":".join(fields[-3:]))
     return keys
 
 
