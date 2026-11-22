@@ -6250,31 +6250,20 @@ fn shipper_counts_an_unterminated_record_before_queueing() {
     assert_eq!(std::fs::read(source.join("tail.log")).unwrap(), with_tail);
 }
 
-/// INVARIANT: the shipper never queues a whole file the store would refuse before
-/// upload, and its literal bound is the store's `MAX_IMPORT_BYTES`.
+/// A completed file above the production single-import ceiling reaches the consume
+/// root unchanged. A sparse file exercises the actual byte boundary without writing GiBs.
 #[test]
-fn shipper_reports_a_whole_file_above_the_import_bound_and_mirrors_it() {
-    let script = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../deploy/libexec/sparrow-ship"
-    ))
-    .unwrap();
-    assert!(
-        script.contains(&format!(
-            "\nMAX_IMPORT_BYTES = {}\n",
-            sparrow_core::MAX_IMPORT_BYTES
-        )),
-        "the shipper's MAX_IMPORT_BYTES must equal sparrow_core::MAX_IMPORT_BYTES"
-    );
+fn shipper_hands_an_over_bound_whole_file_to_its_watch() {
+    use std::os::unix::fs::FileExt;
     let dir = tempfile::tempdir().unwrap();
     let reports = dir.path().join("reports");
     std::fs::create_dir_all(&reports).unwrap();
     std::fs::create_dir_all(dir.path().join("intake/reports")).unwrap();
     // A sparse file costs no blocks, so the bound is cheap to cross.
     let original = reports.join("huge.json");
-    std::fs::File::create(&original)
-        .unwrap()
-        .set_len(sparrow_core::MAX_IMPORT_BYTES + 1)
+    let file = std::fs::File::create(&original).unwrap();
+    file.write_all_at(b"first", 0).unwrap();
+    file.write_all_at(b"last", sparrow_core::MAX_IMPORT_BYTES)
         .unwrap();
     let config = dir.path().join("ship.toml");
     std::fs::write(
@@ -6291,22 +6280,25 @@ fn shipper_reports_a_whole_file_above_the_import_bound_and_mirrors_it() {
         ),
     )
     .unwrap();
-    let refused = ship(&config);
-    assert!(!refused.status.success());
-    let errors = String::from_utf8_lossy(&refused.stderr);
-    assert!(errors.contains("import bound"), "{errors}");
-    let report = String::from_utf8_lossy(&refused.stdout);
-    assert!(report.contains("reports: queued 0"), "{report}");
-    assert_eq!(
-        std::fs::read_dir(dir.path().join("ship/queue/reports"))
-            .unwrap()
-            .count(),
-        0
-    );
-    assert_eq!(
-        std::fs::metadata(&original).unwrap().len(),
-        sparrow_core::MAX_IMPORT_BYTES + 1
-    );
+    let shipped = ship(&config);
+    assert!(shipped.status.success(), "{shipped:?}");
+    let report = String::from_utf8_lossy(&shipped.stdout);
+    assert!(report.contains("reports: queued 1"), "{report}");
+    assert!(report.contains("reports: fed 1"), "{report}");
+    for path in [original, dir.path().join("intake/reports/huge.json")] {
+        let file = std::fs::File::open(path).unwrap();
+        assert_eq!(
+            file.metadata().unwrap().len(),
+            sparrow_core::MAX_IMPORT_BYTES + 4
+        );
+        let mut first = [0; 5];
+        file.read_exact_at(&mut first, 0).unwrap();
+        assert_eq!(&first, b"first");
+        let mut last = [0; 4];
+        file.read_exact_at(&mut last, sparrow_core::MAX_IMPORT_BYTES)
+            .unwrap();
+        assert_eq!(&last, b"last");
+    }
 }
 
 /// INVARIANT: a changed device number alone never ships a file again. The ledger key is
@@ -16894,7 +16886,7 @@ fn set_limits(units: usize) -> sparrow_core::EvictionLimits {
 }
 
 async fn set_harness(dir: &Path) -> SetHarness {
-    set_harness_with(dir, |config| {
+    set_harness_with(dir, Default::default(), |config| {
         let store = config.open_store().unwrap();
         let bounds = store
             .scale_retirement_for_tests(set_limits(20), 1024)
@@ -16907,6 +16899,7 @@ async fn set_harness(dir: &Path) -> SetHarness {
 
 async fn set_harness_with(
     dir: &Path,
+    watches: sparrow_server::watches::WatchRegistry,
     open_store: impl FnOnce(&mut sparrow_server::ServerConfig) -> sparrow_core::Store,
 ) -> SetHarness {
     use sparrow_server::{Rpc, ServerConfig, consumption::ClaimRoot};
@@ -16920,11 +16913,14 @@ async fn set_harness_with(
         std::fs::remove_file(&socket).unwrap();
     }
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-    let capability: wire::sparrow::Client = capnp_rpc::new_client(Rpc::new(
-        store.clone(),
-        std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
-        config.max_pin_members,
-    ));
+    let capability: wire::sparrow::Client = capnp_rpc::new_client(
+        Rpc::new(
+            store.clone(),
+            std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+            config.max_pin_members,
+        )
+        .with_watches(watches),
+    );
     // Every connection is served, so a test can reconnect to read the limits as they stand.
     // One task owns them all, so aborting it drops every connection and releases the store.
     let serving = tokio::task::spawn_local(async move {
@@ -17218,7 +17214,7 @@ async fn a_consume_file_above_the_metadata_record_ceiling_publishes_ordered_part
     tokio::task::LocalSet::new()
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
-            let harness = set_harness_with(dir.path(), |config| {
+            let harness = set_harness_with(dir.path(), Default::default(), |config| {
                 config.max_records = 40_000;
                 config.disk_budget = 4 << 30;
                 config.open_store().unwrap()
@@ -17715,6 +17711,152 @@ async fn over_bound_consume_file_is_split_into_ordered_parts_and_removed() {
                     .join(&journal.import_id)
                     .exists()
             );
+        })
+        .await;
+}
+
+/// The packaged shipper hands over the whole file even without a reachable store.
+/// A real consume worker publishes the parts and manifest, and two later runs use
+/// exact, held bytes before removing the spool original.
+#[tokio::test(flavor = "current_thread")]
+async fn shipper_reaps_an_over_bound_file_only_after_its_ordered_manifest_matches() {
+    use sparrow_server::watches::{ConsumeWorker, WatchRegistry};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let spool = dir.path().join("spool");
+            let intake = dir.path().join("intake");
+            let root = intake.join("reports");
+            let state = dir.path().join("ship");
+            let socket = dir.path().join("store/rpc.sock");
+            std::fs::create_dir(&spool).unwrap();
+            std::fs::create_dir_all(&root).unwrap();
+            let filename = "whole.json";
+            let original = spool.join(filename);
+            let mut input = br#"{"message":""#.to_vec();
+            input.resize(20 * 65_536 + 1, b'x');
+            input.extend_from_slice(br#""}"#);
+            std::fs::write(&original, &input).unwrap();
+            let ship_config = dir.path().join("ship.toml");
+            std::fs::write(
+                &ship_config,
+                format!(
+                    "intake_root = {intake:?}\nstate_dir = {state:?}\nmax_chunk_bytes = 1048576\n\
+                     max_chunk_lines = 32768\nmax_files_per_run = 64\n\
+                     max_pending_bytes = 1048576\nmax_queue_bytes = 1048576\n\
+                     sparrow = {:?}\nsocket = {socket:?}\n\n\
+                     [[source]]\nname = \"reports\"\ndir = {spool:?}\npattern = \"*.json\"\n\
+                     rule = \"settled\"\nformat = \"json\"\nsettle_seconds = 0\n\
+                     delete_acknowledged = true\n",
+                    env!("CARGO_BIN_EXE_sparrow-rpc-fixture"),
+                ),
+            )
+            .unwrap();
+            let run_ship = async || {
+                let config = ship_config.clone();
+                let output = tokio::task::spawn_blocking(move || ship(&config))
+                    .await
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                String::from_utf8(output.stdout).unwrap()
+            };
+            let report = run_ship().await;
+            assert!(report.contains("reports: fed 1"), "{report}");
+            assert!(report.contains("store unreachable"), "{report}");
+            assert_eq!(std::fs::read(root.join(filename)).unwrap(), input);
+            assert_eq!(std::fs::read(&original).unwrap(), input);
+
+            let watches = WatchRegistry::default();
+            let harness = set_harness_with(dir.path(), watches.clone(), |config| {
+                let store = config.open_store().unwrap();
+                let bounds = store
+                    .scale_retirement_for_tests(set_limits(20), 1024)
+                    .unwrap();
+                assert!(bounds.import_bytes < input.len() as u64);
+                store
+            })
+            .await;
+            let mut definition = watch_definition(&root, "completed", 0, 16, 16);
+            definition.source = "set-source".into();
+            definition.format = "json".into();
+            let worker = ConsumeWorker::start(
+                harness.store.clone(),
+                &[definition],
+                socket.clone(),
+                watches,
+                std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+            )
+            .unwrap();
+            watch_until(harness.client.capability(), |watch| {
+                watch.get_completed_claims() == 1
+            })
+            .await;
+            let claims = harness
+                .store
+                .consumption_claims_matching(
+                    0,
+                    sparrow_server::now().unwrap(),
+                    Some(("completed", filename.as_bytes())),
+                )
+                .unwrap();
+            assert_eq!(claims.len(), 1);
+            let manifest = claims[0].journal.published_artifact.as_deref().unwrap();
+            assert!(harness.parts(manifest, "json", &input).len() > 1);
+            assert_eq!(std::fs::read(&original).unwrap(), input);
+
+            // A same-length file whose bytes differ has no set acknowledgment.
+            let wrong = dir.path().join("wrong.json");
+            let mut other = input.clone();
+            other[20] = b'y';
+            std::fs::write(&wrong, other).unwrap();
+            let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
+                .arg(&socket)
+                .args(["parts", "verify", "set-source", manifest, "--match-stdin"])
+                .stdin(std::fs::File::open(&wrong).unwrap())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .admitted_spawn()
+                .unwrap();
+            let output = tokio::time::timeout(CHILD_DEADLINE, child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!output.status.success(), "{output:?}");
+            let mismatch =
+                purrdf_lex::json::read_slice(&output.stdout, purrdf_lex::json::Limits::default())
+                    .unwrap_or_else(|error| panic!("{error}: {output:?}"));
+            assert_eq!(mismatch["matches_input"].as_bool(), Some(false));
+
+            let aside = spool.join(format!(".reaping-{filename}"));
+            let report = run_ship().await;
+            assert!(
+                report.contains("deleted 0 acknowledged, set aside 1"),
+                "{report}"
+            );
+            assert!(!original.exists());
+            assert_eq!(std::fs::read(&aside).unwrap(), input);
+            // A lost local receipt must restart the two-run confirmation.
+            let receipt = std::fs::read_dir(&state)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .find(|entry| entry.file_name().to_string_lossy().starts_with(".ordered-"))
+                .unwrap();
+            std::fs::remove_file(receipt.path()).unwrap();
+            let report = run_ship().await;
+            assert!(
+                report.contains("deleted 0 acknowledged, set aside 1"),
+                "{report}"
+            );
+            assert_eq!(std::fs::read(&aside).unwrap(), input);
+
+            let report = run_ship().await;
+            assert!(
+                report.contains("deleted 1 acknowledged, set aside 0"),
+                "{report}"
+            );
+            assert!(!aside.exists());
+            worker.shutdown().await.unwrap();
         })
         .await;
 }

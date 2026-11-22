@@ -108,6 +108,8 @@ pub struct IngestStatus {
     pub preparation: Option<publication::ImportPreparation>,
     /// Original acceptance receipt with current-session buffered/durable state.
     pub accepted: Option<Artifact>,
+    /// The acceptance represents the ordered manifest of a consume claim.
+    pub ordered_set: bool,
     /// Original terminal tail checkpoint; acknowledging it creates no new records.
     pub tail: Option<super::tail::TailGeneration>,
     /// Authoritative source-retirement phase, separate from evidence acceptance.
@@ -268,9 +270,10 @@ impl Store {
                 "ingestion status found conflicting original acceptance receipts",
             ));
         }
-        let accepted = direct
+        let ordered_set = set.is_some();
+        let accepted = set
+            .or(direct)
             .or_else(|| published.map(|(_, artifact)| artifact))
-            .or(set)
             .map(|a| writer.receipt(a, super::durability::Durability::Buffered))
             .transpose()?;
         if let (Some(manifest), Some(artifact)) = (&staging, &accepted)
@@ -343,6 +346,7 @@ impl Store {
             staging,
             preparation,
             accepted,
+            ordered_set,
             tail,
             deletion,
             removed_at: ownership.as_ref().and_then(|j| j.removed_at),

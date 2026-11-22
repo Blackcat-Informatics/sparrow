@@ -44,6 +44,7 @@ pub(crate) enum Input {
     Claims {
         since: u64,
         until: Option<u64>,
+        exact: Option<(String, Vec<u8>)>,
     },
 }
 
@@ -101,19 +102,47 @@ impl Input {
             }),
             [operation, options @ ..] if operation == "claims" => {
                 let (mut since, mut until) = (0, None);
+                let (mut watch, mut path_hex) = (None, None);
                 for pair in options.chunks(2) {
                     let [flag, value] = pair else {
                         return Err(invalid("watch claims options take one value each"));
                     };
                     let at =
-                        sparrow_core::parse_instant(value).map_err(|e| invalid(e.to_string()))?;
+                        || sparrow_core::parse_instant(value).map_err(|e| invalid(e.to_string()));
                     match flag.as_str() {
-                        "--since" => since = at,
-                        "--until" => until = Some(at),
+                        "--since" => since = at()?,
+                        "--until" => until = Some(at()?),
+                        "--watch" if watch.is_none() => watch = Some(value),
+                        "--path-hex" if path_hex.is_none() => path_hex = Some(value),
+                        "--watch" | "--path-hex" => {
+                            return Err(invalid(format!("duplicate watch claims option: {flag}")));
+                        }
                         _ => return Err(invalid(format!("unknown watch claims option: {flag}"))),
                     }
                 }
-                Ok(Self::Claims { since, until })
+                let exact = match (watch, path_hex) {
+                    (None, None) => None,
+                    (Some(watch), Some(hex)) => {
+                        if hex.len() > 4096 {
+                            return Err(invalid("claim path exceeds 2048 bytes"));
+                        }
+                        let path = purrdf_hash::hex::decode_canonical(hex)
+                            .map_err(|e| invalid(e.to_string()))?;
+                        sparrow_core::validate_consumption_path(watch, &path)
+                            .map_err(|e| invalid(e.to_string()))?;
+                        Some((watch.clone(), path))
+                    }
+                    _ => {
+                        return Err(invalid(
+                            "watch claims requires --watch and --path-hex together",
+                        ));
+                    }
+                };
+                Ok(Self::Claims {
+                    since,
+                    until,
+                    exact,
+                })
             }
             [operation, watch, claim, reason] if operation == "retire-claim" => {
                 Ok(Self::RetireClaim {
@@ -124,7 +153,7 @@ impl Input {
                 })
             }
             _ => Err(invalid(
-                "usage: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION | watch handoff-prepare REQUEST_ID WATCH_ID REVISION RELATIVE_PATH INTENT.capnp [TAIL_GENERATION_ID] | watch handoff INTENT.capnp | watch handoff-status INTENT.capnp | watch retire-claim WATCH_ID CLAIM_ID REASON | watch claims [--since RFC3339] [--until RFC3339]; zero revision creates a watch",
+                "usage: watch list | watch put REQUEST_ID EXPECTED_REVISION DEFINITION.toml | watch remove REQUEST_ID WATCH_ID EXPECTED_REVISION | watch handoff-prepare REQUEST_ID WATCH_ID REVISION RELATIVE_PATH INTENT.capnp [TAIL_GENERATION_ID] | watch handoff INTENT.capnp | watch handoff-status INTENT.capnp | watch retire-claim WATCH_ID CLAIM_ID REASON | watch claims [--watch WATCH --path-hex HEX] [--since RFC3339] [--until RFC3339]; zero revision creates a watch",
             )),
         }
     }
@@ -253,10 +282,19 @@ impl Input {
                     .with("phase", "prepared")
                     .into())
             }
-            Self::Claims { since, until } => {
+            Self::Claims {
+                since,
+                until,
+                exact,
+            } => {
                 let mut call = client.watch_claims_request();
                 let mut query = call.get().init_query();
                 query.set_store_id(&discovery.store_id);
+                if let Some((watch, path)) = exact {
+                    let mut selector = query.reborrow().init_exact_path();
+                    selector.set_watch(watch);
+                    selector.set_relative_path(path);
+                }
                 query.reborrow().init_since().set_unix_millis(*since);
                 match until {
                     Some(at) => query.init_until().init_value().set_unix_millis(*at),
@@ -264,7 +302,7 @@ impl Input {
                 }
                 let response = call.send().promise.await?;
                 match response.get()?.get_result()?.which()? {
-                    wire::result::Ok(value) => claims(value?),
+                    wire::result::Ok(value) => claims(value?, &discovery.store_id, exact.as_ref()),
                     wire::result::Error(error) => Err(failure(error?)),
                 }
             }
@@ -366,11 +404,36 @@ pub(super) fn clock_text(value: wire::optional_instant::Reader<'_>) -> Result<Va
 
 /// A claim listing as JSON: per-state counts, then each claim with its history. A pending
 /// claim's `age_ms` runs from its first-seen time to `as_of`.
-fn claims(value: wire::watch_claims::Reader<'_>) -> Result<Value> {
+fn claims(
+    value: wire::watch_claims::Reader<'_>,
+    store: &str,
+    exact: Option<&(String, Vec<u8>)>,
+) -> Result<Value> {
+    if value.get_store_id()?.to_str()? != store {
+        return Err(invalid("claim listing belongs to another persistent store"));
+    }
+    if let Some((watch, path)) = exact {
+        if !value.has_exact_path() {
+            return Err(invalid(
+                "the daemon did not acknowledge exact watch claim lookup",
+            ));
+        }
+        let scope = value.get_exact_path()?;
+        if scope.get_watch()?.to_str()? != watch || scope.get_relative_path()? != path {
+            return Err(invalid("claim listing returned a different watch or path"));
+        }
+    }
     let as_of = value.get_as_of()?.get_unix_millis();
     let mut counts = [0_u64; 3];
     let mut rows = Vec::new();
     for claim in value.get_claims()? {
+        let watch = claim.get_watch()?.to_str()?;
+        let path = claim.get_relative_path()?;
+        if exact.is_some_and(|(expected_watch, expected_path)| {
+            watch != expected_watch || path != expected_path
+        }) {
+            return Err(invalid("claim row falls outside its exact watch and path"));
+        }
         let state = claim.get_state()?;
         let (index, name) = match state {
             wire::ClaimState::Pending => (0, "pending"),
@@ -391,12 +454,9 @@ fn claims(value: wire::watch_claims::Reader<'_>) -> Result<Value> {
         rows.push(Value::from(
             Object::new()
                 .with("claim_id", claim.get_claim_id()?.to_str()?)
-                .with("watch", claim.get_watch()?.to_str()?)
+                .with("watch", watch)
                 .with("state", name)
-                .with(
-                    "relative_path_hex",
-                    purrdf_hash::hex::encode(claim.get_relative_path()?),
-                )
+                .with("relative_path_hex", purrdf_hash::hex::encode(path))
                 .with("first_seen", clock_text(claim.get_first_seen()?)?)
                 .with("age_ms", age)
                 .with("attempts", u64::from(claim.get_attempts()))
