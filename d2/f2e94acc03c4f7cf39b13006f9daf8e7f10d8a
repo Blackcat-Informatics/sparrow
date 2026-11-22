@@ -1,0 +1,24 @@
+ghprsq source head backlink metadata
+
+parent_hashes: d2f2e94acc03c4f7cf39b13006f9daf8e7f10d8a
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 474
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/474
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 956735f5e6d64140855df6cb807e7297f14d5ba4
+GhpRsq-Head-Ref: paudley/452-quarantine-replay-stores-held-parts
+GhpRsq-Head-OID: d2f2e94acc03c4f7cf39b13006f9daf8e7f10d8a
+GhpRsq-Result-Tree: daecee6bf830bfcf39d3804ed0aa97f1c20c0b9f
+GhpRsq-Result-Commit: 7c2c58c93a815be10aef3c01ffea4dcb981546b5
+GhpRsq-Parent-Hashes: d2f2e94acc03c4f7cf39b13006f9daf8e7f10d8a
+GhpRsq-Squash-Notes-SHA256: b8c97452f80e5129f2cdb92dd076d49e6b7648a541ecdeced5b3a3e179548e4e
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Tree: 5c8516cbf7854c29e80b652d0b0768387146eec7
+GhpRsq-Stage-Commit: d231d41d8b184dc2faba69cf16495c5cebb31887
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/d231d41d8b184dc2faba69cf16495c5cebb31887
+GhpRsq-Stage-Ref: refs/ghprsq/pr/474/stage
+GhpRsq-Stage-Files: 13
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/d231d41d8b184dc2faba69cf16495c5cebb31887
