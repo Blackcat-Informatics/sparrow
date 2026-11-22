@@ -70,11 +70,11 @@ const INFO_LOG_BYTES: usize = 8 * 1024 * 1024;
 /// Compaction threads run at the lowest CPU priority, below intake and the flush threads;
 /// their I/O priority is left alone, because an idle I/O class lets other disk users on a
 /// shared host starve compaction until writes stall.
-pub(super) fn database(max_open_files: i32) -> Result<Options, Error> {
+pub(super) fn database(max_open_files: i32, create: bool) -> Result<Options, Error> {
     let mut options = family("default");
     options.set_max_open_files(max_open_files);
-    options.create_if_missing(true);
-    options.create_missing_column_families(true);
+    options.create_if_missing(create);
+    options.create_missing_column_families(create);
     options.set_max_background_jobs(BACKGROUND_JOBS);
     options.set_max_subcompactions(SUBCOMPACTIONS);
     options.set_max_total_wal_size(MAX_TOTAL_WAL_BYTES);

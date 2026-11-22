@@ -4,14 +4,15 @@
 //! One database owner, serving typed Cap'n Proto RPC over Unix and configured TCP sockets.
 
 use sparrow_server::{
-    Rpc, ServerConfig, local_endpoint,
+    ServerConfig, local_endpoint,
     start_wait::{self, Wait},
 };
 use std::{path::Path, sync::Arc};
-use tokio::sync::Semaphore;
 
 mod maintenance;
 mod pressure_duty;
+mod recovery;
+mod session;
 mod shutdown;
 
 /// Also the contract the deploy scripts read to tell an image with query-only mode and, for
@@ -45,67 +46,6 @@ fn arguments(args: &[String]) -> Result<(&str, Mode), Box<dyn std::error::Error>
         }
     }
     Ok((path.ok_or(USAGE)?, mode.unwrap_or(Mode::Normal)))
-}
-
-/// Wait for the workers the daemon started and return the failure of the first that ends.
-/// Every worker runs until shutdown, so any end before it is a failure the daemon exits
-/// on. Every mode is covered: a normal daemon has all three workers, a no-intake daemon only
-/// maintenance, a query-only one none, so this never returns there.
-///
-/// Ending the daemon here is deliberate. The consume and syslog workers recover from every
-/// error that can clear (one claim, one watch, one listener, a failing store), so they end
-/// only on a panic, which leaves unknown state and is a bug signal the daemon must show by
-/// exiting, or on a closed command channel, which happens only when the daemon is stopping.
-async fn worker_health(
-    consumer: &mut Option<sparrow_server::watches::ConsumeWorker>,
-    syslog: &mut Option<sparrow_server::syslog_listener::SyslogWorker>,
-    maintenance: Option<&mut maintenance::Worker>,
-) -> Box<dyn std::error::Error> {
-    enum Ended {
-        Consumer,
-        Syslog,
-        Maintenance,
-    }
-    // Each worker closes its end signal as it ends, so this waits without sampling.
-    let ended = tokio::select! {
-        () = async {
-            match consumer.as_mut() {
-                Some(worker) => worker.ended().await,
-                None => std::future::pending().await,
-            }
-        } => Ended::Consumer,
-        () = async {
-            match syslog.as_mut() {
-                Some(worker) => worker.ended().await,
-                None => std::future::pending().await,
-            }
-        } => Ended::Syslog,
-        () = async {
-            match maintenance {
-                Some(worker) => worker.ended().await,
-                None => std::future::pending().await,
-            }
-        } => Ended::Maintenance,
-    };
-    match ended {
-        Ended::Consumer => {
-            if let Some(worker) = consumer.take()
-                && let Err(error) = worker.shutdown().await
-            {
-                return error;
-            }
-            "completed-consumption worker terminated unexpectedly".into()
-        }
-        Ended::Syslog => {
-            if let Some(worker) = syslog.take()
-                && let Err(error) = worker.shutdown().await
-            {
-                return error.into();
-            }
-            "syslog intake worker terminated unexpectedly".into()
-        }
-        Ended::Maintenance => "maintenance worker terminated unexpectedly".into(),
-    }
 }
 
 /// Set once the daemon serves. A failure before it is a refused start; one after it is a run
@@ -233,59 +173,37 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .sum::<std::time::Duration>()
             .as_millis()
     );
-    sparrow_server::staging_refusal::install(&store)?;
-    let store_id = store.store_id()?;
-    let operations = Arc::new(Semaphore::new(config.max_concurrent_requests));
-    let admission = sparrow_server::admission::Admission::new(operations.clone());
-    // A begin-import waiting for a journal slot is told when a reclamation commit frees one.
-    store.set_import_slot_waker(Some(Arc::new({
-        let admission = admission.clone();
-        move || admission.import_slot_freed()
-    })));
-    // A query-only or no-intake daemon owns no watch root: it reports the stored catalog and
-    // claims nothing.
-    let (watches, mut consumer) = if config.query_only || !intake {
-        (
-            sparrow_server::watches::WatchRegistry::stored(&store)?,
-            None,
-        )
-    } else {
-        let watches = sparrow_server::watches::WatchRegistry::default();
-        let consumer = sparrow_server::watches::ConsumeWorker::start_with(
-            store.clone(),
-            &config.consume,
-            config.socket_path.clone(),
-            watches.clone(),
-            operations.clone(),
-            private,
-            config.output_paths(),
-        )
-        .map_err(start_wait::consume_start_failure)?;
-        (watches, Some(consumer))
+    let store_id: Arc<str> = store.store_id()?.into();
+    let process = session::Process {
+        config: Arc::new(config),
+        intake,
+        intake_label,
+        private,
+        archive: archive_filesystem,
     };
+    let config = &process.config;
+    let mut session = session::Session::prepare(store, &process).await?;
     // Validate the catalog first; recover only a refused socket under exclusive store ownership.
     // A name a departing owner still holds is waited for (start_wait).
     let bound = start_wait::until(
         &mut interrupt,
         "bind the local endpoint",
-        async || local_endpoint::LocalEndpoint::bind(&config.socket_path, &store).await,
+        async || local_endpoint::LocalEndpoint::bind(&config.socket_path, &session.store).await,
         start_wait::bind_hold,
     )
     .await;
     let endpoint = match bound {
         Ok(Wait::Ready(endpoint)) => endpoint,
         stopped => {
-            return shutdown::finish(
-                stopped.map(|_| ()).map_err(start_wait::bind_failure),
-                shutdown::Workers {
-                    consumer: consumer.take(),
-                    ..Default::default()
-                },
-                &store,
-                &[],
-                &admission,
-            )
-            .await;
+            return session
+                .finish(
+                    stopped
+                        .map(|_| maintenance::End::Stopped)
+                        .map_err(start_wait::bind_failure),
+                    &[],
+                )
+                .await
+                .map(drop);
         }
     };
     let ingest = match (&config.ingest_socket_path, config.ingest_socket_gid) {
@@ -307,17 +225,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ),
                 )),
                 stopped => {
-                    return shutdown::finish(
-                        stopped.map(|_| ()).map_err(start_wait::bind_failure),
-                        shutdown::Workers {
-                            consumer: consumer.take(),
-                            ..Default::default()
-                        },
-                        &store,
-                        &[&endpoint],
-                        &admission,
-                    )
-                    .await;
+                    return session
+                        .finish(
+                            stopped
+                                .map(|_| maintenance::End::Stopped)
+                                .map_err(start_wait::bind_failure),
+                            &[&endpoint],
+                        )
+                        .await
+                        .map(drop);
                 }
             }
         }
@@ -326,177 +242,42 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let endpoints: Vec<&local_endpoint::LocalEndpoint> = std::iter::once(&endpoint)
         .chain(ingest.as_ref().map(|(endpoint, _)| endpoint))
         .collect();
-    let connections = sparrow_server::admission::Ceiling::new(
-        "RPC connection ceiling",
-        config.max_rpc_connections,
-    );
-    let syslog_registry = sparrow_server::syslog_listener::SyslogRegistry::default();
-    let pressure_wake = sparrow_server::pressure_wake::PressureWake::default();
-    if let Err(error) = sparrow_server::syslog_listener::check_spill_owners(
-        &config.syslog_spill_dir(),
-        &config.syslog,
-    ) {
-        return shutdown::finish(
-            Err(start_wait::bind_failure(error)),
-            shutdown::Workers {
-                consumer: consumer.take(),
-                ..Default::default()
-            },
-            &store,
-            &endpoints,
-            &admission,
-        )
-        .await;
-    }
-    let mut syslog = if config.syslog.is_empty() {
-        None
-    } else {
-        // A port a departing owner still holds is waited for (start_wait).
-        let started = start_wait::until(
-            &mut interrupt,
-            "bind the syslog listeners",
-            async || {
-                sparrow_server::syslog_listener::SyslogWorker::start(
-                    store.clone(),
-                    &config.syslog,
-                    operations.clone(),
-                    syslog_registry.clone(),
-                    pressure_wake.clone(),
-                    &config.syslog_spill_dir(),
-                )
-                .await
-            },
-            start_wait::bind_hold,
-        )
-        .await;
-        match started {
-            Ok(Wait::Ready(worker)) => Some(worker),
-            stopped => {
-                return shutdown::finish(
-                    stopped.map(|_| ()).map_err(start_wait::bind_failure),
-                    shutdown::Workers {
-                        consumer: consumer.take(),
-                        ..Default::default()
-                    },
-                    &store,
-                    &endpoints,
-                    &admission,
-                )
-                .await;
+    let sockets = sparrow_server::serving::Sockets {
+        private: &endpoint,
+        ingest: ingest.as_ref().map(|(endpoint, socket)| (endpoint, socket)),
+        tcp: tcp_listener.as_ref().zip(tcp_secret),
+    };
+    let outcome = async {
+        loop {
+            match session.serve(&process, &sockets, &mut interrupt).await? {
+                maintenance::End::Stopped => return Ok(()),
+                maintenance::End::Reopen(_) => {
+                    let Some(store) = recovery::run(
+                        session.store,
+                        config.clone(),
+                        store_id.clone(),
+                        &sockets,
+                        session::interrupted(&mut interrupt),
+                    )
+                    .await?
+                    else {
+                        return Ok(());
+                    };
+                    let Some(replacement) = session::Session::prepare_replacement(
+                        store,
+                        &process,
+                        &sockets,
+                        &mut interrupt,
+                    )
+                    .await?
+                    else {
+                        return Ok(());
+                    };
+                    session = replacement;
+                }
             }
         }
-    };
-    let archive_status = sparrow_server::archive::ArchiveStatus::new();
-    let mut rpc = Rpc::new(store.clone(), operations.clone(), config.max_pin_members)
-        .with_archive_status(archive_status.clone())
-        .with_admission(admission.clone())
-        .with_connections(connections.clone())
-        .with_watches(watches)
-        .with_syslog(syslog_registry);
-    if let Some((_, socket)) = &ingest {
-        rpc = rpc.with_ingest_socket(socket.clone());
     }
-    if config.query_only {
-        rpc = rpc.query_only();
-    } else if let Some(consumer) = consumer.as_ref()
-        && config.max_concurrent_requests >= 2
-    {
-        rpc = rpc.with_watch_controller(consumer.controller());
-    }
-    eprintln!(
-        "sparrowd: store={} capnp={} data={} max_rpc_connections={} max_concurrent_requests={} query_only={} intake={} {}",
-        store_id,
-        config.socket_path.display(),
-        config.data_dir.display(),
-        config.max_rpc_connections,
-        config.max_concurrent_requests,
-        config.query_only,
-        intake_label,
-        store.open_files()
-    );
-    if let (Some(path), Some(gid)) = (&config.ingest_socket_path, config.ingest_socket_gid) {
-        eprintln!(
-            "sparrowd: ingest_socket={} gid={gid} max_ingest_connections={}",
-            path.display(),
-            config.max_ingest_connections
-        );
-    }
-    SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
-    start_wait::notify_serving();
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            // Expiry, eviction and the table rewrite all write; a query-only daemon runs none of them.
-            let mut maintenance = (!config.query_only).then(|| {
-                maintenance::Worker::start(
-                    store.clone(),
-                    std::time::Duration::from_millis(u64::from(config.buffered_flush_interval_ms)),
-                    pressure_wake.clone(),
-                )
-            });
-            // Segments go to `<dir>/<store_id>/`; the worker never writes anywhere else in `dir`.
-            let archive = match config.archive.as_ref().zip(archive_filesystem.as_ref()) {
-                Some((archive, filesystem)) => Some(sparrow_server::archive::Worker::start(
-                    filesystem,
-                    store.clone(),
-                    archive.dir.clone(),
-                    std::time::Duration::from_secs(archive.check_secs),
-                    std::time::Duration::from_secs(archive.stall_warn_secs),
-                    std::time::Duration::from_secs(archive.io_timeout_secs),
-                    archive_status.clone(),
-                )?),
-                None => None,
-            };
-            let serving = async {
-                // Pinned once, so its waits and any worker shutdown it starts survive every turn.
-                let health = worker_health(&mut consumer, &mut syslog, maintenance.as_mut());
-                tokio::pin!(health);
-                // The floor never stops the accept loop (#257): below it the store answers writes with the
-                // floor-labelled retryable refusal and reads are served. The loop observes the floor
-                // once a second and journals the episode; connection slots, taken before accept, and
-                // the 60 s lease are unchanged.
-                let sockets = sparrow_server::serving::Sockets {
-                    private: &endpoint,
-                    ingest: ingest.as_ref().map(|(endpoint, socket)| (endpoint, socket)),
-                    tcp: tcp_listener.as_ref().map(|listener| {
-                        (
-                            listener,
-                            tcp_secret
-                                .clone()
-                                .expect("configuration pairs TCP with its secret"),
-                        )
-                    }),
-                };
-                sparrow_server::serving::serve(
-                    sockets,
-                    &rpc,
-                    &connections,
-                    async {
-                        interrupt.recv().await.map(|_| ()).ok_or_else(
-                            || -> Box<dyn std::error::Error> {
-                                "daemon interrupt subscription terminated unexpectedly".into()
-                            },
-                        )
-                    },
-                    health,
-                    |line| eprintln!("{line}"),
-                )
-                .await
-            }
-            .await;
-            shutdown::finish(
-                serving,
-                shutdown::Workers {
-                    consumer: consumer.take(),
-                    syslog: syslog.take(),
-                    maintenance: maintenance.take(),
-                    archive,
-                },
-                &store,
-                &endpoints,
-                &admission,
-            )
-            .await
-        })
-        .await
+    .await;
+    shutdown::cleanup(outcome, &endpoints)
 }

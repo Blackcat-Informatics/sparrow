@@ -3,6 +3,7 @@
 
 //! Complete owned teardown, preserving the primary failure and every cleanup failure.
 
+use super::maintenance::{End, Worker};
 use sparrow_server::admission::Admission;
 use sparrow_server::local_endpoint::LocalEndpoint;
 
@@ -10,24 +11,32 @@ use sparrow_server::local_endpoint::LocalEndpoint;
 pub(super) struct Workers {
     pub consumer: Option<sparrow_server::watches::ConsumeWorker>,
     pub syslog: Option<sparrow_server::syslog_listener::SyslogWorker>,
-    pub maintenance: Option<super::maintenance::Worker>,
+    pub maintenance: Option<Worker>,
     pub archive: Option<sparrow_server::archive::Worker>,
 }
 
 pub(super) async fn finish(
-    initial: Result<(), Box<dyn std::error::Error>>,
+    initial: Result<End, Box<dyn std::error::Error>>,
     workers: Workers,
     store: &sparrow_core::Store,
     endpoints: &[&LocalEndpoint],
     admission: &Admission,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<End, Box<dyn std::error::Error>> {
     let mut errors = Vec::with_capacity(6);
     // The teardown reports its errors as one text; the class of the start refusal survives it.
     let refused = initial
         .as_ref()
         .err()
         .is_some_and(|error| sparrow_server::start_wait::is_permanent(error.as_ref()));
-    record_failure(&mut errors, "daemon", initial);
+    let end = match initial {
+        Ok(end) => end,
+        Err(error) => {
+            errors.push(format!("daemon: {error}"));
+            End::Stopped
+        }
+    };
+    let reopening = matches!(end, End::Reopen(_));
+    let mut stopped_handle = reopening;
     if let Some(worker) = workers.archive {
         record_failure(&mut errors, "archive shutdown", worker.shutdown().await);
     }
@@ -38,16 +47,24 @@ pub(super) async fn finish(
         record_failure(&mut errors, "syslog shutdown", worker.shutdown().await);
     }
     if let Some(worker) = workers.maintenance {
-        record_failure(&mut errors, "maintenance shutdown", worker.shutdown().await);
+        match worker.shutdown().await {
+            Ok(End::Reopen(cause)) => {
+                stopped_handle = true;
+                eprintln!("sparrowd: maintenance requested reopen during shutdown: {cause}");
+            }
+            Ok(End::Stopped) => {}
+            Err(error) => errors.push(format!("maintenance shutdown: {error}")),
+        }
     }
     // Intake workers may need their owned RPC transport to finish an admitted import.
     // Once joined, drain and close both native budgets before the final WAL fence.
     let drained = admission.drain().await;
-    if drained.is_ok() {
+    let mut proved = false;
+    if drained.is_ok() && !stopped_handle {
         let flushed = store.flush();
-        let closed = flushed.is_ok();
+        proved = flushed.is_ok();
         record_failure(&mut errors, "store flush", flushed);
-        if closed {
+        if proved {
             // The flush made every acknowledged write durable. Abort background compaction
             // now so the store's drop does not wait for a running job to finish its output.
             store.cancel_background_work();
@@ -68,17 +85,54 @@ pub(super) async fn finish(
         }
     } else if let Err(error) = drained {
         errors.push(error.to_string());
-        errors.push("store flush withheld because RPC admission could not be drained".into());
+        if !stopped_handle {
+            errors.push("store flush withheld because RPC admission could not be drained".into());
+        }
     }
-    for endpoint in endpoints {
-        record_failure(
-            &mut errors,
-            "local endpoint cleanup",
-            endpoint.remove_name(),
-        );
+    remove_names(endpoints, &mut errors);
+    if !proved && (!reopening || !errors.is_empty()) {
+        let pending = store.pending_durability_occurrences();
+        match store.store_id() {
+            Ok(id) => super::recovery::unverified(&id, &pending),
+            Err(error) => errors.push(format!("reporting unverified occurrences: {error}")),
+        }
     }
+    finish_result(end, errors, refused)
+}
+
+/// Remove only the process's endpoint names at its terminal exit.
+pub(super) fn cleanup(
+    initial: Result<(), Box<dyn std::error::Error>>,
+    endpoints: &[&LocalEndpoint],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut errors = Vec::new();
+    remove_names(endpoints, &mut errors);
     if errors.is_empty() {
-        Ok(())
+        return initial;
+    }
+    let refused = initial
+        .as_ref()
+        .err()
+        .is_some_and(|error| sparrow_server::start_wait::is_permanent(error.as_ref()));
+    if let Err(error) = initial {
+        errors.insert(0, error.to_string());
+    }
+    finish_result((), errors, refused)
+}
+
+fn remove_names(endpoints: &[&LocalEndpoint], errors: &mut Vec<String>) {
+    for endpoint in endpoints {
+        record_failure(errors, "local endpoint cleanup", endpoint.remove_name());
+    }
+}
+
+fn finish_result<T>(
+    value: T,
+    errors: Vec<String>,
+    refused: bool,
+) -> Result<T, Box<dyn std::error::Error>> {
+    if errors.is_empty() {
+        Ok(value)
     } else {
         let error: Box<dyn std::error::Error> = errors.join("; ").into();
         Err(if refused {
@@ -171,7 +225,13 @@ mod tests {
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
         {
-            let teardown = finish(Ok(()), Workers::default(), &store, &[], &admission);
+            let teardown = finish(
+                Ok(End::Stopped),
+                Workers::default(),
+                &store,
+                &[],
+                &admission,
+            );
             tokio::pin!(teardown);
             tokio::select! {
                 biased;

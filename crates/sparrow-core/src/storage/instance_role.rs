@@ -100,9 +100,7 @@ pub fn stamp(data_dir: impl AsRef<Path>, role: InstanceRole) -> Result<String, E
         return Err(not_a_store(path, "it holds no RocksDB database"));
     }
     let open_files = open_files::OpenFiles::from_process()?;
-    let mut options = table_options::database(open_files.max_open_files)?;
-    options.create_if_missing(false);
-    options.create_missing_column_families(false);
+    let options = table_options::database(open_files.max_open_files, false)?;
     let db = DB::open_cf_descriptors(&options, path, table_options::descriptors()).map_err(
         |error| {
             let cause = error.to_string();

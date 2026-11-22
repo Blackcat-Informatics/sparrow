@@ -28,7 +28,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -242,19 +242,31 @@ impl<T> Waiter<T> {
     }
 }
 
-/// Decrements the running count when a build's thread ends, however it ends.
-struct Running(Arc<AtomicUsize>);
+/// Tracks detached workers through the release of their native handles, including builds
+/// whose registration has already expired or been released.
+#[derive(Default)]
+struct Threads {
+    running: Mutex<usize>,
+    ended: Condvar,
+}
+
+/// Decrements the running count after a build's work releases its captured store.
+struct Running(Arc<Threads>);
 
 impl Drop for Running {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        let mut count = lock(&self.0.running);
+        *count -= 1;
+        if *count == 0 {
+            self.0.ended.notify_all();
+        }
     }
 }
 
 /// One listing kind's builds, at most [`super::catalog_lease::MAX_HANDLES`] at a time.
 pub(super) struct Builds<C, T> {
     builds: BTreeMap<String, Build<C, T>>,
-    running: Arc<AtomicUsize>,
+    threads: Arc<Threads>,
     started: u64,
     wait: Duration,
     #[cfg(feature = "test-support")]
@@ -270,7 +282,7 @@ impl<C, T> Default for Builds<C, T> {
     fn default() -> Self {
         Self {
             builds: BTreeMap::new(),
-            running: Arc::default(),
+            threads: Arc::default(),
             started: 0,
             wait: BUILD_WAIT,
             #[cfg(feature = "test-support")]
@@ -287,6 +299,18 @@ impl<C, T: Send + 'static> Builds<C, T> {
     /// Drop every build whose lease has ended, cancelling its thread.
     pub(super) fn purge(&mut self, now: u64) {
         self.builds.retain(|_, build| build.alive(now));
+    }
+
+    /// Cancel registered builds and wait for every worker, including already retired ones.
+    /// Workers do not take this registry's lock.
+    pub(super) fn cancel_and_wait(&mut self) {
+        self.builds.clear();
+        drop(
+            self.threads
+                .ended
+                .wait_while(lock(&self.threads.running), |count| *count != 0)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
     }
 
     /// Register a build and start `work` on its own thread at once. Returns the build's
@@ -324,15 +348,16 @@ impl<C, T: Send + 'static> Builds<C, T> {
             shared: Arc::clone(&shared),
             work: std::cell::Cell::new(0),
         };
-        self.running.fetch_add(1, Ordering::SeqCst);
-        let running = Running(Arc::clone(&self.running));
+        *lock(&self.threads.running) += 1;
+        let running = Running(Arc::clone(&self.threads));
         #[cfg(feature = "test-support")]
         let entries = Arc::clone(&self.entries);
         std::thread::Builder::new()
             .name("sparrow-listing-build".into())
             .spawn(move || {
                 let _running = running;
-                // A panic is a failed build, not one that never finishes.
+                // Consuming `work` drops the captured store before `_running` can signal
+                // completion. A panic also drops it before we publish the failed build.
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&worker)))
                         .unwrap_or_else(|_| {
@@ -445,7 +470,7 @@ impl<C, T: Send + 'static> Builds<C, T> {
     pub(super) fn census(&self) -> (usize, usize, u64) {
         (
             self.builds.len(),
-            self.running.load(Ordering::SeqCst),
+            *lock(&self.threads.running),
             self.started,
         )
     }

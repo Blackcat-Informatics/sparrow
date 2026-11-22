@@ -31,9 +31,41 @@ pub const SPACE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 struct AcceptFaults {
     consecutive: u32,
     total: u64,
+    resume: Option<tokio::time::Instant>,
 }
 
 impl AcceptFaults {
+    async fn next(
+        &self,
+        sockets: &Sockets<'_>,
+        rpc: bool,
+        ingest: bool,
+    ) -> std::io::Result<Incoming> {
+        if let Some(resume) = self.resume {
+            tokio::time::sleep_until(resume).await;
+        }
+        accepted(sockets.accept(rpc, ingest)).await
+    }
+
+    fn observe(
+        &mut self,
+        incoming: std::io::Result<Incoming>,
+        journal: &mut impl FnMut(&str),
+    ) -> Option<Incoming> {
+        match incoming {
+            Ok(stream) => {
+                self.succeeded();
+                Some(stream)
+            }
+            Err(error) => {
+                let (wait, line) = self.failed(&error);
+                journal(&line);
+                self.resume = Some(tokio::time::Instant::now() + wait);
+                None
+            }
+        }
+    }
+
     /// Count one accept error and return how long accepting pauses and the journal line.
     fn failed(&mut self, error: &std::io::Error) -> (Duration, String) {
         self.consecutive = self.consecutive.saturating_add(1);
@@ -53,6 +85,7 @@ impl AcceptFaults {
 
     fn succeeded(&mut self) {
         self.consecutive = 0;
+        self.resume = None;
     }
 }
 
@@ -76,6 +109,60 @@ pub struct Sockets<'a> {
     pub tcp: Option<(&'a tokio::net::TcpListener, sparrow_client::TcpSecret)>,
 }
 
+enum Incoming {
+    Private(tokio::net::UnixStream),
+    Ingest(tokio::net::UnixStream),
+    Tcp(
+        tokio::net::TcpStream,
+        std::net::SocketAddr,
+        sparrow_client::TcpSecret,
+    ),
+}
+
+impl Sockets<'_> {
+    async fn accept(&self, rpc: bool, ingest: bool) -> std::io::Result<Incoming> {
+        tokio::select! {
+            ready = self.private.accept(), if rpc => {
+                ready.map(|(stream, _)| Incoming::Private(stream))
+            }
+            ready = async {
+                match self.ingest {
+                    Some((endpoint, _)) => endpoint.accept().await,
+                    None => std::future::pending().await,
+                }
+            }, if ingest => ready.map(|(stream, _)| Incoming::Ingest(stream)),
+            ready = async {
+                match &self.tcp {
+                    Some((listener, secret)) => listener.accept().await
+                        .map(|(stream, peer)| Incoming::Tcp(stream, peer, secret.clone())),
+                    None => std::future::pending().await,
+                }
+            }, if rpc => ready,
+        }
+    }
+
+    /// Keep the listeners responsive during a session handoff. Dropping each accepted
+    /// stream gives the peer a retryable transport disconnect without an old capability.
+    /// Unix names stay under store ownership and are restored by the live session only.
+    pub async fn reject_while<T>(
+        &self,
+        work: impl Future<Output = T>,
+        mut journal: impl FnMut(&str),
+    ) -> T {
+        tokio::pin!(work);
+        let mut faults = AcceptFaults::default();
+        loop {
+            tokio::select! {
+                biased;
+                completed = &mut work => return completed,
+                incoming = faults.next(self, true, self.ingest.is_some()) => {
+                    drop(faults.observe(incoming, &mut journal));
+                }
+            }
+        }
+    }
+}
+
 /// Accept connections until `interrupt` resolves (an orderly stop, `Ok`) or `health` resolves
 /// (a worker ended; its failure is returned). `journal` receives each pause line.
 ///
@@ -89,14 +176,14 @@ pub struct Sockets<'a> {
 ///
 /// # Errors
 /// The interrupt's failure, or the failure `health` reports.
-pub async fn serve(
-    sockets: Sockets<'_>,
+pub async fn serve<T>(
+    sockets: &Sockets<'_>,
     rpc: &Rpc,
     connections: &Arc<Ceiling>,
     interrupt: impl Future<Output = Result<(), Box<dyn Error>>>,
-    health: impl Future<Output = Box<dyn Error>>,
+    health: impl Future<Output = T>,
     mut journal: impl FnMut(&str),
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Option<T>, Box<dyn Error>> {
     tokio::pin!(interrupt);
     tokio::pin!(health);
     let floor = rpc.store_floor();
@@ -108,9 +195,6 @@ pub async fn serve(
     let mut ingest_slot = None;
     let mut ingest_wait = None;
     let mut faults = AcceptFaults::default();
-    // While set, no listener is accepted: the backoff after an accept error.
-    let mut resume = std::pin::pin!(tokio::time::sleep(Duration::ZERO));
-    let mut paused = false;
     let mut measuring = None::<String>;
     loop {
         if rpc_slot.is_none() && rpc_wait.is_none() {
@@ -137,10 +221,9 @@ pub async fn serve(
             }
             stopped = &mut interrupt => {
                 stopped?;
-                return Ok(());
+                return Ok(None);
             }
-            failure = &mut health => return Err(failure),
-            () = &mut resume, if paused => paused = false,
+            ended = &mut health => return Ok(Some(ended)),
             _ = space.tick() => {
                 match crate::now().and_then(|now| Ok((now, floor.observe(now)?))) {
                     Ok((now, shortfall)) => {
@@ -165,60 +248,35 @@ pub async fn serve(
                     }
                 }
             }
-            accepted = accepted(sockets.private.accept()), if rpc_slot.is_some() && !paused => {
-                let stream = match accepted {
-                    Ok((stream, _)) => { faults.succeeded(); stream }
-                    Err(error) => {
-                        let (wait, line) = faults.failed(&error);
-                        journal(&line);
-                        resume.as_mut().reset(tokio::time::Instant::now() + wait);
-                        paused = true;
-                        continue;
+            incoming = faults.next(sockets, rpc_slot.is_some(), ingest_slot.is_some()),
+                if rpc_slot.is_some() || ingest_slot.is_some() => {
+                match faults.observe(incoming, &mut journal) {
+                    Some(Incoming::Private(stream)) => {
+                        let Some(slot) = rpc_slot.take() else { continue };
+                        rpc.floor_pause().connection_accepted();
+                        // A connection whose peer the kernel cannot name is dropped unanswered.
+                        match crate::local_caller(&stream) {
+                            Ok(caller) => crate::admit_connection(stream, rpc.clone(), slot, Access::Local(caller)),
+                            Err(error) => eprintln!("sparrowd: private socket peer unreadable: {error}"),
+                        }
                     }
-                };
-                let Some(slot) = rpc_slot.take() else { continue };
-                rpc.floor_pause().connection_accepted();
-                // A connection whose peer the kernel cannot name is dropped unanswered.
-                match crate::local_caller(&stream) {
-                    Ok(caller) => crate::admit_connection(stream, rpc.clone(), slot, Access::Local(caller)),
-                    Err(error) => eprintln!("sparrowd: private socket peer unreadable: {error}"),
+                    Some(Incoming::Ingest(stream)) => {
+                        let (Some(slot), Some((_, socket))) = (ingest_slot.take(), ingest) else { continue };
+                        rpc.floor_pause().connection_accepted();
+                        let _ = socket.admit(stream, rpc.clone(), slot);
+                    }
+                    Some(Incoming::Tcp(stream, peer, secret)) => {
+                        let Some(slot) = rpc_slot.take() else { continue };
+                        rpc.floor_pause().connection_accepted();
+                        // A peer that reset before this call is dropped without ending the daemon.
+                        if let Err(error) = stream.set_nodelay(true) {
+                            eprintln!("sparrowd: TCP peer {peer} dropped before it was served: {error}");
+                            continue;
+                        }
+                        crate::admit_connection(stream, rpc.clone(), slot, Access::PublicTcp(secret, peer.to_string()));
+                    }
+                    None => {}
                 }
-            }
-            accepted = async { accepted(ingest.expect("enabled ingest branch").0.accept()).await }, if ingest.is_some() && ingest_slot.is_some() && !paused => {
-                let stream = match accepted {
-                    Ok((stream, _)) => { faults.succeeded(); stream }
-                    Err(error) => {
-                        let (wait, line) = faults.failed(&error);
-                        journal(&line);
-                        resume.as_mut().reset(tokio::time::Instant::now() + wait);
-                        paused = true;
-                        continue;
-                    }
-                };
-                let Some(slot) = ingest_slot.take() else { continue };
-                rpc.floor_pause().connection_accepted();
-                let _ = ingest.expect("enabled ingest branch").1.admit(stream, rpc.clone(), slot);
-            }
-            accepted = async { accepted(sockets.tcp.as_ref().expect("enabled TCP branch").0.accept()).await }, if sockets.tcp.is_some() && rpc_slot.is_some() && !paused => {
-                let (stream, peer) = match accepted {
-                    Ok(accepted) => { faults.succeeded(); accepted }
-                    Err(error) => {
-                        let (wait, line) = faults.failed(&error);
-                        journal(&line);
-                        resume.as_mut().reset(tokio::time::Instant::now() + wait);
-                        paused = true;
-                        continue;
-                    }
-                };
-                let Some(slot) = rpc_slot.take() else { continue };
-                rpc.floor_pause().connection_accepted();
-                // A peer that reset before this call is dropped; it is not the daemon's failure.
-                if let Err(error) = stream.set_nodelay(true) {
-                    eprintln!("sparrowd: TCP peer {peer} dropped before it was served: {error}");
-                    continue;
-                }
-                let secret = sockets.tcp.as_ref().expect("enabled TCP branch").1.clone();
-                crate::admit_connection(stream, rpc.clone(), slot, Access::PublicTcp(secret, peer.to_string()));
             }
         }
     }
@@ -279,7 +337,7 @@ mod tests {
             let (rpc, lines) = (rpc.clone(), lines.clone());
             async move {
                 serve(
-                    Sockets {
+                    &Sockets {
                         private: &listener,
                         ingest: None,
                         tcp: None,
@@ -291,10 +349,11 @@ mod tests {
                             .await
                             .map_err(|error| Box::new(error) as Box<dyn Error>)
                     },
-                    std::future::pending(),
+                    std::future::pending::<()>(),
                     |line| lines.borrow_mut().push(line.to_owned()),
                 )
                 .await
+                .map(drop)
             }
         });
         Fixture {

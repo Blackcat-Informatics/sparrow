@@ -1346,6 +1346,34 @@ fingerprints = []
 names = ['^(prove_durability_again|clear_poison_before_durability_proof)$']
 
 [[job]]
+id = "store-session-reopen"
+summary = "Use one open path for startup and recovery. Recovery requires the existing database and checks its persistent identity under native exclusive ownership before any Sparrow catalog write."
+home = "sparrow_core::storage::Store::open_store"
+entry_points = ["sparrow_core::storage::Store::open", "sparrow_core::storage::Store::reopen"]
+spec = "docs/architecture.md: 6.1 publication and durability."
+vectors = ["crates/sparrow-core/tests/storage.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "store-session-close"
+summary = "Cancel and wait for detached native owners, then passively collect the bounded pending occurrence identities before closing a drained store session."
+home = "sparrow_core::storage::Store::close_for_reopen"
+entry_points = ["sparrow_core::storage::Store::pending_durability_occurrences", "sparrow_core::storage::durability::State::pending_occurrences", "sparrow_core::storage::listing_build::Builds::cancel_and_wait", "sparrow_core::storage::forced_compaction::Forced::wait_finished"]
+spec = "docs/architecture.md: 6.1 publication and durability."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-core/tests/enospc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
 id = "typed-durability-fence"
 summary = "One generated typed fence codec for direct client and RPC adaptation, with bounded store/session identities."
 home = "sparrow_client::receipt::DurabilityWatermark::encode"
@@ -2193,7 +2221,7 @@ names = ['^(reclaim_direct_pressure|reclaim_import_pressure)$']
 id = "column-family-table-options"
 summary = "One owner builds the database options and every column family's table and compression options from the measured profile, including the reverse family's small blocks and Bloom filter and the payload dictionary."
 home = "sparrow_core::storage::table_options::family"
-entry_points = ["sparrow_core::storage::table_options::database", "sparrow_core::storage::table_options::descriptors", "sparrow_core::storage::Store::open"]
+entry_points = ["sparrow_core::storage::table_options::database", "sparrow_core::storage::table_options::descriptors", "sparrow_core::storage::Store::open_store", "sparrow_core::storage::instance_role::stamp"]
 spec = "docs/architecture.md: 4.2 deduplication and compression; docs/load-qualification.md: table options and dictionaries."
 vectors = ["crates/sparrow-core/tests/storage.rs"]
 bench = []
@@ -2749,11 +2777,11 @@ names = ['^(bind_reconnected_logger_store|bind_reconnected_client_store)$']
 
 [[job]]
 id = "typed-server-connection"
-summary = "Construct the bounded generated server connection once for Unix and public TCP production listeners and adversarial real-daemon relay fixtures."
+summary = "Construct the bounded generated server connection for Unix and public TCP listeners and lost-reply relay fixtures. Start protocol teardown before dropping the driver to release pending calls and capabilities."
 home = "sparrow_server::transport::serve_connection"
 entry_points = []
-spec = "docs/development-runtime.md: shared typed connection and deterministic lost-reply qualification."
-vectors = ["crates/sparrow-server/tests/rpc.rs"]
+spec = "docs/interfaces.md: session replacement. docs/development-runtime.md: shared typed connection and lost-reply qualification."
+vectors = ["crates/sparrow-server/tests/rpc.rs", "crates/sparrow-server/src/session/tests.rs"]
 bench = []
 enforced = true
 [job.forbidden]
@@ -4049,9 +4077,9 @@ names = ['^(unlink_stale_socket_elsewhere|replace_local_endpoint)$']
 
 [[job]]
 id = "complete-daemon-teardown"
-summary = "The teardown owner joins archive, intake and maintenance workers before draining and closing ordinary and diagnostic admission. It then fences the store and cleans only owned endpoints, retaining primary and cleanup failures. Main retains one interrupt subscription through startup and serving."
+summary = "The teardown owner joins archive, intake and maintenance workers before draining and closing ordinary and diagnostic admission. Terminal teardown fences a usable store and cleans only owned endpoints, retaining primary and cleanup failures. Session replacement hands the stopped store to its tracked close. Main retains one interrupt subscription."
 home = "sparrowd::shutdown::finish"
-entry_points = ["sparrowd::shutdown::record_failure", "sparrow_server::admission::Admission::drain", "sparrowd::main"]
+entry_points = ["sparrowd::shutdown::cleanup", "sparrowd::shutdown::record_failure", "sparrow_server::admission::Admission::drain", "sparrowd::session::Session::finish", "sparrowd::main"]
 spec = "docs/interfaces.md: daemon teardown."
 vectors = ["crates/sparrow-server/tests/rpc.rs", "crates/sparrow-server/src/shutdown.rs", "crates/sparrow-server/src/rpc.rs", "crates/sparrow-server/src/admission.rs"]
 bench = []
@@ -4060,6 +4088,34 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(teardown_daemon_elsewhere|discard_shutdown_failure)$']
+
+[[job]]
+id = "daemon-store-session"
+summary = "Rebuild every store-bound worker and capability through one session startup. Keep the process listeners and archive filesystem slot across replacement. Replay the same persistent store and check every buffered occurrence identity retained by the old session."
+home = "sparrowd::session::Session::prepare"
+entry_points = ["sparrowd::session::Session::serve", "sparrowd::session::Session::run_local", "sparrowd::recovery::reopen", "sparrowd::recovery::missing_occurrences", "sparrow_server::config::ServerConfig::reopen_store", "sparrow_server::rpc::Rpc::cancel_queries"]
+spec = "docs/interfaces.md: daemon teardown and buffered durability."
+vectors = ["crates/sparrow-server/src/session/tests.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
+id = "daemon-listener-accept"
+summary = "Active RPC serving and store recovery share the socket accept and failure backoff. During recovery each accepted stream is disconnected so a client can retry."
+home = "sparrow_server::serving::Sockets::accept"
+entry_points = ["sparrow_server::serving::Sockets::reject_while", "sparrow_server::serving::AcceptFaults::next", "sparrow_server::serving::AcceptFaults::observe", "sparrow_server::serving::serve"]
+spec = "docs/interfaces.md: daemon teardown."
+vectors = ["crates/sparrow-server/src/serving.rs", "crates/sparrow-server/src/session/tests.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
 
 [[job]]
 id = "rpc-syslog-config-fixture"
@@ -4189,9 +4245,9 @@ names = ['^(lookup_receiver_window_elsewhere|lookup_producer_window_elsewhere)$'
 
 [[job]]
 id = "joined-daemon-maintenance"
-summary = "One joined serial worker schedules bounded expiry continuations, pressure, buffered synchronization and table rewrite steps fairly. Native jobs run one at a time under existing storage limits; stop prevents further work and joins the current job before final RPC drain and flush."
+summary = "One joined serial worker schedules bounded expiry continuations, pressure, buffered synchronization and table rewrite steps fairly. Stop joins the active native duty and migration deferral before RPC drain. A durability latch that outlives its paced proof window requests a replacement session."
 home = "sparrowd::maintenance::run"
-entry_points = ["sparrowd::maintenance::Worker::start", "sparrowd::maintenance::Worker::shutdown", "sparrowd::maintenance::Job::execute", "sparrowd::main", "sparrowd::shutdown::finish"]
+entry_points = ["sparrowd::maintenance::Worker::start", "sparrowd::maintenance::Worker::shutdown", "sparrowd::maintenance::Job::execute", "sparrowd::maintenance::run_duties", "sparrowd::maintenance::deferred_page", "sparrowd::session::Session::serve", "sparrowd::shutdown::finish"]
 spec = "docs/interfaces.md: daemon maintenance scheduling."
 vectors = ["crates/sparrow-server/src/maintenance.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
