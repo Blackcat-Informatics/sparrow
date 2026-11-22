@@ -5,12 +5,12 @@
 name = "sparrow-client"
 version = "0.1.0"
 description = "Async Sparrow producer SDK for structured logs, terminal output and bulk imports"
-repository = "http://lillith:7555/fleet/sparrow"
+documentation = "https://docs.rs/crate/sparrow-client/latest"
 readme = "README.md"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-publish = ["sparrow-lab"]
+publish = ["crates-io", "sparrow-lab"]
 license.workspace = true
 
 [dependencies]

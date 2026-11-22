@@ -13,19 +13,17 @@ disk and network I/O.
 
 Build on Linux with Rust 1.98 or later and the Cap'n Proto compiler
 (`capnp` on `PATH`). The SDK ships both schemas and builds independently of
-Sparrow's storage engine. Add the lab registry to your application's
-`.cargo/config.toml` or your Cargo home configuration.
+Sparrow's storage engine. Add the SDK from crates.io.
 
-```toml
-[registries.sparrow-lab]
-index = "sparse+http://lillith:7555/api/packages/fleet/cargo/"
+```sh
+cargo add sparrow-client@0.1.0
 ```
 
-Add the following to your application's `Cargo.toml`.
+The console example below uses these dependencies in your application's `Cargo.toml`.
 
 ```toml
 [dependencies]
-sparrow-client = { version = "0.1.0", registry = "sparrow-lab" }
+sparrow-client = "0.1.0"
 tokio = { version = "1", features = ["macros", "rt"] }
 tracing = "0.1"
 ```
@@ -158,5 +156,6 @@ can run alongside application logging.
   count and range count. To stop locally and resume later, use `job.close().await?`.
 
 The package includes runnable examples for the
-[console](examples/console.rs), [configured delivery](examples/configured.rs)
-and [bulk files or stdin](examples/bulk.rs).
+[console](https://docs.rs/crate/sparrow-client/0.1.0/source/examples/console.rs),
+[configured delivery](https://docs.rs/crate/sparrow-client/0.1.0/source/examples/configured.rs)
+and [bulk files or stdin](https://docs.rs/crate/sparrow-client/0.1.0/source/examples/bulk.rs).
