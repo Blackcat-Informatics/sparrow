@@ -6684,7 +6684,7 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
             std::fs::write(
                 &append_before_lookup,
                 format!(
-                    "#!/bin/sh\nif [ \"$2\" = payload ] && [ \"$4\" = {:?} ]\nthen\n\
+                    "#!/bin/sh\nif [ \"$2\" = payload ] && [ \"$4\" = {:?} ] && [ -f {racing:?} ]\nthen\n\
                      printf '%s\\n' '{{\"race\":2}}' >> {racing:?}\nfi\nexec {cli:?} \"$@\"\n",
                     receipt.payload_id
                 ),
@@ -6710,6 +6710,7 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
                 b"{\"race\":1}\n{\"race\":2}\n",
                 "{shipped}"
             );
+            assert!(!racing.exists(), "{shipped}");
             std::fs::write(&ship_config, normal).unwrap();
             // Storage pressure refuses publication: the store holds no part of the new file,
             // so it is neither deleted nor set aside while pressure lasts.

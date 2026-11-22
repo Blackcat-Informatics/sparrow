@@ -367,21 +367,24 @@ REAP_PREFIX = ".reaping-"
 
 
 def acknowledged(source, path, stat, config, store):
-    """Check the exact whole file or each of its parts against the store's payload index."""
+    """Check the whole file or its parts against the payload index, or return None if it vanished."""
     parts, legacy_whole = pieces(source, path, stat, config)
-    if parts is None or legacy_whole:
-        if store.holds(blake3(path=path)):
-            return identity(path.lstat()) == identity(stat)
-        if parts is None:
-            return False
-    confirmed = 0
-    for lines in parts:
-        data = b"".join(lines)
-        if not store.holds(blake3(data=data)):
-            return False
-        confirmed += len(data)
-    # A changing split can yield no parts or cover only part of the original file.
-    return 0 < confirmed == stat.st_size and identity(path.lstat()) == identity(stat)
+    confirmed = (parts is None or legacy_whole) and store.holds(blake3(path=path))
+    if parts is not None and not confirmed:
+        checked = 0
+        for lines in parts:
+            data = b"".join(lines)
+            if not store.holds(blake3(data=data)):
+                break
+            checked += len(data)
+        else:
+            # A changing split can yield no parts or cover only part of the original file.
+            confirmed = 0 < checked == stat.st_size
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        return None
+    return confirmed and identity(current) == identity(stat)
 
 
 def late_name(original):
@@ -404,8 +407,14 @@ def settle_set_aside(source, config, store):
     deleted = 0
     directory = Path(source["dir"])
     for aside in sorted(directory.glob(f"**/{REAP_PREFIX}*")):
-        stat = aside.lstat()
-        if not acknowledged(source, aside, stat, config, store):
+        try:
+            stat = aside.lstat()
+        except FileNotFoundError:
+            continue
+        confirmed = acknowledged(source, aside, stat, config, store)
+        if confirmed is None:
+            continue
+        if not confirmed:
             original = aside.with_name(aside.name[len(REAP_PREFIX):])
             try:
                 os.link(aside, original)
@@ -430,7 +439,10 @@ def reap(source, config, store, now):
     deleted = settle_set_aside(source, config, store)
     set_aside = unacknowledged = 0
     for path, stat in finished(source, now):
-        if not acknowledged(source, path, stat, config, store):
+        confirmed = acknowledged(source, path, stat, config, store)
+        if confirmed is None:
+            continue
+        if not confirmed:
             unacknowledged += 1
             continue
         aside = path.with_name(REAP_PREFIX + path.name)
