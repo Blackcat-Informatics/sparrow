@@ -557,7 +557,8 @@ the run that finds every part of a file held, the shipper links the file to
 `.reaping-NAME` and unlinks NAME, which neither the shipper nor the spool scripts read; a script
 that opens NAME afterwards creates a new file under it. At its next run the
 shipper looks at each `.reaping-` file again and deletes it only if the store
-holds every part of its present content. A file that now holds a line the store
+holds the entire file and its identity is stable through the lookup.
+A file that now holds a line the store
 lacks goes back under NAME (under `NAME-late-NS` when NAME exists again) and
 ships like any finished file, so those lines appear twice at most. A file whose
 parts the store held and has since retired goes back too and stays in the spool.

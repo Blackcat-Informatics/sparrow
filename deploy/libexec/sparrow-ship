@@ -369,11 +369,19 @@ REAP_PREFIX = ".reaping-"
 def acknowledged(source, path, stat, config, store):
     """Check the exact whole file or each of its parts against the store's payload index."""
     parts, legacy_whole = pieces(source, path, stat, config)
-    if parts is None:
-        return store.holds(blake3(path=path))
-    if legacy_whole and store.holds(blake3(path=path)):
-        return True
-    return all(store.holds(blake3(data=b"".join(lines))) for lines in parts)
+    if parts is None or legacy_whole:
+        if store.holds(blake3(path=path)):
+            return identity(path.lstat()) == identity(stat)
+        if parts is None:
+            return False
+    confirmed = 0
+    for lines in parts:
+        data = b"".join(lines)
+        if not store.holds(blake3(data=data)):
+            return False
+        confirmed += len(data)
+    # A changing split can yield no parts or cover only part of the original file.
+    return 0 < confirmed == stat.st_size and identity(path.lstat()) == identity(stat)
 
 
 def late_name(original):

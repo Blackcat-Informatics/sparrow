@@ -6516,7 +6516,7 @@ fn shipper_refuses_a_source_overlapping_its_intake_or_state_tree() {
 /// anything at start besides the spool itself, so a unit restart deletes nothing; a file whose
 /// publication storage pressure refuses stays; an acknowledged file is set aside for a run
 /// and deleted only if it still holds nothing the store lacks, so a line a spool script
-/// appends after the acknowledgement is shipped, under a new name when the old one is in use.
+/// appends after the acknowledgement or during the lookup stays available to ship.
 #[tokio::test(flavor = "current_thread")]
 async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
     tokio::task::LocalSet::new()
@@ -6670,6 +6670,47 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
                 std::fs::read(spool.join(&late[0])).unwrap(),
                 b"{\"a\":1}\n{\"late\":1}\n"
             );
+            // A writer appends through its still-open file during the payload lookup. The
+            // server knows the old payload, but that acknowledgement cannot delete new bytes.
+            let racing = spool.join(".reaping-katamari-stored-race.jsonl");
+            let race_bytes = b"{\"race\":1}\n";
+            std::fs::write(&racing, race_bytes).unwrap();
+            let receipt = producer
+                .ingest("before-late-append", "spool", wire::Format::Jsonl, race_bytes)
+                .await
+                .unwrap();
+            let cli = env!("CARGO_BIN_EXE_sparrow-rpc-fixture");
+            let append_before_lookup = dir.path().join("append-before-lookup");
+            std::fs::write(
+                &append_before_lookup,
+                format!(
+                    "#!/bin/sh\nif [ \"$2\" = payload ] && [ \"$4\" = {:?} ]\nthen\n\
+                     printf '%s\\n' '{{\"race\":2}}' >> {racing:?}\nfi\nexec {cli:?} \"$@\"\n",
+                    receipt.payload_id
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                &append_before_lookup,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .unwrap();
+            let normal = std::fs::read_to_string(&ship_config).unwrap();
+            std::fs::write(
+                &ship_config,
+                normal.replace(
+                    &format!("sparrow = {cli:?}"),
+                    &format!("sparrow = {append_before_lookup:?}"),
+                ),
+            )
+            .unwrap();
+            let shipped = report(ship(&ship_config));
+            assert_eq!(
+                std::fs::read(spool.join("katamari-stored-race.jsonl")).unwrap(),
+                b"{\"race\":1}\n{\"race\":2}\n",
+                "{shipped}"
+            );
+            std::fs::write(&ship_config, normal).unwrap();
             // Storage pressure refuses publication: the store holds no part of the new file,
             // so it is neither deleted nor set aside while pressure lasts.
             let ballast = data.join("test-owned-pressure-ballast");
