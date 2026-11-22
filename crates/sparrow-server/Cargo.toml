@@ -5,6 +5,11 @@
 name = "sparrow-server"
 autotests = false
 version = "0.1.0"
+description = "Cap'n Proto daemon and intake workers for the Sparrow log store"
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true

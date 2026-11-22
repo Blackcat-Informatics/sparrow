@@ -1,4 +1,4 @@
-<!-- SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc. -->
+<!-- SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca> -->
 <!-- SPDX-License-Identifier: CC-BY-4.0 -->
 
 # Licensing
@@ -76,9 +76,9 @@ The test suite reads PurRDF's text-analysis lexicons from a sibling PurRDF
 checkout. Sparrow does not copy or redistribute them; their provenance and
 upstream licenses are recorded in PurRDF.
 
-The helper census (`crates/sparrow-helper-census`) is a port of PurRDF's
-`helper-census` tool. Its provenance is recorded in the crate's module
-documentation and in [`docs/helper-census.md`](./docs/helper-census.md).
+The repository gate uses [`cargo-raf-census`](https://crates.io/crates/cargo-raf-census)
+as a separately installed development tool. Its license is
+MIT OR Apache-2.0 OR MulanPSL-2.0.
 
 ## Proprietary / commercial licensing
 

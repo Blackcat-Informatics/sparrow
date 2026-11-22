@@ -81,7 +81,7 @@ fn a_full_disk_latch_clears_once_space_returns() {
     };
     df("after fill");
     // Incompressible and different every time: the store keeps identical chunks once.
-    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut seed = purrdf_hash::mix::GOLDEN_GAMMA;
     let mut payload = |size: usize| -> Vec<u8> {
         (0..size)
             .map(|_| {

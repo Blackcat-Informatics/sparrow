@@ -23,7 +23,7 @@ refusal. No production throughput or density target has been supplied.
 This is measured preliminary qualification, not full performance acceptance.
 The initial 2026-10-08 experiment exposed broad chronological capture and
 caller-controlled retirement limits. Later installed sources address those
-limits; see [current runtime evidence](development-runtime.md) and the mixed
+limits; see the mixed
 disk-backed paging qualification below. Historical measurements remain tied to
 their original images. No budgets were relaxed to obtain successful runs.
 
@@ -95,9 +95,7 @@ latency, sustained/burst production volume, a deployment quota and native
 reclamation admission remain separate unfinished requirements. Later source
 `ebea75a` measures abandoned in-progress Unix/TCP captures on this finite corpus:
 work finishes after client interruption, and owner maintenance removes its
-anonymous staging at the result lease deadline. See
-[abandoned query cleanup](development-runtime.md#abandoned-query-capture-cleanup)
-for the observed cleanup intervals and preserved corpus. This does not establish
+anonymous staging at the result lease deadline. This does not establish
 prompt cancellation or sustained abandonment acceptance.
 
 ### Four-importer burst
@@ -183,10 +181,10 @@ complete corpus inventory; private bodies and identifiers remain outside Git.
 
 | Sample | Original selection | Copied bytes | Records per pass | Coverage |
 | --- | --- | ---: | ---: | --- |
-| Corrections | `lillith_soul/inner-core/corrections/2026-09-10.jsonl` | 152,659 | 143 | Complete selected file |
-| Discards | `lillith_soul/inner-core/discards/2026-07-20.jsonl` | 2,214 | 2 | Complete selected file |
+| Corrections | an application JSONL log | 152,659 | 143 | Complete selected file |
+| Discards | a second application JSONL log | 2,214 | 2 | Complete selected file |
 | Plain log | `/var/log/pacman.log` | 262,080 | 3,380 | Prefix only |
-| Mentation | `lillith_soul/inner-core/private-mentation/mentation.jsonl` | 161,931 | 4 | Prefix only, including a large record |
+| Mentation | a large live JSONL log | 161,931 | 4 | Prefix only, including a large record |
 
 The corresponding SHA-256 fingerprints, in table order, are:
 
@@ -270,7 +268,7 @@ the required workload behavior.
 ## Evidence and remaining acceptance
 
 Disk evidence is
-`/home/paudley/.local/state/sparrow/qualification-hqh1y0zw`:
+a scratch qualification directory:
 `original-source-manifest.json`, `corpus.json`, immutable input copies,
 `config.toml`, `run.py`, `run.log`, `report.json`, `matrix.py`, `matrix.log`,
 `matrix-report.json`, per-family daemon logs, `rdf-inspection-*.json`,
@@ -285,8 +283,7 @@ isolated owner, never `sparrow.service`.
 
 During the initial baseline, the live server remained PID 1710023, serving
 schema 41 on `0.0.0.0:518` with 212 records. It was not stopped, reconfigured or
-used for those sample imports. Subsequent schema 42 adoption is recorded in
-[Development runtime](development-runtime.md).
+used for those sample imports.
 
 ## Explicit-release follow-up
 
@@ -325,7 +322,7 @@ process-death boundaries using the installed schema 42 daemon `b53f163` and CLI
 `b17f121`. Its persistent identity is inherited from the cloned fixture, not a
 new independent production store. No configured producer input or TCP listener
 was added. Evidence is
-`/home/paudley/.local/state/sparrow/crash-qualification-ci38zu1q`: `driver.py`,
+a scratch crash-qualification directory: `driver.py`,
 `config.toml`, `report.json`, per-phase daemon logs and exact fetched bytes.
 The original fixture remains untouched; the clone ends closed with 7,059 records.
 
@@ -450,13 +447,13 @@ index costs or a compression win. The small synthetic workload is not a measured
 saturation rate, sustained-load envelope or numerical deployment target.
 
 Successful evidence is
-`/home/paudley/.local/state/sparrow/concurrent-qualification-q3wdyj1_`:
+a scratch concurrent-qualification directory:
 `driver.py`, `report.json`, `collector.log`, exact input/output bytes, configuration
 and daemon logs. The production unit stayed PID 2222752 during this trial; no
 production data or producer input was used. The two disk SIGKILL/reopen boundaries
 were repeated with the new daemon and passed, including original receipts/bytes,
 pins and query answers. Their new evidence is
-`/home/paudley/.local/state/sparrow/crash-qualification-y5vxargh`; the earlier crash
+a second scratch crash-qualification directory; the earlier crash
 qualification remains historical evidence, not proof about the new binary.
 
 Full performance acceptance remains unmet: complete corpus census and size/
@@ -517,7 +514,7 @@ This small warm workload does not establish sustained turnover, sparse/dense pin
 capacity, full-corpus distributions, forced physical recovery or complete
 performance acceptance.
 
-The separate [offline turnover qualification](turnover-qualification.md#qualified-run)
+The separate [offline turnover qualification](turnover-qualification.md#historical-default-size-qualified-run)
 now verifies 60 simulated daily cohorts on three new disk stores with no pins,
 one sparse record pin, and dense protection of every accepted artifact. It records
 exact bytes, native RDF stability, bounded expiry/reopen, high-entropy input,

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+
 //! The instance role: one metadata row that fixes, at store creation, whether the store is the
 //! live one or a scratch one. A store with no row has no role and behaves as it always has.
 

@@ -1703,7 +1703,7 @@ mod tests {
             .unwrap()
             .set_len(length - 16 * 1024)
             .unwrap();
-        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut seed = purrdf_hash::mix::GOLDEN_GAMMA;
         let mut failed = None;
         for attempt in 0..480 {
             let payload: Vec<u8> = (0..256 * 1024)

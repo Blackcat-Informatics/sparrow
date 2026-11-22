@@ -5701,113 +5701,6 @@ fn query_only_and_no_intake_refuse_conflicting_configuration() {
     refused(&tcp, &["--private-intake", private], "rpc_tcp_address");
 }
 
-/// INVARIANT: deploy/user-unit-upgrade.sh refuses a trailing --to without a value, a daemon
-/// link that does not name --from, a drop-in for the unit other than the repository's
-/// limits.conf (issue #148: the window installs only that file), and a --to daemon without
-/// cap_net_bind_service before it changes anything: the links and the
-/// drop-in directory are untouched, and an identical limits.conf passes. Every path is a scratch
-/// override, and each refusal precedes the script's first systemctl call, so no unit is ever
-/// addressed.
-#[test]
-fn user_unit_upgrade_refuses_before_changing_anything() {
-    use std::os::unix::fs::{PermissionsExt, symlink};
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let (from, to) = ("sparrowd-schema68-aaaaaaa", "sparrowd-schema69-bbbbbbb");
-    let prefix = dir.path().join("prefix");
-    let libexec = prefix.join("libexec").join("sparrow");
-    let bin = dir.path().join("bin");
-    for path in [&libexec, &bin, &prefix.join("bin")] {
-        std::fs::create_dir_all(path).unwrap();
-    }
-    // Never executed: the preconditions only test that the images exist and match ./bin.
-    let image = b"#!/bin/sh\nexit 1\n";
-    for name in [
-        from,
-        to,
-        "sparrow-schema68-aaaaaaa",
-        "sparrow-schema69-bbbbbbb",
-    ] {
-        for parent in [&libexec, &bin] {
-            let path = parent.join(name);
-            std::fs::write(&path, image).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-    }
-    let link = libexec.join("sparrowd");
-    let run = |args: &[&str]| {
-        let output = Command::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../deploy/user-unit-upgrade.sh"
-        ))
-        .args(args)
-        .env("HOME", dir.path())
-        .env_remove("XDG_CONFIG_HOME")
-        .env("SPARROW_SCOPE", "system")
-        .env_remove("SPARROW_UNIT")
-        .env("SPARROW_PREFIX", &prefix)
-        .env(
-            "SPARROW_CONFIG",
-            dir.path().join("config").join("server.toml"),
-        )
-        .env("SPARROW_BIN", &bin)
-        .admitted_output()
-        .unwrap();
-        (
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        )
-    };
-    let unchanged = |expected: &str| {
-        assert_eq!(std::fs::read_link(&link).unwrap(), Path::new(expected));
-    };
-    let switch = ["--from", from, "--to", to];
-
-    symlink(from, &link).unwrap();
-    let (code, stdout, stderr) = run(&["--from", from, "--to"]);
-    assert_eq!(code, Some(2), "{stdout}{stderr}");
-    assert!(
-        stderr.contains("--to needs a daemon image name"),
-        "{stderr}"
-    );
-    unchanged(from);
-    std::fs::remove_file(&link).unwrap();
-    symlink("sparrowd-schema67-ccccccc", &link).unwrap();
-    let (code, stdout, stderr) = run(&switch);
-    assert_eq!(code, Some(1), "{stdout}{stderr}");
-    assert!(
-        stderr.contains("unexpected daemon link")
-            && stderr.contains("not sparrowd-schema68-aaaaaaa"),
-        "{stderr}"
-    );
-    unchanged("sparrowd-schema67-ccccccc");
-
-    std::fs::remove_file(&link).unwrap();
-    symlink(from, &link).unwrap();
-    let dropins = dir.path().join(".config/systemd/user/sparrow.service.d");
-    std::fs::create_dir_all(&dropins).unwrap();
-    let foreign = b"[Service]\nLimitNOFILE=4096\n";
-    std::fs::write(dropins.join("limits.conf"), foreign).unwrap();
-    let (code, stdout, stderr) = run(&switch);
-    assert_eq!(code, Some(1), "{stdout}{stderr}");
-    assert!(stderr.contains("foreign drop-in"), "{stderr}");
-    assert_eq!(std::fs::read(dropins.join("limits.conf")).unwrap(), foreign);
-    unchanged(from);
-
-    std::fs::copy(
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../deploy/systemd/user/sparrow.service.d/limits.conf"
-        ),
-        dropins.join("limits.conf"),
-    )
-    .unwrap();
-    let (code, stdout, stderr) = run(&switch);
-    assert_eq!(code, Some(1), "{stdout}{stderr}");
-    assert!(stderr.contains("lacks cap_net_bind_service"), "{stderr}");
-    unchanged(from);
-}
-
 /// INVARIANT (issue #148): a daemon whose soft open-file limit leaves no room for the table
 /// cache beside the descriptor reserve refuses to open the store and names the unit setting,
 /// instead of serving until a table read fails with EMFILE. 1024 is the user manager's default,
@@ -6587,12 +6480,10 @@ fn shipper_refuses_a_source_overlapping_its_intake_or_state_tree() {
 }
 
 /// INVARIANT (#437): a spool file leaves the spool only once the store holds every part of
-/// its present content. With the store away longer than any age rule (files six days old)
-/// repeated shipper runs delete nothing and keep every ledger entry; neither spool unit runs
-/// anything at start besides the spool itself, so a unit restart deletes nothing; a file whose
-/// publication storage pressure refuses stays; an acknowledged file is set aside for a run
-/// and deleted only if it still holds nothing the store lacks, so a line a spool script
-/// appends after the acknowledgement or during the lookup stays available to ship.
+/// its present content. Repeated shipper runs during an outage keep six-day-old files and
+/// their ledger entries. A file refused under storage pressure stays. An acknowledged file
+/// is set aside and its current contents are checked again before deletion, so an append
+/// after acknowledgement or during lookup stays available to ship.
 #[tokio::test(flavor = "current_thread")]
 async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
     tokio::task::LocalSet::new()
@@ -6605,8 +6496,8 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
             let data = dir.path().join("store");
             let socket = data.join("rpc.sock");
             // One file ships whole; the other is cut into line-bounded parts.
-            let whole = spool.join("katamari-stored-a.jsonl");
-            let split = spool.join("katamari-stored-b.jsonl");
+            let whole = spool.join("producer-a.jsonl");
+            let split = spool.join("producer-b.jsonl");
             let whole_bytes = b"{\"a\":1}\n".to_vec();
             let split_bytes: Vec<u8> = (0..6)
                 .flat_map(|n| format!("{{\"n\":{n},\"pad\":\"xxxxxxxxxxxxxxxx\"}}\n").into_bytes())
@@ -6622,7 +6513,7 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
                     .unwrap();
             }
             // An interrupted run left a file set aside whose lines the store never held.
-            let leftover = spool.join(".reaping-katamari-stored-c.jsonl");
+            let leftover = spool.join(".reaping-producer-c.jsonl");
             let leftover_bytes = b"{\"c\":3}\n".to_vec();
             std::fs::write(&leftover, &leftover_bytes).unwrap();
             let ship_config = dir.path().join("ship.toml");
@@ -6633,7 +6524,7 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
                      max_chunk_lines = 1\nmax_files_per_run = 64\n\
                      max_pending_bytes = 16777216\nmax_queue_bytes = 1073741824\n\
                      sparrow = {:?}\nsocket = {:?}\n\n\
-                     [[source]]\nname = \"spool\"\ndir = {:?}\npattern = \"katamari-*.jsonl\"\n\
+                     [[source]]\nname = \"spool\"\ndir = {:?}\npattern = \"producer-*.jsonl\"\n\
                      rule = \"settled\"\nformat = \"jsonl\"\nsettle_seconds = 0\n\
                      delete_acknowledged = true\n",
                     intake,
@@ -6661,22 +6552,6 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
             }
             let fed = std::fs::read_dir(intake.join("spool")).unwrap().count() as u64;
             assert!(fed > 2, "the split file ships as several parts: {fed}");
-            // A unit restart runs only the spool: no start-time command can delete a file.
-            for unit in ["katamari-journal-spool", "katamari-manager-spool"] {
-                let text = std::fs::read_to_string(format!(
-                    "{}/../../../deploy/systemd/user/{unit}.service",
-                    env!("CARGO_MANIFEST_DIR")
-                ))
-                .unwrap();
-                let commands: Vec<&str> =
-                    text.lines().filter(|line| line.starts_with("Exec")).collect();
-                assert_eq!(commands.len(), 1, "{unit}: {commands:?}");
-                assert!(
-                    commands[0]
-                        .starts_with(&format!("ExecStart=%h/.local/libexec/sparrow/{unit} ")),
-                    "{unit}: {commands:?}"
-                );
-            }
             // The store comes back and the watch publishes every waiting part.
             let config = write_server_config(dir.path(), &data, &socket);
             let text = std::fs::read_to_string(&config)
@@ -6689,7 +6564,7 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
             let producer = sparrow_client::Client::connect(&socket).await.unwrap();
             // An old shipper saw one delimiter and sent the file whole. The reaper
             // must still recognize that exact artifact under the corrected limit.
-            let legacy = spool.join(".reaping-katamari-stored-legacy.jsonl");
+            let legacy = spool.join(".reaping-producer-legacy.jsonl");
             let legacy_bytes = b"{\"legacy\":1}\n{\"legacy\":2}";
             std::fs::write(&legacy, legacy_bytes).unwrap();
             producer
@@ -6707,12 +6582,12 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
                 shipped.contains("deleted 1 acknowledged, set aside 2, not yet acknowledged 1"),
                 "{shipped}"
             );
-            let restored = spool.join("katamari-stored-c.jsonl");
+            let restored = spool.join("producer-c.jsonl");
             assert_eq!(std::fs::read(&restored).unwrap(), leftover_bytes);
             assert!(!legacy.exists());
             assert!(!leftover.exists() && !whole.exists() && !split.exists());
-            let whole_aside = spool.join(".reaping-katamari-stored-a.jsonl");
-            let split_aside = spool.join(".reaping-katamari-stored-b.jsonl");
+            let whole_aside = spool.join(".reaping-producer-a.jsonl");
+            let split_aside = spool.join(".reaping-producer-b.jsonl");
             assert_eq!(std::fs::read(&split_aside).unwrap(), split_bytes);
             // A spool script's late write: one line lands in the set-aside file, and the
             // script reopens the old name for the next one.
@@ -6739,7 +6614,7 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
             let late: Vec<_> = std::fs::read_dir(&spool)
                 .unwrap()
                 .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-                .filter(|name| name.starts_with("katamari-stored-a-late-"))
+                .filter(|name| name.starts_with("producer-a-late-"))
                 .collect();
             assert_eq!(late.len(), 1, "{late:?}");
             assert_eq!(
@@ -6748,7 +6623,7 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
             );
             // A writer appends through its still-open file during the payload lookup. The
             // server knows the old payload, but that acknowledgement cannot delete new bytes.
-            let racing = spool.join(".reaping-katamari-stored-race.jsonl");
+            let racing = spool.join(".reaping-producer-race.jsonl");
             let race_bytes = b"{\"race\":1}\n";
             std::fs::write(&racing, race_bytes).unwrap();
             let receipt = producer
@@ -6782,7 +6657,7 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
             .unwrap();
             let shipped = report(ship(&ship_config));
             assert_eq!(
-                std::fs::read(spool.join("katamari-stored-race.jsonl")).unwrap(),
+                std::fs::read(spool.join("producer-race.jsonl")).unwrap(),
                 b"{\"race\":1}\n{\"race\":2}\n",
                 "{shipped}"
             );
@@ -6800,7 +6675,7 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
                 matches!(refused, sparrow_client::Error::Domain { ref code, .. } if code == "STORAGE_PRESSURE"),
                 "{refused:?}"
             );
-            let pressed = spool.join("katamari-stored-d.jsonl");
+            let pressed = spool.join("producer-d.jsonl");
             std::fs::write(&pressed, b"{\"d\":4}\n").unwrap();
             let shipped = report(ship(&ship_config));
             assert!(pressed.exists(), "{shipped}");

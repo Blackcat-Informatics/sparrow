@@ -5,8 +5,8 @@
 # Each [[source]] NAME feeds the consume watch whose root is intake_root/NAME.
 # state_dir must be on the same filesystem as intake_root: items are renamed into the roots.
 # Create that directory and its watch (`sparrow ... watch put`) before shipping.
-intake_root = "/SPARROW/intake"
-state_dir = "/SPARROW/ship"
+intake_root = "/var/lib/sparrow/intake"
+state_dir = "/var/lib/sparrow/ship"
 max_chunk_bytes = 1048576      # line formats are split above 1 MiB ...
 max_chunk_lines = 32768        # ... or above 32,768 records, counting an unterminated last line;
                                # other formats ship whole, up to 7.93 GiB
@@ -15,8 +15,9 @@ max_pending_bytes = 16777216   # all consume roots together
 max_queue_bytes = 1073741824   # stop queueing new files while queues hold this much
 # Needed only by a source that sets delete_acknowledged (a spool the shipper owns):
 # sparrow = "/usr/bin/sparrow"           # the CLI that asks the store for each part
-# socket = "/SPARROW/store/rpc.sock"     # the store socket it asks
+# socket = "/var/lib/sparrow/store/rpc.sock"     # the store socket it asks
 
+# The producer directories below are examples; replace them with your own.
 # daily: dated files; the newest name may still be appended to.
 [[source]]
 name = "app-events"

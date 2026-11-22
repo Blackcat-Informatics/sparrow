@@ -221,8 +221,7 @@ was measured with the existing 64-cohort workload and unchanged runtime limits.
 PurRDF is locked to `a47940e1f130bf3739c6d59aaf89643209905ea4`.
 The frozen load image is `load-schema62-bee07bc`, SHA-256
 `104d2d08b68d693cc85a090f07d415114148626abb7feadc1eea86acb4ecbd51`.
-Private daemon/client copies match the default-feature production images in
-[Development runtime](development-runtime.md#schema-62-live-adoption), without
+Private daemon/client copies match the default-feature production images, without
 file capabilities. The example enables core `test-support`; the daemon enables
 no core features.
 
@@ -420,8 +419,7 @@ Subsequent signed source `b8a9a6c` fixes a concrete lost-subscription window in
 the serving loop: one native SIGINT receiver is registered before storage/worker
 startup and retained while maintenance branches await their blocking work.
 The original timeout had no stack capture, so its exact cause is not proven
-retroactively. [The runtime evidence](development-runtime.md#persistent-interrupt-subscription)
-records the real startup comparison, full source gate and public adoption.
+retroactively.
 Frozen failed-load probes `typed-load-qualification-4zk0g50_` and
 `typed-load-qualification-mw88zyrx` retain the same 10,000-match refusal and then
 exit zero about 0.114 seconds after SIGINT, removing their sockets. These are

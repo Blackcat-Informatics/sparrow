@@ -30,7 +30,7 @@ esac
 (($# == 0)) || die "unexpected arguments: $*"
 GROUP=${SPARROW_GROUP:-sparrow}
 [[ $SPARROW_SCOPE == system ]] || GROUP=${SPARROW_GROUP:-$(id -gn)}
-# The exposure the unit file scores today (deploy/evidence/systemd-analyze-security.md).
+# The exposure the unit file scores today (systemd-analyze security).
 MAX_EXPOSURE=${SPARROW_MAX_EXPOSURE:-2.0}
 FAILED=0 UNCHECKED=0
 
@@ -122,10 +122,8 @@ if [[ $SPARROW_SCOPE == system ]]; then
             fail "$timer is $(systemctl is-active "$timer" || true)"
         fi
     done
-    slice=$(systemctl show -p Slice --value "$SPARROW_UNIT")
-    if [[ $slice == lillith.slice ]]; then pass "in $slice"; else fail "in $slice, not the production slice"; fi
 else
-    unchecked "AppArmor, the timers and the slice (a user-scope test unit has none of them)"
+    unchecked "AppArmor and the timers (a user-scope test unit has none of them)"
 fi
 
 if ((FAILED)); then

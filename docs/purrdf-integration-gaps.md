@@ -14,8 +14,7 @@ Historical versioned observations do not describe the newer installed images.
 Schema 62 is deployed on format 92 with native SELECT, ASK, CONSTRUCT,
 DESCRIBE and measured EXPLAIN, typed RPC, CLI/MCP, immutable byte-bounded continuation, retained native
 certificates and source/coverage receipts. Metadata includes populated/recordless
-artifacts and retained Source/Stream declarations; the live qualification is in
-[Development runtime](development-runtime.md#schema-62-live-adoption).
+artifacts and retained Source/Stream declarations.
 Caller-selected stored-text rank/span relations are qualified through typed
 RPC, CLI/MCP and immutable continuation. They preserve native scores, captured
 corpus identity, original byte spans and independent coverage. Current-source
@@ -42,9 +41,7 @@ are unchanged. The qualification evidence below records how these surfaces grew.
 Source schema 57 shares frozen logical scope receipts across native graph,
 context and record/text/key/value captures. Graph receipt ownership uses the
 existing native owned-workspace seam; query certainty and coverage retain their
-original owners. [Source qualification](development-runtime.md#schema-57-graphcontext-scope-source-qualification)
-and [default-image live adoption](development-runtime.md#schema-57-live-adoption)
-are separately recorded; the remaining requirements listed above are still open.
+original owners. The remaining requirements listed above are still open.
 
 Deployed schema 58 adds native correlation through fixed SELECT recipes and typed
 substitutions, sharing the same immutable scope, governor, cancellation and

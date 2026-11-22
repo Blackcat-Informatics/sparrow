@@ -19,8 +19,7 @@ charged working allowance. See
 
 This document specifies the first-version contracts. Implemented schema sections
 describe current typed operations; other design examples retain their required
-target behavior. [Development runtime](development-runtime.md) identifies the
-installed and verified surfaces, and [broad query paging](query-streaming.md)
+target behavior. [Broad query paging](query-streaming.md)
 records the remaining capture limitation. Lifecycle, storage and recovery
 requirements are in [Architecture](architecture.md).
 
@@ -48,12 +47,12 @@ and the database. Rust applications can depend on `sparrow-client` independently
 
 Cruft is what a producer sends Sparrow as material it has set aside: files and
 records the producer no longer wants in its own store but does not want lost
-while it may still be wanted. `lillith_memetics` is the producer, and its cruft
-specification owns what an item means. Sparrow gives cruft no special path,
+while it may still be wanted. The producer's own specification owns what an
+item means. Sparrow gives cruft no special path,
 type or retention: an item of cruft is an ordinary artifact or record. Sparrow answers only where the item is and how long it
 stays.
 
-**Intake.** `lillith_memetics` sends cruft through the typed ingest and import
+**Intake.** A producer sends cruft through the typed ingest and import
 operations. Sparrow accepts them on the ingest-only Unix socket
 (`ingest_socket_path`, see the RPC binding in section 1 and the ingest socket in
 section 5) and on the private socket, like any other producer. The ingest socket records the sender's uid,
@@ -198,36 +197,6 @@ its size. The measurements support this guidance and no more:
   retry either at a fixed interval. A `RESOURCE_LIMIT` that is not retryable names a
   bound on the input: cut the input, because the same bytes fail the same way.
 
-**Mentation intake against the budget.** Two carriers bring `lillith_decodes`
-mentation to Sparrow. Neither is the retired shipped `lillith-mentation` source
-(see [the retired watch](development-runtime.md)); the artifacts it stored
-remain and are not part of either.
-
-- The backlog, 186 files and 6.78 GB, is sent once as `opaque` files through the
-  client crate by the `lillith_memetics` import. The route is proved on synthetic
-  files up to 520,880,974 bytes on a scratch instance; the largest real file is
-  521 MB and goes through the staged import as one artifact.
-- The traces written from now on, other than tool calls, which stay in the
-  producer's own vault, are sent by a sender that is not built. Its rate of about
-  64 MB a day is a planning figure from the backlog's 106 days, not a measured
-  intake.
-
-The arithmetic, in raw bytes before any stored factor: 64 MB a day for 90 days is
-5.76 GB; with the 6.78 GB backlog the total is about 12.5 GB. The live store held
-38.94 GB of a 53.69 GB budget, which leaves about 14.7 GB, so the intake fits with
-about 2.2 GB to spare when the stored size equals the raw size, and does not fit
-above a factor of about 1.2. Sent as `opaque`, the measured factors are 0.21x to
-0.27x for log text and 1.03x to 1.08x for incompressible bytes (the table above),
-which fit; add up to about 256 MiB of in-flight WAL. Sent as `jsonl`, the measured
-factors of 9.9x to 51x put the same intake at about 125 GB or more, over the
-budget, so the intake is sent as `opaque`. Nothing retires for 30 days after
-receipt, and with no archive worker running nothing retires at all, so a full
-budget refuses all ingest with `STORAGE_PRESSURE`. Sources: the 18 and 19 November
-comments on #370 and the table above.
-
-Not measured: the stored factor of the real mentation files in either form, and
-the cost of one small `jsonl` record sent alone as its own artifact.
-
 **Finding a sent item.** The one key for a file or an opaque item is its payload
 id: `blake3:` and 64 lower-case hex digits, the BLAKE3 hash of the artifact's exact
 bytes. A SHA-256 is not an index key. Sparrow computes the payload id of every
@@ -311,7 +280,7 @@ The original selector remains bound to the continuation through the existing
 lease owner. Set normalization describes the logical identity; it does not relax
 continuation selector equality.
 
-`received_from_ms`, `received_before_ms` and pin `expires_at_ms` retain raw UInt64
+`received_from_ms`, `received_before_ms` and pin `expires_at_ms` retain raw `UInt64`
 milliseconds, rendered as decimal strings; `received_before_ms=18446744073709551615`
 is the existing unbounded upper selector, never a formatted civil timestamp.
 Membership counts and revisions also render as decimal strings. Page size and
@@ -327,7 +296,6 @@ fail the existing exact-schema discovery check. The adapter refuses a missing or
 incoherent required scope receipt. Schema 57 extends this same logical scope law
 to SPARQL and context below. Correlation queries and production-volume acceptance
 remain required.
-The installed runtime version is recorded in [Development runtime](development-runtime.md).
 
 ### Graph and context scope receipts (schema 57)
 
@@ -793,7 +761,7 @@ count held and the bytes waiting behind it are reported as unknown.
 
 ```toml
 [archive]
-dir = "/net/synology/archives/sparrow-archive"  # required, absolute, outside data_dir
+dir = "/mnt/archive/sparrow-archive"  # required, absolute, outside data_dir
 start_fraction = 0.75                   # 0.5..0.95
 max_segment_bytes = 67108864            # 1 MiB..256 MiB; a larger entry gets its own segment
 max_segment_records = 10000             # at least 1
@@ -2227,8 +2195,7 @@ units, never proven-answer cardinality. Unknown outcomes expose no items, and
 query failures retain their native diagnostics without answer items. Certain and
 at-most results retain their original certificate and positional-prefix evidence.
 The typed `ResultPage.sparql` arm and generic `result_next` resume that same
-native capture. The installed development image is identified separately in
-`development-runtime.md`; schema additions in source do not imply deployment.
+native capture. Schema additions in source do not imply deployment.
 
 The native registry admits at most eight handles and 8 MiB of aggregate retained
 capacity, with a fixed 60-second lease from capture start. Page size is at most
@@ -2321,7 +2288,7 @@ in each page. Remote requests are always zero. Fuel zero is a real native
 governor setting, not a request for an unbounded query.
 
 Typed RDF values use a flat child-before-parent term forest with page-local
-UInt32 links, preserving blank scope, datatype, language, direction and nested
+`UInt32` links, preserving blank scope, datatype, language, direction and nested
 triple structure. Unreachable nodes, forward/cyclic references and expanded DAG
 amplification refuse admission. Persistent native dictionary IDs never cross
 the wire. Graph items distinguish primary/auxiliary streams, named declarations,
@@ -2475,9 +2442,9 @@ record occurrences, or invent a file-level score.
 `RecordsResults.artifactGroups` is a typed absent/list union. Agent output uses
 `artifact_groups=null` when grouping was not requested and a list when it was,
 including an empty list for no captured matches. Each group contains an opaque
-`artifact_id`, exact `captured_matches` across the frozen capture (a UInt64 decimal
+`artifact_id`, exact `captured_matches` across the frozen capture (a `UInt64` decimal
 string in agent output), and `page_indices` into this page's unchanged `rows`
-(bounded UInt32 integers). Groups are ordered by artifact ID; indices preserve
+(bounded `UInt32` integers). Groups are ordered by artifact ID; indices preserve
 the record matcher order. Text scores and evidence remain in the original text
 result. The count is of proven captured record occurrences, not all file lines,
 all possible matches under incomplete indexing, or a complete file's byte length.
@@ -2534,7 +2501,7 @@ budgets are null, rather than fabricated zero. Limits include candidate,
 native JSON occurrence, field and posting visits; independent membership member
 and record visits; text membership, text input/terms and compiled field admission;
 and result item, row, metadata, byte, page, registry and lease ceilings.
-Numeric UInt64 ceilings use exact decimal strings; requested page_size remains
+Numeric `UInt64` ceilings use exact decimal strings; requested page_size remains
 a bounded integer. These are phase-specific ceilings, not an all-I/O or RSS claim.
 JSON capture refusals identify the exhausted record-visit or native JSON
 occurrence budget and its effective ceiling. Both use the requested
@@ -2622,7 +2589,7 @@ prints the wall time of each open phase once at startup as
 
 Limits report direction_visits, catalog_bytes, response_bytes, output_records,
 requested_before, requested_after and independent membership member/record visit
-ceilings. UInt64 limits remain exact decimal strings; bounded output counts are
+ceilings. `UInt64` limits remain exact decimal strings; bounded output counts are
 integers. Record diagnostic/source-time profile references stay in each immutable
 row. Context does not perform JSON projection, text scoring or a native governor
 query, so its receipt identifies host admission without inventing those profiles.
@@ -2848,9 +2815,7 @@ before publication rather than being silently omitted.
 The installed schema-61 images passed default-image/private-copy and live
 TCP/Unix CLI/MCP qualification, including complete export of the original
 2,990-triple selection under unchanged budgets and exact-byte verification.
-See [runtime adoption](development-runtime.md#schema-61-live-adoption).
-The subsequent [schema-62 adoption](development-runtime.md#schema-62-live-adoption)
-adds stored-text integration. Separate current-source
+Schema 62 adds stored-text integration. Separate current-source
 [load/native measurements](load-qualification.md#schema-62-native-graph-and-text-follow-up)
 and [turnover](turnover-qualification.md#schema-62-retention-and-native-compaction-policy)
 qualify their finite workloads; no production SLA is inferred.
@@ -2914,8 +2879,7 @@ native ranked-retrieval declarations are not registered by this input.
 PurRDF's selected fallible-query return type does not expose its internal
 relation-witness ledger; Sparrow does not invent a returned generation or
 service-level attestation. Schema 62 is installed and qualified through both
-typed transports and CLI/MCP; see
-[Development runtime](development-runtime.md#schema-62-live-adoption).
+typed transports and CLI/MCP.
 
 ### Recordless artifact RDF writer authority
 
@@ -2959,8 +2923,7 @@ Capacity refusal preserves the prior checkpoint and can resume after space or
 budget recovery. Direct empty ingestion also admits its final RDF/catalog batch
 through the original live publication observer before any dependency is committed.
 The development service adopted schema 52 and format 48 after closed-copy
-migration qualification and a fresh closed-store backup; live acceptance is
-recorded in [Development runtime](development-runtime.md#schema-52-live-adoption).
+migration qualification and a fresh closed-store backup.
 
 ### Core graph vocabulary
 
@@ -4002,12 +3965,12 @@ instance and sequence declarations are part of the immutable retry receipt;
 they cannot be attached retrospectively to an ordinary accepted upload.
 
 Records expose an optional typed `ProducerPosition` with opaque stream ID and
-UInt64 sequence. Native occurrence metadata includes `stream` and
+`UInt64` sequence. Native occurrence metadata includes `stream` and
 `producerSequence` triples through PurRDF's dataset builder. `producerStreamGet`
 requires the discovered schema version and matching store identity. Its typed
 summary reports first/last accepted sequence, accepted event count, aggregate
 unobserved sequence count, recent inclusive gap intervals and whether those
-intervals cover all observed gaps. CLI/MCP render UInt64 values as decimal
+intervals cover all observed gaps. CLI/MCP render `UInt64` values as decimal
 strings. Gaps count positions absent between accepted observations; they do not
 identify a loss cause. Positions before the first event and after the last
 remain unknown, so every summary retains `continuity_unknown=true`.
@@ -4598,9 +4561,9 @@ HTTP envelope or alternate query implementation is involved.
 
 ```text
 sparrow /path/to/rpc.sock status
-sparrow --secret-file ~/.config/sparrow/tcp.secret tcp://192.168.2.4:518 status
-sparrow --secret-file ~/.config/sparrow/tcp.secret tcp://192.168.2.4:518 records --source SOURCE
-sparrow --secret-file ~/.config/sparrow/tcp.secret tcp://192.168.2.4:518 mcp --stdio
+sparrow --secret-file ~/.config/sparrow/tcp.secret tcp://192.0.2.4:518 status
+sparrow --secret-file ~/.config/sparrow/tcp.secret tcp://192.0.2.4:518 records --source SOURCE
+sparrow --secret-file ~/.config/sparrow/tcp.secret tcp://192.0.2.4:518 mcp --stdio
 sparrow ENDPOINT pin REQUEST_ID STORE_ID NAME DAYS EVIDENCE_ID...
 sparrow ENDPOINT pin-release REQUEST_ID STORE_ID PIN_ID
 ```
@@ -4713,14 +4676,6 @@ layout, prepare, publish, get and cancel), `eventsIngest` and `flush`
 (`crates/sparrow-server/src/ingest_gate.rs`). A producer that writes its own client speaks
 the same schema and owns every rule the crate holds: resuming from the durable checkpoint,
 canceling on terminal failure and checking receipts.
-
-To consume the lab release, add the registry to the application's
-`.cargo/config.toml` and run `cargo add sparrow-client@0.1.0 --registry sparrow-lab`.
-
-```toml
-[registries.sparrow-lab]
-index = "sparse+http://lillith:7555/api/packages/fleet/cargo/"
-```
 
 The binaries are `sparrowd` for the daemon and `sparrow` for its client.
 Every client invocation takes an optional `--secret-file PATH` and then an
@@ -5093,7 +5048,7 @@ snapshot for its lifetime. Logging producers
 only ingest, so anonymous TCP suffices. Direct clients and workers share discovery, retries,
 store identity checks and native field preservation. Both examples use the
 shared `Endpoint::parse` spelling, `tcp://IP:PORT` or a Unix path. The tracing
-example can therefore send to `tcp://192.168.2.4:518`.
+example can therefore send to `tcp://192.0.2.4:518`.
 
 `sparrow_client::TracingLayer::new(delivery.clone())` composes through
 `SubscriberExt::with`; it never sets a global subscriber. One Sparrow layer per
@@ -5496,7 +5451,7 @@ contradictory reference counts, corrupt payloads and invalid catalog identities
 produce `STORAGE_FAILURE`. Cancellation shares the connection/caller read lifetime
 and preserves worker admission through retirement. The SDK checks store identity,
 wire size, counts, ownership bounds and clock/window agreement before agents
-render the result. UInt64 counters use decimal strings in CLI/MCP JSON.
+render the result. `UInt64` counters use decimal strings in CLI/MCP JSON.
 
 This read does not advance intake, synchronize buffered writes, retire evidence,
 renew pins or run compaction. Logical retirement eligibility never certifies

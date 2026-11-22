@@ -4,6 +4,8 @@
 [package]
 name = "sparrow-archive"
 version = "0.1.0"
+description = "Offline verification and exact-byte extraction of Sparrow GTS archives"
+repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true

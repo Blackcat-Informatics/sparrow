@@ -11,8 +11,8 @@
 # The rendered unit keeps the production sandbox (seccomp filter, MemoryDenyWriteExecute,
 # ProtectSystem=strict, address families, namespaces, resource limits) and drops only what an
 # unprivileged user manager cannot apply: the user and group, the credential, the AppArmor
-# profile, the capability, the slice, negative nice and OOM adjustment. ProtectHome= becomes
-# read-only because the scratch directory is under /home. deploy/evidence/lifecycle.md records a run.
+# profile, the capability, negative nice and OOM adjustment. ProtectHome= becomes
+# read-only because the scratch directory is under /home.
 #
 # The instance serves test loads too (deploy/README.md, "Test instance"): a second socket for
 # senders, readable by one group (SPARROW_TEST_INGEST_GROUP, default the invoking user's primary

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 .DEFAULT_GOAL := check
-.PHONY: all check precommit hook-check tools-check fmt fmt-check lint test check-shipped census census-cross census-check install-hooks build-runtime install-bin seed-excludes-check
+.PHONY: all check precommit hook-check tools-check fmt fmt-check lint test check-shipped census census-cross census-check census-tool-check install-census install-hooks build-runtime install-bin
 
 all: check
 
@@ -29,10 +29,6 @@ install-bin: tools-check
 	@git diff --quiet HEAD -- || { echo "error: commit first; ./bin names images for HEAD"; exit 1; }
 	cargo build --locked --release -p sparrow-access -p sparrow-server --bins --example recovery --example stamp
 	tools/install-bin.sh
-
-# Every exclusion in .config/wt.toml names something this host keeps (tools/seed-excludes-check.sh).
-seed-excludes-check:
-	tools/seed-excludes-check.sh
 
 tools-check:
 	@command -v cargo >/dev/null || { echo "error: cargo is required (Rust 1.98 or newer)"; exit 1; }
@@ -63,22 +59,29 @@ check-shipped:
 	cargo clippy --locked --release -p sparrow-client --lib -- -D warnings
 	cargo clippy --locked --release -p sparrow-server --lib --bins -- -D warnings
 
-# The census defaults to the workspace its binary was compiled in. A shared
-# compile cache can reuse a binary built in another checkout, so name this one.
-CENSUS := cargo run -q --locked --release -p sparrow-helper-census -- --root $(CURDIR)
+CENSUS_VERSION := 0.8.0
+CENSUS := cargo-raf-census --workspace "$(CURDIR)"
+CENSUS_PIN := --reference-pin-file registry/compatibility.toml --reference-pin-key supplier.purrdf.git_revision
+CENSUS_REPOSITORY = $$(python3 -c 'import tomllib; print(tomllib.load(open("registry/compatibility.toml", "rb"))["supplier"]["purrdf"]["repository"])')
+# The repository's lint and check-shipped targets enforce production Clippy.
+CENSUS_PINNED_CHECK = repository="$(CENSUS_REPOSITORY)" && $(CENSUS) check $(CENSUS_PIN) --reference-repo "$$repository" --no-production-lints --require-module-paths-in-package
 
-census: tools-check
-	$(CENSUS) --self-test
-	$(CENSUS) --baseline
+install-census:
+	cargo install --locked --version '=$(CENSUS_VERSION)' cargo-raf-census
 
-census-cross: tools-check
-	$(CENSUS) --cross-baseline
-	$(CENSUS) --cross-report > target/helper-census/cross-report.txt
-	@head -2 target/helper-census/cross-report.txt
+census-tool-check:
+	@version="$$(cargo-raf-census --version 2>/dev/null)" && test "$$version" = 'cargo-raf-census $(CENSUS_VERSION)' || { echo "error: cargo-raf-census $(CENSUS_VERSION) is required; run 'make install-census' and put Cargo's bin directory on PATH" >&2; exit 1; }
 
-census-check: tools-check
-	$(CENSUS) --self-test
-	$(CENSUS) --cross --check
+census: tools-check census-tool-check
+	$(CENSUS) self-test
+	$(CENSUS) baseline --format turtle
+
+census-cross: tools-check census-tool-check
+	@$(CENSUS_PINNED_CHECK)
+
+census-check: tools-check census-tool-check
+	$(CENSUS) self-test
+	@$(CENSUS_PINNED_CHECK)
 
 # Git 2.54's additive hooks preserve existing Stage and repository hooks.
 install-hooks:

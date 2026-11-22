@@ -4,6 +4,8 @@
 [package]
 name = "sparrow-core"
 version = "0.1.0"
+description = "RocksDB storage, retention and query execution for Sparrow"
+repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true

@@ -3,21 +3,21 @@
 #
 # The Sparrow evidence server, installed verbatim as /etc/systemd/system/sparrow.service by
 # deploy/install.sh. It is complete: no drop-in is expected. deploy/README.md lays out the host it
-# needs (the sparrow user and group, /SPARROW, /etc/sparrow, the images under
+# needs (the sparrow user and group, /var/lib/sparrow, /etc/sparrow, the images under
 # /usr/local/libexec/sparrow) and deploy/RECOVERY.md justifies every item systemd-analyze security
 # still reports.
 #
-# Permissions (deploy/README.md, "Permissions"): the store /SPARROW/store is the daemon's, mode
+# Permissions (deploy/README.md, "Permissions"): the store /var/lib/sparrow/store is the daemon's, mode
 # 0710, and its socket rpc.sock is 0660; the daemon sets both itself every time it starts, so
 # members of the sparrow group can reach the socket and nothing else in the store. No ACL is set
-# on the store, because the daemon's own chmod would mask it away. /SPARROW/intake carries a
+# on the store, because the daemon's own chmod would mask it away. /var/lib/sparrow/intake carries a
 # default ACL with a named entry for the sparrow group, so a new root is writable by the daemon
 # whatever the umask of the member who made it.
 
 [Unit]
 Description=Sparrow typed diagnostic evidence server
 Documentation=file:///usr/local/share/doc/sparrow/deploy/README.md
-RequiresMountsFor=/SPARROW
+RequiresMountsFor=/var/lib/sparrow
 # Bound restarts so a failed run stops for diagnosis instead of looping (deploy/RECOVERY.md, "Unit
 # start-limit hit"). A start condition that will pass does not spend them: the daemon waits, and does
 # not exit, for free space for the open and the WAL replay, for a pending upgrade's write allowance,
@@ -39,7 +39,7 @@ User=sparrow
 Group=sparrow
 SyslogIdentifier=sparrowd
 ExecStart=/usr/local/libexec/sparrow/sparrowd --config /etc/sparrow/server.toml
-WorkingDirectory=/SPARROW/store
+WorkingDirectory=/var/lib/sparrow/store
 # The CHAP secret is root's (/etc/sparrow/tcp.secret, mode 0600) and reaches the daemon only as a
 # credential: /run/credentials/sparrow.service/tcp.secret, mode 0400, owned by sparrow, which is
 # what rpc_tcp_secret_file names. The daemon refuses a secret with any group or other bit.
@@ -63,27 +63,24 @@ RestartPreventExitStatus=78
 # The daemon reports its start wait and then readiness as STATUS=/READY=1 (start_wait.rs).
 NotifyAccess=main
 
-# Resources. The live daemon's cgroup peaked at 1.4 GB (2026-11-01) and a sustained deep-JSON
-# backlog reached the 2 GiB throttle (docs/deployment.md), so memory is protected up to 1 GiB,
-# throttled above 2 GiB and stopped at 4 GiB. One core bounds Sparrow against her other services
-# in the same slice; the slice's weight puts it ahead of development.
+# Resources. A busy daemon's cgroup peaks near 1.4 GB and a sustained deep-JSON backlog reaches
+# the 2 GiB throttle (docs/deployment.md), so memory is protected up to 1 GiB, throttled above
+# 2 GiB and stopped at 4 GiB. One core bounds Sparrow against the host's other services.
 MemoryLow=1G
 MemoryHigh=2G
 MemoryMax=4G
 CPUQuota=100%
-# Within lillith.slice Sparrow yields disk to her other services (default weight 100); the slice
-# as a whole outweighs user.slice 100 to 1.
+# Sparrow yields disk to the host's other services (default weight 100).
 IOWeight=20
 # The store keeps 1024 descriptors for RPC, intake, logs and the WAL and bounds RocksDB's table
-# cache (max_open_files) to the rest; below a soft limit of 2048 it refuses to open. The live store
-# held 917 table files at 32 GB, which the default soft limit of 1024 ran out on (issue #148).
+# cache (max_open_files) to the rest; below a soft limit of 2048 it refuses to open. A store
+# holds about 900 table files at 32 GB, which the default soft limit of 1024 runs out on.
 LimitNOFILE=65536
 # Six threads in normal running; tokio's blocking pool may grow to 512 threads under load.
 TasksMax=1024
 
-# Priority (fleet production-launch specification, section B): first on the host, not real time. Her slice's weights,
-# the highest nice and best-effort IO priority, and the OOM killer's last choice short of never.
-Slice=lillith.slice
+# Priority: first on the host, not real time. The highest nice and best-effort IO priority, and
+# the OOM killer's last choice short of never.
 Nice=-20
 IOSchedulingClass=best-effort
 IOSchedulingPriority=0
@@ -98,11 +95,11 @@ AppArmorProfile=sparrow
 NoNewPrivileges=yes
 # Not RestrictSUIDSGID=: seccomp cannot read openat2's mode, so systemd refuses openat2 outright
 # (ENOSYS), and the daemon needs openat2 to resolve paths beneath a consume root without symlinks;
-# it has no weaker fallback (measured on the test instance, deploy/evidence/lifecycle.md). A setuid
+# it has no weaker fallback (measured on the test instance). A setuid
 # or setgid file it made would be inert anyway: NoNewPrivileges=yes, and it creates every file with
 # a fixed mode (0600, 0700, 0710, 0660).
 
-# The public Cap'n Proto listener is 0.0.0.0:518 (2026-10-08), below 1024: binding it is the only
+# The public Cap'n Proto listener defaults to 0.0.0.0:518, below 1024: binding it is the only
 # privilege this service holds. No file capability is set on the image.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
@@ -110,7 +107,7 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ProtectSystem=strict
 ProtectHome=yes
 # The store and socket and the consume roots.
-ReadWritePaths=/SPARROW/store /SPARROW/intake
+ReadWritePaths=/var/lib/sparrow/store /var/lib/sparrow/intake
 PrivateTmp=yes
 PrivateDevices=yes
 PrivateIPC=yes

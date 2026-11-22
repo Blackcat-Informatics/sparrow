@@ -81,10 +81,6 @@ fn encode_durability(
     );
 }
 
-fn refusal(crate::admission::Refusal { code, message }: crate::admission::Refusal) -> Error {
-    Error::new(code, message)
-}
-
 /// Read the server's millisecond acceptance clock.
 pub fn now() -> Result<u64, Error> {
     sparrow_client::unix_millis_now().map_err(invalid)
@@ -323,7 +319,7 @@ impl Rpc {
     }
 
     pub(crate) fn require_admission(&self) -> Result<(), Error> {
-        self.admission.require_open().map_err(refusal)
+        self.admission.require_open().map_err(Error::from)
     }
 
     /// Persistent store identity bound into CHAP responses.
@@ -484,7 +480,7 @@ impl Rpc {
         &self,
         operation: impl FnOnce(Store, u64) -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Error> {
-        let permit = self.admission.writer().await.map_err(refusal)?;
+        let permit = self.admission.writer().await?;
         let result = self.run(permit, operation).await;
         if let Err(error) = &result {
             self.pause.write_refused(error);
@@ -498,11 +494,7 @@ impl Rpc {
         deadline: tokio::time::Instant,
         operation: impl FnOnce(Store, u64) -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Error> {
-        let permit = self
-            .admission
-            .writer_until(deadline)
-            .await
-            .map_err(refusal)?;
+        let permit = self.admission.writer_until(deadline).await?;
         let result = self.run(permit, operation).await;
         if let Err(error) = &result {
             self.pause.write_refused(error);
@@ -515,7 +507,7 @@ impl Rpc {
         &self,
         operation: impl FnOnce(Store, u64) -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Error> {
-        let permit = self.admission.diagnostic().map_err(refusal)?;
+        let permit = self.admission.diagnostic()?;
         let paused = self.pause.paused();
         let result = self.run(permit, operation).await;
         self.pause.read_finished(paused, &result);
@@ -527,7 +519,7 @@ impl Rpc {
         &self,
         operation: impl FnOnce(Store, u64) -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Error> {
-        let permit = self.admission.reader().map_err(refusal)?;
+        let permit = self.admission.reader()?;
         let paused = self.pause.paused();
         let result = self.run(permit, operation).await;
         self.pause.read_finished(paused, &result);

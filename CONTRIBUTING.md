@@ -1,13 +1,13 @@
 <!--
-SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
+SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 -->
 # Contributing to Sparrow
 
 Thanks for your interest in Sparrow. This repository holds the Rust workspace
 for the diagnostic evidence service: the storage core, the server with its
-Cap'n Proto RPC, CLI and stdio MCP adapter, the producer client, and the
-helper census that guards against duplicated code. Issues and pull requests
+Cap'n Proto RPC, CLI and stdio MCP adapter, and the producer client. The
+RAF helper census guards against duplicated code. Issues and pull requests
 are welcome.
 
 Read [the architecture](docs/architecture.md) and
@@ -35,27 +35,28 @@ Read [the architecture](docs/architecture.md) and
   callers through it. Shared test scaffolding belongs in the dev-only
   `sparrow-test-support` crate, not in copied files or cross-package `#[path]`
   modules.
-- **Record helpers in the ledger.** `helpers-ledger.toml` names each helper's
-  owner and its reuse rules. Add an ownership row when you introduce or adopt
+- **Record helpers in the ledger.** `helpers-ledger.ttl` names each helper's
+  owner and its reuse rules. Add an ownership job when you introduce or adopt
   a helper. Resolve a duplicate by sharing the code or adopting PurRDF. A
   necessary independent copy needs a narrowly scoped variant or exact-member
-  `[[distinct]]` row with a documented reason. Do not relax detectors or add
-  blanket exceptions to pass the gate. See
-  [the helper census](docs/helper-census.md).
+  `Distinct` entry with a documented reason. Do not relax detectors or add
+  blanket exceptions to pass the gate.
 - **Fail loudly.** Missing dependencies and broken invariants must produce
   actionable errors. Do not hide them behind silent fallbacks, swallowed
   errors, stubs or partial success.
 - **Keep runtime crates independent of tooling.** No runtime crate may depend
-  on `sparrow-helper-census` or `sparrow-test-support`.
+  on `sparrow-test-support`. Install the census separately with
+  `make install-census`.
 
 ## Development
 
 Prerequisites:
 
-- Rust 1.98 or newer (`rust-version` in `Cargo.toml`) with rustfmt and Clippy
+- Rust 1.98.1 or newer with rustfmt and Clippy. The helper census requires
+  Rust 1.98.1.
 - `capnp` (the Cap'n Proto compiler) and libclang, for the RPC schema and the
   RocksDB bindings
-- Git 2.54 or newer, and `tar`
+- Git 2.54 or newer, Python 3.11 or newer, `b3sum` and `tar`
 - A sibling PurRDF checkout at `../purrdf` that contains the revision pinned
   in [`registry/compatibility.toml`](registry/compatibility.toml). The tests
   read its text lexicons and the census archives its source at that revision.
@@ -68,11 +69,12 @@ git -C ../purrdf checkout "$(sed -n 's/^git_revision = "\(.*\)"/\1/p' registry/c
 The main commands:
 
 ```bash
+make install-census # install the pinned cargo-raf-census
 make check          # the gate: tools, fmt, release Clippy, release tests, census
 make install-hooks  # run make precommit as an additive pre-commit hook
 make fmt            # apply rustfmt
 make census         # local duplicate baseline
-make census-cross   # overlap report against the pinned PurRDF revision
+make census-cross   # report policy findings against the pinned PurRDF source
 make build-runtime  # release build of the server and client binaries
 ```
 
@@ -81,6 +83,11 @@ Clippy over every target with warnings denied, runs the release test suite,
 runs the census self-tests, and runs the pinned cross-workspace census check.
 `make all` is the same gate. Release builds of RocksDB are slow the first
 time; later runs reuse the target directory.
+
+The helper ledger uses canonical RDF 1.2 Turtle. Use RAF's RDF builder to
+edit the graph and render it as Turtle. Verify the result with
+`cargo-raf-census dump-ledger --format turtle`.
+[RAF ledger reference](https://github.com/Blackcat-Informatics/rust-agentic-foundations/blob/v0.8.0/docs/capabilities/census-ledger.md)
 
 ### Commit hooks
 
@@ -100,7 +107,7 @@ a change cannot pass, do not commit it; say so in the pull request instead.
   boundary or invariant. Prefer extending an existing behavioural case.
 - Update the docs when the change is user-visible, including
   [the interfaces](docs/interfaces.md) for any RPC, MCP or CLI change.
-- Keep `helpers-ledger.toml` current for any helper you added or adopted.
+- Keep `helpers-ledger.ttl` current for any helper you added or adopted.
 - Write commit subjects as a plain imperative sentence describing the
   behaviour, for example `Bound the service's CPU and disk use`.
 
@@ -112,12 +119,18 @@ for inclusion is licensed under the same three-way choice, without any
 additional terms or conditions. New source files carry the SPDX header:
 
 ```text
-SPDX-FileCopyrightText: 2026 Blackcat Informatics Inc.
+SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 ```
 
 See [LICENSING.md](./LICENSING.md) for the full terms, including the
 contributor relicensing grant.
+
+## Dependency checks
+
+Run `cargo deny --locked check` against the workspace before preparing a
+release. The policy checks the locked dependencies for advisories, license
+compatibility, wildcard dependencies and unapproved sources.
 
 ## Conduct and security
 

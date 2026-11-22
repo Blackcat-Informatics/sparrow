@@ -217,6 +217,12 @@ pub struct Refusal {
     pub message: &'static str,
 }
 
+impl From<Refusal> for sparrow_core::Error {
+    fn from(refusal: Refusal) -> Self {
+        Self::new(refusal.code, refusal.message)
+    }
+}
+
 const SHUTTING_DOWN: Refusal = Refusal {
     code: "SHUTTING_DOWN",
     message: "RPC storage admission is closed; retry the same intent after reconnecting",

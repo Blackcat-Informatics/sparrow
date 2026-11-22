@@ -15,8 +15,7 @@ above the chunk limits are split on line boundaries so that no artifact can
 exceed the per-artifact record limit or the consume publication deadline; a
 refused publication would otherwise be retried indefinitely. Every other format
 is shipped whole up to `MAX_IMPORT_BYTES`, about 7.93 GiB, the largest artifact
-whose catalog row one Sparrow retirement pass can read, until the v2 store format
-(#5). Sparrow splits a whole
+whose catalog row one Sparrow retirement pass can read. Sparrow splits a whole
 document above 128 MiB into raw records itself. A larger file is reported as a
 failure on every run and never queued, because Sparrow refuses it before upload.
 

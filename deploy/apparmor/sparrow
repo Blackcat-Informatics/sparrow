@@ -9,7 +9,7 @@
 #
 # The daemon runs nothing, so exec of every file is refused at the kernel, whatever another rule
 # grants (a deny wins over every allow). Its reads and writes are the ones a traced test instance
-# made (deploy/evidence/apparmor.md): its image and libraries, its configuration and credential,
+# made: its image and libraries, its configuration and credential,
 # the lexicon bundle, the store, the consume roots, its own /proc entries, the CPU list and
 # RocksDB's identity source.
 
@@ -38,13 +38,13 @@ profile sparrow flags=(attach_disconnected) {
   /run/sparrow-manual/* r,
 
   # The store and its socket: RocksDB files, the exclusive LOCK, the WAL and manifests.
-  /SPARROW/ r,
-  /SPARROW/store/ rw,
-  /SPARROW/store/** rwk,
+  /var/lib/sparrow/ r,
+  /var/lib/sparrow/store/ rw,
+  /var/lib/sparrow/store/** rwk,
 
   # Consume roots: discovery, the claim (a rename into .sparrow-inflight), its lock and deletion.
-  /SPARROW/intake/ r,
-  /SPARROW/intake/** rwk,
+  /var/lib/sparrow/intake/ r,
+  /var/lib/sparrow/intake/** rwk,
   # Its own descriptors (consume observation through /proc/self/fd/N), thread names, the CPUs the
   # runtime sizes itself from, and RocksDB's identity source. Its maps and status are in
   # abstractions/base.
