@@ -1,0 +1,19 @@
+ghprsq source head backlink metadata
+
+parent_hashes: a177ec85efbff2df674c29e93af9936b83e6b2cf
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 476
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/476
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 4b0337e9676c5393ad3474699ba56b0a1b38283a
+GhpRsq-Head-Ref: paudley/92-publish-sparrow-client-and-its-purrdf
+GhpRsq-Head-OID: a177ec85efbff2df674c29e93af9936b83e6b2cf
+GhpRsq-Result-Tree: 05883a1a25ae6262542d7cbd68455fb5dc046845
+GhpRsq-Result-Commit: 6f5b459ebb941705dfa7d0df5fda363e644db1f5
+GhpRsq-Parent-Hashes: a177ec85efbff2df674c29e93af9936b83e6b2cf
+GhpRsq-Squash-Notes-SHA256: a67d384532e145947425d8f1b1c113520cf0bc4e0c4d0307c91b671e825a6707
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
