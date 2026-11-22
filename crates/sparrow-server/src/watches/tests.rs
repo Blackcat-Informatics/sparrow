@@ -1294,6 +1294,129 @@ async fn a_refused_catalog_write_is_retried_and_does_not_end_the_worker() {
         .await;
 }
 
+/// A pressure refusal after a quarantine move leaves the claim pending and visible in watch
+/// status. The next admitted retirement clears that failure and keeps the original bytes and
+/// refusal sidecar available.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn quarantine_retirement_retries_after_storage_pressure_clears() {
+    let (directory, store, detector) = held_fixture("quarantine-pressure");
+    let root = detector.config.root.clone();
+    let filename = "refused.bin";
+    let source = root.join(filename);
+    let bytes = b"refused source\n";
+    std::fs::write(&source, bytes).unwrap();
+    let owner = detector.owner.claim().unwrap();
+    let id = owner
+        .reserve(
+            Path::new(filename),
+            CompletedFileIdentity::capture(&source.metadata().unwrap()),
+            &detector.config.source,
+            &detector.config.format,
+        )
+        .unwrap()
+        .import_id;
+    assert!(matches!(
+        owner.recover(&id, crate::now().unwrap()).unwrap(),
+        Recovery::Claimed(_)
+    ));
+    let refusal = Refusal::of(&Error::Upload(sparrow_client::Error::Domain {
+        code: "INVALID_ARGUMENT".into(),
+        message: "input refused".into(),
+        retryable: false,
+        class: sparrow_client::FailureClass::Unclassified,
+    }))
+    .unwrap();
+    let mut state = PassState::new(&store);
+    state.retry.insert(
+        id.clone(),
+        ClaimRetry {
+            refusal: Some(refusal),
+            ..ClaimRetry::due()
+        },
+    );
+
+    let mut catalog = Catalog::load(&store, std::slice::from_ref(&detector.config)).unwrap();
+    catalog.persist(&store).unwrap();
+    let mut roster = Roster {
+        detectors: vec![detector],
+        unopened: Vec::new(),
+    };
+    let registry = WatchRegistry::default();
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
+    let (_controller, commands) = watch_admin::channel();
+    let mut control = Control {
+        commands,
+        operations: Arc::new(tokio::sync::Semaphore::new(2)),
+        private: None,
+        outputs: crate::config::OutputPaths::default(),
+    };
+    let socket = directory.path().join("store/rpc.sock");
+    let mut catalog_retry = Backoff::default();
+    let mut received = None;
+    let mut pass_once = async |state: &mut PassState| {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            pass(
+                &store,
+                &mut roster,
+                &socket,
+                &mut stopped,
+                &registry,
+                (&mut catalog, &mut catalog_retry),
+                &mut control,
+                &mut received,
+                state,
+            ),
+        )
+        .await
+        .expect("quarantine pass did not reach its next turn")
+        .expect("quarantine pass failed");
+    };
+
+    // Refuse the commit without parking the entire pass at its initial free-space observation.
+    let floor = store.space_floor();
+    floor.refuse_writes_for_tests(true);
+    pass_once(&mut state).await;
+    state.retry.get_mut(&id).unwrap().at = Instant::now();
+    pass_once(&mut state).await;
+
+    let quarantine = root.with_file_name("producer.sparrow-quarantine");
+    let moved = quarantine.join(&id);
+    let sidecar = quarantine.join(format!("{id}.refusal"));
+    let note = "code=INVALID_ARGUMENT\nmessage=input refused\npath=refused.bin\n";
+    assert_eq!(std::fs::read(&moved).unwrap(), bytes);
+    assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), note);
+    assert!(!root.join(".sparrow-inflight").join(&id).exists());
+    assert!(store.consumption_retired().unwrap().is_empty());
+    let pending = store.consumption_pending().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].import_id, id);
+    let status = registry.snapshot().unwrap().pop().unwrap();
+    assert_eq!(status.pending, 1);
+    let failure = status.failure.expect("the failed retirement is visible");
+    assert!(
+        failure.contains(&id) && failure.contains("STORAGE_PRESSURE"),
+        "{failure}"
+    );
+
+    floor.refuse_writes_for_tests(false);
+    state.retry.get_mut(&id).unwrap().at = Instant::now();
+    pass_once(&mut state).await;
+    // The next pass publishes the cleared status. The stop signal ends its idle wait.
+    stop.send_replace(true);
+    pass_once(&mut state).await;
+
+    let retired = store.consumption_retired().unwrap();
+    assert_eq!(retired.len(), 1);
+    assert_eq!(retired[0].journal.import_id, id);
+    assert!(retired[0].retirement.reason.contains("INVALID_ARGUMENT"));
+    let status = registry.snapshot().unwrap().pop().unwrap();
+    assert_eq!(status.pending, 0);
+    assert!(status.failure.is_none(), "{:?}", status.failure);
+    assert_eq!(std::fs::read(&moved).unwrap(), bytes);
+    assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), note);
+}
+
 /// Value (#445): any pass error that names no claim or watch ended the worker (a latched or
 /// poisoned store returned `STORAGE_FAILURE` from the pass). Driven here by a closed operation
 /// budget, which fails the tail pass the same way. Protects: the worker outlives it, every watch

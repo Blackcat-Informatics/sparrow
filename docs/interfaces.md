@@ -3549,10 +3549,13 @@ stream or discards a frame:
   once. A frame the store refuses for pressure during that publication waits as
   a held frame does, so the listener accepts no connection behind it. A refusal
   other than pressure fails the listener and keeps the file. A spill that cannot
-  be written fails the stop with the error naming the file. A spill file that no
-  configured TCP listener owns fails the start, naming the file, and so does a
-  spill directory the daemon cannot write. A spill cut off
-  at its end by a crash drops that record, counted in the journal line in bytes.
+  be written fails the stop with the error naming the file. Startup checks the
+  spill directory even when the configuration has no syslog listeners. A spill
+  file without a matching TCP listener cannot replay, so the daemon refuses to
+  start and names the file. Restore the matching TCP listener to replay the
+  file, or move the file out of the spill directory by hand. A configured TCP
+  listener also requires a writable spill directory. A spill cut off at its end
+  by a crash drops that record, counted in the journal line in bytes.
   A wait for an operation permit is not cut short by a stop: the frame must
   still be published, which takes a permit from the budget shutdown waits on
   anyway. Each new offer is a refused write attempt, so the store-wide refusal
@@ -4505,11 +4508,13 @@ operator reconciles the two.
 
 When the quarantine cannot be written (a read-only or unwritable parent, no
 space, a root that is a mount point) or the retired record is full, the source
-stays in `.sparrow-inflight/`, the claim stays pending, and the watch `failure`
-reads `claim ID: non-retryable CODE: MESSAGE; quarantine failed: CAUSE`. Within one
-daemon run the worker repeats only the move on the ordinary backoff and uploads
-nothing. The refusal is held in memory, so after a restart a parked claim is
-uploaded once more, refused once more and parked again.
+stays in `.sparrow-inflight/` if the rename has yet to happen. If storage pressure
+refuses retirement after the move, the bytes and refusal file stay in quarantine.
+Either failure leaves the claim pending, with the watch `failure` set to
+`claim ID: non-retryable CODE: MESSAGE; quarantine failed: CAUSE`. The worker
+retries on the ordinary backoff without uploading the source. After the move it
+retries only retirement. After a restart it tries to upload a claim still in
+`.sparrow-inflight/` again.
 
 At the 1024-row bound no claim can be retired, by the worker or by an
 administrator. Each refused claim parks in place and holds one of the 16 journal
