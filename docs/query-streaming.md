@@ -107,7 +107,7 @@ snapshot backend ownership test. Its installed daemon preserves the exact live
 source/time/field rows and native ranked witnesses captured before cutover. An
 independent 7,058-record disk corpus retains predecessor source, temporal and text
 pages, including artifact counts, while the broad query still refuses at the
-existing capture bound. See [runtime adoption evidence](development-runtime.md#shared-native-read-adoption).
+existing capture bound.
 This establishes a shared production/helper foundation, not a snapshot-backed
 result lease or removal of the broad capture limit.
 
@@ -118,19 +118,15 @@ returned all 7,058 copied-corpus records over 48 pages, exactly matching the
 original ingestion receipts. The gate covers replay, release, absolute expiry,
 owner restart and disk-pressure refusal; live TCP/Unix/CLI/MCP checks passed.
 The private SIGKILL recovery check preserves evidence and rejects old cursors,
-with explicit removal of the verified dead owner's stale Unix socket. See
-[adoption evidence](development-runtime.md#disk-backed-record-query-adoption).
+with explicit removal of the verified dead owner's stale Unix socket.
 Later signed source `5ca7eeb` qualifies recovery by the production daemon itself,
-without a driver-side unlink, on a copied 7,058-record Btrfs store. See
-[owned endpoint recovery](development-runtime.md#owned-local-endpoint-recovery)
-for ownership checks, preserved names and the unchanged service restart policy.
+without a driver-side unlink, on a copied 7,058-record Btrfs store.
 
 The chronological writer remains serialized during capture. Mixed finite
 concurrency is measured in the [performance baseline](performance-baseline.md).
 Earlier private Unix and TCP client interruptions during partially written captures
 showed that admitted work finished and abandoned result leases retained their staging
-until owner maintenance purged them at the sixty-second deadline; see
-[abandoned query cleanup](development-runtime.md#abandoned-query-capture-cleanup).
+until owner maintenance purged them at the sixty-second deadline.
 That evidence qualifies the predecessor's bounded lease cleanup. Cooperative
 in-flight cancellation is described below; asynchronous native snapshot execution
 and production cancellation resource/latency qualification remain unfinished.

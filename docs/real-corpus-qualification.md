@@ -161,6 +161,5 @@ need separate measurements. These observations do not qualify sustained
 
 The public service received no sample ingestion. It was independently updated
 to the verified budget-diagnostic build; its store remains at 212 records.
-See [the development runtime](development-runtime.md#actionable-json-capture-budgets)
-for the source gate, installed image and public readback evidence. Complete
+Complete
 governed SPARQL and correlation remain required integration work.

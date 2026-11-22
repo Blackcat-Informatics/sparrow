@@ -4,6 +4,8 @@
 [package]
 name = "sparrow-rpc-tests"
 version = "0.1.0"
+description = "Integration tests for Sparrow's daemon, CLI and RPC interfaces"
+repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true

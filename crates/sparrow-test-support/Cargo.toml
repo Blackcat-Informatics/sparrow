@@ -4,6 +4,8 @@
 [package]
 name = "sparrow-test-support"
 version = "0.1.0"
+description = "Internal fixtures and process harnesses for Sparrow tests"
+repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false

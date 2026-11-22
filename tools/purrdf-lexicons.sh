@@ -38,10 +38,9 @@ root = sys.argv[1]
 def refuse(message):
     sys.exit("purrdf-lexicons: " + message)
 with open(root + "/registry/compatibility.toml", "rb") as f:
-    suppliers = [s for s in tomllib.load(f).get("supplier", []) if s.get("name") == "purrdf"]
-if len(suppliers) != 1:
-    refuse("registry/compatibility.toml must hold exactly one purrdf supplier")
-supplier = suppliers[0]
+    supplier = tomllib.load(f).get("supplier", {}).get("purrdf")
+if not isinstance(supplier, dict):
+    refuse("registry/compatibility.toml must contain [supplier.purrdf]")
 try:
     repository, revision, version = supplier["repository"], supplier["git_revision"], supplier["version"]
 except KeyError as missing:

@@ -467,14 +467,14 @@ mod tests {
         assert!(
             wait(
                 "STORAGE_FAILURE",
-                "IO error: lock hold by current process: /SPARROW/store/LOCK"
+                "IO error: lock hold by current process: /var/lib/sparrow/store/LOCK"
             )
             .is_some()
         );
         assert!(
             wait(
                 "STORAGE_FAILURE",
-                "IO error: While lock file: /SPARROW/store/LOCK: Resource temporarily unavailable"
+                "IO error: While lock file: /var/lib/sparrow/store/LOCK: Resource temporarily unavailable"
             )
             .is_some()
         );

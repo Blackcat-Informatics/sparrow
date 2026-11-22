@@ -7,8 +7,8 @@ SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 This is the design contract for Sparrow's first implementation. It defines
 required behavior, selected defaults, and qualification work. The implementation
-and finite acceptance checks are complete; executable surfaces and runtime
-evidence are recorded in [Development runtime](development-runtime.md).
+and finite acceptance checks are complete; executable surfaces are specified in
+[Interfaces](interfaces.md).
 Production capacity claims remain limited to the measured envelopes in the
 [acceptance boundary](implementation-plan.md#current-acceptance-boundary).
 
@@ -33,17 +33,14 @@ radical improvement over scattered log files. It optimizes only for speed and
 storage efficiency. A mechanism that costs speed or space without preventing a
 loss a logging store cannot tolerate is removed or relaxed, and Sparrow owes no
 more durability, privacy or tamper-evidence than the plain log files it
-replaces. The Katamari/Sparrow razor decides where data lives: whatever needs
-long-term storage, privacy, encryption, validation or resilience goes to
-Katamari, at a high and justified bar, and everything else goes to Sparrow. The
-razor may cut one body of data into sets and subsets, each placed by its own
-need. Nothing irreplaceable may have its only copy in Sparrow. Worked examples:
-anonymous intake is allowed because it is the fastest path; deduplication and
-compression matter because efficient storage is a primary goal; signatures and
-integrity come after all other concerns and never on the hot path.
+replaces. Place data requiring long-term storage, privacy, encryption,
+validation or resilience in a system designed for those requirements.
+Different subsets of the same data may need different storage. Keep an
+independent copy of irreplaceable evidence. Sparrow prioritizes a fast inlet,
+deduplication and compression and keeps signatures off the ingestion hot path.
 
-Producers send Sparrow what they set aside, including the cruft that
-`lillith_memetics` sends. Sparrow stores it as any other artifact or record and
+Producers send Sparrow what they set aside, including cruft: material a
+producer no longer wants in its own store. Sparrow stores it as any other artifact or record and
 retires it, once the archive holds it, at `received_at + 30 days` unless a pin
 keeps it, and never deletes it before it is archived; the intake, limits and lookup are in the [cruft section of the interfaces](interfaces.md#cruft).
 
@@ -52,8 +49,8 @@ distributed queries, embeddings, an embedded language model, and a human
 dashboard are outside the first version. Agents perform reasoning using evidence
 and tools exposed by Sparrow.
 
-Local sample locations supplied on 2026-10-06 include `/var/log`,
-`~/Active/lillith_soul/inner-core`, and `~/Active/lillith_brainstem`. Bounded
+Initial sample locations were `/var/log`, application JSONL logs and
+model-inference artifact trees. Bounded
 read-only structural discovery is recorded in the
 [implementation plan](implementation-plan.md). It does not establish complete
 corpus coverage, repetition rates, size distributions, or peak ingestion rates;

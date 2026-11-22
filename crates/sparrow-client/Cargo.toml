@@ -10,7 +10,10 @@ readme = "README.md"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-publish = ["crates-io", "sparrow-lab"]
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = ["crates-io"]
 license.workspace = true
 
 [dependencies]

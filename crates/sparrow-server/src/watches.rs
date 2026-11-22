@@ -1461,6 +1461,12 @@ async fn pause(
     for at in detectors.iter().filter_map(|detector| detector.due(claims)) {
         wake.by(at);
     }
+    // Each descriptor is borrowed from a detector and stays valid until its
+    // registration is dropped. Tokio's replacement constructor requires unsafe.
+    #[expect(
+        deprecated,
+        reason = "BorrowedFd keeps the descriptor valid for the registration"
+    )]
     let events = detectors
         .iter()
         .filter(|detector| detector.live())

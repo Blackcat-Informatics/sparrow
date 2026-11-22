@@ -1,15 +1,15 @@
 # SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 #
-# Production configuration template, installed as /etc/sparrow/server.toml (root:sparrow 0640) by
+# Configuration template, installed as /etc/sparrow/server.toml (root:sparrow 0640) by
 # deploy/install.sh when that file is absent. It holds no secret: rpc_tcp_secret_file names the
 # credential systemd hands the unit (LoadCredential=tcp.secret:/etc/sparrow/tcp.secret), so the
 # secret itself stays in /etc/sparrow/tcp.secret, root 0600. Unknown keys are errors.
 
-socket_path = "/SPARROW/store/rpc.sock"
-data_dir = "/SPARROW/store"
+socket_path = "/var/lib/sparrow/store/rpc.sock"
+data_dir = "/var/lib/sparrow/store"
 
-# The public Cap'n Proto listener (2026-10-08). Anonymous peers may discover, ingest and import;
+# The public Cap'n Proto listener. Anonymous peers may discover, ingest and import;
 # everything else needs a CHAP session with this secret.
 rpc_tcp_address = "0.0.0.0:518"
 rpc_tcp_secret_file = "/run/credentials/sparrow.service/tcp.secret"
@@ -31,7 +31,7 @@ buffered_flush_interval_ms = 2000
 text_lexicon_dir = "/usr/local/share/sparrow/lexicons-REV/artifacts"
 
 # Consume watches live in the store's catalog; an entry here only seeds a missing catalog. Add
-# roots with `sparrow /SPARROW/store/rpc.sock watch put ...` (deploy/config/watch.toml.example).
+# roots with `sparrow /var/lib/sparrow/store/rpc.sock watch put ...` (deploy/config/watch.toml.example).
 
-# The archive table is absent: the live daemon runs no archive worker, and the unit and profile do
+# The archive table is absent: the daemon runs no archive worker, and the unit and profile do
 # not grant its path. See docs/archive-format.md, "Archive status".

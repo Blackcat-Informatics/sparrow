@@ -3,10 +3,10 @@
 
 # Development store and owned synthetic intake only. No live producer directories.
 # Consume entries seed a missing catalog; use typed watch administration afterward.
-socket_path = "/home/paudley/.local/state/sparrow/development-v5/rpc.sock"
+socket_path = "/srv/sparrow-dev/development-v5/rpc.sock"
 rpc_tcp_address = "0.0.0.0:518"
-rpc_tcp_secret_file = "/home/paudley/.config/sparrow/tcp.secret"
-data_dir = "/home/paudley/.local/state/sparrow/development-v5"
+rpc_tcp_secret_file = "/srv/sparrow-dev/tcp.secret"
+data_dir = "/srv/sparrow-dev/development-v5"
 disk_budget = 536870912
 maintenance_reserve = 67108864
 max_records = 100000
@@ -14,11 +14,11 @@ max_pin_members = 10000
 max_concurrent_requests = 4
 max_rpc_connections = 16
 buffered_flush_interval_ms = 2000
-text_lexicon_dir = "/home/paudley/Active/purrdf/crates/text/lexicons/artifacts"
+text_lexicon_dir = "/path/to/purrdf/crates/text/lexicons/artifacts"
 
 [[consume]]
 id = "development-completed"
-root = "/home/paudley/.local/state/sparrow/development-completed"
+root = "/srv/sparrow-dev/development-completed"
 producer_contract = "finished_files"
 source = "development-consume"
 format = "jsonl"

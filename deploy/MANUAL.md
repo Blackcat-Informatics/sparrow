@@ -29,9 +29,9 @@ Expect `inactive` (or `failed`).
 | `OOMScoreAdjust=-900` | `choom -n -900 --` |
 | `AppArmorProfile=sparrow` | `aa-exec -p sparrow --` (the profile must be loaded) |
 | `LoadCredential=tcp.secret:/etc/sparrow/tcp.secret` | A private copy under `/run/sparrow-manual`, which the profile admits |
-| `WorkingDirectory=/SPARROW/store` | `cd /SPARROW/store` |
+| `WorkingDirectory=/var/lib/sparrow/store` | `cd /var/lib/sparrow/store` |
 | `KillSignal=SIGINT` | Ctrl-C in the foreground, or `kill -INT PID` |
-| The slice, the memory and CPU limits, the namespaces and the seccomp filter | Not reproduced by hand; use `systemd-run` below when systemd works |
+| The memory and CPU limits, the namespaces and the seccomp filter | Not reproduced by hand; use `systemd-run` below when systemd works |
 
 ## Foreground, confined, with the public listener
 
@@ -43,7 +43,7 @@ sudo install -d -m 0750 -o root -g sparrow /run/sparrow-manual
 sudo install -m 0400 -o sparrow -g sparrow /etc/sparrow/tcp.secret /run/sparrow-manual/tcp.secret
 sudo sed 's|^rpc_tcp_secret_file = .*|rpc_tcp_secret_file = "/run/sparrow-manual/tcp.secret"|' \
     /etc/sparrow/server.toml | sudo install -m 0640 -o root -g sparrow /dev/stdin /run/sparrow-manual/server.toml
-cd /SPARROW/store
+cd /var/lib/sparrow/store
 sudo choom -n -900 -- nice -n -20 ionice -c 2 -n 0 \
     setpriv --reuid=sparrow --regid=sparrow --init-groups \
         --inh-caps=-all,+net_bind_service --ambient-caps=-all,+net_bind_service \
@@ -52,10 +52,10 @@ sudo choom -n -900 -- nice -n -20 ionice -c 2 -n 0 \
 ```
 
 The daemon logs to standard error: the TCP binding, a free-space wait, watch
-activity. In a second shell, verify it as the operator:
+activity. In a second shell, verify it as an administrator:
 
 ```bash
-sparrow /SPARROW/store/rpc.sock status
+sparrow /var/lib/sparrow/store/rpc.sock status
 ```
 
 Stop it with Ctrl-C, which is SIGINT: it drains workers, synchronizes the WAL
@@ -75,10 +75,10 @@ sudo systemctl start sparrow.service
 - Without AppArmor, to tell a denial from another failure: drop
   `aa-exec -p sparrow --`. Compare with `sudo journalctl -k -b | grep 'profile="sparrow"'`.
 - Traced: insert `strace -f -e trace=%file,%network -o /tmp/sparrowd.trace`
-  before `/usr/local/libexec/sparrow/sparrowd`; `deploy/evidence/apparmor.md`
-  shows how the profile's path list was derived this way.
+  before `/usr/local/libexec/sparrow/sparrowd`; the profile's path list is
+  derived from such a trace.
 - With systemd working but the unit broken, run the same image under a
-  transient unit in the production slice instead. Prepare `/run/sparrow-manual`
+  transient unit instead. Prepare `/run/sparrow-manual`
   first, exactly as in "Foreground, confined, with the public listener" above
   (its first three commands). A transient unit's credentials would land under
   `/run/credentials/sparrow-manual.service/`, which neither the configuration
@@ -86,11 +86,11 @@ sudo systemctl start sparrow.service
   profile admits, and no `LoadCredential=`:
 
   ```bash
-  sudo systemd-run --unit=sparrow-manual --slice=lillith.slice --uid=sparrow --gid=sparrow \
+  sudo systemd-run --unit=sparrow-manual --uid=sparrow --gid=sparrow \
       -p AppArmorProfile=sparrow -p UMask=0077 -p KillSignal=SIGINT -p Nice=-20 \
       -p OOMScoreAdjust=-900 -p AmbientCapabilities=CAP_NET_BIND_SERVICE \
       -p CapabilityBoundingSet=CAP_NET_BIND_SERVICE \
-      -p WorkingDirectory=/SPARROW/store --wait --pty \
+      -p WorkingDirectory=/var/lib/sparrow/store --wait --pty \
       /usr/local/libexec/sparrow/sparrowd --config /run/sparrow-manual/server.toml
   ```
 
@@ -103,7 +103,7 @@ sudo systemctl start sparrow.service
 ## The helpers by hand
 
 ```bash
-sudo -u paudley sh -c 'umask 0077; exec /usr/local/libexec/sparrow/sparrow-ship /etc/sparrow/ship.toml'
+sudo -u sparrow-ship sh -c 'umask 0077; exec /usr/local/libexec/sparrow/sparrow-ship /etc/sparrow/ship.toml'
 ```
 
 The shipper needs only the daemon to be consuming.

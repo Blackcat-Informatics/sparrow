@@ -6470,7 +6470,7 @@ fn floor_retirement_stops_at_the_bound() {
         .map(|at| {
             let line = (0..256 * 1024_u64)
                 .map(|index| {
-                    let hashed = index.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    let hashed = index.wrapping_mul(purrdf_hash::mix::GOLDEN_GAMMA)
                         ^ at.wrapping_mul(0xD6E8_FEB8_6659_FD93);
                     b'a' + ((hashed >> 33) % 26) as u8
                 })
@@ -7333,7 +7333,7 @@ fn forced_compaction_family_sizes_include_blob_file_bytes() {
     };
     // Random letters in one line: log text the projection accepts, and too dense for blob
     // compression to shrink the four 64 KiB chunks (the 256 KiB payload) below the bound asserted.
-    let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut seed = purrdf_hash::mix::GOLDEN_GAMMA;
     let payload: Vec<u8> = (0..256 * 1024)
         .map(|_| {
             seed ^= seed << 13;

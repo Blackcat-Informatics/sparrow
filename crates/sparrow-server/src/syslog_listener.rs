@@ -890,7 +890,7 @@ pub fn check_spill_owners(dir: &std::path::Path, listeners: &[SyslogListener]) -
         .iter()
         .any(|listener| listener.transport == SyslogTransport::Tcp)
     {
-        require_writable(dir)?;
+        prepare_spill_directory(dir)?;
     }
     let owned: std::collections::BTreeSet<std::ffi::OsString> = listeners
         .iter()
@@ -934,7 +934,7 @@ pub fn check_spill_owners(dir: &std::path::Path, listeners: &[SyslogListener]) -
 /// Create the spill directory if it is missing and prove the daemon can write in it, so a stop
 /// under pressure never finds out that the spill cannot be kept. The failure names the directory
 /// and the host steps that make it writable.
-fn require_writable(dir: &std::path::Path) -> io::Result<()> {
+fn prepare_spill_directory(dir: &std::path::Path) -> io::Result<()> {
     let refuse = |action: &str, error: io::Error| {
         io::Error::new(
             error.kind(),

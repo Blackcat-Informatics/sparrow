@@ -17,9 +17,8 @@ These requirements bind this design:
 - Sparrow never deletes unarchived evidence, even when the archive is down.
 - Archiving starts early, at 75% of the retention window or of the data budget.
   A record counts as archived only once its segment is written and verified.
-- The archive directory is `/net/synology/archives/sparrow-archive`, set by `[archive] dir`,
-  which is required and has no built-in default. `/net/synology/archives/sparrow` is the
-  retired online-backup tree (removed in #330) and is not an archive root.
+- The archive directory is set by `[archive] dir`, which is required and has no built-in
+  default; typically a network share such as `/mnt/archive/sparrow-archive`.
 - An unreachable archive at startup starts the daemon degraded; it does not refuse to start.
 - When archiving is enabled on an existing store, the whole retained backlog is
   archived before anything is deleted.
@@ -33,27 +32,16 @@ These requirements bind this design:
 
 ## Archive status
 
-The archive is implemented on `main` and is not running on the live daemon.
+Configure `[archive]` to start the archive worker on a writable daemon.
+The worker encodes and verifies GTS segments before advancing the store's
+archive watermark. A new store without archiving retains unarchived
+evidence past its deadline. Ingestion can receive `STORAGE_PRESSURE`
+when the budget fills. A store that has adopted an archive policy requires
+compatible archive configuration at the next writable open.
 
-- Implemented: the specification and the deletion gate with its store fence
-  (phases P0 and P1), segment encoding (P2, `Store::archive_prepare`), the
-  archive worker and NAS thread (P3, `sparrow_server::archive::Worker`, started
-  by `sparrowd` when `[archive]` is configured and the daemon is not
-  query-only) and the offline reader (P4, the `sparrow-archive` crate with its
-  `list`, `verify` and `extract` commands).
-- Not running: the live daemon has no `[archive]` table, so it runs no archive
-  worker and its store carries no archive policy.
-
-The live store deletes nothing today, because the live daemon runs no archive worker and so nothing is retired. Running the worker on the live daemon waits on an authorized image switch.
-
-Implemented does not mean running: whether a daemon runs the worker is
-operational state, set by its `[archive]` table and shown in its journal. Until
-a worker runs, a store retires nothing on its own. Expiry waits, and under
-pressure ingest is refused with `STORAGE_PRESSURE`. Other documents link to this
-section for the state of the archive.
-
-A daemon with a worker reports its phase, watermark and last failure in status; see
-[section 8](#8-write-protocol).
+Status reports the worker phase, watermark and last failure. The offline
+`sparrow-archive` command lists, verifies and extracts from GTS files.
+[Write protocol](#8-write-protocol) · [Offline commands](#10-readers)
 
 ## 1. Layout
 
@@ -354,8 +342,9 @@ leave one copy), the watermark stays and the intent
 stays. The next pass rebuilds the range; bytes of another identity replace the intent and take
 the freed name, and the same bytes are refused again. A valid file a crash left under the
 range's name, followed by a rebuild under another identity, fails the byte-equal check; the
-journal line names the file, and the operator moves it aside. A Synology NFS export must use synchronous writes
-(`sync`); with `async` exports fsync proves nothing.
+journal line names the file, and the operator moves it aside. Configure NFS
+exports for synchronous writes (`sync`) so a successful fsync certifies
+the committed bytes.
 
 A held worker is visible in status. After a failed pass `status` reports `archive_worker`
 (`Status.archiveWorker`) with `phase` `holding`, the watermark in `through`, `intent_in_flight`,

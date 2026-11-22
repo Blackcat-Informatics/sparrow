@@ -4,3 +4,6 @@
 /target/
 /.stage/
 /bin/
+/.cargo/config.toml
+/.config/wt.toml
+/config/development.toml

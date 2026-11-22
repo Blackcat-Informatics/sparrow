@@ -5,8 +5,7 @@ SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 # Sparrow implementation plan
 
-Current executable surfaces, deployed schemas and verification are recorded in
-[Development runtime](development-runtime.md); native integration and its gaps
+Current executable surfaces are specified in [Interfaces](interfaces.md); native integration and its gaps
 are in [PurRDF integration gaps](purrdf-integration-gaps.md). This plan states
 the query priorities, sample discovery and delivery slices.
 
@@ -16,9 +15,7 @@ import, then query surfaces, then continuous producers.
 
 ## Current acceptance boundary
 
-The following evidence covers the original first-version scope. Installed image
-identities and source qualification are recorded separately in
-[Development runtime](development-runtime.md). Finite fixtures do not establish
+The following evidence covers the original first-version scope. Finite fixtures do not establish
 production capacity.
 
 | Required area | Evidence already present | Qualification boundary |
@@ -72,22 +69,20 @@ evidence. SPARQL remains the composable graph query surface.
 
 ## Sample discovery
 
-Read-only discovery used these local locations. The supplied `lillith-soul` path
-resolves here under the repository spelling `lillith_soul`.
+Read-only discovery used these kinds of local input.
 
 | Location | Observed evidence and implication |
 | --- | --- |
 | `/var/log` | Plain and rotated logs, compressed files, and native `.journal` files coexist. Several directories/files are unreadable to the current user. Corpus discovery must report inaccessible inputs rather than claim complete coverage. |
-| `~/Active/lillith_soul/inner-core/corrections` and `discards` | JSONL with timestamp, component/producer, process/sequence, nested objects/arrays, strings, integers, booleans, and nulls. Source profiles must map diagnostic fields without limiting discovery to those mappings. |
-| `~/Active/lillith_soul/inner-core/private-mentation` | A live JSONL file measured about 153 MB at inspection, with rotated segments. Its sampled records include deep nested content and a line of 153,749 bytes. Size-bounded streaming and oversized-record cases are required. |
-| `~/Active/lillith_soul/inner-core/inference-evidence/brainstem-terminal-v2` | Many small artifact bundles. All six inspected `.bin` files were valid UTF-8 JSON, including accounting, allocation, job, and terminal timing fields. Extensions alone cannot establish an artifact's format. |
-| `~/Active/lillith_brainstem` | The source/evidence tree contains many JSON files, including large generated analysis artifacts. A repository-wide sample selection must distinguish diagnostic evidence from source and generated tooling data. |
+| Application JSONL logs | JSONL with timestamp, component/producer, process/sequence, nested objects/arrays, strings, integers, booleans, and nulls. Source profiles must map diagnostic fields without limiting discovery to those mappings. |
+| A large live JSONL log | A live JSONL file measured about 153 MB at inspection, with rotated segments. Its sampled records include deep nested content and a line of 153,749 bytes. Size-bounded streaming and oversized-record cases are required. |
+| Model-inference artifact bundles | Many small artifact bundles. All six inspected `.bin` files were valid UTF-8 JSON, including accounting, allocation, job, and terminal timing fields. Extensions alone cannot establish an artifact's format. |
+| A source tree with generated JSON | The source/evidence tree contains many JSON files, including large generated analysis artifacts. A repository-wide sample selection must distinguish diagnostic evidence from source and generated tooling data. |
 
-This is preliminary discovery, not a corpus census or benchmark. The inner-core
+This is preliminary discovery, not a corpus census or benchmark. The application-log
 inventory stopped at 25,000 file entries and does not establish total size or
 file counts. Structural JSONL inspection read at most 2 MiB per selected file and
-considered at most 100 complete lines: 17 correction records, 8 discard records,
-and 100 mentation records parsed successfully. No complete malformed line was
+considered at most 100 complete lines: 25 application-log records and 100 large-log records parsed successfully. No complete malformed line was
 observed in those samples; that does not establish corpus-wide validity.
 The inspected `/var/log/pacman.log` prefix contained 870 bracket-prefixed lines
 within 64 KiB. Binary inspection read at most 64 KiB per selected `.bin` file.

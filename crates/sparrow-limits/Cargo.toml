@@ -9,7 +9,8 @@ documentation = "https://docs.rs/sparrow-limits"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-publish = ["crates-io", "sparrow-lab"]
+repository.workspace = true
+publish = ["crates-io"]
 license.workspace = true
 
 [lints]

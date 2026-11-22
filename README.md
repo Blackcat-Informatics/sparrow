@@ -14,8 +14,7 @@ SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 </p>
 
 <p align="center">
-  <a href="https://github.com/Blackcat-Informatics/sparrow/actions/workflows/ci.yaml"><img src="https://github.com/Blackcat-Informatics/sparrow/actions/workflows/ci.yaml/badge.svg" alt="CI"></a>
-  <a href="./LICENSING.md"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0%20OR%20MulanPSL--2.0-blue.svg" alt="License: MIT OR Apache-2.0 OR MulanPSL-2.0"></a>
+  <a href="./LICENSING.md"><img src="https://img.shields.io/badge/runtime%20license-MIT%20OR%20Apache--2.0%20OR%20MulanPSL--2.0-blue.svg" alt="Runtime license: MIT OR Apache-2.0 OR MulanPSL-2.0"></a>
   <img src="https://img.shields.io/badge/MSRV-1.98-orange.svg" alt="MSRV 1.98">
   <a href="https://github.com/Blackcat-Informatics/purrdf"><img src="https://img.shields.io/badge/built%20on-PurRDF-111214.svg" alt="Built on PurRDF"></a>
 </p>
@@ -24,46 +23,65 @@ Sparrow is a high-density, temporal diagnostic log and data server. It turns
 scattered operational artifacts into retained evidence that agents can discover,
 inspect, correlate, and query as a semantic graph.
 
-## Purpose
+Sparrow stores disposable operational logs and artifacts on one Linux server.
+It keeps original bytes in RocksDB and uses PurRDF to project JSON and Markdown,
+rank text searches, and evaluate governed SPARQL queries. Keep an independent
+copy of anything irreplaceable. [Architecture](docs/architecture.md)
 
-The charter (what Sparrow is, its method, consumers, suppliers and what it is
-not) is the Purpose section of [AGENTS.md](AGENTS.md#purpose). In short, Sparrow
-is a low-assurance, high-throughput, searchable log store that optimizes only
-for speed and storage efficiency; anything irreplaceable, and all assurance,
-privacy, encryption and validation work, belongs to Katamari. The
-[glossary](docs/glossary.md) names each term and the document that governs it.
+`sparrowd` serves typed Cap'n Proto RPC. The `sparrow-access` package supplies
+the `sparrow` CLI and stdio MCP adapter. Rust producers can use
+[`sparrow-client`](https://crates.io/crates/sparrow-client) and negotiate
+`sparrow-producer/1` across compatible wire versions. The current wire schema
+is 73. [Interfaces](docs/interfaces.md)
 
-## Status
+## Quickstart
 
-**Implemented and running; measured limits apply.** A RocksDB daemon, Cap'n Proto RPC,
-CLI with resumable typed file imports and bounded oversized-record preparation,
-stdio MCP, JSON field discovery, immutable JSON source-time and diagnostic profiles,
-mapped service/host/severity/trace/span filters,
-explicit partial diagnostic scope coverage with typed unknown totals,
-explicit event-time intervals, artifact/record/pin query scopes, combined same-record field/text searches,
-persistent native full-text retrieval, bounded
-record context, durable stable-ID pin renewal and paginated pin discovery,
-persistent native JSON/Markdown RDF dictionaries and six-way
-quad indexes, a standalone typed producer client with bounded delivery and a
-composable tracing layer, bounded buffered/durable ingestion with session-scoped
-WAL flush controls, and helper-census tooling are implemented. Active tailing
-with explicit completed-generation retirement, typed public TCP
-ingestion, and syslog are implemented. Stored-view SELECT, ASK, CONSTRUCT,
-DESCRIBE, measured EXPLAIN and native stored-text rank/span relations are
-implemented. The wire schema is version 73. Producers negotiate the
-`sparrow-producer/1` profile across compatible schema versions. The archive is implemented and not
-yet running on the live daemon ([Archive status](docs/archive-format.md#archive-status)). See [Development runtime](docs/development-runtime.md) for
-present commands, verified behavior and limits.
+Build from source on Linux with Rust 1.98 or newer, a C and C++ toolchain, Make,
+`capnp` (the Cap'n Proto compiler), libclang, Git, `tar`, and Python 3.11 or
+newer. Clone PurRDF beside Sparrow. The lexicon tool reads the revision pinned
+in [`registry/compatibility.toml`](registry/compatibility.toml).
 
-The production deployment is the system unit in [`deploy/`](deploy/README.md),
-serving typed Cap'n Proto on `0.0.0.0:518` and a private Unix socket at
-`/SPARROW/store/rpc.sock`. Anonymous TCP peers may only discover,
-ingest and import; other TCP operations require `--secret-file` CHAP authentication.
-The `sparrow-access` package supplies the installed `~/.local/bin/sparrow`
-command and its stdio MCP adapter. Rust producers depend on `sparrow-client`.
-Graph queries use PurRDF's native semantics and governors over bounded stored
-views, with explicit admission refusals; see
-[native integration evidence](docs/purrdf-integration-gaps.md).
+```bash
+git clone https://github.com/Blackcat-Informatics/purrdf ../purrdf
+make build-runtime
+```
+
+From the checkout root, create a disposable store and start the daemon in the
+foreground. The example binds a private Unix socket and installs no service.
+
+```bash
+demo=.stage/quickstart
+mkdir -p .stage
+mkdir -m 700 "$demo"
+lexicons="$(tools/purrdf-lexicons.sh "$PWD" "$demo/bin")/artifacts"
+cat > "$demo/server.toml" <<EOF
+data_dir = "$demo/store"
+socket_path = "$demo/store/rpc.sock"
+text_lexicon_dir = "$lexicons"
+instance_role = "scratch"
+disk_budget = 536870912
+maintenance_reserve = 67108864
+max_records = 4096
+max_pin_members = 1024
+max_concurrent_requests = 4
+EOF
+target/release/sparrowd --config "$demo/server.toml"
+```
+
+Once it reports that it is serving, open a second terminal in the checkout
+and import one JSONL record.
+
+```bash
+demo=.stage/quickstart
+printf '%s\n' '{"message":"Sparrow quickstart","level":"info"}' > "$demo/event.jsonl"
+target/release/sparrow "$demo/store/rpc.sock" status
+target/release/sparrow "$demo/store/rpc.sock" ingest demo-1 quickstart jsonl "$demo/event.jsonl"
+target/release/sparrow "$demo/store/rpc.sock" records --source quickstart --limit 10
+```
+
+The last command lists the imported record. Stop the foreground daemon with
+Ctrl-C. See the [deployment guide](docs/deployment.md) for a long-running
+service and the [archive format](docs/archive-format.md) for retention setup.
 
 ## Operating model
 
@@ -164,24 +182,16 @@ durability interval. Source-file deletion and successful pin mutations require
 durable commits. Parsing or indexing failures are visible independently of byte
 ingestion; successful raw import is sufficient to consume a completed source.
 
-## Build
+## Contributing
 
-Sparrow builds on Linux with:
-
-- Rust 1.98 or newer, with rustfmt and Clippy
-- `capnp` (the Cap'n Proto compiler) and libclang
-- Git 2.54 or newer, and `tar`
-- A PurRDF checkout at `../purrdf`, beside this repository, containing the
-  revision pinned in `registry/compatibility.toml`. The tests read its text
-  lexicons and the helper census archives its source at that revision.
+Use Rust 1.98.1 or newer with rustfmt and Clippy for verification. The gate
+uses Git 2.54 or newer, `b3sum`, and the same sibling PurRDF checkout as the
+quickstart. Install the helper census and commit hook before running it.
 
 ```bash
-git clone https://github.com/Blackcat-Informatics/purrdf ../purrdf
-git -C ../purrdf checkout "$(sed -n 's/^git_revision = "\(.*\)"/\1/p' registry/compatibility.toml)"
-
-make check          # fmt, release Clippy (warnings denied), shipped crates without test-support, release tests, census
-make build-runtime  # release server and client binaries
-make install-hooks  # run make precommit before every commit
+make install-census
+make install-hooks
+make check
 ```
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for the gate, the PurRDF reuse rules
@@ -202,10 +212,7 @@ text analysis, scoring, and query governors.
   CLI examples, named pins, and the Rust client contract.
 - [Implementation plan](docs/implementation-plan.md): agent investigation
   priorities, initial sample discovery, query contracts, and delivery slices.
-- [Helper census](docs/helper-census.md): PurRDF reuse and local duplication gates.
-- [Development runtime](docs/development-runtime.md): implemented surfaces,
-  verification evidence and unfinished server acceptance.
-- [Deployment](docs/deployment.md): configuration, kept images, seeded builds,
+- [Deployment](docs/deployment.md): configuration, kept images, unit behavior,
   shipping and backups behind the [`deploy/`](deploy/README.md) procedures.
 - [Performance baseline](docs/performance-baseline.md): copied-corpus disk
   measurements, explicit query-capacity refusals and remaining qualification.
@@ -224,9 +231,8 @@ from unindexed or missing evidence.
 
 Each milestone has acceptance criteria in the architecture document. Performance
 measurements must include graph indexes and maintenance, as well as raw payloads.
-Sample discovery (local `/var/log`, Lillith Soul's `inner-core` and Brainstem
-evidence) is bounded structural inspection, not a qualified benchmark corpus;
-performance claims require sample-based benchmarking.
+Initial sample discovery inspected system logs, application logs and
+model-inference artifacts. Performance claims require workload measurements.
 
 Per-class retention, clustering, embeddings, and a human dashboard are later
 extensions. The initial service focuses on agent access to disposable operational

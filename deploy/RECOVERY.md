@@ -11,16 +11,16 @@ Commands prefixed with `sudo` need root.
 
 ## Where state lives and what is kept
 
-Sparrow backs up nothing except the age-out to GTS files on the NAS (the archive worker,
-docs/interfaces.md, "Archive"). The online store backup (#156) was removed in #330. There is
+Sparrow backs up nothing except the age-out to GTS files on a network share (the archive worker,
+docs/interfaces.md, "Archive"). Sparrow takes no online store backup. There is
 no copy of the store to restore: a lost or damaged store is not recoverable from this
 directory.
 
 | State | Location | Kept by |
 | --- | --- | --- |
-| Store (catalog, bytes, indexes, WAL, watch catalog, consume journals) | `/SPARROW/store` | Nothing; aged-out evidence is archived to GTS files on the NAS before it is retired |
-| Files waiting in consume roots | `/SPARROW/intake/NAME` | Nothing |
-| Shipper queue, ledgers, lock | `/SPARROW/ship` | Nothing |
+| Store (catalog, bytes, indexes, WAL, watch catalog, consume journals) | `/var/lib/sparrow/store` | Nothing; aged-out evidence is archived to GTS files on the network share before it is retired |
+| Files waiting in consume roots | `/var/lib/sparrow/intake/NAME` | Nothing |
+| Shipper queue, ledgers, lock | `/var/lib/sparrow/ship` | Nothing |
 | Configuration, watch definitions, CHAP secret | `/etc/sparrow` | Nothing; the watch definitions applied are also in the store's catalog |
 | Images and lexicons | `/usr/local/libexec/sparrow`, `/usr/local/share/sparrow` | The kept previous pair (`.previous`); everything else is rebuilt from the repository into `./bin` |
 | Units, profile, layout | `/etc/systemd/system`, `/etc/apparmor.d`, `/etc/{sysusers,tmpfiles}.d` | This directory (`install.sh`) |
@@ -31,67 +31,43 @@ directory.
 sudo deploy/check.sh
 systemctl status sparrow.service
 journalctl -u sparrow.service -b --no-pager | tail -50
-sparrow /SPARROW/store/rpc.sock status
+sparrow /var/lib/sparrow/store/rpc.sock status
 ```
 
 In `status`, `pressure.phase` is `ready`, `durability.failure` is `null` and
 every watch in `consume_watches` names a root that exists.
 
-## 2026-11-01: /home filled and durability latched
+## A shared filesystem fills and durability latches
 
-- Symptom: from 08:39 every write was refused with `STORAGE_FAILURE: durability
-  uncertain; reopen and inspect the store`, 103,274 refusals in all.
-- Cause: `/home` filled. RocksDB hit `ENOSPC` writing its WAL, which latches
-  durability as uncertain until the store is reopened. Sparrow's own
-  `disk_budget` bounds only the store's bytes; other programs filled the shared
-  filesystem.
-- Recovery: once space returned, a restart reopened the store and it served
-  again.
-- Prevention since 600ee97: `min_free_bytes` (default 4 GiB) is a floor on
-  free space in the filesystem that holds `data_dir`. Below it the daemon
-  refuses writes with a retriable `STORAGE_PRESSURE` that carries the
-  `freeSpaceFloor` class, keeps accepting Unix, ingest, TCP and syslog TCP
-  connections, serves reads, and claims no consumed files (consume and tail
-  watches keep their files); it logs a line when the pause begins, one a minute
-  while it lasts and one when it ends. A write that still fails with durability uncertain
-  latches the store (see "Store latched: durability uncertain"); when the proof of durability keeps failing the daemon exits, and `Restart=on-failure` reopens the store; at startup it waits
-  for the maintenance reserve plus every byte of write-ahead log an unclean stop left (the open replays it), so a full disk does not spend
-  the start limit, and below the floor alone the store opens and serves reads.
-- `/SPARROW` is on the same btrfs device as `/home`, so the move to `/SPARROW`
-  did not isolate Sparrow from a full `/home`.
-- Reversible: yes; the restart only reopens the store.
+A full filesystem can cause RocksDB to fail a write or WAL sync. The daemon
+then refuses writes with retryable `STORAGE_PRESSURE`, and `durability.failure`
+names the cause. The configured `disk_budget` accounts for store bytes.
+Other writers on the filesystem can consume the remaining space.
+
+Restore space on the store filesystem and observe the daemon's recovery.
+Below `min_free_bytes`, new writes receive a floor-labelled refusal and reads
+remain available. Consume watches keep their files. At startup, the open floor
+also includes space for replaying the WAL left by an unclean stop.
+[Free-space behavior](../docs/interfaces.md#the-free-space-pause-257)
 
 ## Store latched: durability uncertain
 
-- Symptom: writes refused with the retryable `STORAGE_PRESSURE` and `durability
-  uncertain; writes resume once the store re-establishes it`, `durability.failure`
-  set in status, and then either the journal line `store durability re-established
-  in place after: ...` or, when the latch has stood 120 s with adequate free space, the line `store durability
-  uncertain and not re-established within 120s of adequate free space (...); RocksDB clears
-  this only by reopening, so exiting for the supervisor to reopen it` followed by a restart.
-- Cause: a RocksDB write or WAL sync failed. The maintenance worker proves every accepted
-  write durable: it writes every memtable to a synchronized table file and syncs the WAL.
-  It leaves the store alone while free space is below RocksDB's 32 MiB recovery buffer,
-  proves once space has been adequate for 15 s, and spaces further proofs 30 s then 60 s
-  apart. When the proof succeeds the latch clears in place and `durability.recoveries`
-  counts it. A latch still standing 120 s after space became adequate ends the daemon with
-  an ordinary failure status (exit 1, never 78), the journal line names the cause, and
-  `Restart=on-failure` reopens the store; at startup the daemon waits for space.
-- Observed and not observed: in the full-disk test on a tmpfs (`tools/enospc-check.sh`) the
-  latch cleared in place after space returned in 5 clean runs. Repeated proofs from the
-  instant space returned (every 0.5 s) never let RocksDB resume in 3 runs, while one proof at
-  that instant resumed; the threshold between them is not isolated. The worker's 15 s grace
-  avoids that window by schedule only, and does not if a resume takes longer than 15 s. A
-  recovery that does not resume still ends the daemon (exit 1, restart, the start waits for
-  space) until #449 lands, and #449 is required before the switch image. An I/O error other
-  than no space (EIO and similar) is not known to clear and ends the daemon the same way. A
-  forced compaction has no latch check. Untested: EIO, an explicit RocksDB `Resume()` and a
-  real filesystem near full.
-- Recover: make space if the disk is full (see "Full disk"). The daemon
-  restarts itself; run `sudo systemctl restart sparrow.service` only if it has
-  not. Confirm `durability.failure` is `null`; `durability.latches` and
-  `durability.recoveries` count the latches and in-place clears since the open.
-- Reversible: yes.
+The maintenance worker retries proof of durability after adequate space has
+been available for 15 seconds. Success clears the latch in place. After
+120 seconds of adequate space without proof, the daemon drains the old
+session and reopens the original store in the same process.
+
+During the transition, the listeners stay bound. Existing sessions are retired
+and clients can receive a retryable refusal or disconnect. The journal and
+systemd status identify close, reopen and retry phases. A repairable refusal
+continues on a bounded retry schedule. A terminal refusal ends recovery
+with the cause recorded.
+
+After recovery, check the store identity, durability status and confirmed
+payloads. A fence from the retired session returns `STALE_WATERMARK`.
+Inspect the original request or retry with its stable ID. Check the journal
+for buffered occurrence IDs reported missing or still unverified.
+[Session replacement](../docs/interfaces.md#daemon-teardown)
 
 ## Full disk
 
@@ -103,8 +79,8 @@ every watch in `consume_watches` names a root that exists.
   write-ahead log a stop left behind, the unit waits at startup with
   `waiting to open the store` (nothing can answer then, so `check.sh` cannot
   connect). Above that amount a restart opens the store and serves reads.
-- Diagnose: `df -h /SPARROW /home`, then find what grew:
-  `sudo du -xsh /home/* /SPARROW/* | sort -h | tail`.
+- Diagnose: `df -h /var/lib/sparrow /home`, then find what grew:
+  `sudo du -xsh /home/* /var/lib/sparrow/* | sort -h | tail`.
 - Recover: free space on the filesystem (another program's files, a read-only
   pre-move copy once approved). No backup is kept on it. The daemon
   resumes by itself within a second of crossing the floor; nothing needs a
@@ -141,8 +117,7 @@ every watch in `consume_watches` names a root that exists.
   daemon sets it through `NotifyAccess=main`, and it reads `serving` once the
   daemon serves). Nothing answers during a wait: the Unix socket needs the
   store's lock, which the open takes, and the sockets a later bind wait holds
-  accept nothing until the daemon serves. `deploy/user-unit-upgrade.sh` names the
-  wait when its status gate times out.
+  accept nothing until the daemon serves.
 - Stop: `systemctl stop` sends SIGINT, which ends the wait at once. The
   unit stays `active (running)` through a wait because it is `Type=exec`: a
   readiness gate would hold the unit in `activating` and its start timeout
@@ -229,10 +204,10 @@ every watch in `consume_watches` names a root that exists.
   analyzer change means the lexicon bundle differs from the one the store was
   built with; point `text_lexicon_dir` back at that bundle. A Markdown
   count means the store still holds Markdown projections from before PurRDF
-  fb02dd38b: return to the previous image (`sudo deploy/restart.sh
+  a PurRDF revision that advances the RDF profile: return to the previous image (`sudo deploy/restart.sh
   --rollback`) until those records retire. The newer image advances the
-  profile itself once none remains (#28). The plain profile refusal on an
-  image built before fb02dd38b means a newer image has already advanced the
+ profile itself once none remains. The plain profile refusal on an
+  image built before that revision means a newer image has already advanced the
   profile: see "Rollback". A store fenced for
   archiving needs its `[archive]` table restored. Never delete or rebuild the
   store to get past a refusal.
@@ -248,12 +223,11 @@ every watch in `consume_watches` names a root that exists.
   `start.sh` and `restart.sh` therefore refuse an image whose schema number
   (`sparrowd-schemaN-REV`) is lower than the current image's, before stopping
   anything. There is no backup to restore: a format-changing upgrade has no undo, so stay on
-  the new image and fix forward. The one exception is the copy a user-unit switch keeps with
-  `deploy/user-unit-upgrade.sh --keep-copy` (`docs/deployment.md`, "Switch 1"). The kept previous image and the link swap are all an
-  upgrade relies on ([evidence/lifecycle.md](evidence/lifecycle.md) shows a schema 62 image
-  refusing a store a schema 63 image had opened).
-- Limit without a schema change: the move to PurRDF fb02dd38b (#28) keeps
-  schema 67 but advances the store's RDF profile at the first open. An image
+  the new image and fix forward. The one exception is a copy of the closed store taken with
+  `deploy/copy-on-write.sh copy SOURCE DEST` before the switch (`deploy/README.md`, "Upgrades and rollback"). The kept previous image and the link swap are all an
+  upgrade relies on: an older image refuses a store a newer schema has opened.
+- Limit without a schema change: a move to a PurRDF revision can keep the
+  schema but advance the store's RDF profile at the first open. An image
   built before it then refuses with `RDF profile changed`, and the schema
   check does not catch this, so `--rollback` stops the service. Run
   `--rollback` again to swap forward.
@@ -269,9 +243,9 @@ every watch in `consume_watches` names a root that exists.
   retried every minute at most. A root missing when the daemon starts is the same
   case: the daemon starts and serves, reports that watch, and the watch begins
   when the root appears.
-- Diagnose: `sparrow /SPARROW/store/rpc.sock watch list`;
-  `ls -la /SPARROW/intake/NAME /SPARROW/intake/NAME/.sparrow-inflight`;
-  `getfacl /SPARROW/intake/NAME`. A file the daemon cannot read is mode 0600
+- Diagnose: `sparrow /var/lib/sparrow/store/rpc.sock watch list`;
+  `ls -la /var/lib/sparrow/intake/NAME /var/lib/sparrow/intake/NAME/.sparrow-inflight`;
+  `getfacl /var/lib/sparrow/intake/NAME`. A file the daemon cannot read is mode 0600
   or not in the `sparrow` group.
 - Recover: no restart is needed: the watch resumes by itself within a minute
   of the exact root being restored. Recreate a missing root with plain `mkdir`
@@ -292,84 +266,30 @@ every watch in `consume_watches` names a root that exists.
   only then removes a socket nobody listens on. Never remove the socket until
   the previous owner is proven terminal.
 
-## NAS archive unavailable
+## Archive share unavailable
 
 - Symptom: the journal has `sparrowd: archive pass failed; the watermark did not move`
   followed by an I/O error, a missing archive directory, a `STORE_ID` naming another store or a
   directory with content but no `STORE_ID`, or "archive directory ... is not on its expected
   mount".
 - Effect: none on ingestion. The archive worker runs on its own thread and the daemon starts and
-  serves without the NAS; the store keeps what it could not archive and the watermark does not
+  serves without the share; the store keeps what it could not archive and the watermark does not
   move, so nothing is retired before it is archived. The disk budget and the free-space floor
   then apply as usual.
 - "Not on its expected mount" means the archive directory is on the same device as `/`, or on a local
   filesystem of the same type as `/`'s (the message names which): the share is not mounted and
   its mount point is an ordinary local directory. The worker wrote, moved and
   deleted nothing. Never create the archive on the local disk instead.
-- Diagnose: `findmnt -T /net/synology/archives/sparrow-archive` must show `nfs4` from
-  `192.168.1.1:/volume1/archives`.
-- Recover: restore the mount; the next pass retries by itself. The unit and the profile
-  grant no archive path yet. The archive worker is implemented; it runs on the live daemon only once it is enabled (see `docs/archive-format.md`, "Archive status").
-
-## Revert the cutover to the user unit
-
-- When: the system unit cannot serve after the cutover of Sparrow issue #22,
-  and the operator's old user unit must serve `/SPARROW` again.
-- Limit: the revert used to restore the issue's step 5a online backup. That backup feature was
-  removed in #330 and none exists, so this revert keeps the cutover's store and intake in place
-  and serves them with the user unit. This script cannot undo a store-format change.
-- Fenced store: if the system unit's image upgraded the store's format, the old user image refuses
-  the store (the store fence), and there is no revert by this procedure. Before anything else the
-  user unit's `sparrowd` and CLI links must point at an image that opens the store's format (the
-  system unit's image or a newer one). `user-unit-upgrade.sh` cannot do it, because it needs a
-  running daemon that answers status; swap the links by hand and start the unit.
-- Unfenced store: the shipper's state must agree with the store it feeds. Known from the
-  repository: the shipper renames each item into the consume root, so `state_dir` must be on the
-  same filesystem as `intake_root` (`config/ship.toml.example`); `/SPARROW` is on the root
-  filesystem and `/home` is a separate mount, so the user shipper's `state_dir` under
-  `~/.local/state/sparrow/ship` cannot feed `/SPARROW/intake`. The system shipper's ledgers
-  (`/SPARROW/ship`, kept by `uninstall.sh`) record what was delivered into the kept store; the
-  user shipper's older ledgers would resend those files and ingest them twice. Not tested: point
-  the user `ship.toml` at `intake_root = "/SPARROW/intake"` and `state_dir = "/SPARROW/ship"`, and
-  check that the operator can write `/SPARROW/ship` (it is `paudley:sparrow`, 2700 under the
-  tmpfiles entry) before enabling the timer.
-- Configuration: the user `server.toml` must name neither `backup_root` nor `backup_keep`; the
-  current image refuses them.
-- Before the cutover (`stat`, 2026-11-02), `/SPARROW` was `paudley:root` 0700
-  with no ACL entries, `/SPARROW/store` was `paudley:paudley` 0700, and
-  nothing else existed under `/SPARROW`.
-
-`deploy/uninstall.sh` makes the host changes needed to return to that state:
-
-- It disables and removes the system units.
-- It unloads and removes the AppArmor profile.
-- It removes `/etc/tmpfiles.d/sparrow.conf`, which would re-own `/SPARROW` at
-  the next boot, and the `/usr/local/bin/sparrow` link.
-- It runs `daemon-reload`.
-- It gives `/SPARROW` back to the operator as `paudley:root` 0700 without
-  ACLs. `/SPARROW/store` and `/SPARROW/intake` go to `paudley:paudley`, with
-  directories at 0700 and no ACLs.
-
-It checks first, changing nothing, that no Sparrow system unit is active and
-that the sysusers file names exactly one operator. It leaves `/etc/sparrow`,
-the `sparrow` user and group, the installed images and `/SPARROW/ship` in place, and says so.
-Once `/SPARROW` is paudley's again, the user manager does not need the `sparrow` group.
-
-Stop the shipper timer and the system unit through its drain first (`sudo systemctl stop
-sparrow-ship.timer`, then `sudo deploy/stop.sh`), run `sudo deploy/uninstall.sh`, settle the links
-and the shipper state as above, and enable the user units. Reversible: run `install.sh` again.
-
-Unverified: `uninstall.sh` was exercised only in staged mode
-(`SPARROW_DESTDIR`) against a test instance's root, where it removes the
-staged files and prints the host commands without running them
-([evidence/lifecycle.md](evidence/lifecycle.md)). Neither the script as root
-nor this revert has run on a host.
+- Diagnose: `findmnt -T /mnt/archive/sparrow-archive` must show `nfs4` from
+  `nas.example:/export/archive`.
+- Recover: restore the mount. The next pass retries by itself. The default
+  unit and profile need explicit access to the configured archive path.
+  [Archive configuration](../docs/deployment.md#archive-and-backups)
 
 ## Exposure
 
-`systemd-analyze security` scores the units 1.6 (`sparrow.service`), 0.4
-(`sparrow-ship.service`), each under the
-fleet target of 2.0 ([evidence/systemd-analyze-security.md](evidence/systemd-analyze-security.md)).
+`systemd-analyze security` scores the units 1.6 (`sparrow.service`) and 0.4
+(`sparrow-ship.service`), each under the target of 2.0.
 Each remaining item and why it stays:
 
 | Unit | Item | Why |
@@ -380,12 +300,12 @@ Each remaining item and why it stays:
 | all | `DeviceAllow=char-rtc:r` | Added by `ProtectClock=yes` itself; read-only clock access. |
 | `sparrow` | `PrivateNetwork=`, `RestrictAddressFamilies=~AF_(INET\|INET6)`, `IPAddressDeny=` | The public Cap'n Proto listener on 0.0.0.0:518 serves remote agents on any trusted network; CHAP guards it. |
 | `sparrow` | `AmbientCapabilities=`, `CAP_NET_BIND_SERVICE` | Binding port 518; the bounding set holds nothing else. |
-| `sparrow` | `RestrictSUIDSGID=` | systemd implements it with a seccomp rule that cannot inspect `openat2`'s mode, so it refuses `openat2` outright, and the daemon needs `openat2` to open files beneath a consume root without following symlinks (measured, [evidence/lifecycle.md](evidence/lifecycle.md)). `NoNewPrivileges=yes` makes a setuid file inert, and the daemon creates every file with a fixed mode. |
-| `ship` | `ProtectHome=read-only` | It reads the producers' directories under `/home/paudley`. |
+| `sparrow` | `RestrictSUIDSGID=` | systemd implements it with a seccomp rule that cannot inspect `openat2`'s mode, so it refuses `openat2` outright, and the daemon needs `openat2` to open files beneath a consume root without following symlinks. `NoNewPrivileges=yes` makes a setuid file inert, and the daemon creates every file with a fixed mode. |
+| `ship` | `ProtectHome=read-only` | It reads the producers' directories, which may be under `/home`. |
 
-Hardening settings the specification lists that the units do not use, and why:
+Hardening settings that the units do not use, and why:
 `StateDirectory=`, `RuntimeDirectory=`, `CacheDirectory=` and `LogsDirectory=`
-on `sparrow.service`, because the store is `/SPARROW/store`, the
+on `sparrow.service`, because the store is `/var/lib/sparrow/store`, the
 daemon keeps no runtime or cache files and it logs to the journal; `WatchdogSec=`, because the
 daemon does not implement the systemd notification protocol (`Type=exec`).
 

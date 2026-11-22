@@ -48,8 +48,8 @@ note() {
 # links written, RAN the host commands run (their effects are not itemized).
 CHANGED=() RAN=()
 
-# Run a host-changing command, or print it when staging (DEST set, as install.sh and uninstall.sh
-# do for SPARROW_DESTDIR).
+# Run a host-changing command, or print it when staging (DEST set, as install.sh does for
+# SPARROW_DESTDIR).
 host() {
     if [[ -n ${DEST:-} ]]; then
         note "staged, not run: $*"
@@ -80,37 +80,6 @@ report_changes() {
         printf '%s: ran (effects not itemized; README.md, "Layout", gives the result):\n' "${0##*/}"
         printf '  %s\n' "${RAN[@]}"
     fi
-}
-
-# The operators: the accounts config/sysusers-sparrow.conf adds to the sparrow group.
-operators() {
-    sed -n 's/^m \([^ ]*\) sparrow$/\1/p' "$DEPLOY_DIR/config/sysusers-sparrow.conf"
-}
-
-# What keeps OPERATOR's old user unit sparrow.service in the way, one line each: enabled, and
-# running. Read-only. Run as the operator or as root (through the operator's user manager).
-old_user_unit_problems() {
-    local operator=$1 home wants state uid manager
-    home=$(getent passwd "$operator" | cut -d: -f6)
-    [[ -n $home ]] || die "no account $operator"
-    wants=$home/.config/systemd/user/default.target.wants/sparrow.service
-    [[ ! -e $wants ]] || printf 'enabled (%s)\n' "$wants"
-    if [[ $(id -un) == "$operator" ]]; then
-        state=$(systemctl --user is-active sparrow.service || true)
-    else
-        state=$(systemctl --user --machine="$operator@" is-active sparrow.service 2>/dev/null || true)
-        if [[ -z $state ]]; then
-            uid=$(id -u "$operator")
-            # No answer is fine only when the operator has no user manager to run the unit. The
-            # state, not is-active's exit status: a manager still starting is "activating".
-            manager=$(systemctl show -p ActiveState --value "user@$uid.service")
-            [[ $manager == inactive || $manager == failed ]] \
-                || die "cannot query $operator's user manager ($manager) for sparrow.service"
-        fi
-    fi
-    case $state in
-        active | activating | deactivating | reloading | refreshing) printf '%s\n' "$state" ;;
-    esac
 }
 
 # A string value of a top-level key in the daemon's TOML configuration.
@@ -222,7 +191,11 @@ select_current() {
     swap_link "$LIBEXEC/sparrowd" "${daemon##*/}"
     swap_link "$LIBEXEC/sparrow" "${cli##*/}"
     install -d -m 0755 -- "$(dirname -- "$CLI_LINK")"
-    swap_link "$CLI_LINK" "$LIBEXEC/sparrow"
+    if [[ -n ${DEST:-} ]]; then
+        swap_link "$CLI_LINK" ../libexec/sparrow/sparrow
+    else
+        swap_link "$CLI_LINK" "$LIBEXEC/sparrow"
+    fi
 }
 
 # The unit's ActiveState. is-active's exit status is 0 only for "active", so gating on it treats a
@@ -341,8 +314,7 @@ print(v["store_id"], v["schema_version"], v["pressure"]["phase"], len(v["consume
         "$store" "$schema" "$pressure" "$durability" "$watches"
 }
 
-# Copy-on-write is off for the store, by Katamari's
-# mechanism (katamari-io copy_on_write.rs). On btrfs, a file or directory created in a directory
+# Copy-on-write is off for the store. On btrfs, a file or directory created in a directory
 # that carries the no-copy-on-write attribute (chattr +C) inherits it. So the attribute is set on
 # a directory before anything is written there. A file that already holds data keeps
 # copy-on-write, so an existing store is rewritten by copy while it is closed
@@ -371,14 +343,14 @@ copy_on_write_files() {
 # work. Such a directory is converted with convert_store_no_cow.
 switch_off_copy_on_write() {
     local dir=$1 output
+    if [[ -n ${DEST:-} ]]; then
+        note "staged, not run: chattr +C $dir"
+        return 0
+    fi
     on_btrfs "$dir" || return 0
     no_copy_on_write "$dir" && return 0
     if (($(copy_on_write_files "$dir"))); then
         note "$dir holds copy-on-write files; convert it while closed (deploy/copy-on-write.sh convert $dir)"
-        return 0
-    fi
-    if [[ -n ${DEST:-} ]]; then
-        note "staged, not run: chattr +C $dir"
         return 0
     fi
     output=$(chattr +C -- "$dir" 2>&1) || note "copy-on-write stays on for $dir: $output"

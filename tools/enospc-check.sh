@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 # Runs a full-disk durability test on a tmpfs of SPARROW_ENOSPC_MIB MiB (default 160, which leaves
 # RocksDB's 32 MiB recovery buffer free once the filler is removed) mounted in a user and mount
 # namespace, so no root and no change outside the namespace is needed (#447). The tests need real

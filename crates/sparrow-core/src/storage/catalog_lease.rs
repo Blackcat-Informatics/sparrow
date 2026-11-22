@@ -4,6 +4,8 @@
 //! One bounded metadata lease and cursor implementation for catalog readers.
 
 use super::Error;
+// Each update replaces the whole value, so poison carries no meaning.
+pub(super) use purrdf_core::dataset_view::lock_read_state as lock_whole;
 use std::{
     collections::BTreeMap,
     mem::size_of,
@@ -241,15 +243,6 @@ pub(super) fn read_stats(ledger: &Ledger, now: u64) -> (usize, usize) {
         .fold((0, 0), |(handles, bytes), row| {
             (handles + 1, bytes + row.bytes)
         })
-}
-
-/// Lock a value every change replaces whole, such as a ledger, which each change rewrites
-/// from its registry, or a listing build's state: a panic part-way through one leaves
-/// nothing the next change does not replace, so poison carries no meaning.
-pub(super) fn lock_whole<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// One published handle's lease and size, as [`read_stats`] counts it.
