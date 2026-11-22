@@ -15,8 +15,10 @@ pub(crate) mod diagnostic;
 #[cfg(test)]
 mod tests;
 
-pub(crate) const MAX_NODES: usize = 512;
-pub(crate) const MAX_BYTES: usize = 256 * 1024;
+/// Maximum expanded nodes in a wire RDF forest.
+pub const MAX_NODES: usize = 512;
+/// Maximum expanded bytes in a wire RDF forest.
+pub const MAX_BYTES: usize = 256 * 1024;
 
 use crate::rpc::invalid;
 /// The forest is over a fixed bound: no retry of the same request passes. The bound also
@@ -104,7 +106,7 @@ fn children(value: wire::rdf_term_node::Reader<'_>) -> Result<Option<[u32; 3]>, 
 
 /// Decode only referenced roots after pricing the expanded forest. Shared node
 /// references cannot amplify a compact DAG into unbounded owned term trees.
-pub(crate) fn decode(
+pub fn decode(
     nodes: capnp::struct_list::Reader<'_, wire::rdf_term_node::Owned>,
     roots: &[u32],
     validate_bindings: bool,
@@ -215,7 +217,7 @@ enum Node<'a> {
 }
 
 /// Encode native roots once, with page-local links and no recursive wire structs.
-pub(crate) fn encode<'a>(
+pub fn encode<'a>(
     roots: &[&TermValue],
     init: impl FnOnce(u32) -> capnp::struct_list::Builder<'a, wire::rdf_term_node::Owned>,
 ) -> Result<Vec<u32>, Error> {

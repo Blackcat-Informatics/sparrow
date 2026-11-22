@@ -84,7 +84,8 @@ fn encode_interval(mut out: wire::correlation_interval::Builder<'_>, value: Inte
     out.init_before().set_unix_millis(value.before);
 }
 
-pub(crate) fn encode_selector(
+/// Encode one bounded correlation selector against its store.
+pub fn encode_selector(
     mut out: wire::correlation_selector::Builder<'_>,
     value: &Selector,
     store: &str,
@@ -108,7 +109,8 @@ pub(crate) fn encode_selector(
     Ok(())
 }
 
-pub(crate) fn encode_relation(mut out: wire::correlation_relation::Builder<'_>, value: Relation) {
+/// Encode a typed correlation relation.
+pub fn encode_relation(mut out: wire::correlation_relation::Builder<'_>, value: Relation) {
     match value {
         Relation::TraceId => out.set_trace_id(()),
         Relation::SpanId => out.set_span_id(()),
@@ -129,7 +131,8 @@ pub(crate) fn encode(
     Ok(())
 }
 
-pub(crate) fn decode(
+/// Decode and validate the native correlation capture.
+pub fn decode(
     value: wire::correlation_capture::Reader<'_>,
     store: &str,
 ) -> capnp::Result<CorrelationCapture> {

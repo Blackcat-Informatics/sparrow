@@ -10,7 +10,8 @@ use sparrow_core::{
 };
 use std::collections::BTreeMap;
 
-pub(crate) fn dimension(value: wire::DiagnosticDimension) -> Dimension {
+/// Decode a diagnostic dimension.
+pub fn dimension(value: wire::DiagnosticDimension) -> Dimension {
     match value {
         wire::DiagnosticDimension::Service => Dimension::Service,
         wire::DiagnosticDimension::Host => Dimension::Host,
@@ -20,7 +21,8 @@ pub(crate) fn dimension(value: wire::DiagnosticDimension) -> Dimension {
     }
 }
 
-pub(crate) fn wire_dimension(value: Dimension) -> wire::DiagnosticDimension {
+/// Encode a diagnostic dimension.
+pub fn wire_dimension(value: Dimension) -> wire::DiagnosticDimension {
     match value {
         Dimension::Service => wire::DiagnosticDimension::Service,
         Dimension::Host => wire::DiagnosticDimension::Host,
@@ -56,7 +58,8 @@ pub(crate) fn mappings(
     Ok(Ok(result))
 }
 
-pub(crate) fn encode_mappings(
+/// Encode the source's typed diagnostic mappings.
+pub fn encode_mappings(
     mut target: capnp::struct_list::Builder<'_, wire::diagnostic_mapping::Owned>,
     values: &BTreeMap<Dimension, String>,
 ) {
@@ -110,9 +113,8 @@ pub(crate) fn snapshot(
     }
 }
 
-pub(crate) fn render_snapshot(
-    value: wire::diagnostic_snapshot::Reader<'_>,
-) -> capnp::Result<Value> {
+/// Render a diagnostic snapshot from a query result.
+pub fn render_snapshot(value: wire::diagnostic_snapshot::Reader<'_>) -> capnp::Result<Value> {
     let profile = match value.get_profile_id()?.which()? {
         wire::optional_text::Absent(()) => Value::Null,
         wire::optional_text::Value(id) => Value::from(id?.to_str()?),
@@ -144,7 +146,8 @@ pub(crate) fn render_snapshot(
         .into())
 }
 
-pub(crate) fn render_profile(value: wire::diagnostic_profile::Reader<'_>) -> capnp::Result<Value> {
+/// Render the diagnostic mappings from a wire profile.
+pub fn render_profile(value: wire::diagnostic_profile::Reader<'_>) -> capnp::Result<Value> {
     let mappings = value
         .get_mappings()?
         .iter()

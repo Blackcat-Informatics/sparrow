@@ -21,13 +21,13 @@ hook-check:
 # Select both executable artifacts explicitly after verification hooks. Some
 # managed Cargo targets may republish unselected artifacts from another lease.
 build-runtime: tools-check
-	cargo build --locked --release -p sparrow-server --bins
+	cargo build --locked --release -p sparrow-access -p sparrow-server --bins
 
 # Keep the deployed images and lexicons in ./bin under revision-qualified names
 # (tools/install-bin.sh); deploy/install.sh installs from there.
 install-bin: tools-check
 	@git diff --quiet HEAD -- || { echo "error: commit first; ./bin names images for HEAD"; exit 1; }
-	cargo build --locked --release -p sparrow-server --bins --example recovery --example stamp
+	cargo build --locked --release -p sparrow-access -p sparrow-server --bins --example recovery --example stamp
 	tools/install-bin.sh
 
 # Every exclusion in .config/wt.toml names something this host keeps (tools/seed-excludes-check.sh).
@@ -57,6 +57,7 @@ test:
 # hides warnings a shipped build hits. Check each shipped crate on its own, one cargo invocation
 # per crate so no other package's features unify in, with warnings denied and no test-support.
 check-shipped:
+	cargo clippy --locked --release -p sparrow-access --lib --bins -- -D warnings
 	cargo clippy --locked --release -p sparrow-limits --lib -- -D warnings
 	cargo clippy --locked --release -p sparrow-core --lib -- -D warnings
 	cargo clippy --locked --release -p sparrow-client --lib -- -D warnings

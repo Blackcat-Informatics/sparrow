@@ -4,6 +4,7 @@
 //! Typed Cap'n Proto contract and daemon RPC implementation.
 
 pub use sparrow_client::{Connection, connect, sparrow_capnp};
+pub mod access_wire;
 pub mod admission;
 pub mod archive;
 mod config;
@@ -43,7 +44,3 @@ mod rdf_wire;
 mod rpc;
 pub mod serving;
 pub use rpc::{Rpc, now};
-mod agent;
-pub use agent::{AgentError, AgentResult, run_cli};
-mod mcp;
-pub use mcp::run_mcp;

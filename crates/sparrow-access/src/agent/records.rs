@@ -221,7 +221,7 @@ pub(super) fn render(found: wire::records_results::Reader<'_>) -> Result<Value> 
                 .with("byte_end", row.get_byte_end().to_string())
                 .with(
                     "diagnostics",
-                    crate::diagnostics::render_snapshot(row.get_diagnostics()?)?,
+                    crate::codec::render_diagnostic_snapshot(row.get_diagnostics()?)?,
                 )
                 .with(
                     "event_time",

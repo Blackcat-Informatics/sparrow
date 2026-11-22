@@ -286,7 +286,7 @@ dispatcher and release owner as CLI/MCP. JSON fixture serialization and report
 serialization use PurRDF's native codec. No evaluator or text analysis is copied.
 
 ```bash
-cargo build --locked --release -p sparrow-server --example load
+cargo build --locked --release -p sparrow-access --example load
 target/release/examples/load --secret-file SECRET tcp://127.0.0.1:10330 /new/input/directory 16 64 1024 > report.json
 ```
 

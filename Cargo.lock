@@ -1366,6 +1366,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sparrow-access"
+version = "0.1.0"
+dependencies = [
+ "capnp",
+ "futures",
+ "purrdf",
+ "purrdf-hash",
+ "purrdf-lex",
+ "sparrow-client",
+ "sparrow-core",
+ "sparrow-server",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "sparrow-archive"
 version = "0.1.0"
 dependencies = [
@@ -1432,6 +1448,30 @@ name = "sparrow-limits"
 version = "0.1.0"
 
 [[package]]
+name = "sparrow-rpc-tests"
+version = "0.1.0"
+dependencies = [
+ "capnp",
+ "capnp-rpc",
+ "futures",
+ "log",
+ "purrdf",
+ "purrdf-hash",
+ "purrdf-lex",
+ "rustix",
+ "sparrow-access",
+ "sparrow-client",
+ "sparrow-core",
+ "sparrow-server",
+ "sparrow-test-support",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sparrow-server"
 version = "0.1.0"
 dependencies = [
@@ -1439,7 +1479,6 @@ dependencies = [
  "capnp-rpc",
  "futures",
  "getrandom 0.3.4",
- "log",
  "purrdf",
  "purrdf-hash",
  "purrdf-lex",

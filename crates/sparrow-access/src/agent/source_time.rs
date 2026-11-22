@@ -85,7 +85,9 @@ fn profile(value: wire::source_time_profile::Reader<'_>) -> Result<Value> {
             .with("kind", "json_pointer")
             .with("path", value.get_path()?.to_str()?)
             .into(),
-        wire::time_extraction::LogCapture(value) => crate::time_wire::capture(value?)?.descriptor(),
+        wire::time_extraction::LogCapture(value) => {
+            crate::codec::decode_time_capture(value?)?.descriptor()
+        }
     };
     Ok(Object::new()
         .with("store_id", value.get_store_id()?.to_str()?)
@@ -138,7 +140,7 @@ impl Input {
                     input.set_representation(*representation);
                 }
                 Definition::Log(capture, representation) => {
-                    crate::time_wire::encode(
+                    crate::codec::encode_time_capture(
                         input.reborrow().init_extraction().init_log_capture(),
                         capture,
                     );

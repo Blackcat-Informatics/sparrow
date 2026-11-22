@@ -294,7 +294,7 @@ impl Input {
                 input.set_store_id(&discovery.store_id);
                 input.set_request_id(request);
                 input.set_expected_revision(*expected);
-                crate::watch_admin::encode_definition(input.init_definition(), definition)?;
+                crate::codec::encode_watch_definition(input.init_definition(), definition)?;
                 let response = call.send().promise.await?;
                 mutation(response.get()?.get_result()?)
             }
@@ -461,7 +461,7 @@ fn info(value: wire::watch_info::Reader<'_>) -> Result<Value> {
 
 pub(super) fn definition(value: wire::watch_definition::Reader<'_>) -> Result<Value> {
     let definition =
-        crate::watch_admin::decode_definition(value).map_err(|error| invalid(error.to_string()))?;
+        crate::codec::decode_watch_definition(value).map_err(|error| invalid(error.to_string()))?;
     Ok(Object::new()
         .with("id", definition.id)
         .with(

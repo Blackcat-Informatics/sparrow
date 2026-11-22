@@ -129,9 +129,8 @@ pub(crate) fn encode(
     Ok(())
 }
 
-pub(crate) fn render(
-    value: wire::native_diagnostic::Reader<'_>,
-) -> crate::agent::AgentResult<Value> {
+/// Render a native RDF diagnostic including its presentation arguments.
+pub fn render(value: wire::native_diagnostic::Reader<'_>) -> Result<Value, sparrow_client::Error> {
     let mut out = Object::new()
         .with("schema", "purrdf-diagnostic-v1")
         .with(
@@ -198,11 +197,9 @@ pub(crate) fn render(
                     "character",
                     Value::from(
                         char::from_u32(v)
-                            .ok_or_else(|| crate::agent::AgentError {
-                                code: "PROTOCOL_FAILURE".into(),
-                                message: "native diagnostic has an invalid Unicode scalar".into(),
-                                retryable: false,
-                            })?
+                            .ok_or(sparrow_client::Error::Protocol(
+                                "native diagnostic has an invalid Unicode scalar",
+                            ))?
                             .to_string(),
                     ),
                 ),

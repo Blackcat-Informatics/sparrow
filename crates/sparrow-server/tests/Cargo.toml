@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+
+[package]
+name = "sparrow-rpc-tests"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[test]]
+name = "rpc"
+path = "rpc.rs"
+
+[[bin]]
+name = "sparrow-rpc-fixture"
+path = "../../sparrow-access/src/main.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "sparrowd-rpc-fixture"
+path = "../src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+purrdf.workspace = true
+purrdf-hash.workspace = true
+purrdf-lex.workspace = true
+sparrow-access.workspace = true
+sparrow-client.workspace = true
+sparrow-core.workspace = true
+sparrow-server.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+capnp.workspace = true
+capnp-rpc.workspace = true
+futures.workspace = true
+log.workspace = true
+sparrow-test-support.workspace = true
+toml.workspace = true
+tracing-subscriber.workspace = true
+rustix = { workspace = true, features = ["process", "net"] }
+sparrow-client = { workspace = true, features = ["test-timing"] }
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -660,7 +660,8 @@ impl ConsumeWatch {
         Ok(())
     }
 
-    pub(crate) fn validate_fields(watches: &[Self]) -> Result<(), Box<dyn std::error::Error>> {
+    /// Verify structural watch bounds and overlap without reading the host filesystem.
+    pub fn validate_fields(watches: &[Self]) -> Result<(), Box<dyn std::error::Error>> {
         if watches.len() > MAX_CONSUME_ROOTS {
             return Err("consume requires at most eight roots".into());
         }

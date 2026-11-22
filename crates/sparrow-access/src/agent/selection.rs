@@ -142,7 +142,7 @@ impl Input {
             .init_diagnostics(self.diagnostics.len() as u32);
         for (index, (dimension, values)) in self.diagnostics.iter().enumerate() {
             let mut row = filters.reborrow().get(index as u32);
-            row.set_dimension(crate::diagnostics::wire_dimension(*dimension));
+            row.set_dimension(crate::codec::wire_diagnostic_dimension(*dimension));
             let mut target = row.init_alternatives(values.ids().len() as u32);
             for (index, value) in values.ids().iter().enumerate() {
                 target.set(index as u32, value);

@@ -4,7 +4,8 @@
 //! Anchored completed-file claims. Readiness and discovery belong to the watcher.
 
 use crate::source_file::{BENEATH, open};
-use rustix::fs::{self, AtFlags, FlockOperation, Mode, OFlags, RenameFlags, ResolveFlags};
+use rustix::fs::{self, AtFlags, Mode, OFlags, RenameFlags, ResolveFlags};
+use sparrow_client::ExclusiveFileLock as ClaimLock;
 use sparrow_client::parts::{
     ClaimParts, Frontier, MissingLimits, PartLimits, PartsProgress, Resume,
 };
@@ -328,24 +329,6 @@ pub struct ClaimRoot {
     lock: ClaimLock,
 }
 
-/// Explicitly release ownership even if a fork temporarily inherited the open description.
-struct ClaimLock(File);
-
-impl ClaimLock {
-    fn acquire(file: File) -> Result<Self, Error> {
-        fs::flock(&file, FlockOperation::NonBlockingLockExclusive)?;
-        Ok(Self(file))
-    }
-}
-
-impl Drop for ClaimLock {
-    fn drop(&mut self) {
-        if let Err(error) = fs::flock(&self.0, FlockOperation::Unlock) {
-            eprintln!("sparrowd: releasing completed-consumption ownership lock failed: {error}");
-        }
-    }
-}
-
 /// The opened claimed generation. The original pathname is never reopened for upload.
 #[derive(Debug)]
 pub struct ClaimedFile {
@@ -469,7 +452,7 @@ impl ClaimRoot {
             ));
         }
         let lock = ClaimLock::acquire(lock)?;
-        lock.0.sync_all()?;
+        lock.as_ref().sync_all()?;
         inflight.sync_all()?;
         let known = pending
             .iter()
@@ -539,7 +522,7 @@ impl ClaimRoot {
         }
         let current = open(&self.inflight, Path::new(".lock"), OFlags::RDONLY, BENEATH)?;
         let current = CompletedFileIdentity::capture(&current.metadata()?);
-        let held = CompletedFileIdentity::capture(&self.lock.0.metadata()?);
+        let held = CompletedFileIdentity::capture(&self.lock.as_ref().metadata()?);
         if current.device != held.device || current.inode != held.inode {
             return Err(Error::State(
                 "private coordination lock was replaced; source transfer refused",
@@ -1278,7 +1261,7 @@ mod lock_tests {
     fn ownership_release_is_independent_of_inherited_descriptor_lifetime() {
         let path = tempfile::NamedTempFile::new().unwrap();
         let owner = ClaimLock::acquire(path.reopen().unwrap()).unwrap();
-        let inherited = owner.0.try_clone().unwrap();
+        let inherited = owner.as_ref().try_clone().unwrap();
         assert!(ClaimLock::acquire(path.reopen().unwrap()).is_err());
         drop(owner);
         let replacement = ClaimLock::acquire(path.reopen().unwrap()).unwrap();

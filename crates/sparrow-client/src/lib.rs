@@ -80,6 +80,8 @@ pub use retention_metrics::{RetentionMetrics, RetentionReadLimits, get_retention
 mod handoff;
 pub use handoff::{CompletedHandoff, HandoffReceipt, completed_handoff};
 mod intent_file;
+mod journal_lock;
+pub use journal_lock::ExclusiveFileLock;
 mod tail_finish;
 pub use tail_finish::{TailFinishIntent, TailFinishReceipt, tail_finish};
 mod events;
