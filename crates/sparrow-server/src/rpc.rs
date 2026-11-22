@@ -4568,17 +4568,27 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
+                let subcase = format!(
+                    "{handles}: owns_capture={owns_capture}, after_capture={after_capture}, connection_close={connection_close}"
+                );
                 if connection_close {
                     drop(connection_guard);
+                    assert_eq!(admission.available_permits(), 0, "{subcase}");
+                    release.send(()).unwrap();
+                    assert!(
+                        matches!(task.await, Ok(Err(error)) if error.code == "CANCELLED"),
+                        "{subcase}"
+                    );
                 } else {
                     task.abort();
-                }
-                assert_eq!(admission.available_permits(), 0);
-                release.send(()).unwrap();
-                if connection_close {
-                    assert!(matches!(task.await, Ok(Err(error)) if error.code == "CANCELLED"));
-                } else {
-                    assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+                    // Wait for the caller's guard to signal cancellation before the
+                    // worker can reach its final checkpoint.
+                    assert!(
+                        matches!(task.await, Err(error) if error.is_cancelled()),
+                        "{subcase}"
+                    );
+                    assert_eq!(admission.available_permits(), 0, "{subcase}");
+                    release.send(()).unwrap();
                 }
                 let permit = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
@@ -4590,7 +4600,8 @@ mod tests {
                 drop(permit);
                 assert_eq!(
                     rpc.store.status(now().unwrap()).unwrap()[handles].as_str(),
-                    Some(expected)
+                    Some(expected),
+                    "{subcase}"
                 );
             }
             let action = capture.clone();
