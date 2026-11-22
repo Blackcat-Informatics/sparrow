@@ -4840,9 +4840,9 @@ names = ['^(check_clock_regression|archive_clock_guard_again)$']
 
 [[job]]
 id = "part-set-cut-rule"
-summary = "One cut rule plans every part of a consume-root file above the import bound: the byte bound, the record limit and the joint retirement bound, read from discovery and charged per line as the layout charges."
+summary = "Consume roots and bulk imports share the byte and retirement bounds from discovery and count records as the layout does. The smaller of the configured count and sparrow_limits::MAX_PUBLICATION_RECORDS bounds each part."
 home = "sparrow_client::parts::next_cut"
-entry_points = ["sparrow_client::parts::upload_parts", "sparrow_client::parts::is_one_part"]
+entry_points = ["sparrow_client::parts::PartLimits::from_discovery", "sparrow_client::parts::upload_parts", "sparrow_client::parts::is_one_part"]
 spec = "docs/interfaces.md: Part sets for consume roots (#280)"
 vectors = ["crates/sparrow-client/src/parts.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []

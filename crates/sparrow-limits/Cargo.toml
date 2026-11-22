@@ -3,7 +3,7 @@
 
 [package]
 name = "sparrow-limits"
-version = "0.1.0"
+version = "0.1.1"
 description = "Shared admission limits for Sparrow producers and storage"
 documentation = "https://docs.rs/sparrow-limits"
 edition.workspace = true

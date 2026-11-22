@@ -56,7 +56,8 @@ pub struct Discovery {
     /// Largest artifact carried in one inline ingest message. Larger artifacts
     /// stream through the staged import, up to its fixed publication bound.
     pub max_inline_artifact_bytes: u64,
-    /// Maximum record membership in one artifact.
+    /// Configured maximum record membership. Staged parts also obey the fixed
+    /// [publication ceiling](sparrow_limits::MAX_PUBLICATION_RECORDS).
     pub max_records_per_artifact: u64,
     /// Native analyzer identity.
     pub text_analyzer: String,

@@ -3,10 +3,10 @@
 
 //! The part cut and part driver for a completed file above the import bound (#280).
 //!
-//! A file is cut lazily, one part at a time, so that every part satisfies the three limits the
-//! daemon advertises and enforces: the import bound, the record limit and the joint retirement
-//! bound. Each part is an ordinary staged import under `consumeset:{H}.part{k:010}`; the
-//! manifest `consumeset:{H}.manifest` lists the parts in order and alone defines the set.
+//! A file is cut lazily, one part at a time, within the import byte bound, effective record
+//! count and joint retirement budget. Each part is an ordinary staged import under
+//! `consumeset:{H}.part{k:010}`. The manifest `consumeset:{H}.manifest` lists the parts in
+//! order and alone defines the set.
 
 use crate::imports::{Checkpoint, StagedInput, payload_id, upload};
 use crate::ingest_status::PartGate;
@@ -23,14 +23,14 @@ use std::sync::{Arc, Mutex};
 /// The daemon's chunk unit; a record of `n` bytes costs `ceil(n / CHUNK)` chunks.
 const CHUNK: u64 = crate::IMPORT_CHUNK_BYTES as u64;
 
-/// The limits a part must satisfy, all read from the daemon's discovery (#280).
+/// Admission limits for a staged artifact, combining discovery and fixed storage limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PartLimits {
     /// Largest declared input the daemon admits.
     pub max_bytes: u64,
     /// Longest record the daemon's layout keeps whole.
     pub raw_split_bytes: u64,
-    /// Most records one artifact may hold.
+    /// Most records one part may hold under both configuration and metadata admission.
     pub max_records: u64,
     /// What one artifact's chunk and record charges may sum to.
     pub retire_row_budget: u64,
@@ -96,7 +96,9 @@ impl PartLimits {
         Ok(Self {
             max_bytes: discovery.max_import_bytes,
             raw_split_bytes: discovery.raw_record_bytes,
-            max_records: discovery.max_records_per_artifact,
+            max_records: discovery
+                .max_records_per_artifact
+                .min(sparrow_limits::MAX_PUBLICATION_RECORDS as u64),
             retire_row_budget: discovery.retire_row_budget,
             retire_chunk_charge: discovery.retire_chunk_charge,
             retire_record_charge: discovery.retire_record_charge,

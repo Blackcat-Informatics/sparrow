@@ -6,6 +6,7 @@
 use super::store_counters::Reader;
 use super::{Error, Record, Writer, catalog_upgrade, integer, parse, read_field, store_counters};
 use rocksdb::{DB, WriteBatch};
+use sparrow_limits::MAX_PUBLICATION_RECORDS;
 use std::collections::BTreeMap;
 
 const PREFIX_STR: &str = "source-context-v1:";
@@ -23,10 +24,6 @@ const FAILURE: &str = "source-context-cache-failure";
 /// The rebuild migration's checkpoint.
 pub(super) const CHECKPOINT: &str = JOB.checkpoint;
 const SCRATCH_BYTES: usize = 32 * 1024 * 1024;
-const METADATA_BYTES: usize = 32 * 1024 * 1024;
-/// Distinct records one atomic write may change source context for (32,768): the bound of the
-/// metadata admission. A sealed import of more records is refused at layout, before preparation.
-pub(super) const MAX_CONTEXT_RECORDS: usize = METADATA_BYTES / 1024;
 const JOB: catalog_upgrade::Job = catalog_upgrade::Job {
     checkpoint: "source-context-cache-upgrade",
     source: "record:",
@@ -324,9 +321,9 @@ impl Changes {
                 "source context update requires a bounded record ID",
             ));
         }
-        if !self.rows.contains_key(id) && self.rows.len() >= MAX_CONTEXT_RECORDS {
+        if !self.rows.contains_key(id) && self.rows.len() >= MAX_PUBLICATION_RECORDS {
             return Err(Error::input_bound(format!(
-                "atomic source context update exceeds metadata admission of {MAX_CONTEXT_RECORDS} distinct records; split the input into parts of at most that many records"
+                "atomic source context update exceeds metadata admission of {MAX_PUBLICATION_RECORDS} distinct records; split the input into parts of at most that many records"
             )));
         }
         Ok(self.rows.entry(id.to_owned()).or_default())

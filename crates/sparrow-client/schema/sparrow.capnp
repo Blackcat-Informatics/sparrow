@@ -270,6 +270,7 @@ struct Status {
   diskBudget @3 :UInt64; maintenanceReserve @4 :UInt64; liveRecords @5 :UInt64;
   uniquePayloadChunks @6 :UInt64; activePins @7 :UInt64;
   uniqueJsonProjections @8 :UInt64; retryWindowSeconds @9 :UInt64;
+  # maxRecordsPerArtifact is the configured count. Atomic metadata also caps a publication at 32,768 records.
   maxInlineArtifactBytes @10 :UInt64; maxRecordsPerArtifact @11 :UInt64; maxPinMembers @12 :UInt64;
   schemaVersion @13 :UInt32 = 1;
   textAnalyzer @14 :Text; textProfile @15 :Text;
@@ -471,6 +472,7 @@ struct OptionalIngestSocketStatus { union { absent @0 :Void; value @1 :IngestSoc
 # Constant-size compatibility and admission metadata; no evidence catalog counts.
 struct Discovery {
   storeId @0 :Text; schemaVersion @1 :UInt32;
+  # maxRecordsPerArtifact has the same configured meaning as in Status.
   maxInlineArtifactBytes @2 :UInt64; maxRecordsPerArtifact @3 :UInt64;
   textAnalyzer @4 :Text; textProfile @5 :Text; rdfProfile @6 :Text;
   maxEventBatchBytes @7 :UInt32; maxEventBatchEvents @8 :UInt32;
