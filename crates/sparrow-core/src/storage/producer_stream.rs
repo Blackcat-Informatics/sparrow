@@ -436,7 +436,7 @@ mod tests {
                 .is_none()
         );
         drop(store);
-        let store = Store::open(dir.path(), config).unwrap();
+        let store = Store::open(dir.path(), config.clone()).unwrap();
         assert_eq!(
             original(&store, now + 1).unwrap_err().code,
             "UNCERTAIN_DELIVERY"
@@ -455,6 +455,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(store.artifacts(later).unwrap().len(), 2);
+        // An upgraded writer cannot make a fresh assumption about missing GC evidence.
+        store
+            .lock()
+            .unwrap()
+            .db
+            .delete(super::super::writer_format::RETRY_GC)
+            .unwrap();
+        drop(store);
+        assert_eq!(
+            Store::open(dir.path(), config).err().unwrap().code,
+            "STORAGE_FAILURE"
+        );
     }
 
     /// INVARIANT (#215): a registry at its byte bound never refuses a batch. An existing
