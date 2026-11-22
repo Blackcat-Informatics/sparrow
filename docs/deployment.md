@@ -250,7 +250,10 @@ naming the directory when it cannot write there:
    `/etc/apparmor.d/sparrow` and reload the profile with `apparmor_parser -r`.
 4. Restart the daemon on the new unit.
 
-A configuration with only UDP listeners needs none of this.
+These write permissions are required only for TCP listeners. Startup still scans
+the spill directory even when no syslog listener is configured. If it names a
+file without a matching TCP listener, restore that listener to replay the file
+or move the file out of the spill directory by hand.
 
 ### Ingest-only group socket
 
