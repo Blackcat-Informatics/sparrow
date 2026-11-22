@@ -81,6 +81,8 @@ pub use events::{
     MAX_EVENT_BYTES, MAX_EVENT_FIELDS, MAX_EVENT_SPANS, ProducerEvent,
     read_wide as decode_wide_integer, wide as encode_wide_integer,
 };
+/// Durable file and byte-stream imports for ordinary Tokio tasks.
+pub mod bulk;
 mod console;
 mod delivery;
 mod producer_config;

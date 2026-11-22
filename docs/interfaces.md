@@ -1107,6 +1107,64 @@ stderr, one event per line with no timestamp (the journal adds one) and with lin
 a field written as `\n`. The daemon's own warnings are not written by it; they have the
 `sparrowd:` lines above.
 
+### Bulk producer imports
+
+Use `sparrow_client::bulk::BulkImporter` from an ordinary Tokio runtime. Give
+`BulkConfig::new` the producer endpoint and an absolute private staging
+directory. A job ID identifies one input and its source and format across
+process restarts. One process at a time holds its journal. Use distinct IDs for
+distinct occurrences, including two files with identical bytes.
+
+`import_file` imports a completed file. `import_files` accepts an iterator and
+yields each input and its result as it finishes, with bounded concurrency.
+`open` exposes the same per-input job for progress, local staging and recovery.
+`stage_file` keeps the caller's file and verifies its original inode, length
+and mutation clocks around reads. A file within the staging allowance can be
+fully staged while Sparrow is offline. Larger files stop reading at the allowance
+and continue as Sparrow confirms ranges. Reopen a partial file job with the same
+unchanged file. Once EOF is staged, repeating `import_file` with that job ID
+uses the retained snapshot. Published ranges remain visible if a later source read fails.
+
+`stage_stream(offset, reader)` accepts Tokio `AsyncRead`. Reattach an upstream
+source at the job's durably staged offset after interruption. The process can
+recover bytes through that offset. A pipe's upstream must supply any bytes it
+handed the reader past that boundary. Complete lines can reach Sparrow before
+EOF. Long lines split into opaque fragments under the range bound. Only EOF
+finishes a final unterminated line. The input retains its original bytes,
+including binary values, and each range receipt identifies its source offsets.
+
+`BulkJob::progress` observes locally staged bytes, the contiguous remote durable
+prefix, receipt count, and the latest retry or refusal. `upload_progress`
+exposes the native received, prepared and raw-chunk checkpoints for an active
+upload. `receipt(index)` returns one durable range receipt. `finish` waits for
+the whole input and returns its store, artifact, byte length and range count.
+Small multipart inputs produce a `sparrow.parts/1` manifest. Longer inputs
+publish bounded `sparrow.bulk-window/1` manifests during the import. Each
+window names its previous window's artifact, absolute byte range, first part
+ordinal, and ordered `parts`. The final window sets `complete`. Follow the
+previous links and concatenate the data artifacts in ascending source-offset
+order. Each window and data artifact follows the store's retention policy from
+its own publication time. Window sizing obeys the discovered manifest bounds.
+
+The local journal keeps at most eight current range receipts. After a window
+is certified, `last_window` points to its artifact and `first_local_range`
+marks the start of the remaining local receipts. The input's completion
+record and the final window's local receipts survive reopening. `close` stops
+a worker and waits for it to release the input for another process.
+
+Bulk jobs have their own worker threads, connections and byte quotas. The
+defaults are two active jobs, 128 MiB of outstanding bytes per job and a
+256 KiB stream range. Each reader prefetches up to 64 KiB after reserving room.
+Bulk operations leave ordinary log admission and its queue available. Once
+discovery succeeds the journal binds the persistent store. Before sending
+`importPublish` the uploader syncs the native import identity. An unknown
+publication retries that same native import on the same store. If its receipt
+has expired, the job retains its pending input and reports the refusal. Input
+blocks become reclaimable after their certified range receipt is on disk.
+
+Run `cargo run -p sparrow-client --example bulk -- ENDPOINT ABSOLUTE_SPOOL JOB_ID [FILE]`
+for a completed file or a new input arriving on stdin.
+
 ### Part sets for consume roots (#280)
 
 A consume-root file above what one artifact can hold is published as a part set

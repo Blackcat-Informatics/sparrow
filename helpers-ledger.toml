@@ -1430,6 +1430,20 @@ fingerprints = []
 names = ['^(capture_direct_tracing_event|capture_alternate_span_context)$']
 
 [[job]]
+id = "bulk-import-journal"
+summary = "File and stream imports persist exact local byte offsets and synchronize the native import identity before publication."
+home = "sparrow_client::bulk::disk::Journal"
+entry_points = ["sparrow_client::bulk::BulkJob::stage_file", "sparrow_client::bulk::BulkJob::stage_stream"]
+spec = "docs/interfaces.md: Bulk producer imports."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(publish_bulk_replacement_import|encode_alternate_bulk_manifest)$']
+
+[[job]]
 id = "developer-console-display"
 summary = "Structured producers share one human-readable severity, message and field formatter on the bounded console output thread."
 home = "sparrow_client::console::render::line"

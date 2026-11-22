@@ -170,7 +170,7 @@ fn holds_payload(file: &[u8], payload: &[u8]) -> bool {
 
 /// Create the directory with mode 0700 and make every directory entry this call created
 /// durable, so a crash after the first save cannot lose the directory that holds it.
-fn create_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_dir(dir: &Path) -> std::io::Result<()> {
     let created: Vec<&Path> = dir.ancestors().take_while(|path| !path.exists()).collect();
     std::fs::DirBuilder::new()
         .recursive(true)

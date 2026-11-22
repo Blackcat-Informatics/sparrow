@@ -57,6 +57,7 @@ test:
 # hides warnings a shipped build hits. Check each shipped crate on its own, one cargo invocation
 # per crate so no other package's features unify in, with warnings denied and no test-support.
 check-shipped:
+	cargo clippy --locked --release -p sparrow-limits --lib -- -D warnings
 	cargo clippy --locked --release -p sparrow-core --lib -- -D warnings
 	cargo clippy --locked --release -p sparrow-client --lib -- -D warnings
 	cargo clippy --locked --release -p sparrow-server --lib --bins -- -D warnings

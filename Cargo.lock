@@ -1390,6 +1390,7 @@ dependencies = [
  "purrdf-lex",
  "rustix",
  "serde",
+ "sparrow-limits",
  "sparrow-test-support",
  "tempfile",
  "tokio",
@@ -1410,6 +1411,7 @@ dependencies = [
  "purrdf-lex",
  "rocksdb",
  "rustix",
+ "sparrow-limits",
  "sparrow-test-support",
  "tempfile",
  "tracing",
@@ -1424,6 +1426,10 @@ dependencies = [
  "regex",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "sparrow-limits"
+version = "0.1.0"
 
 [[package]]
 name = "sparrow-server"

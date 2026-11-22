@@ -630,28 +630,28 @@ pub fn manifest_body(
     byte_length: u64,
     parts: &[(PartSpan, String)],
 ) -> Vec<u8> {
-    let parts = parts
+    let rows = parts
         .iter()
-        .map(|(span, artifact)| {
-            Value::from(
-                Object::new()
-                    .with("index", u64::from(span.index))
-                    .with("start", span.start)
-                    .with("length", span.length)
-                    .with("format", crate::format_label(span.format))
-                    .with("artifact", artifact.clone()),
-            )
-        })
-        .collect::<Vec<_>>();
+        .map(|(span, artifact)| manifest_part(span, artifact));
     let body: Value = Object::new()
         .with("schema", "sparrow.parts/1")
         .with("set", set)
         .with("source", source)
         .with("format", crate::format_label(format))
         .with("byte_length", byte_length)
-        .with("parts", Value::array(parts))
+        .with("parts", Value::array(rows))
         .into();
     json::write_compact(&body).into_bytes()
+}
+
+pub(crate) fn manifest_part(span: &PartSpan, artifact: &str) -> Value {
+    Object::new()
+        .with("index", u64::from(span.index))
+        .with("start", span.start)
+        .with("length", span.length)
+        .with("format", crate::format_label(span.format))
+        .with("artifact", artifact.to_owned())
+        .into()
 }
 
 /// What the first index with no kept receipt says (#285).
