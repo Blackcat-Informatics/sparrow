@@ -273,6 +273,7 @@ pub(crate) async fn upload_or_cancel(
 /// so a caller whose attempt future is dropped at a deadline still sees how far it got (#280).
 #[derive(Default)]
 pub(crate) struct Checkpoint {
+    required_import: Option<String>,
     import: Option<(String, String)>,
     progress: (u64, u8, u64, u64),
     sink: Option<(std::sync::Arc<crate::parts::PartsProgress>, u32)>,
@@ -287,6 +288,13 @@ impl Checkpoint {
     ) -> Self {
         Self {
             sink: sink.map(|sink| (sink, parts_done)),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn expecting_import(id: String) -> Self {
+        Self {
+            required_import: Some(id),
             ..Self::default()
         }
     }
@@ -529,6 +537,15 @@ pub(crate) async fn upload(
     {
         return Err(Error::Protocol(
             "import staging contradicts the discovered store or requested input",
+        ));
+    }
+    if checkpoint
+        .required_import
+        .as_ref()
+        .is_some_and(|id| *id != progress.id)
+    {
+        return Err(Error::Protocol(
+            "re-offered part changed the native import identity",
         ));
     }
     checkpoint.observe(&progress);

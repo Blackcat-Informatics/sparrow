@@ -1308,8 +1308,12 @@ directory. The per-store journal lives under
 `${XDG_STATE_HOME}/sparrow-client/file-sets`, with `~/.local/state` as the
 default state root. It preserves the completed prefix and the original
 publication identity. Retry an uncertain publication within the daemon's
-48-hour retry window. After that receipt expires, the CLI reports the refusal
-and keeps the source and journal. A completed journal returns the same
+48-hour retry window. Once an unconfirmed part's native attempt has expired
+and been reclaimed, the CLI re-offers it under the same request ID.
+It retains the certified prefix and original file. When a part committed and
+its reply was lost, re-offering after receipt expiry can create another
+occurrence. An unresolved final manifest publication keeps its ticket and
+reports the refusal after expiry. A completed journal returns the same
 original receipt on repetition, while each artifact remains subject to the
 store's independent retention rules.
 

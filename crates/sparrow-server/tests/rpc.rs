@@ -8021,6 +8021,9 @@ struct EventRelayState {
     withhold_publication: std::cell::Cell<Option<usize>>,
     /// Answer `importPublish` with this daemon-style refusal `(code, retryable)` instead of forwarding it.
     refuse_publish: std::cell::Cell<Option<(&'static str, bool)>>,
+    /// Pass this many publications before imposing the configured refusal.
+    publish_refusal_skip: std::cell::Cell<usize>,
+    refused_import: std::cell::RefCell<Option<String>>,
     /// Answer `importCancel` with this daemon refusal `(code, retryable)` instead of forwarding it.
     refuse_cancel: std::cell::Cell<Option<(&'static str, bool)>>,
     /// Daemon-style refusals `(code, retryable)` answered, in order, to the next event batches
@@ -8278,7 +8281,12 @@ impl wire::sparrow::Server for EventRelay {
         params: wire::sparrow::ImportPublishParams,
         mut results: wire::sparrow::ImportPublishResults,
     ) -> capnp::Result<()> {
-        if let Some((code, retryable)) = self.0.refuse_publish.get() {
+        let skip = self.0.publish_refusal_skip.get();
+        if skip != 0 {
+            self.0.publish_refusal_skip.set(skip - 1);
+        } else if let Some((code, retryable)) = self.0.refuse_publish.get() {
+            let id = params.get()?.get_import()?.get_id()?.to_str()?.to_owned();
+            *self.0.refused_import.borrow_mut() = Some(id);
             let mut failure = results.get().init_result().init_error();
             failure.set_code(code);
             failure.set_message("injected refusal");
@@ -8923,6 +8931,8 @@ fn relay(
         corrupt_publication: std::cell::Cell::new(false),
         withhold_publication: std::cell::Cell::new(None),
         refuse_publish: std::cell::Cell::new(None),
+        publish_refusal_skip: std::cell::Cell::new(0),
+        refused_import: std::cell::RefCell::new(None),
         refuse_cancel: std::cell::Cell::new(None),
         refusals: std::cell::RefCell::new(std::collections::VecDeque::new()),
         refusal_after_accept: std::cell::Cell::new(None),
@@ -17939,6 +17949,86 @@ async fn cli_ingest_resumes_ordered_parts_and_keeps_ordinary_receipts() {
             assert_eq!(parts.len(), 2);
             assert!(parts.iter().all(|(format, _)| format == "opaque"));
             proxy.abort();
+        })
+        .await;
+}
+
+/// A direct CLI file set resumes a physically reclaimed, unaccepted part without
+/// publishing the certified prefix again or moving the original source.
+#[tokio::test]
+async fn cli_ingest_reoffers_a_reclaimed_part_and_preserves_its_certified_prefix() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let harness = set_harness(dir.path()).await;
+            let relay_socket = dir.path().join("expiry.sock");
+            let (relay_state, _proxy) = relay(&relay_socket, harness.client.capability().clone());
+            let state = dir.path().join("state");
+            let file = dir.path().join("events.jsonl");
+            let input = chunk_lines(0, 45, b'p');
+            std::fs::write(&file, &input).unwrap();
+            let run = async |socket: &Path| {
+                let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
+                    .arg(socket)
+                    .args(["ingest", "lapsed-part", "set-source", "jsonl"])
+                    .arg(&file)
+                    .env("XDG_STATE_HOME", &state)
+                    .kill_on_drop(true)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .admitted_spawn()
+                    .unwrap();
+                tokio::time::timeout(CHILD_DEADLINE, child.wait_with_output())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            };
+
+            relay_state.publish_refusal_skip.set(1);
+            relay_state
+                .refuse_publish
+                .set(Some(("RESOURCE_LIMIT", true)));
+            let refused = run(&relay_socket).await;
+            assert!(!refused.status.success(), "{refused:?}");
+            assert!(
+                String::from_utf8_lossy(&refused.stderr).contains("RESOURCE_LIMIT"),
+                "{refused:?}"
+            );
+            let import = relay_state.refused_import.borrow_mut().take().unwrap();
+            let now = sparrow_server::now().unwrap();
+            let prefix = harness.store.artifacts(now).unwrap();
+            assert_eq!(prefix.len(), 1, "exactly the first part was published");
+            let first = &prefix[0].id;
+            let before = harness.store.import_get(&import, now).unwrap();
+            assert!(before.sealed && before.layout_complete && before.published_artifact.is_none());
+            assert_eq!(
+                harness
+                    .store
+                    .import_publish(&import, before.expires_at)
+                    .unwrap_err()
+                    .code,
+                "IMPORT_EXPIRED"
+            );
+            for _ in 0..=before.layout_records {
+                harness.store.import_reclaim(before.expires_at).unwrap();
+            }
+            assert_eq!(
+                harness.store.import_get(&import, now).unwrap_err().code,
+                "NOT_FOUND"
+            );
+            assert_eq!(std::fs::read(&file).unwrap(), input);
+
+            let resumed = run(&harness.socket).await;
+            assert!(resumed.status.success(), "{resumed:?}");
+            let receipt =
+                purrdf_lex::json::read_slice(&resumed.stdout, purrdf_lex::json::Limits::default())
+                    .unwrap();
+            let manifest = receipt["manifest"]["artifact_id"].as_str().unwrap();
+            let parts = harness.parts(manifest, "jsonl", &input);
+            assert_eq!(parts.len(), 3);
+            assert_eq!(&parts[0].1, first);
+            harness.assert_lines_read_once(manifest, 45);
+            assert_eq!(std::fs::read(&file).unwrap(), input);
         })
         .await;
 }
