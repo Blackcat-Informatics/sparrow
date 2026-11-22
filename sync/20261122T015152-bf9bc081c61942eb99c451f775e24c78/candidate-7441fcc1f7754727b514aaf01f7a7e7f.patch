@@ -1,0 +1,2015 @@
+diff --git README.md README.md
+index f48388d..1313247 100644
+--- README.md
++++ README.md
+@@ -91,7 +91,12 @@ delivery.close_local(Duration::from_secs(5)).await?;
+ 
+ Use `send_with_token(event, cursor).await?` when advancing an upstream cursor
+ requires a local disk receipt. Use `shutdown_async(timeout).await?` when the
+-caller requires a durable receipt from Sparrow. TCP endpoints, file-backed
++caller requires a durable receipt from Sparrow. For latency-sensitive diagnostics,
++`DeliveryConfig::lossy(endpoint, source)` counts each dropped observation and
++returns immediately on queue contention. It performs no disk writes. A producer
++that tolerates RAM backpressure can select `DeliveryConfig::lossy_spooled` and
++await `offer_spooled(event)` to buffer offline until its disk budget fills.
++TCP endpoints, file-backed
+ configuration, limits and recovery are covered in the
+ [Rust client contract](docs/interfaces.md#7-rust-client-and-logging-integration).
+ 
+diff --git crates/sparrow-client/examples/producer.rs crates/sparrow-client/examples/producer.rs
+index 52d58cc..938a003 100644
+--- crates/sparrow-client/examples/producer.rs
++++ crates/sparrow-client/examples/producer.rs
+@@ -5,8 +5,8 @@
+ 
+ use purrdf_lex::json::{self, Object, Value};
+ use sparrow_client::{
+-    Delivery, DeliveryConfig, DeliveryStats, Endpoint, EventKind, EventLevel, ProducerEvent,
+-    SendError, SpoolConfig,
++    Delivery, DeliveryConfig, DeliveryStats, DropReason, Endpoint, EventField, EventKind,
++    EventLevel, FieldValue, FlushError, ProducerEvent, SendError, SpoolConfig,
+ };
+ use std::time::Duration;
+ 
+@@ -50,29 +50,73 @@ fn progress(stats: &DeliveryStats, flush: &str) -> String {
+     json::write_compact(&object.with("held", held).into())
+ }
+ 
++fn lossy_progress(stats: &DeliveryStats, max_send_micros: u64, flush: Option<&str>) -> String {
++    let mut dropped = Object::new();
++    for (reason, key) in [
++        (DropReason::Full, "full"),
++        (DropReason::Contended, "contended"),
++        (DropReason::Invalid, "invalid"),
++        (DropReason::Closed, "closed"),
++        (DropReason::Refused, "refused"),
++        (DropReason::Late, "late"),
++        (DropReason::CounterExhausted, "counter_exhausted"),
++    ] {
++        dropped = dropped.with(key, stats.dropped_by_reason[reason as usize]);
++    }
++    let mut object = Object::new()
++        .with("instance", purrdf_hash::hex::encode(&stats.client_instance))
++        .with("offered", stats.offered_events)
++        .with("queued", stats.admitted_events)
++        .with("dropped", dropped)
++        .with(
++            "dropped_total",
++            stats
++                .dropped_by_reason
++                .iter()
++                .copied()
++                .fold(0u64, u64::saturating_add),
++        )
++        .with("max_send_micros", max_send_micros);
++    if let Some(outcome) = flush {
++        object = object
++            .with("flush", outcome)
++            .with("durable_sequence", stats.last_durable_sequence)
++            .with("durable_events", stats.durable_events);
++    }
++    json::write_compact(&object.into())
++}
++
+ #[tokio::main(flavor = "current_thread")]
+ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+     let args: Vec<_> = std::env::args().skip(1).collect();
+-    if !(args.len() == 7 || args.len() == 9 && args[7] == "--spool-max-bytes")
+-        || args[2] != "lossless"
+-    {
+-        return Err("usage: producer ENDPOINT SOURCE lossless SPOOL_DIR COUNT RATE TAG [--spool-max-bytes N]".into());
+-    }
+-    let mut spool = SpoolConfig::new(std::path::absolute(&args[3])?);
+-    if let Some(raw) = args.get(8) {
+-        spool.max_bytes = raw.parse()?;
+-    }
+-    let count: u64 = args[4].parse()?;
+-    let rate: u64 = args[5].parse()?;
++    const USAGE: &str = "usage: producer ENDPOINT SOURCE lossy COUNT RATE TAG | producer ENDPOINT SOURCE lossless SPOOL_DIR COUNT RATE TAG [--spool-max-bytes N]";
++    let [endpoint, source, mode, rest @ ..] = args.as_slice() else {
++        return Err(USAGE.into());
++    };
++    let endpoint = Endpoint::parse(endpoint)?;
++    let lossy = mode == "lossy";
++    let (config, inputs) = match mode.as_str() {
++        "lossy" if rest.len() == 3 => (DeliveryConfig::lossy(endpoint, source), rest),
++        "lossless" if rest.len() == 4 || rest.len() == 6 && rest[4] == "--spool-max-bytes" => {
++            let mut spool = SpoolConfig::new(std::path::absolute(&rest[0])?);
++            if let Some(raw) = rest.get(5) {
++                spool.max_bytes = raw.parse()?;
++            }
++            (
++                DeliveryConfig::lossless(endpoint, source, spool),
++                &rest[1..4],
++            )
++        }
++        _ => return Err(USAGE.into()),
++    };
++    let count: u64 = inputs[0].parse()?;
++    let rate: u64 = inputs[1].parse()?;
++    let tag = &inputs[2];
+     if rate == 0 {
+         return Err("RATE must be positive".into());
+     }
+-    let delivery = Delivery::start_async(DeliveryConfig::lossless(
+-        Endpoint::parse(&args[0])?,
+-        &args[1],
+-        spool,
+-    ))
+-    .await?;
++    let delivery = Delivery::start_async(config).await?;
++    let mut max_send_micros = 0;
+     let start = tokio::time::Instant::now();
+     let mut report = start + Duration::from_secs(1);
+     for index in 0..count {
+@@ -81,25 +125,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+             event_time: sparrow_client::unix_millis_now()?,
+             kind: EventKind::Log,
+             level: EventLevel::Info,
+-            name: args[6].clone(),
++            name: tag.clone(),
+             target: "sparrow.example".to_owned(),
+-            fields: vec![],
++            fields: vec![EventField {
++                name: "message".into(),
++                value: FieldValue::Text(format!("{tag} {}", index + 1)),
++            }],
+             context: vec![],
+             span: None,
+             follows_from: None,
+         };
+-        if let Err(SendError::Uncertain { sequence }) = delivery.send(event).await {
++        if lossy {
++            let before = std::time::Instant::now();
++            delivery.try_send(event);
++            max_send_micros = max_send_micros
++                .max(u64::try_from(before.elapsed().as_micros()).unwrap_or(u64::MAX));
++        } else if let Err(SendError::Uncertain { sequence }) = delivery.send(event).await {
+             return Err(format!("recover local spool sequence {sequence}").into());
+         }
+         if tokio::time::Instant::now() >= report {
+-            eprintln!("{}", progress(&delivery.stats()?, "pending"));
++            let stats = delivery.stats()?;
++            eprintln!(
++                "{}",
++                if lossy {
++                    lossy_progress(&stats, max_send_micros, None)
++                } else {
++                    progress(&stats, "pending")
++                }
++            );
+             report = tokio::time::Instant::now() + Duration::from_secs(1);
+         }
+-        let due = start + Duration::from_secs_f64((index + 1) as f64 / rate as f64);
++        let elapsed = Duration::try_from_secs_f64((index + 1) as f64 / rate as f64)?;
++        let due = start
++            .checked_add(elapsed)
++            .ok_or("rate schedule exceeds the supported clock range")?;
+         if due > tokio::time::Instant::now() {
+             tokio::time::sleep_until(due).await;
+         }
+     }
++    if lossy {
++        let outcome = match delivery.shutdown_async(Duration::from_secs(60)).await {
++            Ok(_) => "ok",
++            Err(FlushError::Dropped(_)) => "dropped",
++            Err(FlushError::TimedOut(_)) => "timed_out",
++            Err(error) => return Err(error.into()),
++        };
++        println!(
++            "{}",
++            lossy_progress(&delivery.stats()?, max_send_micros, Some(outcome))
++        );
++        return Ok(());
++    }
+     delivery.flush_local(Duration::from_secs(10)).await?;
+     let flush = match delivery.shutdown_async(Duration::from_secs(10)).await {
+         Ok(_) => "ok",
+diff --git crates/sparrow-client/src/delivery.rs crates/sparrow-client/src/delivery.rs
+index 807c624..14dd166 100644
+--- crates/sparrow-client/src/delivery.rs
++++ crates/sparrow-client/src/delivery.rs
+@@ -16,6 +16,7 @@ use std::{
+     },
+     time::{Duration, Instant},
+ };
++mod lossy;
+ mod spooled;
+ 
+ /// Explicit producer resource and timing bounds.
+@@ -64,6 +65,27 @@ pub struct DeliveryConfig {
+ const MIN_INTERVAL: Duration = Duration::from_secs(1);
+ 
+ impl DeliveryConfig {
++    /// Nonwaiting in-memory delivery. Every validly allocated offer sequence is accounted for.
++    pub fn lossy(endpoint: crate::Endpoint, source: impl Into<String>) -> Self {
++        let mut config = Self::for_endpoint(endpoint, source);
++        config.mode = crate::DeliveryMode::LossyMemory;
++        config
++    }
++
++    /// Use the bounded persistent journal with counted best-effort admission.
++    pub fn lossy_spooled(
++        endpoint: crate::Endpoint,
++        source: impl Into<String>,
++        spool: crate::SpoolConfig,
++    ) -> Self {
++        let mut config = Self::for_endpoint(endpoint, source);
++        config.mode = crate::DeliveryMode::LossySpooled(spool);
++        config
++    }
++
++    fn disk_free(&self) -> bool {
++        matches!(self.mode, crate::DeliveryMode::LossyMemory)
++    }
+     /// Send to the local group-accessible producer socket.
+     pub fn local(source: impl Into<String>) -> Self {
+         Self::new("/run/sparrow-ingest/ingest.sock", source)
+@@ -162,7 +184,9 @@ impl DeliveryConfig {
+         if let Some(expect) = &self.expect {
+             expect.validate()?;
+         }
+-        if self.mode.spool().is_none() && !self.quarantine_dir.is_absolute() {
++        if matches!(self.mode, crate::DeliveryMode::LossyAspirational)
++            && !self.quarantine_dir.is_absolute()
++        {
+             return Err(Error::InvalidArgument(
+                 "quarantine_dir must be an absolute directory: set DeliveryConfig::quarantine_dir, or provide an absolute XDG_STATE_HOME or HOME for the default",
+             ));
+@@ -232,10 +256,18 @@ pub enum DropReason {
+     Failed,
+     /// Sequence/diagnostic counters exhausted their exact range.
+     CounterExhausted,
++    /// A nonwaiting offer found the in-memory queue lock occupied.
++    Contended,
++    /// The daemon permanently refused the batch or its destination changed.
++    Refused,
++    /// A delayed offer arrived behind an already dispatched sequence.
++    Late,
++    /// A lossy spooled offer exhausted the journal's segment budget.
++    SpoolFull,
+ }
++const DROP_REASONS: usize = DropReason::SpoolFull as usize + 1;
+ 
+-/// Admission never waits for network I/O; it waits only for the queue's push-sized critical
+-/// section, so a briefly held lock never discards an event.
++/// Immediate memory admission. Disk-free lossy producers also refuse queue contention.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum Admission {
+     /// Local confirmation was refused and no durable acceptance is claimed.
+@@ -354,8 +386,8 @@ pub enum FlushError {
+     Dropped(Box<DeliveryWatermark>),
+     /// The deadline elapsed; accepted progress may still advance afterward.
+     TimedOut(Box<DeliveryStats>),
+-    /// The worker ended on a local invariant failure, with the pending batch retained and
+-    /// written to a quarantine file. Refusals and transport failures never end the worker.
++    /// The worker ended on a local invariant or storage failure. The delivery mode
++    /// determines whether pending input remains on disk or is counted as lost.
+     Delivery(Arc<Error>),
+     /// The worker/state/control invariant is unavailable.
+     Unavailable(&'static str),
+@@ -391,6 +423,14 @@ impl std::error::Error for FlushError {
+ /// Queue and delivery diagnostics. These counters are not an RSS measurement.
+ #[derive(Debug, Clone)]
+ pub struct DeliveryStats {
++    /// Stable instance for joining local progress and the server's producer window.
++    pub client_instance: [u8; 16],
++    /// Assigned disk-free offer sequences lost to a named drop reason.
++    pub dropped_sequences: u64,
++    /// Latest permanent disk-free refusal, including the typed daemon code and message.
++    pub last_refusal: Option<Arc<Error>>,
++    /// Observed replacement store. Disk-free offers are refused until explicitly rebound.
++    pub store_mismatch: Option<String>,
+     /// Configured disk intake and recovery progress.
+     pub spool: Option<crate::SpoolStats>,
+     /// Confirmed-offer refusals indexed by [`Refusal`]. These never represent lost accepted events.
+@@ -405,7 +445,7 @@ pub struct DeliveryStats {
+     /// Events acknowledged durably by the daemon.
+     pub durable_events: u64,
+     /// Refusals indexed by `DropReason`'s discriminant.
+-    pub dropped_by_reason: [u64; 5],
++    pub dropped_by_reason: [u64; DROP_REASONS],
+     /// Queued plus in-flight observations.
+     pub pending_events: usize,
+     /// Conservative in-memory event charge. Disk occupancy is reported by `spool.bytes`.
+@@ -416,7 +456,7 @@ pub struct DeliveryStats {
+     pub flush_lag: Duration,
+     /// Observations retained in the immutable pending batch.
+     pub in_flight_events: usize,
+-    /// Last sequence assigned under admission serialization.
++    /// Highest assigned sequence, including refused attempts in disk-free mode.
+     pub last_sequence: u64,
+     /// Last durably accepted sequence.
+     pub last_durable_sequence: u64,
+@@ -430,8 +470,8 @@ pub struct DeliveryStats {
+     pub running: bool,
+     /// Whether explicit shutdown closed producer admission.
+     pub closing: bool,
+-    /// A local invariant failure that ended the worker; pending bodies remain inspectable and
+-    /// are in quarantine files. Never set by a refusal or a transport failure.
++    /// A local invariant or spool failure that ended the worker. Disk-free mode counts
++    /// pending input as lost. Memory mode writes its pending bodies to quarantine.
+     pub terminal_failure: Option<Arc<Error>>,
+     /// Last failure that held the pending batch for a retry (a busy or paused daemon, a lost
+     /// connection, or a refusal about the daemon such as `READ_ONLY`),
+@@ -463,6 +503,7 @@ pub struct DeliveryStats {
+ }
+ 
+ struct Queued {
++    disk: u64,
+     token: Vec<u8>,
+     ack: Option<tokio::sync::oneshot::Sender<()>>,
+     event: ProducerEvent,
+@@ -475,6 +516,7 @@ struct Pending {
+     at: Instant,
+ }
+ struct State {
++    lossy: lossy::Progress,
+     released_workers: u8,
+     held: Option<Arc<Error>>,
+     force_local: u64,
+@@ -513,6 +555,7 @@ struct State {
+     held_unsaved_events: u64,
+ }
+ struct Shared {
++    request_prefix: String,
+     spool: Option<Arc<Mutex<crate::spool::Log>>>,
+     intake_work: Condvar,
+     intake_room: Arc<tokio::sync::Notify>,
+@@ -537,7 +580,7 @@ struct Shared {
+     owners: AtomicUsize,
+     offered: AtomicU64,
+     spans: AtomicU64,
+-    drops: [AtomicU64; 5],
++    drops: [AtomicU64; DROP_REASONS],
+     exhausted: AtomicBool,
+     aborted: AtomicBool,
+     stopped: AtomicBool,
+@@ -642,10 +685,12 @@ impl Delivery {
+                 }));
+                 match result {
+                     Ok(Ok(())) => {}
+-                    Ok(Err(error)) if worker.spool.is_some() => worker.fail(error),
++                    Ok(Err(error)) if worker.spool.is_some() || worker.config.disk_free() => {
++                        worker.fail(error)
++                    }
+                     Ok(Err(error)) => worker.settle_failure(&runtime, error),
+-                    Err(_) if worker.spool.is_some() => {
+-                        worker.fail(Error::Protocol("spool sender panicked"))
++                    Err(_) if worker.spool.is_some() || worker.config.disk_free() => {
++                        worker.fail(Error::Protocol("producer sender panicked"))
+                     }
+                     Err(_) => worker.settle_failure(
+                         &runtime,
+@@ -673,36 +718,65 @@ impl Delivery {
+     }
+ 
+     /// Offer a bounded event, assigning its sequence without waiting for I/O.
+-    pub fn try_send(&self, mut event: ProducerEvent) -> Admission {
++    pub fn try_send(&self, event: ProducerEvent) -> Admission {
+         let shared = &self.shared;
+         if shared.spool.is_some() {
+             return self.spool_offer(event);
+         }
+-        if !shared.bump(&shared.offered) {
+-            return shared.reject(DropReason::CounterExhausted, None);
+-        }
++        let ticket = match shared.offer_ticket() {
++            Some(n) => n,
++            None => return shared.reject(DropReason::CounterExhausted, None),
++        };
++        self.enqueue_memory(event, ticket)
++    }
++
++    fn enqueue_memory(&self, mut event: ProducerEvent, ticket: u64) -> Admission {
++        let shared = &self.shared;
++        let nonwaiting = shared.config.disk_free();
+         let bytes = match event.admission_bytes() {
+             Ok(bytes) => bytes,
+-            Err(_) => return shared.reject(DropReason::Invalid, None),
++            Err(_) => return shared.reject(DropReason::Invalid, nonwaiting.then_some(ticket)),
+         };
+-        // Every holder of this lock does bounded in-memory work (the longest assembles one
+-        // batch within the batch limits) and never performs I/O under it, so waiting is brief; refusing the event for a held lock would lose it for
+-        // no reason and without a sequence for the daemon to see as a gap.
+-        let Ok(mut state) = shared.state.lock() else {
++        // The original memory policy waits for a bounded critical section. Disk-free
++        // callers can immediately observe a sequenced loss if another producer holds it.
++        let mut state = if nonwaiting {
++            match shared.state.try_lock() {
++                Ok(state) => state,
++                Err(std::sync::TryLockError::WouldBlock) => {
++                    return shared.reject(DropReason::Contended, Some(ticket));
++                }
++                Err(std::sync::TryLockError::Poisoned(_)) => {
++                    return shared.reject(DropReason::Closed, Some(ticket));
++                }
++            }
++        } else if let Ok(state) = shared.state.lock() {
++            state
++        } else {
+             return shared.reject(DropReason::Failed, None);
+         };
+         if state.failure.is_some() || shared.exhausted.load(Ordering::SeqCst) {
+-            return shared.reject(DropReason::Failed, None);
++            return if nonwaiting {
++                shared.reject(DropReason::Closed, Some(ticket))
++            } else {
++                shared.reject(DropReason::Failed, None)
++            };
+         }
+         if state.closing || shared.aborted.load(Ordering::SeqCst) {
+-            return shared.reject(DropReason::Closed, None);
++            return shared.reject(DropReason::Closed, nonwaiting.then_some(ticket));
+         }
+-        let Some(sequence) = state.sequence.checked_add(1) else {
++        if nonwaiting && state.lossy.mismatch.is_some() {
++            return shared.reject(DropReason::Refused, Some(ticket));
++        }
++        let Some(sequence) = (if nonwaiting {
++            Some(ticket)
++        } else {
++            state.sequence.checked_add(1)
++        }) else {
+             shared.exhausted.store(true, Ordering::SeqCst);
+             shared.wake.notify_one();
+             return shared.reject(DropReason::CounterExhausted, None);
+         };
+-        state.sequence = sequence;
++        state.sequence = state.sequence.max(sequence);
+         if state.count == shared.config.max_queued_events
+             || bytes > shared.config.max_queued_bytes - state.bytes
+         {
+@@ -712,8 +786,9 @@ impl Delivery {
+         state.bytes += bytes;
+         state.count += 1;
+         state.admitted += 1;
+-        state.admitted_sequence = sequence;
++        state.admitted_sequence = state.admitted_sequence.max(sequence);
+         state.queue.push_back(Queued {
++            disk: 0,
+             token: Vec::new(),
+             ack: None,
+             event,
+@@ -739,8 +814,11 @@ impl Delivery {
+             self.shared
+                 .bump(&self.shared.refusals[Refusal::Invalid as usize]);
+         }
+-        if self.shared.bump(&self.shared.offered) {
+-            self.shared.reject(DropReason::Invalid, None);
++        if let Some(sequence) = self.shared.offer_ticket() {
++            self.shared.reject(
++                DropReason::Invalid,
++                self.shared.config.disk_free().then_some(sequence),
++            );
+         } else {
+             self.shared.reject(DropReason::CounterExhausted, None);
+         }
+@@ -883,7 +961,12 @@ impl Fence<'_> {
+         if let Some(error) = &state.failure {
+             return Some(Err(FlushError::Delivery(error.clone())));
+         }
+-        if state.durable_sequence.max(state.quarantined_sequence) < self.target
++        let unfinished = if self.shared.config.disk_free() {
++            state.cut_losses().is_none()
++        } else {
++            state.durable_sequence.max(state.quarantined_sequence) < self.target
++        };
++        if unfinished
+             || state
+                 .spool
+                 .as_ref()
+@@ -896,6 +979,7 @@ impl Fence<'_> {
+             return expired.then(|| Err(FlushError::TimedOut(Box::new(self.shared.stats(state)))));
+         }
+         let new_quarantined = state.quarantined.saturating_sub(state.reported_quarantined);
++        let cut_losses = state.cut_losses().unwrap_or(0);
+         let watermark = DeliveryWatermark {
+             client_instance: self.shared.instance,
+             required_sequence: self.target,
+@@ -904,12 +988,14 @@ impl Fence<'_> {
+             dropped_before_fence: self
+                 .dropped
+                 .saturating_sub(state.reported_drops)
++                .saturating_add(cut_losses.saturating_sub(state.lossy.reported_losses))
+                 .saturating_add(new_quarantined),
+             quarantined_before_fence: new_quarantined,
+             last_receipt: state.receipt.clone(),
+         };
+         state.reported_drops = state.reported_drops.max(self.dropped);
+         state.reported_quarantined = state.quarantined;
++        state.lossy.reported_losses = cut_losses;
+         Some(if watermark.dropped_before_fence == 0 {
+             Ok(watermark)
+         } else {
+@@ -930,16 +1016,22 @@ impl Shared {
+         if self.barrier_active.swap(true, Ordering::SeqCst) {
+             return Err(FlushError::Busy);
+         }
++        if self.config.disk_free() {
++            state.capture_cut();
++        }
+         let fence = Fence {
+             shared: self,
+             target: state.admitted_sequence,
+-            dropped: self.drop_total(),
++            dropped: self.drop_total().saturating_sub(state.lossy.worker_losses),
+             closing,
+         };
+         state.closing |= closing;
+         state.force_through = state.force_through.max(fence.target);
+         drop(state);
+         self.intake_work.notify_all();
++        if closing {
++            self.intake_room.notify_waiters();
++        }
+         self.wake.notify_one();
+         self.retry_wake.notify_one();
+         Ok(fence)
+@@ -969,7 +1061,13 @@ impl Shared {
+             span_limit = span + u64::from(u32::MAX);
+             log.stats.clone()
+         });
++        let queue = if config.disk_free() {
++            VecDeque::with_capacity(config.max_queued_events)
++        } else {
++            VecDeque::new()
++        };
+         Arc::new(Self {
++            request_prefix: format!("events:{}:", purrdf_hash::hex::encode(&instance)),
+             spool: spool.map(|log| Arc::new(Mutex::new(log))),
+             intake_work: Condvar::new(),
+             intake_room: Arc::default(),
+@@ -978,12 +1076,13 @@ impl Shared {
+             config,
+             instance,
+             state: Arc::new(Mutex::new(State {
++                lossy: lossy::Progress::default(),
+                 released_workers: 0,
+                 held: None,
+                 force_local: 0,
+                 spool: stats,
+                 reserved_disk: 0,
+-                queue: VecDeque::new(),
++                queue,
+                 pending: None,
+                 bytes: 0,
+                 count: 0,
+@@ -1048,6 +1147,20 @@ impl Shared {
+         }
+         ok
+     }
++    fn offer_ticket(&self) -> Option<u64> {
++        let sequence = self
++            .offered
++            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1));
++        match sequence {
++            Ok(previous) => Some(previous + 1),
++            Err(_) => {
++                self.exhausted.store(true, Ordering::Release);
++                self.wake.notify_one();
++                self.notify_barrier();
++                None
++            }
++        }
++    }
+     fn reject(&self, reason: DropReason, sequence: Option<u64>) -> Admission {
+         self.bump(&self.drops[reason as usize]);
+         Admission::Dropped { reason, sequence }
+@@ -1064,14 +1177,27 @@ impl Shared {
+             .map(|pending| pending.at)
+             .or_else(|| state.queue.front().map(|queued| queued.at))
+             .map(|at| at.elapsed());
++        let dropped_by_reason = std::array::from_fn(|i| self.drops[i].load(Ordering::Relaxed));
++        let offered_events = self.offered.load(Ordering::Relaxed);
+         DeliveryStats {
++            client_instance: self.instance,
++            dropped_sequences: if self.config.disk_free() {
++                dropped_by_reason
++                    .iter()
++                    .enumerate()
++                    .filter(|(index, _)| *index != DropReason::CounterExhausted as usize)
++                    .map(|(_, n)| *n)
++                    .sum()
++            } else {
++                0
++            },
++            last_refusal: state.lossy.refusal.clone(),
++            store_mismatch: state.lossy.mismatch.clone(),
+             spool: state.spool.clone(),
+             refused_by_reason: std::array::from_fn(|i| self.refusals[i].load(Ordering::Relaxed)),
+             held: state.held.clone(),
+-            dropped_by_reason: std::array::from_fn(|index| {
+-                self.drops[index].load(Ordering::SeqCst)
+-            }),
+-            offered_events: self.offered.load(Ordering::SeqCst),
++            dropped_by_reason,
++            offered_events,
+             admitted_events: state.admitted,
+             durable_events: state.durable,
+             pending_events: if state.spool.is_some() {
+@@ -1093,7 +1219,11 @@ impl Shared {
+                 .pending
+                 .as_ref()
+                 .map_or(0, |pending| pending.batch.events.len()),
+-            last_sequence: state.sequence,
++            last_sequence: if self.config.disk_free() {
++                offered_events
++            } else {
++                state.sequence
++            },
+             last_durable_sequence: state.durable_sequence,
+             retries: state.retries,
+             floor_refusals: state.floor_refusals,
+@@ -1111,7 +1241,28 @@ impl Shared {
+         }
+     }
+     fn fail(&self, error: Error) {
+-        if let Ok(mut state) = self.state.lock() {
++        let guard = self.state.lock();
++        if self.config.disk_free() {
++            // A panic can interrupt batch construction with events detached from
++            // the FIFO. Only certified receipts and already counted losses settle
++            // those admissions. Close the queue before exposing it to readers.
++            let mut state = guard.unwrap_or_else(std::sync::PoisonError::into_inner);
++            let lost = state
++                .admitted
++                .saturating_sub(state.durable)
++                .saturating_sub(state.lossy.worker_losses);
++            state.failure = Some(Arc::new(error));
++            state.closing = true;
++            state.count = 0;
++            state.bytes = 0;
++            state.lossy.worker_losses += lost;
++            self.drops[DropReason::Closed as usize].fetch_add(lost, Ordering::Relaxed);
++            let queue = std::mem::take(&mut state.queue);
++            let pending = state.pending.take();
++            self.state.clear_poison();
++            drop(state);
++            drop((queue, pending));
++        } else if let Ok(mut state) = guard {
+             state.failure = Some(Arc::new(error));
+         }
+         self.notify_barrier();
+@@ -1159,21 +1310,21 @@ impl Shared {
+             .batch_number
+             .checked_add(1)
+             .ok_or(Error::Protocol("producer batch identity exhausted"))?;
+-        let request_id = format!(
+-            "events:{}:{:020}",
+-            purrdf_hash::hex::encode(&self.instance),
+-            state.batch_number
+-        );
+-        let overhead = 1024 + 6 * (request_id.len() + self.config.source.len());
++        let number = state.batch_number;
++        // The wire identity ends in a zero-padded twenty-digit u64.
++        let overhead = 1024 + 6 * (self.request_prefix.len() + 20 + self.config.source.len());
+         let mut bytes = 0;
+-        let mut events = Vec::new();
+         // Before discovery only one event is certain to fit the count ceiling. A singleton
+         // that exceeds a newly advertised byte ceiling is kept whole for input quarantine.
+-        let count_limit = if advertised.is_some() {
++        let mut count_limit = if advertised.is_some() {
+             limits.events
+         } else {
+             1
+         };
++        if self.config.disk_free() && self.barrier_active.load(Ordering::Relaxed) {
++            count_limit = count_limit.min(state.cut_room());
++        }
++        let mut events = Vec::with_capacity(count_limit.min(state.queue.len()));
+         while let Some(next) = state.queue.front() {
+             if events.len() == count_limit
+                 || (!events.is_empty() && bytes + next.bytes + overhead > limits.payload_bytes)
+@@ -1185,24 +1336,53 @@ impl Shared {
+                 .pop_front()
+                 .ok_or(Error::Protocol("producer queue front disappeared"))?;
+             bytes += next.bytes;
+-            events.push(next.event);
++            events.push(next);
+         }
+         if events.is_empty() {
+             return Err(Error::Protocol(
+                 "admitted event cannot fit its configured delivery batch",
+             ));
+         }
++        let sent = state.lossy.sent;
++        drop(state);
++        let mut late_bytes = 0;
++        let mut late = 0;
++        if self.config.disk_free() {
++            events.sort_unstable_by_key(|entry| entry.event.sequence);
++            events.retain(|entry| {
++                if entry.event.sequence <= sent {
++                    late += 1;
++                    late_bytes += entry.bytes;
++                    false
++                } else {
++                    true
++                }
++            });
++        }
+         let batch = Arc::new(EventBatch {
+-            request_id,
++            request_id: format!("{}{:020}", self.request_prefix, number),
+             source: self.config.source.clone(),
+             client_instance: self.instance,
+-            events,
++            events: events.into_iter().map(|entry| entry.event).collect(),
+         });
++        let mut state = self
++            .state
++            .lock()
++            .map_err(|_| Error::Protocol("producer queue state poisoned"))?;
++        if late > 0 {
++            state.release_credit(late_bytes, late, true)?;
++            self.drops[DropReason::Late as usize].fetch_add(late as u64, Ordering::Relaxed);
++            self.notify_barrier();
++        }
++        if batch.events.is_empty() {
++            return Ok(Action::Continue);
++        }
+         state.pending = Some(Pending {
+             batch: batch.clone(),
+-            bytes,
++            bytes: bytes - late_bytes,
+             at,
+         });
++        drop(state);
+         batch.validate()?;
+         Ok(Action::Send(batch))
+     }
+@@ -1237,7 +1417,7 @@ impl Shared {
+             .store = None;
+         Ok(())
+     }
+-    fn accepted(&self, batch: &EventBatch, receipt: ArtifactReceipt) -> Result<(), Error> {
++    fn accepted(&self, batch: &Arc<EventBatch>, receipt: ArtifactReceipt) -> Result<(), Error> {
+         // Client::events certifies the exact canonical payload and durable record count.
+         // This queue additionally preserves its binding across reconnects.
+         self.bind_store(&receipt.store_id)?;
+@@ -1249,21 +1429,13 @@ impl Shared {
+             .pending
+             .as_ref()
+             .ok_or(Error::Protocol("producer acceptance has no pending batch"))?;
+-        if pending.batch.as_ref() != batch {
++        if !Arc::ptr_eq(&pending.batch, batch) {
+             return Err(Error::Protocol(
+                 "producer acceptance changed pending identity",
+             ));
+         }
+         let bytes = pending.bytes;
+         let count = batch.events.len();
+-        let bytes_left = state
+-            .bytes
+-            .checked_sub(bytes)
+-            .ok_or(Error::Protocol("producer byte ownership underflow"))?;
+-        let count_left = state
+-            .count
+-            .checked_sub(count)
+-            .ok_or(Error::Protocol("producer event ownership underflow"))?;
+         let durable = state
+             .durable
+             .checked_add(count as u64)
+@@ -1273,8 +1445,8 @@ impl Shared {
+             .last()
+             .ok_or(Error::Protocol("producer accepted an empty batch"))?
+             .sequence;
+-        state.bytes = bytes_left;
+-        state.count = count_left;
++        state.release_credit(bytes, count, false)?;
++        state.lossy.sent = durable_sequence;
+         state.durable = durable;
+         state.durable_sequence = durable_sequence;
+         state.receipt = Some(receipt);
+@@ -1428,7 +1600,7 @@ impl Shared {
+     /// Give up the immutable pending batch after its bytes reached a quarantine file: its
+     /// events stay counted and visible, their quota is released, and later events proceed
+     /// instead of queueing behind a batch that can never be accepted.
+-    fn quarantine(&self, batch: &EventBatch, error: Error) -> Result<(), Error> {
++    fn quarantine(&self, batch: &Arc<EventBatch>, error: Error) -> Result<(), Error> {
+         let mut state = self
+             .state
+             .lock()
+@@ -1437,7 +1609,7 @@ impl Shared {
+             .pending
+             .as_ref()
+             .ok_or(Error::Protocol("producer quarantine has no pending batch"))?;
+-        if pending.batch.as_ref() != batch {
++        if !Arc::ptr_eq(&pending.batch, batch) {
+             return Err(Error::Protocol(
+                 "producer quarantine changed pending identity",
+             ));
+@@ -1565,6 +1737,7 @@ impl std::error::Error for WriteContext {
+ }
+ 
+ enum Action {
++    Continue,
+     Wait(Option<Duration>),
+     Send(Arc<EventBatch>),
+     Stop,
+@@ -1578,6 +1751,7 @@ async fn run(shared: &Shared) -> Result<(), Error> {
+             .as_ref()
+             .map(|client| client.discovery().event_limits());
+         match shared.next(advertised)? {
++            Action::Continue => continue,
+             Action::Stop => return Ok(()),
+             Action::Wait(duration) => match duration {
+                 Some(duration) => {
+@@ -1586,6 +1760,7 @@ async fn run(shared: &Shared) -> Result<(), Error> {
+                 None => shared.wake.notified().await,
+             },
+             Action::Send(batch) => {
++                let mut replacement = None;
+                 let attempt = async {
+                     if connection.is_none() {
+                         let client = Client::open(
+@@ -1595,6 +1770,10 @@ async fn run(shared: &Shared) -> Result<(), Error> {
+                         )
+                         .await?;
+                         let bound = shared.bind_store(&client.discovery().store_id);
++                        if matches!(&bound, Err(Error::Domain { code, .. }) if code == STORE_MISMATCH)
++                        {
++                            replacement = Some(client.discovery().store_id.clone());
++                        }
+                         connection = Some(client);
+                         bound?;
+                     }
+@@ -1618,7 +1797,11 @@ async fn run(shared: &Shared) -> Result<(), Error> {
+                     };
+                     // A store replaced behind a live connection answers with its own receipt:
+                     // refuse it here, as a hold, rather than as a worker failure.
+-                    shared.bind_store(&receipt.store_id)?;
++                    let bound = shared.bind_store(&receipt.store_id);
++                    if matches!(&bound, Err(Error::Domain { code, .. }) if code == STORE_MISMATCH) {
++                        replacement = Some(receipt.store_id.clone());
++                    }
++                    bound?;
+                     Ok(receipt)
+                 };
+                 let result = tokio::select! {
+@@ -1638,7 +1821,11 @@ async fn run(shared: &Shared) -> Result<(), Error> {
+                         // A refusal during connection, discovery or CHAP cannot be about the
+                         // pending event batch. Store binding, once connected, is a separate
+                         // identity check with its own replacement policy.
+-                        let action = if connection.is_some() {
++                        let mismatch =
++                            matches!(&error, Error::Domain { code, .. } if code == STORE_MISMATCH);
++                        let action = if connection.is_some()
++                            && !(shared.config.disk_free() && mismatch && replacement.is_none())
++                        {
+                             disposition(&error)
+                         } else {
+                             Disposition::Hold
+@@ -1655,9 +1842,13 @@ async fn run(shared: &Shared) -> Result<(), Error> {
+                         // failure is counted and reported as the transient failure whatever
+                         // its kind, and the next attempt tries again: that batch is not
+                         // dropped. Every other failure holds the batch and retries it.
+-                        let mismatch =
+-                            matches!(&error, Error::Domain { code, .. } if code == STORE_MISMATCH);
+                         let error = match action {
++                            Disposition::SetAside if shared.config.disk_free() => {
++                                shared.discard_batch(&batch, error, replacement, may_have_sent)?;
++                                may_have_sent = false;
++                                backoff.reset();
++                                continue;
++                            }
+                             Disposition::SetAside => match shared.save(&batch, &error) {
+                                 Ok(_) => {
+                                     shared.quarantine(&batch, error)?;
+@@ -1798,6 +1989,172 @@ mod tests {
+         }
+     }
+ 
++    /// A caller with a missing daemon stamps each attempt before contention, validation
++    /// or quota refusal. A worker can settle a refused prefix with no durable receipt.
++    #[test]
++    fn disk_free_offers_count_every_attempt_without_waiting_for_a_held_lock() {
++        let mut config = DeliveryConfig::lossy(crate::Endpoint::Unix("absent.sock".into()), "fast");
++        config.max_queued_events = 1;
++        config.batch_events = 1;
++        let delivery = Delivery {
++            shared: Shared::new(config, [3; 16]),
++        };
++        let held = delivery.shared.state.lock().unwrap();
++        assert_eq!(
++            delivery.try_send(event()),
++            Admission::Dropped {
++                reason: DropReason::Contended,
++                sequence: Some(1)
++            }
++        );
++        drop(held);
++        delivery.capture_failed();
++        assert_eq!(
++            delivery.try_send(event()),
++            Admission::Queued { sequence: 3 }
++        );
++        for sequence in 4..=10_000 {
++            assert_eq!(
++                delivery.try_send(event()),
++                Admission::Dropped {
++                    reason: DropReason::Full,
++                    sequence: Some(sequence)
++                }
++            );
++        }
++        let Action::Send(batch) = delivery.shared.next(None).unwrap() else {
++            panic!("expected a pending request")
++        };
++        delivery
++            .shared
++            .discard_batch(&batch, Error::InvalidArgument("input-bound"), None, true)
++            .unwrap();
++        let Err(FlushError::Dropped(first)) = delivery.flush(Duration::ZERO) else {
++            panic!("losses missing from fence")
++        };
++        assert_eq!(
++            (first.durable_events, first.dropped_before_fence),
++            (0, 10_000)
++        );
++        assert_eq!(delivery.stats().unwrap().dropped_sequences, 10_000);
++        assert_eq!(
++            delivery.flush(Duration::ZERO).unwrap().dropped_before_fence,
++            0
++        );
++    }
++
++    /// A delayed lower ticket never reaches the wire after a higher one. A later
++    /// worker loss stays outside an earlier fence even when its caller resumes last.
++    #[test]
++    fn late_disk_free_tickets_and_cancelled_fences_preserve_fifo_loss_boundaries() {
++        let mut config = DeliveryConfig::lossy(crate::Endpoint::Unix("absent.sock".into()), "late");
++        config.batch_events = 2;
++        let delivery = Delivery {
++            shared: Shared::new(config, [4; 16]),
++        };
++        let shared = &delivery.shared;
++        let delayed = shared.offer_ticket().unwrap();
++        assert_eq!(
++            delivery.try_send(event()),
++            Admission::Queued { sequence: 2 }
++        );
++        let first = shared.fence(false).unwrap();
++        let Action::Send(batch) = shared.next(None).unwrap() else {
++            panic!("higher ticket was not dispatched")
++        };
++        assert_eq!(
++            delivery.enqueue_memory(event(), delayed),
++            Admission::Queued { sequence: 1 }
++        );
++        shared
++            .discard_batch(&batch, Error::InvalidArgument("input-bound"), None, true)
++            .unwrap();
++        assert!(matches!(shared.next(None).unwrap(), Action::Continue));
++        let mut state = shared.state.lock().unwrap();
++        let Some(Err(FlushError::Dropped(watermark))) = first.result(&mut state, false) else {
++            panic!("earlier fence unsettled")
++        };
++        assert_eq!(
++            (watermark.required_sequence, watermark.dropped_before_fence),
++            (2, 1)
++        );
++        drop(state);
++        drop(first);
++        drop(shared.fence(false).unwrap());
++        let Err(FlushError::Dropped(later)) = delivery.flush(Duration::ZERO) else {
++            panic!("late loss escaped cancelled fence")
++        };
++        assert_eq!(later.dropped_before_fence, 1);
++        let stats = delivery.stats().unwrap();
++        assert_eq!(
++            (
++                stats.dropped_by_reason[DropReason::Late as usize],
++                stats.dropped_sequences
++            ),
++            (1, 2)
++        );
++        let earlier = shared.offer_ticket().unwrap();
++        assert_eq!(
++            delivery.try_send(event()),
++            Admission::Queued { sequence: 4 }
++        );
++        assert_eq!(
++            delivery.enqueue_memory(event(), earlier),
++            Admission::Queued { sequence: 3 }
++        );
++        let Action::Send(ordered) = shared
++            .next(Some(crate::events::BatchLimits::NATIVE))
++            .unwrap()
++        else {
++            panic!("a complete admitted batch did not dispatch")
++        };
++        assert_eq!(
++            ordered
++                .events
++                .iter()
++                .map(|event| event.sequence)
++                .collect::<Vec<_>>(),
++            [3, 4]
++        );
++    }
++
++    /// An asynchronous best-effort offer waits through temporary RAM pressure and
++    /// synchronizes its own event even when the daemon is absent and max_wait is zero.
++    #[tokio::test]
++    async fn lossy_spool_waits_for_a_busy_intake_slot() {
++        use futures::FutureExt;
++        let dir = tempfile::tempdir().unwrap();
++        let mut spool = crate::SpoolConfig::new(dir.path().join("spool"));
++        spool.max_wait = Duration::ZERO;
++        let mut config = DeliveryConfig::lossy_spooled(
++            crate::Endpoint::Unix(dir.path().join("missing.sock")),
++            "intake",
++            spool,
++        );
++        config.max_queued_events = 1;
++        let delivery = Delivery::start_async(config).await.unwrap();
++        let offer = delivery.offer_spooled(event());
++        tokio::pin!(offer);
++        {
++            let _disk = delivery.shared.spool.as_ref().unwrap().lock().unwrap();
++            assert_eq!(
++                delivery.try_send(event()),
++                Admission::Queued { sequence: 1 }
++            );
++            assert!(offer.as_mut().now_or_never().is_none());
++            assert_eq!(delivery.stats().unwrap().admitted_events, 1);
++        }
++        assert_eq!(offer.await.unwrap().unwrap().sequence, 2);
++        let stats = delivery.stats().unwrap();
++        assert_eq!(stats.spool.unwrap().synced_sequence, 2);
++        assert_eq!(stats.refused_by_reason, [0; 5]);
++        delivery
++            .clone()
++            .close_local(Duration::from_secs(5))
++            .await
++            .unwrap();
++    }
++
+     /// INVARIANT: retries back off from the configured interval, double up to the maximum
+     /// and never exceed it, and an accepted batch restarts the sequence, so an outage does
+     /// not hold a client at a fast retry rate and a recovered daemon is not met with a stale
+@@ -2222,6 +2579,7 @@ mod tests {
+         {
+             let mut state = shared.state.lock().unwrap();
+             state.queue.push_back(Queued {
++                disk: 0,
+                 token: Vec::new(),
+                 ack: None,
+                 event: ProducerEvent {
+@@ -2408,21 +2766,61 @@ mod tests {
+         }
+     }
+ 
+-    /// INVARIANT: a worker that panicked while holding the state lock poisons it, and the
+-    /// bytes it held are still saved and reported saved: `save` writes the file and counts it,
+-    /// and `save_held` reports success. The old code wrote the file and
+-    /// then answered "state poisoned", so a saved batch was reported unsaved.
+-    #[test]
+-    fn a_poisoned_state_lock_still_saves_and_reports_the_held_bytes_as_saved() {
+-        let dir = tempfile::tempdir().unwrap();
+-        let shared = shared(&dir.path().join("quarantine"));
+-        let poisoner = shared.clone();
++    fn poison_queue(shared: Arc<Shared>) {
+         std::thread::spawn(move || {
+-            let _held = poisoner.state.lock().unwrap();
++            let _held = shared.state.lock().unwrap();
+             panic!("poison the state lock on purpose");
+         })
+         .join()
+         .unwrap_err();
++    }
++
++    /// If intake fails with admitted offers behind a detached append, both kinds of
++    /// disk confirmation must wake their callers and name the assigned sequences.
++    #[tokio::test]
++    async fn a_poisoned_spool_wakes_confirmed_senders_with_uncertain_sequences() {
++        use futures::FutureExt;
++        let dir = tempfile::tempdir().unwrap();
++        let mut config = DeliveryConfig::lossy_spooled(
++            crate::Endpoint::Unix(dir.path().join("absent.sock")),
++            "terminal-spool",
++            crate::SpoolConfig::new(dir.path().join("spool")),
++        );
++        config.batch_events = 1;
++        let delivery = Delivery::start_async(config).await.unwrap();
++        let first = delivery.offer_spooled(event());
++        let second = delivery.send(event());
++        tokio::pin!(first, second);
++        {
++            let _disk = delivery.shared.spool.as_ref().unwrap().lock().unwrap();
++            assert!(first.as_mut().now_or_never().is_none());
++            assert!(second.as_mut().now_or_never().is_none());
++            assert_eq!(delivery.stats().unwrap().admitted_events, 2);
++            poison_queue(delivery.shared.clone());
++        }
++        let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
++            tokio::join!(first, second)
++        })
++        .await
++        .unwrap();
++        assert!(matches!(first, Err(SendError::Uncertain { sequence: 1 })));
++        assert!(matches!(second, Err(SendError::Uncertain { sequence: 2 })));
++        assert!(matches!(
++            delivery.offer_spooled(event()).await,
++            Err(SendError::Refused {
++                reason: Refusal::SpoolFailed,
++                ..
++            })
++        ));
++    }
++
++    /// A poisoned queue still exposes terminal settlement: quarantine mode reports its
++    /// saved files and disk-free mode publishes the cause and counts remaining admissions.
++    #[test]
++    fn a_poisoned_queue_reports_saved_or_discarded_events_under_its_delivery_policy() {
++        let dir = tempfile::tempdir().unwrap();
++        let shared = shared(&dir.path().join("quarantine"));
++        poison_queue(shared.clone());
+         assert!(shared.state.is_poisoned());
+         let path = shared
+             .save(&batch_of("events:poison:1", 1), &Error::Protocol("refused"))
+@@ -2434,6 +2832,7 @@ mod tests {
+             .unwrap_or_else(std::sync::PoisonError::into_inner)
+             .queue
+             .push_back(Queued {
++                disk: 0,
+                 token: Vec::new(),
+                 ack: None,
+                 event: ProducerEvent {
+@@ -2451,6 +2850,36 @@ mod tests {
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
+         assert_eq!((state.quarantine_files, state.quarantine_failures), (2, 0));
++        let config = DeliveryConfig::lossy(crate::Endpoint::Unix("absent.sock".into()), "terminal");
++        let disk_free = Delivery {
++            shared: Shared::new(config, [5; 16]),
++        };
++        assert_eq!(
++            disk_free.try_send(event()),
++            Admission::Queued { sequence: 1 }
++        );
++        poison_queue(disk_free.shared.clone());
++        disk_free.shared.fail(Error::Protocol("sender panic"));
++        assert_eq!(
++            disk_free.try_send(event()),
++            Admission::Dropped {
++                reason: DropReason::Closed,
++                sequence: Some(2)
++            }
++        );
++        let stats = disk_free.stats().unwrap();
++        assert!(matches!(
++            stats.terminal_failure.as_deref(),
++            Some(Error::Protocol("sender panic"))
++        ));
++        assert_eq!(
++            (
++                stats.pending_events,
++                stats.dropped_sequences,
++                stats.quarantine_files
++            ),
++            (0, 2, 0)
++        );
+     }
+ 
+     /// INVARIANT: when the quarantine write fails, the error the worker reports as the
+diff --git crates/sparrow-client/src/delivery/lossy.rs crates/sparrow-client/src/delivery/lossy.rs
+new file mode 100644
+index 0000000..144972b
+--- /dev/null
++++ crates/sparrow-client/src/delivery/lossy.rs
+@@ -0,0 +1,143 @@
++// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++//! Disk-free loss accounting. Wire sequence and FIFO admission order can differ.
++
++use super::*;
++
++#[derive(Default)]
++pub(super) struct Progress {
++    pub(super) mismatch: Option<String>,
++    pub(super) refusal: Option<Arc<Error>>,
++    pub(super) sent: u64,
++    pub(super) worker_losses: u64,
++    pub(super) reported_losses: u64,
++    cut: Option<Cut>,
++}
++
++struct Cut {
++    admitted: u64,
++    losses: Option<u64>,
++}
++
++impl State {
++    fn settled(&self) -> u64 {
++        self.admitted - self.count as u64
++    }
++
++    pub(super) fn capture_cut(&mut self) {
++        self.lossy.cut = Some(Cut {
++            admitted: self.admitted,
++            losses: (self.count == 0).then_some(self.lossy.worker_losses),
++        });
++    }
++    pub(super) fn cut_losses(&self) -> Option<u64> {
++        self.lossy.cut.as_ref().and_then(|cut| cut.losses)
++    }
++
++    pub(super) fn cut_room(&self) -> usize {
++        self.lossy
++            .cut
++            .as_ref()
++            .filter(|cut| cut.losses.is_none())
++            .map_or(usize::MAX, |cut| {
++                usize::try_from(cut.admitted - self.settled()).unwrap_or(usize::MAX)
++            })
++    }
++
++    /// Release a contiguous FIFO prefix with one outcome. A racing fence keeps the
++    /// exact loss total at its prefix even if the observer is scheduled much later.
++    pub(super) fn release_credit(
++        &mut self,
++        bytes: usize,
++        count: usize,
++        lost: bool,
++    ) -> Result<(), Error> {
++        let before = self.settled();
++        self.bytes = self
++            .bytes
++            .checked_sub(bytes)
++            .ok_or(Error::Protocol("producer byte ownership underflow"))?;
++        self.count = self
++            .count
++            .checked_sub(count)
++            .ok_or(Error::Protocol("producer event ownership underflow"))?;
++        let after = self.settled();
++        if let Some(cut) = &mut self.lossy.cut
++            && cut.losses.is_none()
++            && (before..=after).contains(&cut.admitted)
++        {
++            cut.losses =
++                Some(self.lossy.worker_losses + if lost { cut.admitted - before } else { 0 });
++        }
++        if lost {
++            self.lossy.worker_losses += count as u64;
++        }
++        Ok(())
++    }
++}
++impl Shared {
++    pub(super) fn discard_batch(
++        &self,
++        batch: &Arc<EventBatch>,
++        error: Error,
++        replacement: Option<String>,
++        sent: bool,
++    ) -> Result<(), Error> {
++        let mut state = self
++            .state
++            .lock()
++            .map_err(|_| Error::Protocol("producer queue state poisoned"))?;
++        let pending = state
++            .pending
++            .take()
++            .ok_or(Error::Protocol("producer refusal has no pending batch"))?;
++        if !Arc::ptr_eq(batch, &pending.batch) {
++            return Err(Error::Protocol("producer refusal changed pending identity"));
++        }
++        let count = batch.events.len();
++        if sent {
++            state.lossy.sent = state.lossy.sent.max(
++                batch
++                    .events
++                    .last()
++                    .ok_or(Error::Protocol("refused empty batch"))?
++                    .sequence,
++            );
++        }
++        state.release_credit(pending.bytes, count, true)?;
++        let mut discarded = count;
++        let mut queue = VecDeque::new();
++        if let Some(observed) = replacement {
++            state.lossy.mismatch = Some(observed);
++            queue = std::mem::take(&mut state.queue);
++            let bytes = state.bytes;
++            state.release_credit(bytes, queue.len(), true)?;
++            discarded += queue.len();
++        }
++        self.drops[DropReason::Refused as usize].fetch_add(discarded as u64, Ordering::Relaxed);
++        state.lossy.refusal = Some(Arc::new(error));
++        state.transient = None;
++        drop(state);
++        drop(queue);
++        self.notify_barrier();
++        Ok(())
++    }
++
++    pub(super) fn rebind_memory(&self, store: &str) -> Result<(), Error> {
++        if !crate::receipt::valid_store_id(store) {
++            return Err(Error::InvalidArgument("invalid persistent store id"));
++        }
++        let mut state = self
++            .state
++            .lock()
++            .map_err(|_| Error::Protocol("producer queue state poisoned"))?;
++        if state.lossy.mismatch.as_deref() != Some(store) {
++            return Err(Error::InvalidArgument(
++                "rebind requires the observed replacement store id",
++            ));
++        }
++        state.store = state.lossy.mismatch.take();
++        Ok(())
++    }
++}
+diff --git crates/sparrow-client/src/delivery/spooled.rs crates/sparrow-client/src/delivery/spooled.rs
+index 9ad7acf..53e3d67 100644
+--- crates/sparrow-client/src/delivery/spooled.rs
++++ crates/sparrow-client/src/delivery/spooled.rs
+@@ -39,6 +39,7 @@ impl Completion {
+ }
+ 
+ struct Offer {
++    disk: u64,
+     event: ProducerEvent,
+     bytes: usize,
+     token: Vec<u8>,
+@@ -56,14 +57,19 @@ impl Delivery {
+         if matches!(shared.config.mode, DeliveryMode::LosslessConfirmed(_)) {
+             Admission::Refused { reason }
+         } else {
+-            shared.reject(reason.drop_reason(), None)
++            let drop = if reason == Refusal::SpoolFull {
++                DropReason::SpoolFull
++            } else {
++                reason.drop_reason()
++            };
++            shared.reject(drop, None)
+         }
+     }
+ 
+     fn permit(
+         &self,
+-        bytes: usize,
+-        token: usize,
++        offer: &Offer,
++        exact: bool,
+     ) -> Result<(std::sync::MutexGuard<'_, State>, u64), Refusal> {
+         let shared = &self.shared;
+         let config = shared.config.mode.spool().ok_or(Refusal::Invalid)?;
+@@ -74,18 +80,21 @@ impl Delivery {
+         if state.closing || shared.aborted.load(Ordering::Acquire) {
+             return Err(Refusal::Closed);
+         }
+-        let disk = reserve(bytes, token);
+-        let used = state
+-            .spool
+-            .as_ref()
+-            .ok_or(Refusal::SpoolFailed)?
+-            .bytes
+-            .saturating_add(state.reserved_disk);
+-        if disk > config.max_bytes.saturating_sub(used) {
++        let used = state.spool.as_ref().ok_or(Refusal::SpoolFailed)?.bytes;
++        let free = config.max_bytes.saturating_sub(used);
++        if offer.disk > free {
+             return Err(Refusal::SpoolFull);
+         }
++        if offer.disk > free.saturating_sub(state.reserved_disk) {
++            return Err(if exact {
++                Refusal::Busy
++            } else {
++                Refusal::SpoolFull
++            });
++        }
+         if state.count >= shared.config.max_queued_events
+-            || bytes + token > shared.config.max_queued_bytes.saturating_sub(state.bytes)
++            || offer.bytes + offer.token.len()
++                > shared.config.max_queued_bytes.saturating_sub(state.bytes)
+         {
+             return Err(Refusal::Busy);
+         }
+@@ -105,8 +114,9 @@ impl Delivery {
+         state.admitted += 1;
+         state.bytes += input.bytes + input.token.len();
+         state.count += 1;
+-        state.reserved_disk += reserve(input.bytes, input.token.len());
++        state.reserved_disk += input.disk;
+         state.queue.push_back(Queued {
++            disk: input.disk,
+             event: input.event,
+             bytes: input.bytes,
+             at: Instant::now(),
+@@ -122,18 +132,23 @@ impl Delivery {
+         let Ok(bytes) = event.admission_bytes() else {
+             return self.refuse(Refusal::Invalid);
+         };
+-        match self.permit(bytes, 0) {
++        let mut offer = Offer {
++            disk: reserve(bytes, 0),
++            event,
++            bytes,
++            token: Vec::new(),
++            ack: None,
++        };
++        let mut admission = self.permit(&offer, false);
++        if matches!(admission, Err(Refusal::SpoolFull))
++            && matches!(self.shared.config.mode, DeliveryMode::LossySpooled(_))
++        {
++            offer.disk = Log::frame_bytes(&offer.event, &[]);
++            admission = self.permit(&offer, true);
++        }
++        match admission {
+             Ok((state, sequence)) => {
+-                self.enqueue(
+-                    state,
+-                    sequence,
+-                    Offer {
+-                        event,
+-                        bytes,
+-                        token: Vec::new(),
+-                        ack: None,
+-                    },
+-                );
++                self.enqueue(state, sequence, offer);
+                 Admission::Queued { sequence }
+             }
+             Err(reason) => self.refuse(reason),
+@@ -152,7 +167,35 @@ impl Delivery {
+         event: ProducerEvent,
+         token: &[u8],
+     ) -> Result<SpoolReceipt, SendError> {
+-        self.shared.bump(&self.shared.offered);
++        self.confirmed_offer(event, token, false).await
++    }
++
++    /// Wait for bounded intake room in lossy spooled mode. A synchronized event returns
++    /// its receipt. Only an actual full on-disk segment budget drops valid input and
++    /// returns `Ok(None)`. Setup, closed admission and storage failures remain errors.
++    pub async fn offer_spooled(
++        &self,
++        event: ProducerEvent,
++    ) -> Result<Option<SpoolReceipt>, SendError> {
++        match self.confirmed_offer(event, &[], true).await {
++            Ok(receipt) => Ok(Some(receipt)),
++            Err(SendError::Refused {
++                reason: Refusal::SpoolFull,
++                ..
++            }) => {
++                self.shared.reject(DropReason::SpoolFull, None);
++                Ok(None)
++            }
++            Err(e) => Err(e),
++        }
++    }
++
++    async fn confirmed_offer(
++        &self,
++        event: ProducerEvent,
++        token: &[u8],
++        backpressure: bool,
++    ) -> Result<SpoolReceipt, SendError> {
+         let refused = |reason, event| {
+             self.shared.bump(&self.shared.refusals[reason as usize]);
+             Err(SendError::Refused {
+@@ -160,18 +203,33 @@ impl Delivery {
+                 event: Box::new(event),
+             })
+         };
++        // A disk confirmation API cannot offer an event on a disk-free handle.
++        if self.shared.config.disk_free() {
++            return refused(Refusal::Invalid, event);
++        }
++        self.shared.bump(&self.shared.offered);
+         let Ok(bytes) = event.admission_bytes() else {
+             return refused(Refusal::Invalid, event);
+         };
+         let Some(config) = self.shared.config.mode.spool() else {
+             return refused(Refusal::Invalid, event);
+         };
+-        if token.len() > 256 {
++        if token.len() > 256
++            || backpressure && !matches!(self.shared.config.mode, DeliveryMode::LossySpooled(_))
++        {
++            return refused(Refusal::Invalid, event);
++        }
++        if bytes + token.len() > self.shared.config.max_queued_bytes {
+             return refused(Refusal::Invalid, event);
+         }
+         let deadline = tokio::time::Instant::now() + config.max_wait;
+         let (tx, rx) = oneshot::channel();
+         let offer = Offer {
++            disk: if backpressure {
++                Log::frame_bytes(&event, token)
++            } else {
++                reserve(bytes, token.len())
++            },
+             event,
+             bytes,
+             token: token.to_owned(),
+@@ -181,7 +239,7 @@ impl Delivery {
+             let room = self.shared.intake_room.notified();
+             tokio::pin!(room);
+             room.as_mut().enable();
+-            let reason = match self.permit(bytes, token.len()) {
++            let reason = match self.permit(&offer, backpressure) {
+                 Ok((state, seq)) => {
+                     self.enqueue(state, seq, offer);
+                     break seq;
+@@ -189,6 +247,7 @@ impl Delivery {
+                 Err(reason) => reason,
+             };
+             match reason {
++                Refusal::Busy if backpressure => room.await,
+                 Refusal::Busy if tokio::time::Instant::now() < deadline => {
+                     let _ = tokio::time::timeout_at(deadline, room).await;
+                 }
+@@ -284,6 +343,7 @@ impl Delivery {
+             }
+             state.closing = true;
+         }
++        self.shared.intake_room.notify_waiters();
+         self.shared.intake_work.notify_all();
+         let synced = self.flush_local(timeout).await?;
+         self.shared.aborted.store(true, Ordering::Release);
+@@ -305,6 +365,9 @@ impl Delivery {
+     /// Bind an unsealed prefix to an explicitly named store. An unresolved seal stays on
+     /// its original store until an exact receipt establishes its outcome.
+     pub async fn rebind(&self, store: &str) -> Result<(), Error> {
++        if self.shared.config.disk_free() {
++            return self.shared.rebind_memory(store);
++        }
+         let spool = self
+             .shared
+             .spool
+@@ -338,10 +401,15 @@ pub(super) fn start_intake(shared: &Arc<Shared>) -> Result<(), Error> {
+                 Err(_) => Some(Error::Protocol("spool intake panicked")),
+             } {
+                 worker.fail(error);
+-                if let Ok(mut state) = worker.state.lock() {
+-                    for queued in &mut state.queue {
+-                        queued.ack.take();
+-                    }
++                // Intake has stopped. Even a poisoned queue retains its ack
++                // senders; release them so assigned offers learn their outcome
++                // is uncertain. Leave admission closed on the poisoned state.
++                let mut state = worker
++                    .state
++                    .lock()
++                    .unwrap_or_else(std::sync::PoisonError::into_inner);
++                for queued in &mut state.queue {
++                    queued.ack.take();
+                 }
+             }
+             worker.intake_room.notify_waiters();
+@@ -427,7 +495,7 @@ fn intake(shared: &Shared) -> Result<(), Error> {
+             for item in &group {
+                 state.count -= 1;
+                 state.bytes -= item.bytes + item.token.len();
+-                state.reserved_disk -= reserve(item.bytes, item.token.len());
++                state.reserved_disk -= item.disk;
+             }
+         }
+         drop(log);
+diff --git crates/sparrow-client/src/producer_config.rs crates/sparrow-client/src/producer_config.rs
+index 4a6c110..cc1c258 100644
+--- crates/sparrow-client/src/producer_config.rs
++++ crates/sparrow-client/src/producer_config.rs
+@@ -61,6 +61,7 @@ struct FileConfig {
+ #[serde(rename_all = "snake_case")]
+ enum FileMode {
+     Memory,
++    Lossy,
+     LossySpooled,
+     Lossless,
+ }
+@@ -140,6 +141,7 @@ impl FileConfig {
+         }
+         config.mode = match file.mode.unwrap_or(FileMode::Lossless) {
+             FileMode::Memory => crate::DeliveryMode::LossyAspirational,
++            FileMode::Lossy => crate::DeliveryMode::LossyMemory,
+             FileMode::LossySpooled => crate::DeliveryMode::LossySpooled(spool),
+             FileMode::Lossless => crate::DeliveryMode::LosslessConfirmed(spool),
+         };
+diff --git crates/sparrow-client/src/spool.rs crates/sparrow-client/src/spool.rs
+index 3f7f2cd..db1dbbc 100644
+--- crates/sparrow-client/src/spool.rs
++++ crates/sparrow-client/src/spool.rs
+@@ -62,6 +62,8 @@ impl SpoolConfig {
+ pub enum DeliveryMode {
+     /// Memory queue with exact refusal counters and permanent-input quarantine.
+     LossyAspirational,
++    /// Nonwaiting, disk-free offers with sequenced losses and explicit store rebinding.
++    LossyMemory,
+     /// Fast memory admission followed by asynchronous disk intake.
+     LossySpooled(SpoolConfig),
+     /// Supports both fast memory offers and explicit confirmed disk acceptance.
+@@ -71,7 +73,7 @@ pub enum DeliveryMode {
+ impl DeliveryMode {
+     pub(crate) fn spool(&self) -> Option<&SpoolConfig> {
+         match self {
+-            Self::LossyAspirational => None,
++            Self::LossyAspirational | Self::LossyMemory => None,
+             Self::LossySpooled(config) | Self::LosslessConfirmed(config) => Some(config),
+         }
+     }
+@@ -330,6 +332,24 @@ fn read_frame(reader: &mut impl Read) -> Result<Frame, Error> {
+ }
+ 
+ impl Log {
++    fn entry_message(
++        event: &ProducerEvent,
++        token: &[u8],
++        at: u64,
++    ) -> capnp::message::Builder<capnp::message::HeapAllocator> {
++        let mut msg = capnp::message::Builder::new_default();
++        let mut out = msg.init_root::<wire::entry::Builder<'_>>();
++        out.set_at(at);
++        out.set_token(token);
++        event.encode(out.init_event());
++        msg
++    }
++
++    /// Sequence and timestamp occupy fixed-width slots, so this is also the final append size.
++    pub(crate) fn frame_bytes(event: &ProducerEvent, token: &[u8]) -> u64 {
++        let msg = Self::entry_message(event, token, 0);
++        (PREFIX + 8 * capnp::serialize::compute_serialized_size_in_words(&msg)) as u64
++    }
+     pub(crate) fn open(
+         config: &SpoolConfig,
+         source: &str,
+@@ -596,12 +616,7 @@ impl Log {
+         if self.stats.spooled_sequence.checked_add(1) != Some(event.sequence) || token.len() > 256 {
+             return Err(Error::Protocol("invalid local spool append order or token"));
+         }
+-        let mut msg = capnp::message::Builder::new_default();
+-        let mut out = msg.init_root::<wire::entry::Builder<'_>>();
+-        out.set_at(at);
+-        out.set_token(token);
+-        event.encode(out.init_event());
+-        let body = message_bytes(&msg);
++        let body = message_bytes(&Self::entry_message(event, token, at));
+         let size = (PREFIX + body.len()) as u64;
+         if body.len() > FRAME_MAX || size > self.config.max_bytes.saturating_sub(self.stats.bytes) {
+             return Err(Error::Protocol(
+diff --git crates/sparrow-server/src/serving.rs crates/sparrow-server/src/serving.rs
+index 588e910..51e8994 100644
+--- crates/sparrow-server/src/serving.rs
++++ crates/sparrow-server/src/serving.rs
+@@ -611,10 +611,8 @@ mod tests {
+             let stats = delivery.stats().unwrap();
+             assert!(stats.floor_refusals >= 1, "{stats:?}");
+             assert!(stats.retries >= stats.floor_refusals);
+-            assert_eq!(
+-                (stats.quarantined_events, stats.dropped_by_reason),
+-                (0, [0; 5])
+-            );
++            assert_eq!(stats.quarantined_events, 0);
++            assert!(stats.dropped_by_reason.iter().all(|&count| count == 0));
+             assert!(stats.terminal_failure.is_none());
+             fixture.stop.take().unwrap().send(()).unwrap();
+             fixture.served.await.unwrap().unwrap();
+diff --git crates/sparrow-server/tests/rpc.rs crates/sparrow-server/tests/rpc.rs
+index 4c84158..3f85384 100644
+--- crates/sparrow-server/tests/rpc.rs
++++ crates/sparrow-server/tests/rpc.rs
+@@ -7785,6 +7785,16 @@ async fn configured_spools_recover_after_producer_sigkill_and_drain_once() {
+                         .sequence,
+                     index
+                 );
++            } else if name == "lossy" && index == 1 {
++                assert_eq!(
++                    delivery
++                        .offer_spooled(event)
++                        .await
++                        .unwrap()
++                        .unwrap()
++                        .sequence,
++                    index
++                );
+             } else {
+                 assert_eq!(
+                     delivery.try_send(event),
+@@ -7839,6 +7849,66 @@ async fn configured_spools_recover_after_producer_sigkill_and_drain_once() {
+     );
+ }
+ 
++/// A full offline journal drops only frames exceeding its remaining physical capacity.
++/// Reopening drains that prefix to the daemon and reclaimed space admits the next sequence.
++#[tokio::test(flavor = "current_thread")]
++async fn full_lossy_spool_recovers_drains_and_accepts_after_cleanup() {
++    use sparrow_client::{Delivery, DeliveryConfig, DropReason, Endpoint, SpoolConfig};
++    let dir = tempfile::tempdir().unwrap();
++    let store = dir.path().join("store");
++    let socket = store.join("rpc.sock");
++    let daemon_config = write_server_config(dir.path(), &store, &socket);
++    let mut spool = SpoolConfig::new(dir.path().join("spool"));
++    spool.max_bytes = 1 << 20;
++    spool.segment_bytes = 64 << 10;
++    let config = DeliveryConfig::lossy_spooled(
++        Endpoint::Unix(socket.clone()),
++        "full-offline",
++        spool.clone(),
++    );
++    let producer = Delivery::start_async(config.clone()).await.unwrap();
++    let large = delivery_event(&"x".repeat(7900));
++    let mut accepted = 0;
++    while let Some(receipt) = producer.offer_spooled(large.clone()).await.unwrap() {
++        accepted += 1;
++        assert_eq!(receipt.sequence, accepted);
++        assert!(accepted < 200);
++    }
++    let stats = producer.stats().unwrap();
++    let used = stats.spool.unwrap().bytes;
++    assert!(accepted > 100);
++    assert!(used <= spool.max_bytes && spool.max_bytes - used < used / accepted);
++    assert!(producer.offer_spooled(large).await.unwrap().is_none());
++    assert_eq!(
++        producer.stats().unwrap().dropped_by_reason[DropReason::SpoolFull as usize],
++        2
++    );
++    assert_eq!(
++        producer.close_local(Duration::from_secs(5)).await.unwrap(),
++        accepted
++    );
++    let _daemon = start(&daemon_config, &socket).await;
++    let producer = Delivery::start_async(config).await.unwrap();
++    let timeout = Duration::from_secs(20);
++    let fence = producer.flush_async(timeout).await.unwrap();
++    assert_eq!(fence.durable_sequence, accepted);
++    assert_eq!(producer.stats().unwrap().spool.unwrap().bytes, 0);
++    let next = producer
++        .offer_spooled(delivery_event("after recovery"))
++        .await
++        .unwrap()
++        .unwrap();
++    assert_eq!(next.sequence, accepted + 1);
++    assert_eq!(
++        producer
++            .shutdown_async(timeout)
++            .await
++            .unwrap()
++            .durable_sequence,
++        next.sequence
++    );
++}
++
+ fn delivery_event(text: &str) -> sparrow_client::ProducerEvent {
+     sparrow_client::ProducerEvent {
+         sequence: 0,
+@@ -9828,6 +9898,101 @@ async fn producer_delivery_retries_a_busy_refusal_on_the_same_connection() {
+         .await;
+ }
+ 
++/// The disk-free sender exports an interior sequence gap through the real server,
++/// continues after a permanent refusal, and requires explicit consent to a new store.
++#[tokio::test(flavor = "current_thread")]
++async fn disk_free_delivery_reports_gaps_and_rebinds_only_to_the_observed_store() {
++    use sparrow_client::{Admission, Delivery, DeliveryConfig, DropReason, Endpoint, FlushError};
++    async fn queued(handle: &Delivery, text: &str) -> u64 {
++        tokio::time::timeout(Duration::from_secs(2), async {
++            loop {
++                match handle.try_send(delivery_event(text)) {
++                    Admission::Queued { sequence } => return sequence,
++                    Admission::Dropped {
++                        reason: DropReason::Contended,
++                        ..
++                    } => tokio::task::yield_now().await,
++                    other => panic!("unexpected loss: {other:?}"),
++                }
++            }
++        })
++        .await
++        .unwrap()
++    }
++    tokio::task::LocalSet::new().run_until(async {
++        let dir = tempfile::tempdir().unwrap();
++        let other = tempfile::tempdir().unwrap();
++        let mut servers = Vec::new();
++        for location in [dir.path(), other.path()] {
++            let store = location.join("store");
++            let socket = store.join("rpc.sock");
++            let config = write_server_config(location, &store, &socket);
++            let daemon = start(&config, &socket).await;
++            let connection = connect(&socket).await.unwrap();
++            servers.push((daemon, connection, socket));
++        }
++        let proxy_socket = dir.path().join("relay.sock");
++        let (state, proxy) = relay(&proxy_socket, servers[0].1.client.clone());
++        state.drop_first.set(false);
++        let quarantine = dir.path().join("quarantine");
++        let source = "disk-free-gaps";
++        let mut config = DeliveryConfig::lossy(Endpoint::Unix(proxy_socket), source)
++            .with_quarantine_dir(&quarantine)
++            .with_test_timing(Duration::from_secs(2), Duration::from_millis(10), Duration::from_millis(30));
++        config.batch_events = 1;
++        config.max_queued_events = 1;
++        config.rpc_timeout = Duration::from_millis(500);
++        let handle = Delivery::start_async(config).await.unwrap();
++        let timeout = Duration::from_secs(5);
++        let first = queued(&handle, "first observed sequence").await;
++        let initial = reached_delivery(handle.flush_async(timeout).await);
++        let store = initial.last_receipt.unwrap().store_id;
++        state.refusals.borrow_mut().push_back(("INVALID_ARGUMENT", false));
++        queued(&handle, "permanently refused").await;
++        // The relay and daemon run on this LocalSet. Until we yield, the in-flight
++        // singleton stays charged. Lock contention can race a worker state transition.
++        loop {
++            match handle.try_send(delivery_event("quota")) {
++                Admission::Dropped { reason: DropReason::Full, .. } => break,
++                Admission::Dropped { reason: DropReason::Contended, .. } => continue,
++                other => panic!("queue must be occupied: {other:?}"),
++            }
++        }
++        let refused = reached_delivery(handle.flush_async(timeout).await);
++        assert!(refused.dropped_before_fence >= 2);
++        let stats = handle.stats().unwrap();
++        assert_eq!(stats.dropped_by_reason[DropReason::Refused as usize], 1);
++        assert!(matches!(stats.last_refusal.as_deref(), Some(sparrow_client::Error::Domain { code, message, .. }) if code == "INVALID_ARGUMENT" && message.contains("injected refusal")));
++        let last = queued(&handle, "later valid observation").await;
++        let fence = reached_delivery(handle.flush_async(timeout).await);
++        assert_eq!(fence.durable_events, 2);
++        let rows = cli(&servers[0].2, &["sources", &store, "--source", source]);
++        let stream = rows["rows"][0]["producer_stream_ids"][0].as_str().unwrap();
++        let window = cli(&servers[0].2, &["producer-stream", &store, stream]);
++        let number = |value: &purrdf_lex::json::Value| value.as_str().unwrap().parse::<u64>().unwrap();
++        assert_eq!(number(&window["unobserved_sequences"]), last-first-1);
++        assert_eq!(number(&window["gaps"][0]["first"]), first+1);
++        assert_eq!(number(&window["gaps"][0]["last"]), last-1);
++        assert_eq!(handle.stats().unwrap().dropped_sequences, last-2);
++        state.drop_first.set(true);
++        queued(&handle, "unknown reply on the original store").await;
++        tokio::time::timeout(timeout, state.first_accepted.notified()).await.unwrap();
++        *state.backend.borrow_mut() = servers[1].1.client.clone();
++        assert!(matches!(handle.flush_async(timeout).await, Err(FlushError::Dropped(_))));
++        let new_store = handle.stats().unwrap().store_mismatch.unwrap();
++        assert_ne!(new_store, store);
++        assert!(handle.rebind(&store).await.is_err());
++        assert!(matches!(handle.try_send(delivery_event("held")), Admission::Dropped { reason: DropReason::Refused, .. }));
++        handle.rebind(&new_store).await.unwrap();
++        queued(&handle, "after rebind").await;
++        let fence = reached_delivery(handle.shutdown_async(timeout).await);
++        assert_eq!(fence.last_receipt.unwrap().store_id, new_store);
++        assert_eq!(fence.durable_events, 3);
++        assert!(!quarantine.exists());
++        proxy.abort();
++    }).await;
++}
++
+ /// INVARIANT (#216): a permanent refusal (a non-retryable `INVALID_ARGUMENT`: a batch that can
+ /// never fit) quarantines that batch into a file, with the reason, the count and every event
+ /// line, while a busy or capacity refusal is never quarantined. The next event is delivered
+diff --git docs/development-runtime.md docs/development-runtime.md
+index 3760433..ea08a0b 100644
+--- docs/development-runtime.md
++++ docs/development-runtime.md
+@@ -5086,9 +5086,14 @@ application tracing example below.
+ 
+ ### Bounded producer delivery worker
+ 
+-`sparrow_client::Delivery` owns one producer thread, a Tokio LocalSet and the
++`sparrow_client::Delivery` owns a sender thread, a Tokio LocalSet and the
+ shared typed client. Producers call `try_send(ProducerEvent)` without waiting for
+-socket I/O; admission waits only for the queue lock, whose holders do bounded
++socket I/O. `DeliveryConfig::lossy` stamps each offer before validation and
++returns immediately if the queue lock is occupied. It counts each sequenced
++loss, skips permanently refused batches and requires explicit rebinding when
++the store changes. See [disk-free lossy delivery](interfaces.md#disk-free-lossy-delivery).
++
++With `DeliveryConfig::new` or file mode `memory`, admission waits for the queue lock. Its holders do bounded
+ in-memory work and never I/O, so a briefly held lock never drops an event. The
+ worker assigns increasing sequences under queue serialization. Full, invalid,
+ closed, failed and counter-exhausted admission each have visible drop counters.
+@@ -5115,9 +5120,9 @@ these are configurable. Queue and immutable pending-batch ownership stay charged
+ until a matching durable receipt. Retryable Unix-socket/transport/daemon errors
+ preserve exactly the same request ID, instance, sequences, timestamps and values.
+ RPC timeout means delivery unknown. The first discovered persistent store binds
+-the worker; reconnecting to another store fails explicitly with pending input
+-retained. Permanent failures remain inspectable through `stats` and
+-`pending_batch`, with no manufactured acknowledgement. Source-time registration
++the worker. The selected mode determines how it handles a replacement store.
++Refusals, held requests and durable progress are inspectable through `stats`
++and `pending_batch`. Source-time registration
+ pressure now uses the same retryable `STORAGE_PRESSURE` code as ingestion.
+ 
+ `stats` exposes offered/admitted/durable counts, drops by reason, pending count/
+diff --git docs/interfaces.md docs/interfaces.md
+index bef06df..f8cebab 100644
+--- docs/interfaces.md
++++ docs/interfaces.md
+@@ -4806,6 +4806,7 @@ an exclusive lock and binds one persistent producer instance to its source.
+ | --- | --- |
+ | `try_send(event)` | `Admission::Queued` assigns a sequence and transfers the event to bounded RAM without file or socket I/O. |
+ | `send(event).await` or `send_with_token(event, cursor).await` | A local disk sync covers the event and its optional application cursor of up to 256 bytes, even offline. |
++| `offer_spooled(event).await` in `lossy_spooled` mode | `Ok(Some(receipt))` confirms local disk sync. `Ok(None)` counts one drop when the encoded frame exceeds the remaining disk budget. |
+ | `flush_local(timeout).await` | All admitted events through the captured sequence have reached synchronized local disk. |
+ | `close_local(timeout).await` | Local flush completes and both workers stop. Release other producer handles before reopening its directory. |
+ | `flush_async(timeout).await` or `shutdown_async(timeout).await` | Sparrow has durably acknowledged the captured prefix. Shutdown also closes admission and stops delivery. |
+@@ -4848,7 +4849,12 @@ its existing watermark.
+ File configuration selects `mode = "lossless"` by default. Fast offers report
+ `Admission::Refused` on capacity or other admission failures. In
+ `"lossy_spooled"` they report counted drops and successful admissions follow
+-the same disk path. `"memory"` enables bounded RAM delivery and quarantine.
++the same disk path. Select that policy in Rust with
++`DeliveryConfig::lossy_spooled(endpoint, source, spool)`. For valid input
++and a healthy spool, `offer_spooled` waits for RAM and temporary disk
++reservations. A disk capacity drop increments `DropReason::SpoolFull`
++and consumes no sequence. Invalid input, shutdown and disk failures return
++typed errors. `"memory"` enables bounded RAM delivery and quarantine.
+ `spool_max_bytes` defaults to 1 GiB of segment bytes and
+ `spool_segment_bytes` to 16 MiB. Leave filesystem space for the checkpoint,
+ lock and filesystem metadata. `spool_sync_interval_ms` defaults to 1,000 for
+@@ -4875,6 +4881,47 @@ batch number. `retry_held()` wakes the sender after remediation.
+ `rebind(store_id).await` can move an unsealed prefix. An unresolved seal
+ requires its original store and exact receipt evidence.
+ 
++### Disk-free lossy delivery
++
++Use `DeliveryConfig::lossy(endpoint, source)` or TOML `mode = "lossy"`
++when the application requires immediate admission and can lose diagnostics.
++`try_send` assigns a checked sequence before validation or queue access.
++The configured count and byte quotas include detached and in-flight events.
++A background worker sorts each batch by sequence, holds uncertain requests
++across retries and counts permanent refusals before continuing.
++
++| Drop reason | When it occurs |
++| --- | --- |
++| `Full` | The next event exceeds the remaining RAM quota. |
++| `Contended` | Another thread holds the queue lock. |
++| `Invalid` | Event validation or capture fails. |
++| `Closed` | Shutdown or a terminal local failure closes admission. |
++| `Refused` | The daemon permanently refuses a batch, or a changed destination awaits rebinding. |
++| `Late` | A delayed offer arrives behind a sequence already dispatched. |
++| `CounterExhausted` | The producer cannot allocate another sequence. |
++
++`DeliveryStats.dropped_sequences` counts assigned sequences for all six
++sequenced reasons. A remote window can count an interior gap once it observes
++events on both sides. Leading and trailing loss, an expired window and a
++registry at capacity can leave loss unobserved. `continuity_unknown` preserves
++that uncertainty. Use local counters for the complete instance history. A
++flush covers the captured FIFO admissions and reports new losses once, even
++when concurrent producers finish admission in a different sequence order.
++
++`last_refusal` retains the daemon code and message. On store replacement the
++worker records the observed identifier in `store_mismatch`, counts all pending
++input as refused and refuses subsequent offers. Verify the destination and call
++`rebind(observed_store_id).await?` to resume. The original store may have
++accepted a request whose reply was lost. A replacement that fails a configured
++store or role expectation is refused during discovery with `INSTANCE_MISMATCH`.
++The worker retains the immutable batch and retries until an eligible daemon
++answers. Rebinding cannot override the configured expectation.
++
++`producer ENDPOINT SOURCE lossy COUNT RATE TAG` exercises this mode. Each
++observation carries a typed message with the tag and offer number. The example
++reports the instance, admissions, named losses and maximum caller latency on
++stderr and prints its final remote watermark and flush outcome on stdout.
++
+ ### Memory delivery and shared event capture
+ 
+ The separate `sparrow-client` crate keeps producers independent of the database
+@@ -4886,7 +4933,8 @@ or semantic engine. The public surface includes:
+ - Structured events with client instance/sequence identities, producer event
+   time, level, target, message/fields, and current span/trace context. Span
+   lifecycle/context becomes typed relationships with source evidence.
+-- Bounded batching/retry queues and visible delivery/drop counters. The default
++- Bounded batching/retry queues and visible delivery/drop counters. With
++  `DeliveryConfig::new`, `for_endpoint`, `tcp` or TOML `mode = "memory"`, the
+   logging path is nonblocking and drops new events when full; it never silently
+   allocates an unlimited queue or stalls a production thread on network I/O. The queue
+   holds at most 1024 events and 4 MiB by default (`max_queued_events`, `max_queued_bytes`); an event past either bound is refused as `Full` and
+diff --git helpers-ledger.toml helpers-ledger.toml
+index ff6049e..a576ce9 100644
+--- helpers-ledger.toml
++++ helpers-ledger.toml
+@@ -2354,7 +2354,7 @@ names = ['^(validate_cli_discovery|validate_producer_discovery)$']
+ id = "producer-spool"
+ summary = "Recover, seal, confirm and reclaim ordered producer segments under one persistent identity and bounded disk budget."
+ home = "sparrow_client::spool::Log"
+-entry_points = ["sparrow_client::delivery::spooled::Delivery::send_with_token", "sparrow_client::delivery::spooled::Delivery::flush_local", "sparrow_client::delivery::Delivery::try_send"]
++entry_points = ["sparrow_client::delivery::spooled::Delivery::send_with_token", "sparrow_client::delivery::spooled::Delivery::offer_spooled", "sparrow_client::delivery::spooled::Delivery::flush_local", "sparrow_client::delivery::Delivery::try_send"]
+ spec = "docs/interfaces.md: Configured spool."
+ vectors = ["crates/sparrow-client/src/spool.rs", "crates/sparrow-server/tests/rpc.rs"]
+ bench = []
+@@ -2365,6 +2365,21 @@ constants = []
+ fingerprints = []
+ names = ['^(append_offline_event|replay_offline_segment)$']
+ 
++[[job]]
++id = "lossy-producer-fence"
++summary = "Release FIFO queue credit and capture the cumulative worker losses through a disk-free producer fence."
++home = "sparrow_client::delivery::lossy::State::release_credit"
++entry_points = ["sparrow_client::delivery::Shared::accepted", "sparrow_client::delivery::lossy::Shared::discard_batch", "sparrow_client::delivery::Shared::next"]
++spec = "docs/interfaces.md: Disk-free lossy delivery."
++vectors = ["crates/sparrow-client/src/delivery.rs", "crates/sparrow-server/tests/rpc.rs"]
++bench = []
++enforced = true
++
++[job.forbidden]
++constants = []
++fingerprints = []
++names = ['^(release_lossy_credit|settle_lossy_prefix)$']
++
+ [[job]]
+ id = "durable-producer-directory-creation"
+ summary = "Create private producer directories and synchronize newly created directory entries through their first existing parent."

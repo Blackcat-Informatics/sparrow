@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/463-package-the-existing-command-line-and",
+  "branch": "paudley/463-package-the-existing-command-line-and",
+  "base_ref": "origin/main",
+  "head": "0fde5a15a9f12420dcba610776f778814a8948b6",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/463-package-the-existing-command-line-and/.stage/package-the-existing-command-line-and/sync/20261122T015152-bf9bc081c61942eb99c451f775e24c78",
+  "conflicts": [],
+  "status": "completed",
+  "base": "f6622e362a2996b0d4bb84f7d32b52d8af5efb94",
+  "merge_bases": [
+    "89740d13c245cdff1fc8a7c546d05c649854f12d"
+  ],
+  "merge_index": "66a49e3c5ca08490de1d3b43f3dfe30494b551a324442786d097e4171e35e6f2",
+  "candidate_tree": "e5f324122f20eba5a33acd2afc63afc363474f11",
+  "candidate_patch": "candidate-7441fcc1f7754727b514aaf01f7a7e7f.patch",
+  "stdout_log": "commit-7441fcc1f7754727b514aaf01f7a7e7f.stdout.log",
+  "stderr_log": "commit-7441fcc1f7754727b514aaf01f7a7e7f.stderr.log",
+  "validation_records": [],
+  "commit_duration_seconds": 27.199276994011598,
+  "commit": "a56c61d81899a1e915d96422879ca3b8428f8354",
+  "tree": "e5f324122f20eba5a33acd2afc63afc363474f11",
+  "exit_code": 0
+}
