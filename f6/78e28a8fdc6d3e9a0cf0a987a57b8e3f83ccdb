@@ -1,0 +1,19 @@
+ghprsq source head backlink metadata
+
+parent_hashes: f678e28a8fdc6d3e9a0cf0a987a57b8e3f83ccdb
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 491
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/491
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 637a16e16a3fa1d587bdb1537aaaa9a7529d9277
+GhpRsq-Head-Ref: paudley/488-qualify-quarantine-retirement-under
+GhpRsq-Head-OID: f678e28a8fdc6d3e9a0cf0a987a57b8e3f83ccdb
+GhpRsq-Result-Tree: 1872e2cb44b78492d6d1e86f2aa595f4776277a5
+GhpRsq-Result-Commit: 12d786c951077c32a1bc415962fda1e505f11114
+GhpRsq-Parent-Hashes: f678e28a8fdc6d3e9a0cf0a987a57b8e3f83ccdb
+GhpRsq-Squash-Notes-SHA256: 46e42ab4775cd1d0e7b3ef54475144e983dbecf79dd8a637a9631936110be798
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
