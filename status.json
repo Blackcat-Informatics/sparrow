@@ -1,0 +1,79 @@
+{
+  "issue": 452,
+  "pr_number": 474,
+  "branch": "paudley/452-quarantine-replay-stores-held-parts",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/452-quarantine-replay-stores-held-parts/.stage/quarantine-replay-stores-held-parts",
+  "observed_at": "2026-11-22T02:35:56.653338+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/452-quarantine-replay-stores-held-parts/.stage/quarantine-replay-stores-held-parts/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/452-quarantine-replay-stores-held-parts/.stage/quarantine-replay-stores-held-parts/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/452-quarantine-replay-stores-held-parts/.stage/quarantine-replay-stores-held-parts/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/452-quarantine-replay-stores-held-parts/.stage/quarantine-replay-stores-held-parts/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/452-quarantine-replay-stores-held-parts/.stage/quarantine-replay-stores-held-parts/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 474,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Recover quarantined producer events with certified receipts",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/474",
+    "baseRefName": "main",
+    "baseRefOid": "956735f5e6d64140855df6cb807e7297f14d5ba4",
+    "headRefName": "paudley/452-quarantine-replay-stores-held-parts",
+    "headRefOid": "d2f2e94acc03c4f7cf39b13006f9daf8e7f10d8a",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/468/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "d2f2e94acc03c4f7cf39b13006f9daf8e7f10d8a",
+    "branch": "paudley/452-quarantine-replay-stores-held-parts",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 474,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #474 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}

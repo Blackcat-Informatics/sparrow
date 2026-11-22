@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/452-quarantine-replay-stores-held-parts",
+  "branch": "paudley/452-quarantine-replay-stores-held-parts",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "f6622e362a2996b0d4bb84f7d32b52d8af5efb94",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/452-quarantine-replay-stores-held-parts/.stage/quarantine-replay-stores-held-parts/sync/20261122T021321-7ae600d8777f47b4ac8bb36d3e285007",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "956735f5e6d64140855df6cb807e7297f14d5ba4",
+  "merge_bases": [
+    "f6622e362a2996b0d4bb84f7d32b52d8af5efb94"
+  ],
+  "commit": "956735f5e6d64140855df6cb807e7297f14d5ba4"
+}
