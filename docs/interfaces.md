@@ -1170,19 +1170,19 @@ for a completed file or a new input arriving on stdin.
 
 ### Part sets for consume roots (#280)
 
-A consume-root file above what one artifact can hold is published as a part set
-instead of being refused. Discovery advertises everything the cut needs, all
-additive, with no schema version change: `maxImportBytes @11`, `rawRecordBytes @12`
-(the longest record a layout keeps whole), and the joint retirement bound
-`retireRowBudget @13`, `retireChunkCharge @14` and `retireRecordCharge @15`. A staged
-artifact of `chunks` chunks (the sum over its records of the record length over
-65536, rounded up) and `records` records is refused with the non-retryable `RESOURCE_LIMIT` at layout
-exactly when `retireChunkCharge * chunks + retireRecordCharge * records` exceeds
-`retireRowBudget`. Each value comes from the store's own properties
-(`max_raw_record_bytes`, `retire_row_budget`, `retire_chunk_charge`,
-`retire_record_charge`), so what is advertised is what is enforced, test hooks
-included. An older daemon sends 0 for each; the client then keeps the single path
-and plans no split.
+A consume-root file above what one artifact can hold is published as a part set.
+Discovery and status report the configured `maxRecordsPerArtifact`. Consume roots
+and SDK bulk imports limit each part to the smaller of that count and the storage
+metadata ceiling of 32,768 records. A file can need several parts on record count
+alone even when its bytes fit in one import.
+
+Discovery also reports `maxImportBytes @11`, `rawRecordBytes @12` (the longest
+record a layout keeps whole) and the joint retirement bound. Each record costs one
+chunk per 65,536 bytes, rounded up. Layout refuses the artifact with non-retryable
+`RESOURCE_LIMIT` if `retireChunkCharge * chunks + retireRecordCharge * records`
+exceeds `retireRowBudget`. An older daemon sends zero for the byte and retirement
+limits. A consume root then keeps the single path for files within the advertised
+import bound or when that bound is unknown.
 
 The cut lives in `sparrow_client::parts` (`next_cut`). A `jsonl` or `log` part
 holds whole lines while the byte bound, the record limit and the joint bound all

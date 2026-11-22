@@ -16991,8 +16991,7 @@ async fn an_over_bound_declaration_is_permanent_named_advertised_and_counted() {
         .await;
 }
 
-/// An in-process daemon whose import bound is 20 chunks (1,310,720 bytes) and whose
-/// retirement row budget is 20 one-chunk records, with a claim root over `producer`.
+/// An in-process daemon with a claim root over `producer`.
 struct SetHarness {
     store: sparrow_core::Store,
     client: sparrow_client::Client,
@@ -17017,14 +17016,26 @@ fn set_limits(units: usize) -> sparrow_core::EvictionLimits {
 }
 
 async fn set_harness(dir: &Path) -> SetHarness {
+    set_harness_with(dir, |config| {
+        let store = config.open_store().unwrap();
+        let bounds = store
+            .scale_retirement_for_tests(set_limits(20), 1024)
+            .unwrap();
+        assert_eq!(bounds.import_bytes, 20 * 65_536);
+        store
+    })
+    .await
+}
+
+async fn set_harness_with(
+    dir: &Path,
+    open_store: impl FnOnce(&mut sparrow_server::ServerConfig) -> sparrow_core::Store,
+) -> SetHarness {
     use sparrow_server::{Rpc, ServerConfig, consumption::ClaimRoot};
     let data = dir.join("store");
     let socket = data.join("rpc.sock");
-    let config = ServerConfig::read(&write_server_config(dir, &data, &socket)).unwrap();
-    let store = config.open_store().unwrap();
-    let limits = set_limits(20);
-    let bounds = store.scale_retirement_for_tests(limits, 1024).unwrap();
-    assert_eq!(bounds.import_bytes, 20 * 65_536);
+    let mut config = ServerConfig::read(&write_server_config(dir, &data, &socket)).unwrap();
+    let store = open_store(&mut config);
     let producer = dir.join("producer");
     std::fs::create_dir_all(&producer).unwrap();
     if socket.exists() {
@@ -17320,6 +17331,59 @@ impl SetHarness {
         ids.dedup();
         assert_eq!(ids.len(), records.len());
     }
+}
+
+/// A log above the fixed metadata ceiling and below the configured limit publishes as
+/// ordered parts and completes its claim, even when all its bytes fit in a single import.
+#[tokio::test(flavor = "current_thread")]
+async fn a_consume_file_above_the_metadata_record_ceiling_publishes_ordered_parts() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let harness = set_harness_with(dir.path(), |config| {
+                config.max_records = 40_000;
+                config.disk_budget = 4 << 30;
+                config.open_store().unwrap()
+            })
+            .await;
+            assert_eq!(harness.client.discovery().max_records_per_artifact, 40_000);
+            let mut input = b"a\n".repeat(32_768);
+            input.extend_from_slice(b"final marker\n");
+            let (manifest, claim) = harness.publish("many.log", "log", &input).await;
+            let parts = harness.parts(&manifest, "log", &input);
+            assert_eq!(parts.len(), 2);
+            for ((format, artifact), count) in parts.iter().zip([32_768, 1]) {
+                assert_eq!(format, "log");
+                assert_eq!(
+                    harness.store.artifact(artifact).unwrap().record_ids.len(),
+                    count
+                );
+            }
+
+            let now = sparrow_server::now().unwrap();
+            let removed = harness.root.remove(&claim, now).unwrap();
+            assert_eq!(
+                removed.published_artifact.as_deref(),
+                Some(manifest.as_str())
+            );
+            assert_eq!(removed.removed_at, Some(now));
+            assert!(!harness.producer.join("many.log").try_exists().unwrap());
+            assert!(
+                !harness
+                    .producer
+                    .join(".sparrow-inflight")
+                    .join(removed.import_id)
+                    .try_exists()
+                    .unwrap()
+            );
+            assert!(
+                !dir.path()
+                    .join("producer.sparrow-quarantine")
+                    .try_exists()
+                    .unwrap()
+            );
+        })
+        .await;
 }
 
 /// INVARIANT (#285, condition 1): the source of a set claim stays held, and its bytes

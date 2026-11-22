@@ -10,6 +10,7 @@ use super::{
 };
 use purrdf_lex::json::{Object, Value};
 use rocksdb::WriteBatch;
+use sparrow_limits::MAX_PUBLICATION_RECORDS;
 
 /// Fixed raw staging unit; only the final unit may be shorter.
 pub const IMPORT_CHUNK_BYTES: usize = CHUNK;
@@ -1469,10 +1470,9 @@ impl Layout<'_> {
         }
         // The publication's atomic source-context update admits this many distinct records.
         // Refusing here costs the layout read, not the preparation of every record (#397).
-        if self.next_index >= super::source_context::MAX_CONTEXT_RECORDS as u64 {
+        if self.next_index >= MAX_PUBLICATION_RECORDS as u64 {
             return Err(Error::input_bound(format!(
-                "import of more than {} records in one publication exceeds metadata admission; split the input into parts of at most that many records",
-                super::source_context::MAX_CONTEXT_RECORDS
+                "import of more than {MAX_PUBLICATION_RECORDS} records in one publication exceeds metadata admission; split the input into parts of at most that many records"
             )));
         }
         let length = usize::try_from(byte_end - self.record_start)
