@@ -1,0 +1,19 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 7b5683a77302a10211aec8e700783e14393ee168
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 484
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/484
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 019c2acba602763df139d4350ceb8bec3d63bf80
+GhpRsq-Head-Ref: paudley/482-keep-healthy-shipper-sources-moving
+GhpRsq-Head-OID: 7b5683a77302a10211aec8e700783e14393ee168
+GhpRsq-Result-Tree: 74f5dad2c10d5edc8b7ccfe7900c1fd9dc5b5545
+GhpRsq-Result-Commit: 785f0f1c78fe5a15ce61ab3bf9d395515c542a94
+GhpRsq-Parent-Hashes: 7b5683a77302a10211aec8e700783e14393ee168
+GhpRsq-Squash-Notes-SHA256: 9cf5c871f33a6d82978e49d44faaf23f54b1e594cd7bfed6fc9e4b8933eceefb
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
