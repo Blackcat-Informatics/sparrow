@@ -93,6 +93,15 @@ pub async fn get_import_progress(
         ));
     }
     crate::receipt::Contract::Producer.discover(client).await?;
+    read_import_progress(client, store_id, import_id).await
+}
+
+/// Read a specific import on a capability whose producer contract was already discovered.
+pub(crate) async fn read_import_progress(
+    client: &wire::sparrow::Client,
+    store_id: &str,
+    import_id: &str,
+) -> Result<ImportProgress, Error> {
     let mut call = client.import_get_request();
     let mut query = call.get().init_import();
     query.set_store_id(store_id);

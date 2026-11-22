@@ -1,5 +1,5 @@
 VERSION "1.2"
-BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/a140d1f9b37b0f19d2ca41038cb6f1b96fb951ec41b3d801cd3798daf8c279bd>
+BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/99cd62d4e53fd90901f7cb29205f3e55c3ed33dfe0499d4abdff4a4ef9894f12>
 <> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#Ledger> .
 <> <https://blackcatinformatics.ca/raf/report/1#distinct> <#distinct/0> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/active-file-checkpoint-attachment> .
@@ -1320,6 +1320,7 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/a140d1f9b37b0f
 <#job/durable-upload-progress-certificate> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
 <#job/durable-upload-progress-certificate> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
 <#job/durable-upload-progress-certificate> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_client::import_progress::get_import_progress" .
+<#job/durable-upload-progress-certificate> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_client::import_progress::read_import_progress" .
 <#job/durable-upload-progress-certificate> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_client::imports::upload" .
 <#job/durable-upload-progress-certificate> <https://blackcatinformatics.ca/raf/report/1#forbiddenName> "^(decode_import_progress_elsewhere|certify_upload_offset_elsewhere)$" .
 <#job/durable-upload-progress-certificate> <https://blackcatinformatics.ca/raf/report/1#homeSymbol> "sparrow_client::import_progress::ImportProgress::decode" .
