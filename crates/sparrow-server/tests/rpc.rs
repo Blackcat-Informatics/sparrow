@@ -3771,7 +3771,17 @@ async fn bounded_discovery_and_status_do_not_read_corrupt_evidence_and_keys_refu
             let discovery = sparrow_client::Discovery::fetch(client.capability())
                 .await
                 .unwrap();
-            assert_eq!(discovery, client.discovery().clone());
+            // Each discovery samples its own server-clock deadline. The negotiated
+            // capabilities and identities are stable across both reads.
+            let cached = client.discovery();
+            assert!(cached.sealed_event_deadline_ms > 0 && discovery.sealed_event_deadline_ms > 0);
+            assert_eq!(
+                discovery,
+                sparrow_client::Discovery {
+                    sealed_event_deadline_ms: discovery.sealed_event_deadline_ms,
+                    ..cached.clone()
+                }
+            );
             assert_eq!(
                 Some(discovery.store_id.as_str()),
                 properties["store_id"].as_str()
