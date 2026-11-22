@@ -140,7 +140,7 @@ impl State {
         }
     }
     /// Refuse while durability is latched uncertain (see [`uncertain`]).
-    fn check(&self) -> Result<(), Error> {
+    pub(super) fn check(&self) -> Result<(), Error> {
         match &self.failure {
             Some(failure) => Err(uncertain(failure)),
             None => Ok(()),
@@ -408,13 +408,38 @@ impl Store {
 
     /// Clear a durability latch in the running store once every accepted write is proven
     /// durable (see [`Writer::reestablish`]); `Ok(None)` when nothing was latched,
-    /// `Ok(Some(cause))` when the latch cleared.
+    /// `Ok(Some(cause))` when the latch cleared. The daemon's maintenance worker paces
+    /// calls to this operation. A poisoned writer remains poisoned until both its
+    /// catalog state has been revalidated and the proof succeeds.
     ///
     /// # Errors
-    /// `STORAGE_FAILURE` when RocksDB still refuses the proof: the handle is stopped and only
-    /// reopening the store clears the latch.
+    /// The catalog validation or durability proof failed. The latch keeps its cause.
     pub fn reestablish_durability(&self) -> Result<Option<String>, Error> {
-        self.lock()?.reestablish()
+        let arrival = self.unlocked.writers.arrive()?;
+        let locked = self.inner.lock();
+        drop(arrival);
+        let writer = match locked {
+            Ok(writer) => return writer.reestablish(),
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if writer.durability.borrow().failure.is_none() {
+            self.recover_unlatched_writer(&writer)?;
+            return Ok(None);
+        }
+        writer.revalidate().map_err(|error| {
+            error.with_context("validate the poisoned writer before proving durability")
+        })?;
+        let cleared = writer.reestablish()?;
+        if cleared.is_some() {
+            self.note_writer_recovered();
+        }
+        Ok(cleared)
+    }
+
+    /// Read the last published durability failure without acquiring or recovering the writer.
+    #[must_use]
+    pub fn durability_failure(&self) -> Option<String> {
+        self.unlocked.durability.read().failure
     }
 
     /// Whether free space on the filesystem holding the store is below what RocksDB needs to
@@ -454,7 +479,8 @@ impl Store {
     }
 
     /// Inspect current sequence, queue charge, age and any latched uncertainty.
-    /// Reads the observed state without the writer lock, and recovers a poisoned writer first.
+    /// Reads the observed state without the writer lock, and recovers an unlatched poisoned
+    /// writer first.
     pub fn durability_status(&self) -> Result<DurabilityStatus, Error> {
         self.recover_poisoned()?;
         let state = self.unlocked.durability.read();

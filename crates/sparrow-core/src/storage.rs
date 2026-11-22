@@ -1188,9 +1188,7 @@ impl Writer {
     /// Every catalog change is one atomic batch, so the database holds no half-applied write;
     /// only the writer's working state may be half updated. Each part that derives from the
     /// database is loaded again, as an open loads it: the pressure, table rewrite and archive
-    /// states, and the session-local eviction and expiry cursors. The durability ledger may
-    /// lack a write that reached the WAL, so a WAL sync certifies everything accepted; when that
-    /// sync fails the writer is not recovered and the lock stays poisoned.
+    /// states, and the session-local eviction and expiry cursors.
     fn revalidate(&self) -> Result<(), Error> {
         *self.pressure.borrow_mut() = pressure::State::load(&self.db)?;
         *self.recompression.borrow_mut() = recompression::State::load(&self.db)?;
@@ -1204,12 +1202,6 @@ impl Writer {
         *self.eviction.borrow_mut() = eviction::Cursor::default();
         *self.expiry.borrow_mut() = expiry::Cursor::default();
         self.reclaiming.set(false);
-        // A latched durability is re-established first (the proof the maintenance worker would
-        // otherwise run), so a poisoned writer and a latch clear together. A writer that cannot
-        // prove what it accepted is not recovered: a failed proof or sync leaves the lock
-        // poisoned and the next operation tries again.
-        self.reestablish()?;
-        self.synchronize()?;
         Ok(())
     }
 
@@ -1994,23 +1986,40 @@ impl Store {
             Err(poisoned) => poisoned,
         };
         let writer = poisoned.into_inner();
-        // A refused re-validation leaves the lock poisoned, so the next operation retries it.
+        writer.durability.borrow().check()?;
+        self.recover_unlatched_writer(&writer)?;
+        Ok(writer)
+    }
+
+    /// Recover a poisoned writer that has no known durability failure. Its ledger may lack a
+    /// write that reached the WAL before the panic, so synchronize before clearing poison.
+    fn recover_unlatched_writer(&self, writer: &Writer) -> Result<(), Error> {
         writer
             .revalidate()
+            .and_then(|()| writer.synchronize())
             .map_err(|error| writer_unrecovered(&error))?;
+        self.note_writer_recovered();
+        Ok(())
+    }
+
+    fn note_writer_recovered(&self) {
         self.inner.clear_poison();
         self.unlocked
             .writer_recoveries
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(writer)
     }
 
-    /// Recover a poisoned writer before a read that never takes the writer lock (status and
-    /// the observed states), so it reports the re-validated state rather than what the
-    /// panicked writer left. It waits for the writer only while the lock is poisoned.
+    /// Recover unlatched poison before reporting observed state. While a durability latch
+    /// stands, diagnostics use their snapshots and published values until maintenance proves it.
     pub(crate) fn recover_poisoned(&self) -> Result<(), Error> {
-        if self.inner.is_poisoned() {
-            drop(self.lock_uncounted()?);
+        if self.inner.is_poisoned()
+            && self.durability_failure().is_none()
+            && let Err(poisoned) = self.inner.lock()
+        {
+            let writer = poisoned.into_inner();
+            if writer.durability.borrow().check().is_ok() {
+                self.recover_unlatched_writer(&writer)?;
+            }
         }
         Ok(())
     }
@@ -3259,7 +3268,7 @@ impl Store {
 
     /// Report measured database bytes, the store counters and active pins. It never takes
     /// the writer lock: every count comes from one snapshot, so a migration page or a write
-    /// in progress does not delay it, and it first recovers a poisoned writer lock. `counts` is
+    /// in progress does not delay it, and it recovers an unlatched poisoned writer. `counts` is
     /// `pending` while the store counters seed;
     /// `live_records`, `unique_payload_chunks` and `unique_json_projections` are then exact
     /// only through the seeding watermark, not totals. Its cost does not grow with the store.

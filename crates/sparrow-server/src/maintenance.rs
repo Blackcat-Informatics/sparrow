@@ -447,11 +447,23 @@ impl Proofs {
     }
 
     /// The step at `now`, given whether measured free space is below RocksDB's recovery
-    /// buffer. Free space falling low again restarts the wait.
-    fn step(&mut self, pace: &Pace, now: tokio::time::Instant, space_low: bool) -> Step {
-        if space_low {
-            *self = Self::default();
-            return Step::Wait;
+    /// buffer. Low or unmeasured free space restarts the grace interval and keeps the
+    /// latch under observation. An unknown reading still preserves the failed proof's
+    /// backoff in case space was adequate throughout.
+    fn step(&mut self, pace: &Pace, now: tokio::time::Instant, space_low: Option<bool>) -> Step {
+        match space_low {
+            None => {
+                self.adequate_since = None;
+                return Step::Wait;
+            }
+            Some(true) => {
+                *self = Self {
+                    active: self.active,
+                    ..Self::default()
+                };
+                return Step::Wait;
+            }
+            Some(false) => {}
         }
         let elapsed = now.saturating_duration_since(*self.adequate_since.get_or_insert(now));
         if elapsed >= pace.bound {
@@ -503,14 +515,6 @@ fn cause(message: &str, space_low: bool) -> Cause {
     } else {
         Cause::Other
     }
-}
-
-/// Whether durability is latched, read without taking the writer.
-fn latched(store: &Store) -> Result<bool, String> {
-    store
-        .durability_status()
-        .map(|status| status.failure.is_some())
-        .map_err(|error| error.to_string())
 }
 
 /// The first wait before a duty that panicked runs again.
@@ -661,6 +665,7 @@ mod skips {
         static RECLAIM_WAKES: Cell<u64> = const { Cell::new(0) };
         static RECLAIM: Cell<u64> = const { Cell::new(0) };
         static RECLAIM_OBSERVED: Cell<u64> = const { Cell::new(0) };
+        static FAILED_PROOF_AT: Cell<Option<tokio::time::Instant>> = const { Cell::new(None) };
     }
 
     /// The reclaim observation ran (inside `observe_floor`).
@@ -712,6 +717,14 @@ mod skips {
 
     pub(super) fn passes() -> Rc<Notify> {
         PASS.with(Rc::clone)
+    }
+
+    pub(super) fn proof_failed(at: tokio::time::Instant) {
+        FAILED_PROOF_AT.set(Some(at));
+    }
+
+    pub(super) fn failed_proof() -> Option<tokio::time::Instant> {
+        FAILED_PROOF_AT.get()
     }
 
     /// An expiry pass finished and scheduled the next one.
@@ -845,6 +858,7 @@ async fn run(
     // The proofs of the standing latch and the last failure they met.
     let mut proofs = Proofs::default();
     let mut proof_failure: Option<String> = None;
+    let mut space_measurement_failure = None;
     let mut journal = MigrationJournal::default();
     loop {
         let job = tokio::select! {
@@ -941,22 +955,34 @@ async fn run(
                 continue;
             }
         };
-        let latched = if proofs.must_read(result.is_err()) {
-            let owner = store.clone();
-            tokio::task::spawn_blocking(move || latched(&owner))
-                .await
-                .map_err(|error| format!("{} latch read join failed: {error}", job.name()))?
-                .map_err(|error| format!("{}: {error}", job.name()))?
+        let latch = if proofs.must_read(result.is_err()) {
+            store.durability_failure()
         } else {
-            false
+            None
         };
-        let first_sight = latched && !proofs.active;
-        proofs.read(latched);
-        if !latched {
-            proof_failure = None;
-        } else {
-            let space_low = store.free_space_is_low().unwrap_or(false);
-            let named = cause(proof_failure.as_deref().unwrap_or_default(), space_low);
+        let first_sight = latch.is_some() && !proofs.active;
+        proofs.read(latch.is_some());
+        if let Some(latch) = latch {
+            let space_low = match store.free_space_is_low() {
+                Ok(low) => {
+                    space_measurement_failure = None;
+                    Some(low)
+                }
+                Err(error) => {
+                    if space_measurement_failure.is_none() {
+                        eprintln!(
+                            "sparrowd: cannot measure free space for durability recovery ({:?}). Waiting for a successful measurement",
+                            error.to_string()
+                        );
+                    }
+                    space_measurement_failure = Some(error);
+                    None
+                }
+            };
+            let named = cause(
+                proof_failure.as_deref().unwrap_or(&latch),
+                space_low == Some(true),
+            );
             if first_sight {
                 eprintln!(
                     "sparrowd: store durability latched ({}); writes are refused, the store is left alone until free space is adequate and RocksDB has had time to resume, then the proof runs",
@@ -970,7 +996,7 @@ async fn run(
                         "store durability uncertain and not re-established within {:?} of adequate free space ({}); RocksDB clears this only by reopening, so exiting for the supervisor to reopen it: {}",
                         pace.bound,
                         named.name(),
-                        proof_failure.as_deref().unwrap_or("no proof ran")
+                        proof_failure.as_deref().unwrap_or(&latch)
                     ));
                 }
                 Step::Prove => {
@@ -993,12 +1019,23 @@ async fn run(
                         }
                         Ok(None) => proofs.read(false),
                         Err(error) => {
-                            proofs.failed(tokio::time::Instant::now());
+                            let now = tokio::time::Instant::now();
+                            proofs.failed(now);
+                            #[cfg(test)]
+                            skips::proof_failed(now);
+                            eprintln!(
+                                "sparrowd: store durability proof failed (latch={latch:?}, error={:?}). Retry backoff {:?}",
+                                error.to_string(),
+                                pace.after(proofs.failures)
+                            );
                             proof_failure = Some(error.message);
                         }
                     }
                 }
             }
+        } else {
+            proof_failure = None;
+            space_measurement_failure = None;
         }
         // A deferral that finished while this duty ran no longer reflects the writers
         // waiting now; the page it admits waits again first.
@@ -1386,26 +1423,45 @@ mod tests {
         let mut proofs = Proofs::default();
         // Low free space waits indefinitely, far past the bound.
         for seconds in [0, 10, 300, 3600] {
-            assert_eq!(proofs.step(&pace, at(seconds), true), Step::Wait);
+            assert_eq!(proofs.step(&pace, at(seconds), Some(true)), Step::Wait);
         }
         // Space returns at 4000 s: wait out the grace, then prove once.
-        assert_eq!(proofs.step(&pace, at(4000), false), Step::Wait);
-        assert_eq!(proofs.step(&pace, at(4014), false), Step::Wait);
-        assert_eq!(proofs.step(&pace, at(4015), false), Step::Prove);
+        assert_eq!(proofs.step(&pace, at(4000), Some(false)), Step::Wait);
+        assert_eq!(proofs.step(&pace, at(4014), Some(false)), Step::Wait);
+        assert_eq!(proofs.step(&pace, at(4015), Some(false)), Step::Prove);
         // A failed proof is followed by 30 s, then 60 s, then 60 s of silence.
         proofs.failed(at(4015));
-        assert_eq!(proofs.step(&pace, at(4044), false), Step::Wait);
-        assert_eq!(proofs.step(&pace, at(4045), false), Step::Prove);
+        assert_eq!(proofs.step(&pace, at(4044), Some(false)), Step::Wait);
+        assert_eq!(proofs.step(&pace, at(4045), Some(false)), Step::Prove);
         proofs.failed(at(4045));
-        assert_eq!(proofs.step(&pace, at(4104), false), Step::Wait);
-        assert_eq!(proofs.step(&pace, at(4105), false), Step::Prove);
+        assert_eq!(proofs.step(&pace, at(4104), Some(false)), Step::Wait);
+        assert_eq!(proofs.step(&pace, at(4105), Some(false)), Step::Prove);
         proofs.failed(at(4105));
         // The bound counts from when space became adequate.
-        assert_eq!(proofs.step(&pace, at(4119), false), Step::Wait);
-        assert_eq!(proofs.step(&pace, at(4120), false), Step::Exit);
-        // Space falling low again restarts the whole wait.
-        assert_eq!(proofs.step(&pace, at(4121), true), Step::Wait);
-        assert_eq!(proofs.step(&pace, at(4200), false), Step::Wait);
+        assert_eq!(proofs.step(&pace, at(4119), Some(false)), Step::Wait);
+        assert_eq!(proofs.step(&pace, at(4120), Some(false)), Step::Exit);
+        // Low space or a failed measurement restarts the entire wait.
+        for (interrupted, restart_at) in [(Some(true), 4200), (None, 4300)] {
+            assert_eq!(
+                proofs.step(&pace, at(restart_at - 1), interrupted),
+                Step::Wait
+            );
+            assert_eq!(proofs.step(&pace, at(restart_at), Some(false)), Step::Wait);
+            assert_eq!(
+                proofs.step(&pace, at(restart_at + 14), Some(false)),
+                Step::Wait
+            );
+            assert_eq!(
+                proofs.step(&pace, at(restart_at + 15), Some(false)),
+                Step::Prove
+            );
+        }
+        // A failed observation restarts grace without shortening an active proof backoff.
+        proofs.failed(at(4315));
+        assert_eq!(proofs.step(&pace, at(4316), None), Step::Wait);
+        assert_eq!(proofs.step(&pace, at(4317), Some(false)), Step::Wait);
+        assert_eq!(proofs.step(&pace, at(4344), Some(false)), Step::Wait);
+        assert_eq!(proofs.step(&pace, at(4345), Some(false)), Step::Prove);
 
         for (message, space_low, expected) in [
             ("Input/output error", true, Cause::NoSpace),
@@ -1434,6 +1490,7 @@ mod tests {
         assert!(!proofs.must_read(false), "no latch was seen");
         assert!(proofs.must_read(true), "a failed duty may have met one");
         proofs.read(true);
+        assert_eq!(proofs.step(&pace, origin, Some(true)), Step::Wait);
         let mut proved_at = None;
         for second in 0..=20_u64 {
             // Every second a different duty succeeds and the latch is read again.
@@ -1442,7 +1499,8 @@ mod tests {
                 "a standing latch is read after every duty"
             );
             proofs.read(true);
-            if proofs.step(&pace, origin + Duration::from_secs(second), false) == Step::Prove {
+            if proofs.step(&pace, origin + Duration::from_secs(second), Some(false)) == Step::Prove
+            {
                 proved_at = Some(second);
                 break;
             }
@@ -1452,11 +1510,8 @@ mod tests {
         assert!(!proofs.must_read(false), "a cleared latch is forgotten");
     }
 
-    /// INVARIANT (#447): a durability latch the store can clear no longer ends the daemon.
-    /// The worker's next failed duty proves every accepted write durable in place: the latch
-    /// clears, the buffered write it left uncertain is certified, writes are accepted again,
-    /// and the worker is still running to shut down cleanly. Fails on the worker that exits on
-    /// every latch: the latch never clears and the worker has ended.
+    /// A scheduled proof clears a durability latch and writer poison in place, certifies the
+    /// buffered write, and lets the worker admit later writes and shut down cleanly.
     #[tokio::test]
     async fn a_durability_latch_clears_in_place_and_the_worker_keeps_running() {
         let dir = tempfile::tempdir().unwrap();
@@ -1481,6 +1536,7 @@ mod tests {
         store
             .latch_durability_for_tests("injected WAL sync failure")
             .unwrap();
+        store.poison_writer_for_tests();
         let worker = Worker::start_paced(
             store.clone(),
             Duration::from_millis(1),
@@ -1494,12 +1550,80 @@ mod tests {
         );
         until("the latch to clear", || {
             let status = store.durability_status().unwrap();
-            status.failure.is_none() && status.pending_writes == 0
+            status.failure.is_none() && status.pending_writes == 0 && status.writer_recoveries == 1
         })
         .await;
         store
             .ingest("after", "source", "log", b"accepted\n", now)
             .unwrap();
+        worker.shutdown().await.unwrap();
+    }
+
+    /// A stopped native handle refuses the proof. The worker keeps the original latch and
+    /// poison through two failed attempts, separated by the configured backoff.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_durability_proof_waits_before_retrying_the_poisoned_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let path =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let store = sparrow_server::ServerConfig::read(&path)
+            .unwrap()
+            .open_store()
+            .unwrap();
+        let artifact = store
+            .ingest_with_durability(
+                "buffered",
+                "source",
+                "opaque",
+                b"buffered",
+                sparrow_server::now().unwrap(),
+                sparrow_core::Durability::Buffered,
+            )
+            .unwrap();
+        store.space_floor().set_free_for_tests(Some(1 << 30));
+        let cause = "injected WAL sync failure";
+        store.latch_durability_for_tests(cause).unwrap();
+        store.poison_writer_for_tests();
+        store.cancel_background_work();
+
+        let pace = Pace {
+            grace: Duration::from_secs(3),
+            first: Duration::from_secs(6),
+            longest: Duration::from_secs(6),
+            bound: Duration::from_secs(25),
+        };
+        let began = tokio::time::Instant::now();
+        let worker = Worker::start_paced(
+            store.clone(),
+            Duration::from_secs(1),
+            Default::default(),
+            pace,
+        );
+        until("the first failed durability proof", || {
+            skips::failed_proof().is_some()
+        })
+        .await;
+        let first = skips::failed_proof().unwrap();
+        assert!(first.duration_since(began) >= pace.grace);
+        until("the second failed durability proof", || {
+            skips::failed_proof() > Some(first)
+        })
+        .await;
+        assert!(skips::failed_proof().unwrap().duration_since(first) >= pace.first);
+
+        let status = store.durability_status().unwrap();
+        assert_eq!(status.failure.as_deref(), Some(cause));
+        assert_eq!(
+            (
+                status.pending_writes,
+                status.recoveries,
+                status.writer_recoveries
+            ),
+            (1, 0, 0)
+        );
+        let refusal = store.artifact(&artifact.id).unwrap_err();
+        assert!(refusal.is_retryable() && refusal.message.contains(cause));
         worker.shutdown().await.unwrap();
     }
 

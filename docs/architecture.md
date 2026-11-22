@@ -427,9 +427,12 @@ Receipt comparison and first publication share the ordinary writer lock.
 
 A failed write or WAL sync latches durability uncertain: the store refuses writes
 and fences with a retryable refusal naming the latch and certifies nothing it accepted
-after the last successful sync. Reads are served; an artifact read reports its pending
-fence. The latch clears in the running store once every accepted write is proven durable
-by writing every memtable to a synchronized table file and syncing the WAL. The maintenance
+after the last successful sync. Reads are served, and an artifact read reports its pending
+fence. If the writer mutex is also poisoned, diagnostics still read snapshots and published
+state, and operations that need the writer receive the retryable refusal. The latch clears
+once every accepted write is proven durable by writing every memtable to a synchronized
+table file and syncing the WAL. A scheduled proof reloads a poisoned writer's catalog state
+first and clears poison only after the proof succeeds. The maintenance
 worker leaves a latched store alone while free space is below RocksDB's recovery buffer
 (32 MiB, or the maintenance reserve or floor if larger), proves once after space has been
 adequate for 15 s, spaces further proofs 30 s then 60 s apart, and exits with an ordinary

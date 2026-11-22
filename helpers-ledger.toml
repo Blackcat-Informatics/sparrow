@@ -201,9 +201,9 @@ names = ['^(yield_to_writers_by_polling|fair_writer_mutex|spin_until_writers_dra
 id = "observed-writer-state"
 summary = "Durability, pressure and table rewrite state stay writer-local and may be held across commits; a mutable borrow publishes a small Observe::View copy when it ends, and status reads only that copy, so status never waits for a pressure pass, rewrite step or commit. Read-lease handle counts come from each registry's ledger, mirrored on every registry change and locked only to copy rows, so status never waits for a registry a listing holds while it waits for the writer."
 home = "sparrow_core::storage::writer_queue::Observed::borrow_mut"
-entry_points = ["sparrow_core::storage::writer_queue::Published::read", "sparrow_core::storage::Store::durability_status", "sparrow_core::storage::Store::pressure_status", "sparrow_core::storage::Store::recompression_status", "sparrow_core::storage::catalog_lease::read_stats"]
+entry_points = ["sparrow_core::storage::writer_queue::Published::read", "sparrow_core::storage::Store::durability_failure", "sparrow_core::storage::Store::durability_status", "sparrow_core::storage::Store::pressure_status", "sparrow_core::storage::Store::recompression_status", "sparrow_core::storage::catalog_lease::read_stats"]
 spec = "docs/interfaces.md: store counters (store format); docs/architecture.md section 7."
-vectors = ["crates/sparrow-core/tests/storage.rs"]
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/src/maintenance.rs"]
 bench = []
 enforced = true
 [job.forbidden]
@@ -1330,6 +1330,20 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(measure_pending_wal_age_again|measure_pending_wal_bytes_again)$']
+
+[[job]]
+id = "store-writer-durability-recovery"
+summary = "One native proof flushes every column family and synchronizes the WAL. The maintenance worker paces proofs for a known latch. A poisoned writer reloads its catalog state before synchronization or proof and clears poison after success."
+home = "sparrow_core::storage::Writer::reestablish"
+entry_points = ["sparrow_core::storage::Store::reestablish_durability", "sparrow_core::storage::Store::recover_unlatched_writer", "sparrow_core::storage::Store::note_writer_recovered", "sparrow_core::storage::Writer::revalidate"]
+spec = "docs/interfaces.md: server WAL acceptance and synchronization."
+vectors = ["crates/sparrow-core/tests/storage.rs", "crates/sparrow-server/src/maintenance.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(prove_durability_again|clear_poison_before_durability_proof)$']
 
 [[job]]
 id = "typed-durability-fence"

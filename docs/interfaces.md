@@ -1623,14 +1623,14 @@ across commits; when a change ends the writer publishes a small copy, and status
 reads only that copy. A status reply therefore waits for no migration page,
 write, pressure pass or rewrite step, at most for one short copy. It still
 checks, without waiting, whether a writer panicked while holding the writer
-lock. A lock a panicked writer left is recovered by the next operation that takes
-it, status and the three observed-status reads included: the writer reloads the
-state it derives from the store (pressure, table rewrite and archive state, the
-eviction and expiry cursors) as an open does, and syncs the WAL so the durability
-ledger certifies every accepted write. `durability.writerRecoveries` counts the
-recoveries. A re-validation that fails (including a WAL sync that fails) leaves the lock poisoned and
-refuses with the retryable `STORAGE_PRESSURE` ("catalog writer poisoned and not yet
-recovered"); the next operation tries again.
+lock. With no durability latch, the next operation that needs to recover the
+writer reloads pressure, table rewrite and archive state and resets the eviction
+and expiry cursors. It synchronizes the WAL before clearing poison. A failed
+revalidation or synchronization leaves the writer poisoned and returns retryable
+`STORAGE_PRESSURE`. While a durability latch stands, status reads snapshots and
+published state. Operations that need the poisoned writer return the retryable
+refusal naming the latch. `durability.writerRecoveries` counts successful writer
+recoveries.
 
 One owner, `store_counters::apply`, runs on every write batch after the
 per-source counters and adds its row changes to the same batch. A key the batch
@@ -5290,13 +5290,15 @@ with retryable `STORAGE_PRESSURE` before publication. Default intended WAL sync 
 2000 ms, configurable from 1..60000 ms. Status exposes session, accepted/durable
 sequences, pending count/bytes, age, interval, lag and latched storage uncertainty.
 Any synchronized control write covers earlier WAL writes; empty control batches
-use explicit synchronization. Write/WAL-sync failure latches uncertainty: writes and fences are refused
-with the retryable `STORAGE_PRESSURE` naming the latch, and reads are served (an artifact read
-reports its still-pending fence) until the store proves every
-accepted write durable (every memtable written to a synchronized table file, then a
-WAL sync), which clears the latch in place and certifies the ledger. The maintenance worker
-leaves a latched store alone while free space is below RocksDB's recovery buffer, proves once
-space has been adequate for 15 s, and spaces further proofs 30 s then 60 s apart. A latch that
+use explicit synchronization. A write or WAL sync failure latches uncertainty. Writes and
+fences receive retryable `STORAGE_PRESSURE`, and artifact reads report their pending fences
+when the writer lock is usable. The maintenance worker owns durability proofs. It leaves a
+latched store alone while free space is below RocksDB's recovery buffer or cannot be
+measured. It proves once space has been adequate for 15 s, and spaces further proofs
+30 s then 60 s apart. Each proof writes
+every memtable to a synchronized table file and then synchronizes the WAL. If the writer is
+poisoned, maintenance reloads its catalog state before the proof and clears poison after the
+proof succeeds. The worker logs each failed proof and its backoff. A latch that
 still stands 120 s after space became adequate ends the daemon with an ordinary failure status
 so the store is reopened; an I/O error other than no space (EIO) is expected to end it that way
 until #449 lands. Status counts latches,
