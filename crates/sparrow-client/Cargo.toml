@@ -3,7 +3,7 @@
 
 [package]
 name = "sparrow-client"
-version = "0.1.0"
+version = "0.2.0"
 description = "Async Sparrow producer SDK for structured logs, terminal output and bulk imports"
 documentation = "https://docs.rs/crate/sparrow-client/latest"
 readme = "README.md"

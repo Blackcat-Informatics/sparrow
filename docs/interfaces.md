@@ -4688,7 +4688,7 @@ resend). The 32,768-record bound is checked while the layout is prepared, before
 any record is prepared.
 
 `sparrow-client` is the producer SDK. Install it from crates.io with
-`cargo add sparrow-client@0.1.0`. The [SDK guide](../crates/sparrow-client/README.md)
+`cargo add sparrow-client@0.2.0`. The [SDK guide](../crates/sparrow-client/README.md)
 covers console output, local spooling and bulk imports. The package
 includes the Cap'n Proto schemas and builds with the host `capnp` compiler and
 Rust 1.98 on Linux, independently of Sparrow storage. The ingest socket carries

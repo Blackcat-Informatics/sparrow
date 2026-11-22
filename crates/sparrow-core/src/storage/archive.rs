@@ -21,8 +21,7 @@ const POSITION_BYTES: usize = 20 + 1 + ID_BYTES;
 pub const ARCHIVE_START_FRACTION: f64 = 0.75;
 /// Default closing size of one segment's payload.
 pub const ARCHIVE_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
-/// Largest admitted segment payload. A memory limit of the GTS writer, which holds the whole
-/// segment resident: it relaxes when PurRDF issue 1257 (a streaming writer) lands.
+/// Largest admitted segment payload for the in-memory GTS encoder.
 pub const ARCHIVE_MAX_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
 /// Smallest admitted segment closing size. An entry larger than the target forms
 /// its own segment.

@@ -89,10 +89,10 @@ implement a second RDF parser, SPARQL evaluator, JSON-to-RDF converter, Markdown
 slicer, tokenizer, or scoring law. Missing public integration seams are an
 upstream integration task, not a reason to copy private implementation code.
 
-The inspected local PurRDF baseline is `../purrdf`, commit `d80d072f88e1`, with
-workspace version `3.0.1` and declared Rust MSRV `1.98`. These identify the design
-baseline rather than an already resolved Sparrow dependency. Implementation must
-record its exact dependency revision and supported Rust toolchain.
+Sparrow builds with Rust 1.98 or later. Cargo resolves the PurRDF 5 packages
+from crates.io. `Cargo.lock` identifies the compiled packages and
+`registry/compatibility.toml` records the matching source revision for the
+text lexicons and helper census.
 
 ## 3. Logical model and identity
 
@@ -854,5 +854,5 @@ the later configured consume operation is the producer handoff authority.
 - [PurRDF text ranking](https://github.com/Blackcat-Informatics/purrdf/tree/main/crates/text)
 - [PurRDF query governor profile](https://github.com/Blackcat-Informatics/purrdf/blob/main/docs/SPARQL-GOVERNOR-PROFILE.md)
 
-The inspected local revision above is the baseline for these references;
-`main` links may evolve. Implementation qualification must use its pinned revision.
+The `main` links track upstream development. Use the revision in
+`registry/compatibility.toml` when qualifying the compiled release.

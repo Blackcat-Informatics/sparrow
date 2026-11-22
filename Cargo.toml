@@ -21,20 +21,20 @@ sparrow-access = { path = "crates/sparrow-access" }
 sparrow-limits = { path = "crates/sparrow-limits", version = "0.1.0" }
 blake3 = "1"
 rocksdb = { version = "0.25", default-features = false, features = ["lz4", "zstd", "bindgen-runtime"] }
-purrdf = "=4"
-purrdf-hash = "=4"
-purrdf-lex = "=4"
-purrdf-ed25519 = "=4"
-purrdf-core = "=4"
+purrdf = "=5"
+purrdf-hash = "=5"
+purrdf-lex = "=5"
+purrdf-ed25519 = "=5"
+purrdf-core = "=5"
 getrandom = "0.3"
 tempfile = "3"
 rustix = { version = "1.1.5", features = ["fs"] }
 tracing = "0.1.44"
 log = { version = "0.4", features = ["std", "kv"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std", "fmt"] }
-capnp = "0.27"
-capnp-rpc = "0.27"
-capnpc = "0.27"
+capnp = "0.28.1"
+capnp-rpc = "0.28.0"
+capnpc = "0.28.1"
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["compat"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "io-std", "io-util", "process"] }
