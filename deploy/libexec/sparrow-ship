@@ -408,10 +408,11 @@ def settle_set_aside(source, config, store):
 
     A spool script opens a file by name and appends a line a moment later, so a line can land
     in a file after it was acknowledged and set aside. The set-aside file is therefore deleted a
-    run later, and only if the store holds every part of its present content; otherwise it goes
-    back under its own name (or a `-late-` name when that is in use again); a file whose
-    content the store never held ships like any finished file, and one whose ledger identity is
-    unchanged (the store retired it) stays, counted as not acknowledged. Returns the number deleted.
+    run later, and only if the store holds every part of its current bytes and its identity
+    stays stable during lookup. Otherwise a hard link restores its original name, or a
+    `-late-` name if that name is in use. On later runs, queueing skips a restored file whose
+    inode, size and modification time still match its shipped ledger entry. Reaping counts it
+    as not acknowledged until the store holds its current bytes. Returns the number deleted.
     """
     deleted = 0
     directory = Path(source["dir"])
