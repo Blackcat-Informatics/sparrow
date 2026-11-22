@@ -200,15 +200,22 @@ impl Journal {
                 last = Some(certified(client, part, certificate)?);
                 continue;
             }
+            let newly_attempted = !ambiguous && file.header.get("replay_attempt").is_none();
+            // A reduced ceiling can refuse an indivisible event locally. Do not
+            // create a deadline for a part that cannot leave this process.
+            let bytes = if newly_attempted {
+                part.source_bytes_with_limits(info.event_limits())?
+            } else {
+                part.source_bytes()?
+            };
             let expected = ExpectedArtifact::bytes(
                 info,
                 &part.source,
                 Format::Jsonl,
-                &part.source_bytes()?,
+                &bytes,
                 Durability::Durable,
                 Some(part.events.len()),
             );
-            let newly_attempted = !ambiguous && file.header.get("replay_attempt").is_none();
             let deadline = match file.header.get("replay_attempt") {
                 Some(attempt) => {
                     if attempt.get("request").and_then(Value::as_str) != Some(&part.request_id)

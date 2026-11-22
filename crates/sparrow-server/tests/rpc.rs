@@ -10479,6 +10479,13 @@ async fn quarantine_replay_removes_the_file_only_on_acknowledgment() {
             assert_eq!(json["certificates"].as_array().unwrap().len(), 1);
             assert!(json.get("replay_attempt").is_none(), "a definitive first refusal permits a fresh deadline");
             assert!(!scratch.exists(), "recover the writer's second link");
+            let calls_before_local_refusal = state.calls.borrow().len();
+            state.artifact_limits.set(Some((1, 1)));
+            let limited = sparrow_client::Client::connect_producer(&sparrow_client::Endpoint::Unix(proxy_socket.clone())).await.unwrap();
+            assert!(matches!(sparrow_client::replay_quarantine(&limited, &file).await, Err(sparrow_client::Error::InvalidArgument(_))));
+            assert_eq!(state.calls.borrow().len(), calls_before_local_refusal);
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), kept_text, "a local size refusal must not seal an unsent part");
+            state.artifact_limits.set(None);
             // Simulate process loss while appending the next attempt. No RPC was authorized.
             use std::io::Write;
             std::fs::OpenOptions::new().append(true).open(&file).unwrap().write_all(br#"{"part":1,"attempt":"#).unwrap();

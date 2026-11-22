@@ -101,7 +101,7 @@ pub(crate) enum Original {
 impl Original {
     pub(crate) fn definitively_refused(error: &crate::Error) -> bool {
         matches!(error, crate::Error::Domain { code, .. } if matches!(code.as_str(),
-            "INVALID_ARGUMENT" | "CONFLICT" | "RESOURCE_LIMIT" | "UNAUTHENTICATED" | "PERMISSION_DENIED" | "READ_ONLY"))
+            "INVALID_ARGUMENT" | "CONFLICT" | "RESOURCE_LIMIT" | "UNAUTHENTICATED" | "PERMISSION_DENIED" | "READ_ONLY" | "SHUTTING_DOWN" | "STORE_MISMATCH"))
     }
     pub(crate) fn label(self) -> &'static str {
         match self {
