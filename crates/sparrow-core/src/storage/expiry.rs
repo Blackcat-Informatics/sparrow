@@ -265,6 +265,7 @@ struct Walked {
 
 /// One bounded pass: the shared budgets, batch and per-pass parent state of both walks.
 struct Pass<'a> {
+    retry_gc: Option<u64>,
     writer: &'a Writer,
     now: u64,
     limits: EvictionLimits,
@@ -686,6 +687,11 @@ impl Pass<'_> {
                 };
             self.report.visited += 1;
             if !managed && expires_at <= self.now {
+                if key.starts_with(b"request:ingest:")
+                    && let Some(watermark) = &mut self.retry_gc
+                {
+                    *watermark = (*watermark).max(expires_at);
+                }
                 staged(&mut self.retirement, writer)?.batch.delete(&key);
                 self.report.deleted += 1;
             }
@@ -744,6 +750,7 @@ impl Writer {
             local.rewind();
         }
         let mut pass = Pass {
+            retry_gc: self.retry_gc_clock.get(),
             writer: self,
             now,
             limits,
@@ -788,6 +795,7 @@ impl Writer {
             }
         }
         let Pass {
+            retry_gc,
             retirement,
             mut report,
             held,
@@ -795,10 +803,15 @@ impl Writer {
             reads,
             ..
         } = pass;
-        let batch = match retirement {
+        let mut batch = match retirement {
             Some(retirement) => retirement.finish()?,
             None => rocksdb::WriteBatch::default(),
         };
+        if retry_gc != self.retry_gc_clock.get()
+            && let Some(watermark) = retry_gc
+        {
+            batch.put(super::writer_format::RETRY_GC, watermark.to_be_bytes());
+        }
         // The shared writer appends the bounded format and feature fence.
         if batch.size_in_bytes().saturating_add(256) > limits.max_batch_bytes {
             return Err(Error::new(
@@ -808,6 +821,7 @@ impl Writer {
         }
         if !batch.is_empty() {
             self.commit(batch)?;
+            self.retry_gc_clock.set(retry_gc);
         }
         report.frontier = frontier.unwrap_or_default();
         report.continuation = frontier.is_some_and(|stopped| stopped != ExpiryFrontier::ArchiveLag);

@@ -211,7 +211,7 @@ impl Fragment {
                     name: "message".into(),
                     value: message,
                 });
-                delivery.try_send(event);
+                delivery.observe(event);
             }
             (Some(Err(())), _) => console.capture_failed(),
             _ => {}

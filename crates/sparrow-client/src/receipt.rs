@@ -49,6 +49,8 @@ pub struct Discovery {
     pub schema_version: u32,
     /// Named ingestion contracts the daemon advertises.
     pub producer_profiles: Vec<String>,
+    /// Server-clock deadline for sealing a new durable request. Zero means unavailable.
+    pub sealed_event_deadline_ms: u64,
     /// Server limits for tracking producer evidence. These describe the server's windows.
     pub producer_limits: ProducerLimits,
     /// Largest artifact carried in one inline ingest message. Larger artifacts
@@ -142,6 +144,7 @@ impl Discovery {
             store_id: value.get_store_id()?.to_str()?.to_owned(),
             schema_version: value.get_schema_version(),
             producer_profiles,
+            sealed_event_deadline_ms: value.get_sealed_event_deadline_ms(),
             producer_limits: ProducerLimits {
                 max_streams: limits.get_max_streams(),
                 max_gap_intervals: limits.get_max_gap_intervals(),

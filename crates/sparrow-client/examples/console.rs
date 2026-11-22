@@ -9,7 +9,7 @@ use std::time::Duration;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let delivery = match std::env::args().nth(1) {
         Some(value) => {
-            let config = DeliveryConfig::for_endpoint(Endpoint::parse(&value)?, "console-example");
+            let config = DeliveryConfig::configured(Endpoint::parse(&value)?, "console-example");
             Some(Delivery::start_async(config).await?)
         }
         None => None,

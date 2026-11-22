@@ -39,6 +39,13 @@ pub mod sparrow_capnp {
     include!(concat!(env!("OUT_DIR"), "/sparrow_capnp.rs"));
 }
 
+/// Generated on-disk spool format. Applications use `Delivery` and its checked cursors.
+#[doc(hidden)]
+#[allow(missing_docs, clippy::extra_unused_type_parameters)]
+pub mod spool_capnp {
+    include!(concat!(env!("OUT_DIR"), "/spool_capnp.rs"));
+}
+
 mod transport;
 pub use transport::{Connection, Endpoint, connect, connect_tcp};
 mod tcp_secret;
@@ -88,11 +95,14 @@ pub use producer_config::ConfigError;
 mod logging;
 mod quarantine;
 mod replay;
+mod spool;
 pub use console::{Console, ConsoleStats, ConsoleStream, ConsoleWriter};
 pub use delivery::{
     Admission, Delivery, DeliveryConfig, DeliveryStats, DeliveryWatermark, DropReason, FlushError,
+    Refusal, SendError, SpoolReceipt,
 };
 pub use logging::TracingLayer;
+pub use spool::{DeliveryMode, SpoolConfig, SpoolStats};
 
 #[doc(hidden)]
 pub use tracing as __tracing;
@@ -111,7 +121,7 @@ pub use replay::{ReplayReceipt, replay_quarantine};
 pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
 
 /// Exact schema version used by query and administrative clients.
-pub const SCHEMA_VERSION: u32 = 72;
+pub const SCHEMA_VERSION: u32 = 73;
 /// Ingestion and durability profile advertised across compatible schema versions.
 pub const PRODUCER_PROFILE: &str = "sparrow-producer/1";
 /// Fixed upload unit admitted by the schema's private staging contract.
@@ -208,8 +218,27 @@ impl Client {
         batch: &EventBatch,
         durability: Durability,
     ) -> Result<ArtifactReceipt, Error> {
+        self.submit_events(batch, durability, None).await
+    }
+
+    async fn submit_events(
+        &self,
+        batch: &EventBatch,
+        durability: Durability,
+        seal: Option<u64>,
+    ) -> Result<ArtifactReceipt, Error> {
         self.discovery.require(receipt::Contract::Producer)?;
-        let bytes = batch.source_bytes_with_limits(self.discovery.event_limits())?;
+        let bytes = batch
+            .source_bytes_with_limits(self.discovery.event_limits())
+            .map_err(|error| {
+                if seal.is_some() && matches!(error, Error::InvalidArgument(_)) {
+                    // Newly sealed input already passed admission. A recovered seal must wait
+                    // for compatible advertised ceilings without changing its identity or range.
+                    Error::Unsupported(delivery::IMMUTABLE_BATCH_LIMIT)
+                } else {
+                    error
+                }
+            })?;
         let expected = receipt::ExpectedArtifact::bytes(
             &self.discovery,
             &batch.source,
@@ -218,6 +247,16 @@ impl Client {
             durability,
             Some(batch.events.len()),
         );
+        if let Some(deadline) = seal {
+            let mut request = self.capability().sealed_events_ingest_request();
+            request.get().set_store_id(&self.discovery.store_id);
+            request.get().set_deadline_ms(deadline);
+            batch.encode(request.get().init_batch())?;
+            let response = request.send().promise.await?;
+            return receipt::certify_result(response.get()?.get_result()?, |value| {
+                expected.certify(ArtifactReceipt::decode(value)?)
+            });
+        }
         let mut request = self.capability().events_ingest_request();
         request.get().set_durability(durability);
         batch.encode(request.get().init_batch())?;

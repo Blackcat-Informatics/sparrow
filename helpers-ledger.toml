@@ -2337,6 +2337,36 @@ fingerprints = []
 names = ['^(validate_cli_discovery|validate_producer_discovery)$']
 
 [[job]]
+id = "producer-spool"
+summary = "Recover, seal, confirm and reclaim ordered producer segments under one persistent identity and bounded disk budget."
+home = "sparrow_client::spool::Log"
+entry_points = ["sparrow_client::delivery::Delivery::send_with_token", "sparrow_client::delivery::Delivery::flush_local", "sparrow_client::delivery::Delivery::try_send"]
+spec = "docs/interfaces.md: Configured spool."
+vectors = ["crates/sparrow-client/src/spool.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(append_offline_event|replay_offline_segment)$']
+
+[[job]]
+id = "sealed-producer-publication"
+summary = "Compare the exact retained receipt and fence a missing receipt against the server deadline and persistent retirement watermark before first publication."
+home = "sparrow_core::storage::Store::ingest_events_before"
+entry_points = ["sparrow_core::storage::Writer::accepted_ingest", "sparrow_core::storage::Store::sealed_event_deadline"]
+spec = "docs/architecture.md: publication and durability."
+vectors = ["crates/sparrow-core/src/storage/producer_stream.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(lookup_sealed_retry|publish_offline_events)$']
+
+[[job]]
 id = "completed-file-upload"
 summary = "Hash and stream the opened stable regular file through shared typed durable staging and publication."
 home = "sparrow_client::imports::upload"
@@ -2474,8 +2504,8 @@ names = ['^(charge_event_decode_budget|charge_event_encode_budget)$']
 [[job]]
 id = "typed-event-wire-encoding"
 summary = "Marshal the producer's ordered native Rust values and context through one shared generated contract."
-home = "sparrow_client::events::EventBatch::encode"
-entry_points = []
+home = "sparrow_client::events::ProducerEvent::encode"
+entry_points = ["sparrow_client::events::EventBatch::encode", "sparrow_client::spool::Log::append"]
 spec = "crates/sparrow-client/schema/sparrow.capnp: typed EventBatch and field union."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -2489,8 +2519,8 @@ names = ['^(encode_logger_event_batch|encode_direct_event_batch)$']
 [[job]]
 id = "typed-event-wire-decoding"
 summary = "Decode typed fields, exact float bits, wide integers and span relationships with admission before allocations."
-home = "sparrow_client::events::EventBatch::decode"
-entry_points = []
+home = "sparrow_client::events::ProducerEvent::decode"
+entry_points = ["sparrow_client::events::EventBatch::decode", "sparrow_client::spool::read_frame"]
 spec = "crates/sparrow-client/schema/sparrow.capnp: typed EventBatch and field union."
 vectors = ["crates/sparrow-server/tests/rpc.rs"]
 bench = []
