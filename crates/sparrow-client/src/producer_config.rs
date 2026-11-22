@@ -61,6 +61,7 @@ struct FileConfig {
 #[serde(rename_all = "snake_case")]
 enum FileMode {
     Memory,
+    Lossy,
     LossySpooled,
     Lossless,
 }
@@ -140,6 +141,7 @@ impl FileConfig {
         }
         config.mode = match file.mode.unwrap_or(FileMode::Lossless) {
             FileMode::Memory => crate::DeliveryMode::LossyAspirational,
+            FileMode::Lossy => crate::DeliveryMode::LossyMemory,
             FileMode::LossySpooled => crate::DeliveryMode::LossySpooled(spool),
             FileMode::Lossless => crate::DeliveryMode::LosslessConfirmed(spool),
         };

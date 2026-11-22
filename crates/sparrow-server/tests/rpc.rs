@@ -7785,6 +7785,16 @@ async fn configured_spools_recover_after_producer_sigkill_and_drain_once() {
                         .sequence,
                     index
                 );
+            } else if name == "lossy" && index == 1 {
+                assert_eq!(
+                    delivery
+                        .offer_spooled(event)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .sequence,
+                    index
+                );
             } else {
                 assert_eq!(
                     delivery.try_send(event),
@@ -7836,6 +7846,66 @@ async fn configured_spools_recover_after_producer_sigkill_and_drain_once() {
     assert_eq!(
         cli(&socket, &["status"])["live_records"].as_str(),
         Some("24")
+    );
+}
+
+/// A full offline journal drops only frames exceeding its remaining physical capacity.
+/// Reopening drains that prefix to the daemon and reclaimed space admits the next sequence.
+#[tokio::test(flavor = "current_thread")]
+async fn full_lossy_spool_recovers_drains_and_accepts_after_cleanup() {
+    use sparrow_client::{Delivery, DeliveryConfig, DropReason, Endpoint, SpoolConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    let socket = store.join("rpc.sock");
+    let daemon_config = write_server_config(dir.path(), &store, &socket);
+    let mut spool = SpoolConfig::new(dir.path().join("spool"));
+    spool.max_bytes = 1 << 20;
+    spool.segment_bytes = 64 << 10;
+    let config = DeliveryConfig::lossy_spooled(
+        Endpoint::Unix(socket.clone()),
+        "full-offline",
+        spool.clone(),
+    );
+    let producer = Delivery::start_async(config.clone()).await.unwrap();
+    let large = delivery_event(&"x".repeat(7900));
+    let mut accepted = 0;
+    while let Some(receipt) = producer.offer_spooled(large.clone()).await.unwrap() {
+        accepted += 1;
+        assert_eq!(receipt.sequence, accepted);
+        assert!(accepted < 200);
+    }
+    let stats = producer.stats().unwrap();
+    let used = stats.spool.unwrap().bytes;
+    assert!(accepted > 100);
+    assert!(used <= spool.max_bytes && spool.max_bytes - used < used / accepted);
+    assert!(producer.offer_spooled(large).await.unwrap().is_none());
+    assert_eq!(
+        producer.stats().unwrap().dropped_by_reason[DropReason::SpoolFull as usize],
+        2
+    );
+    assert_eq!(
+        producer.close_local(Duration::from_secs(5)).await.unwrap(),
+        accepted
+    );
+    let _daemon = start(&daemon_config, &socket).await;
+    let producer = Delivery::start_async(config).await.unwrap();
+    let timeout = Duration::from_secs(20);
+    let fence = producer.flush_async(timeout).await.unwrap();
+    assert_eq!(fence.durable_sequence, accepted);
+    assert_eq!(producer.stats().unwrap().spool.unwrap().bytes, 0);
+    let next = producer
+        .offer_spooled(delivery_event("after recovery"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.sequence, accepted + 1);
+    assert_eq!(
+        producer
+            .shutdown_async(timeout)
+            .await
+            .unwrap()
+            .durable_sequence,
+        next.sequence
     );
 }
 
@@ -9753,6 +9823,101 @@ async fn producer_delivery_retries_a_busy_refusal_on_the_same_connection() {
             drop(daemon);
         })
         .await;
+}
+
+/// The disk-free sender exports an interior sequence gap through the real server,
+/// continues after a permanent refusal, and requires explicit consent to a new store.
+#[tokio::test(flavor = "current_thread")]
+async fn disk_free_delivery_reports_gaps_and_rebinds_only_to_the_observed_store() {
+    use sparrow_client::{Admission, Delivery, DeliveryConfig, DropReason, Endpoint, FlushError};
+    async fn queued(handle: &Delivery, text: &str) -> u64 {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match handle.try_send(delivery_event(text)) {
+                    Admission::Queued { sequence } => return sequence,
+                    Admission::Dropped {
+                        reason: DropReason::Contended,
+                        ..
+                    } => tokio::task::yield_now().await,
+                    other => panic!("unexpected loss: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+    tokio::task::LocalSet::new().run_until(async {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let mut servers = Vec::new();
+        for location in [dir.path(), other.path()] {
+            let store = location.join("store");
+            let socket = store.join("rpc.sock");
+            let config = write_server_config(location, &store, &socket);
+            let daemon = start(&config, &socket).await;
+            let connection = connect(&socket).await.unwrap();
+            servers.push((daemon, connection, socket));
+        }
+        let proxy_socket = dir.path().join("relay.sock");
+        let (state, proxy) = relay(&proxy_socket, servers[0].1.client.clone());
+        state.drop_first.set(false);
+        let quarantine = dir.path().join("quarantine");
+        let source = "disk-free-gaps";
+        let mut config = DeliveryConfig::lossy(Endpoint::Unix(proxy_socket), source)
+            .with_quarantine_dir(&quarantine)
+            .with_test_timing(Duration::from_secs(2), Duration::from_millis(10), Duration::from_millis(30));
+        config.batch_events = 1;
+        config.max_queued_events = 1;
+        config.rpc_timeout = Duration::from_millis(500);
+        let handle = Delivery::start_async(config).await.unwrap();
+        let timeout = Duration::from_secs(5);
+        let first = queued(&handle, "first observed sequence").await;
+        let initial = reached_delivery(handle.flush_async(timeout).await);
+        let store = initial.last_receipt.unwrap().store_id;
+        state.refusals.borrow_mut().push_back(("INVALID_ARGUMENT", false));
+        queued(&handle, "permanently refused").await;
+        // The relay and daemon run on this LocalSet. Until we yield, the in-flight
+        // singleton stays charged. Lock contention can race a worker state transition.
+        loop {
+            match handle.try_send(delivery_event("quota")) {
+                Admission::Dropped { reason: DropReason::Full, .. } => break,
+                Admission::Dropped { reason: DropReason::Contended, .. } => continue,
+                other => panic!("queue must be occupied: {other:?}"),
+            }
+        }
+        let refused = reached_delivery(handle.flush_async(timeout).await);
+        assert!(refused.dropped_before_fence >= 2);
+        let stats = handle.stats().unwrap();
+        assert_eq!(stats.dropped_by_reason[DropReason::Refused as usize], 1);
+        assert!(matches!(stats.last_refusal.as_deref(), Some(sparrow_client::Error::Domain { code, message, .. }) if code == "INVALID_ARGUMENT" && message.contains("injected refusal")));
+        let last = queued(&handle, "later valid observation").await;
+        let fence = reached_delivery(handle.flush_async(timeout).await);
+        assert_eq!(fence.durable_events, 2);
+        let rows = cli(&servers[0].2, &["sources", &store, "--source", source]);
+        let stream = rows["rows"][0]["producer_stream_ids"][0].as_str().unwrap();
+        let window = cli(&servers[0].2, &["producer-stream", &store, stream]);
+        let number = |value: &purrdf_lex::json::Value| value.as_str().unwrap().parse::<u64>().unwrap();
+        assert_eq!(number(&window["unobserved_sequences"]), last-first-1);
+        assert_eq!(number(&window["gaps"][0]["first"]), first+1);
+        assert_eq!(number(&window["gaps"][0]["last"]), last-1);
+        assert_eq!(handle.stats().unwrap().dropped_sequences, last-2);
+        state.drop_first.set(true);
+        queued(&handle, "unknown reply on the original store").await;
+        tokio::time::timeout(timeout, state.first_accepted.notified()).await.unwrap();
+        *state.backend.borrow_mut() = servers[1].1.client.clone();
+        assert!(matches!(handle.flush_async(timeout).await, Err(FlushError::Dropped(_))));
+        let new_store = handle.stats().unwrap().store_mismatch.unwrap();
+        assert_ne!(new_store, store);
+        assert!(handle.rebind(&store).await.is_err());
+        assert!(matches!(handle.try_send(delivery_event("held")), Admission::Dropped { reason: DropReason::Refused, .. }));
+        handle.rebind(&new_store).await.unwrap();
+        queued(&handle, "after rebind").await;
+        let fence = reached_delivery(handle.shutdown_async(timeout).await);
+        assert_eq!(fence.last_receipt.unwrap().store_id, new_store);
+        assert_eq!(fence.durable_events, 3);
+        assert!(!quarantine.exists());
+        proxy.abort();
+    }).await;
 }
 
 /// INVARIANT (#216): a permanent refusal (a non-retryable `INVALID_ARGUMENT`: a batch that can

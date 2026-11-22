@@ -62,6 +62,8 @@ impl SpoolConfig {
 pub enum DeliveryMode {
     /// Memory queue with exact refusal counters and permanent-input quarantine.
     LossyAspirational,
+    /// Nonwaiting, disk-free offers with sequenced losses and explicit store rebinding.
+    LossyMemory,
     /// Fast memory admission followed by asynchronous disk intake.
     LossySpooled(SpoolConfig),
     /// Supports both fast memory offers and explicit confirmed disk acceptance.
@@ -71,7 +73,7 @@ pub enum DeliveryMode {
 impl DeliveryMode {
     pub(crate) fn spool(&self) -> Option<&SpoolConfig> {
         match self {
-            Self::LossyAspirational => None,
+            Self::LossyAspirational | Self::LossyMemory => None,
             Self::LossySpooled(config) | Self::LosslessConfirmed(config) => Some(config),
         }
     }
@@ -327,6 +329,24 @@ fn read_frame(reader: &mut impl Read) -> Result<Frame, Error> {
 }
 
 impl Log {
+    fn entry_message(
+        event: &ProducerEvent,
+        token: &[u8],
+        at: u64,
+    ) -> capnp::message::Builder<capnp::message::HeapAllocator> {
+        let mut msg = capnp::message::Builder::new_default();
+        let mut out = msg.init_root::<wire::entry::Builder<'_>>();
+        out.set_at(at);
+        out.set_token(token);
+        event.encode(out.init_event());
+        msg
+    }
+
+    /// Sequence and timestamp occupy fixed-width slots, so this is also the final append size.
+    pub(crate) fn frame_bytes(event: &ProducerEvent, token: &[u8]) -> u64 {
+        let msg = Self::entry_message(event, token, 0);
+        (PREFIX + 8 * capnp::serialize::compute_serialized_size_in_words(&msg)) as u64
+    }
     pub(crate) fn open(
         config: &SpoolConfig,
         source: &str,
@@ -576,12 +596,7 @@ impl Log {
         if self.stats.spooled_sequence.checked_add(1) != Some(event.sequence) || token.len() > 256 {
             return Err(Error::Protocol("invalid local spool append order or token"));
         }
-        let mut msg = capnp::message::Builder::new_default();
-        let mut out = msg.init_root::<wire::entry::Builder<'_>>();
-        out.set_at(at);
-        out.set_token(token);
-        event.encode(out.init_event());
-        let body = message_bytes(&msg);
+        let body = message_bytes(&Self::entry_message(event, token, at));
         let size = (PREFIX + body.len()) as u64;
         if body.len() > FRAME_MAX || size > self.config.max_bytes.saturating_sub(self.stats.bytes) {
             return Err(Error::Protocol(
