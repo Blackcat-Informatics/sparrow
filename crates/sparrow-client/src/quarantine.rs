@@ -22,7 +22,12 @@ use std::{
 /// configuration validation then fails with an actionable error. There is no volatile fallback,
 /// because this directory holds the only copy of a refused log.
 pub(crate) fn default_dir() -> PathBuf {
-    let state = std::env::var_os("XDG_STATE_HOME")
+    state_directory().map_or_else(PathBuf::new, |dir| dir.join("quarantine"))
+}
+
+/// The SDK state root under the user's absolute XDG state directory or home.
+pub(crate) fn state_directory() -> Option<PathBuf> {
+    std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| {
@@ -30,10 +35,8 @@ pub(crate) fn default_dir() -> PathBuf {
                 .map(PathBuf::from)
                 .filter(|path| path.is_absolute())
                 .map(|home| home.join(".local/state"))
-        });
-    state.map_or_else(PathBuf::new, |state| {
-        state.join("sparrow-client").join("quarantine")
-    })
+        })
+        .map(|state| state.join("sparrow-client"))
 }
 
 /// A save that did not complete. `created` names the quarantine file this call had already

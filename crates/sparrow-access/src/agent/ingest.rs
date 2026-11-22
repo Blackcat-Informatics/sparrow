@@ -3,6 +3,7 @@
 
 use super::{Result, invalid, wire};
 use purrdf_lex::json::{Object, Value};
+use sparrow_client::parts::{FileImport, import_file_or_set};
 use std::path::PathBuf;
 
 pub(crate) struct Input {
@@ -25,17 +26,28 @@ impl Input {
         })
     }
 
-    pub(super) async fn execute(&self, endpoint: &sparrow_client::Endpoint) -> Result<Value> {
-        render_receipt(
-            sparrow_client::import_file(
-                endpoint,
-                &self.request,
-                &self.source,
-                self.format,
-                &self.path,
-            )
-            .await?,
-        )
+    pub(super) async fn execute(&self, client: &sparrow_client::Client) -> Result<Value> {
+        match import_file_or_set(client, &self.request, &self.source, self.format, &self.path)
+            .await?
+        {
+            FileImport::Single(artifact) => render_receipt(artifact),
+            FileImport::Set(manifest, members) => {
+                let parts = members.into_iter().map(|(span, artifact)| {
+                    Value::from(
+                        Object::new()
+                            .with("index", span.index)
+                            .with("start", span.start)
+                            .with("byte_length", span.length)
+                            .with("format", sparrow_client::format_label(span.format))
+                            .with("artifact_id", artifact),
+                    )
+                });
+                Ok(Object::new()
+                    .with("manifest", render_receipt(manifest)?)
+                    .with("parts", Value::array(parts))
+                    .into())
+            }
+        }
     }
 }
 

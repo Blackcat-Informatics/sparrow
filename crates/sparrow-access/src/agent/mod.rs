@@ -18,6 +18,7 @@ mod explanation;
 mod ingest;
 mod ingest_status;
 mod json;
+mod parts;
 mod payload;
 mod pin;
 mod producer;
@@ -48,7 +49,7 @@ pub(crate) mod tool;
 pub(super) const USAGE: &str = concat!(
     "sparrow SOCKET_PATH sparql REQUEST.json | sparql-explain REQUEST.json | correlate REQUEST.json; ",
     "usage: sparrow SOCKET_PATH capabilities | discover | status | rdf STORE_ID RECORD_ID | ingest REQUEST_ID SOURCE FORMAT FILE | ingest-get STORE_ID IMPORT_ID | flush STORE_ID SESSION_ID SEQUENCE",
-    " | quarantine-replay FILE",
+    " | quarantine-replay FILE | parts verify SOURCE MANIFEST_ARTIFACT_ID",
     " | retention-metrics STORE_ID [--max-visits N] [--catalog-bytes N] [--payload-bytes N]",
     " | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION]",
     " | pins STORE_ID [--cursor CURSOR] [--page-size N] [--scan-budget N]",
@@ -85,6 +86,7 @@ pub(super) enum Command {
     Diagnostic(diagnostic::Input),
     Records(records::Input),
     Ingest(ingest::Input),
+    Parts(parts::Verify),
     IngestStatus(ingest_status::Input),
     Retention(retention::Input),
     Bytes(read::Input),
@@ -237,6 +239,9 @@ impl Command {
                 return Err(invalid("quarantine-replay requires FILE"));
             };
             return Ok(Self::QuarantineReplay(file.into()));
+        }
+        if args.first().is_some_and(|arg| arg == "parts") {
+            return Ok(Self::Parts(parts::Verify::parse(&args[1..])?));
         }
         if args.first().is_some_and(|arg| arg == "ingest-get") {
             return Ok(Self::IngestStatus(ingest_status::Input::parse(&args[1..])?));
@@ -625,7 +630,10 @@ impl Command {
             return Ok(Some(input.execute(client).await?));
         }
         if let Self::Ingest(input) = self {
-            return Ok(Some(input.execute(connection.endpoint()).await?));
+            return Ok(Some(input.execute(connection).await?));
+        }
+        if let Self::Parts(input) = self {
+            return Ok(Some(input.execute(connection).await?));
         }
         if let Self::IngestStatus(input) = self {
             return Ok(Some(input.execute(client).await?));

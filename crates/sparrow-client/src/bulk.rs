@@ -4,6 +4,8 @@
 mod disk;
 mod worker;
 
+pub(crate) use disk::{read_meta, write_meta};
+
 use crate::{
     CompletedFileIdentity, Endpoint, Error, Format, IMPORT_CHUNK_BYTES, format_label,
     open_completed_file,

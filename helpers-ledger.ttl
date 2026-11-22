@@ -1,5 +1,5 @@
 VERSION "1.2"
-BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/aebc0d3ff5d8bae1ee2e97230ccf380e450b2da2104e4ee9d96ef7aa0ad710e3>
+BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/9c46d8cc8ed19bb70b07aad9bcb6467fcb1a3c47a8cd522ea3ba55c5aa495813>
 <> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#Ledger> .
 <> <https://blackcatinformatics.ca/raf/report/1#distinct> <#distinct/0> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/active-file-checkpoint-attachment> .
@@ -169,6 +169,7 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/aebc0d3ff5d8ba
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/offline-turnover-qualification> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/oldest-unpinned-eviction> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/one-time-table-rewrite> .
+<> <https://blackcatinformatics.ca/raf/report/1#job> <#job/ordered-part-set-verification> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/oversized-raw-record-preparation> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/owned-anonymous-query-observer> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/owned-local-endpoint> .
@@ -532,6 +533,7 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/aebc0d3ff5d8ba
 <#job/artifact-catalog-discovery> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
 <#job/artifact-catalog-discovery> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
 <#job/artifact-catalog-discovery> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_access::agent::artifacts::Input::execute" .
+<#job/artifact-catalog-discovery> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_access::agent::artifacts::Input::read_page" .
 <#job/artifact-catalog-discovery> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::artifact_read::Writer::artifact_capture" .
 <#job/artifact-catalog-discovery> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_server::rpc::Rpc::artifacts_list" .
 <#job/artifact-catalog-discovery> <https://blackcatinformatics.ca/raf/report/1#forbiddenName> "^capture_artifact_catalog$" .
@@ -2152,6 +2154,14 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/aebc0d3ff5d8ba
 <#job/one-time-table-rewrite> <https://blackcatinformatics.ca/raf/report/1#specRef> "docs/architecture.md: 4.2 deduplication and compression; docs/interfaces.md: table rewrite status (schema 64)." .
 <#job/one-time-table-rewrite> <https://blackcatinformatics.ca/raf/report/1#summary> "One prompt step drives the one-time rewrite of table files written under an older options profile through RocksDB periodic compaction: it records a durable start, sets the rewritten families' periodic window to the time since it, and turns the window off for pressure, the data allowance or the free-space floor. It completes when no older file remains." .
 <#job/one-time-table-rewrite> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-core/tests/storage.rs" .
+<#job/ordered-part-set-verification> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
+<#job/ordered-part-set-verification> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+<#job/ordered-part-set-verification> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_access::agent::parts::Verify::list_members" .
+<#job/ordered-part-set-verification> <https://blackcatinformatics.ca/raf/report/1#homeSymbol> "sparrow_access::agent::parts::Verify::execute" .
+<#job/ordered-part-set-verification> <https://blackcatinformatics.ca/raf/report/1#jobId> "ordered-part-set-verification" .
+<#job/ordered-part-set-verification> <https://blackcatinformatics.ca/raf/report/1#specRef> "docs/interfaces.md: CLI ingestion and verification of ordered part sets." .
+<#job/ordered-part-set-verification> <https://blackcatinformatics.ca/raf/report/1#summary> "Read a bounded manifest, check each member against the catalog and release the catalog result." .
+<#job/ordered-part-set-verification> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/tests/rpc.rs" .
 <#job/oversized-raw-record-preparation> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
 <#job/oversized-raw-record-preparation> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
 <#job/oversized-raw-record-preparation> <https://blackcatinformatics.ca/raf/report/1#forbiddenName> "^(prepare_large_record_payload|prepare_oversized_record_bytes)$" .
@@ -2235,6 +2245,8 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/aebc0d3ff5d8ba
 <#job/part-set-cut-rule> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
 <#job/part-set-cut-rule> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
 <#job/part-set-cut-rule> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_client::parts::PartLimits::from_discovery" .
+<#job/part-set-cut-rule> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_client::parts::file::import_file_or_set" .
+<#job/part-set-cut-rule> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_client::parts::file::publish_file_set" .
 <#job/part-set-cut-rule> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_client::parts::is_one_part" .
 <#job/part-set-cut-rule> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_client::parts::upload_parts" .
 <#job/part-set-cut-rule> <https://blackcatinformatics.ca/raf/report/1#forbiddenName> "^(cut_parts|plan_parts|split_parts)$" .

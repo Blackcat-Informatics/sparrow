@@ -6,6 +6,8 @@ use super::{invalid, wire};
 use purrdf_lex::json::{Object, Value};
 use std::{fs::OpenOptions, io::Write, path::PathBuf};
 
+pub(super) const MAX_BYTES: u32 = 1024 * 1024;
+
 pub(crate) struct Input {
     store: String,
     id: String,
@@ -35,7 +37,7 @@ impl Input {
         let length = args[3]
             .parse()
             .map_err(|_| invalid("length requires UInt32"))?;
-        if length > 1048576 {
+        if length > MAX_BYTES {
             return Err(invalid(
                 "byte read limit is 1 MiB; select an explicit range",
             ));
