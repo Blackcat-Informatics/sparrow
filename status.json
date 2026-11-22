@@ -1,0 +1,79 @@
+{
+  "issue": 503,
+  "pr_number": 505,
+  "branch": "paudley/503-resume-a-direct-cli-ordered-file-after",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/503-resume-a-direct-cli-ordered-file-after/.stage/resume-a-direct-cli-ordered-file-after",
+  "observed_at": "2026-11-22T23:06:54.050921+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/503-resume-a-direct-cli-ordered-file-after/.stage/resume-a-direct-cli-ordered-file-after/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/503-resume-a-direct-cli-ordered-file-after/.stage/resume-a-direct-cli-ordered-file-after/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/503-resume-a-direct-cli-ordered-file-after/.stage/resume-a-direct-cli-ordered-file-after/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/503-resume-a-direct-cli-ordered-file-after/.stage/resume-a-direct-cli-ordered-file-after/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/503-resume-a-direct-cli-ordered-file-after/.stage/resume-a-direct-cli-ordered-file-after/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 505,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Resume ordered CLI parts after native staging expires",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/505",
+    "baseRefName": "main",
+    "baseRefOid": "9164c72e40d1a897f30fd42381cc97fa7525858a",
+    "headRefName": "paudley/503-resume-a-direct-cli-ordered-file-after",
+    "headRefOid": "23c305c0d5a370659e28052cfc2454c0ea42a910",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/510/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "23c305c0d5a370659e28052cfc2454c0ea42a910",
+    "branch": "paudley/503-resume-a-direct-cli-ordered-file-after",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 505,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #505 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}

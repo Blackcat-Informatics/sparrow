@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/503-resume-a-direct-cli-ordered-file-after",
+  "branch": "paudley/503-resume-a-direct-cli-ordered-file-after",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "ded208f9e8ad469ac0e90990231c27e318c65c49",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/503-resume-a-direct-cli-ordered-file-after/.stage/resume-a-direct-cli-ordered-file-after/sync/20261122T225309-e220d03e48dc47f18ff284feafcd159c",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "9164c72e40d1a897f30fd42381cc97fa7525858a",
+  "merge_bases": [
+    "ded208f9e8ad469ac0e90990231c27e318c65c49"
+  ],
+  "commit": "9164c72e40d1a897f30fd42381cc97fa7525858a"
+}
