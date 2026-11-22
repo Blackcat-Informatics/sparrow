@@ -147,12 +147,12 @@ impl Input {
         query.set_store_id(&self.controls.store);
         query.set_schema_version(sparrow_client::SCHEMA_VERSION);
         super::fill_scope(query.reborrow().init_scope(), &self.controls.options)?;
-        crate::correlation_wire::encode_selector(
+        crate::codec::encode_correlation_selector(
             query.reborrow().init_selector(),
             &self.selector,
             &self.controls.store,
         )?;
-        crate::correlation_wire::encode_relation(query.reborrow().init_relation(), self.relation);
+        crate::codec::encode_correlation_relation(query.reborrow().init_relation(), self.relation);
         self.controls.fill_limits(query.init_limits());
         let response = request.send().promise.await?;
         match response.get()?.get_result()?.which()? {

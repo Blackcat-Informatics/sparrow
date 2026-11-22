@@ -97,7 +97,8 @@ pub(crate) fn encode(
     Ok(())
 }
 
-pub(crate) fn decode(value: wire::pressure_status::Reader<'_>) -> capnp::Result<Value> {
+/// Decode pressure counters and eviction frontiers for status.
+pub fn decode(value: wire::pressure_status::Reader<'_>) -> capnp::Result<Value> {
     let phase = match value.get_phase()? {
         wire::PressurePhase::Ready => "ready",
         wire::PressurePhase::Requested => "requested",

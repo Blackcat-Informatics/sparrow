@@ -739,15 +739,7 @@ fn fill_scope(mut scope: wire::scope::Builder<'_>, options: &Options) -> Result<
     options.selection.encode(scope)
 }
 
-/// The one encoder of an optional wire text field, shared with the daemon's status encoders.
-pub(crate) fn optional(field: wire::optional_text::Builder<'_>, value: &Option<String>) {
-    sparrow_client::encode_optional(
-        field,
-        value.as_deref(),
-        |mut field, value| field.set_value(value),
-        |mut field| field.set_absent(()),
-    );
-}
+use crate::codec::optional;
 
 pub(super) fn optional_value(field: wire::optional_text::Reader<'_>) -> Result<Value> {
     match field.which()? {

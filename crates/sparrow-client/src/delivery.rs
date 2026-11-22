@@ -577,23 +577,54 @@ impl Delivery {
     }
 
     /// Start only an owned producer worker. This does not synchronously connect.
-    pub fn start(mut config: DeliveryConfig) -> Result<Self, Error> {
+    pub fn start(config: DeliveryConfig) -> Result<Self, Error> {
         config.validate()?;
-        // Retain only bounded source/path allocations supplied at setup.
-        config.source = config.source.as_str().to_owned();
-        if let crate::Endpoint::Unix(path) = &mut config.endpoint {
-            *path = path.as_path().to_path_buf();
-        }
         let mut instance = [0; 16];
         getrandom::fill(&mut instance).map_err(|error| std::io::Error::other(error.to_string()))?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
         let spool = config
             .mode
             .spool()
             .map(|settings| crate::spool::Log::open(settings, &config.source, instance))
             .transpose()?;
+        Self::spawn(config, instance, spool)
+    }
+
+    /// Drain an existing inactive producer journal to its confirmed remote watermark.
+    /// The directory and lock must exist. The verified journal supplies its source and
+    /// persistent instance. The timeout bounds the remote fence after local recovery.
+    pub async fn drain_spool(
+        endpoint: crate::Endpoint,
+        directory: impl Into<PathBuf>,
+        timeout: Duration,
+    ) -> Result<DeliveryWatermark, FlushError> {
+        let settings = crate::SpoolConfig::new(directory);
+        let delivery = tokio::task::spawn_blocking(move || {
+            endpoint.validate()?;
+            let spool = crate::spool::Log::existing(&settings)?;
+            let config = DeliveryConfig::lossless(endpoint, spool.head.source.clone(), settings);
+            Self::spawn(config, spool.head.instance, Some(spool))
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .map_err(Error::from)
+        .and_then(|opened| opened)
+        .map_err(|error| FlushError::Delivery(Arc::new(error)))?;
+        delivery.shutdown_async(timeout).await
+    }
+
+    fn spawn(
+        mut config: DeliveryConfig,
+        instance: [u8; 16],
+        spool: Option<crate::spool::Log>,
+    ) -> Result<Self, Error> {
+        // Retain only bounded source/path allocations supplied at setup.
+        config.source = config.source.as_str().to_owned();
+        if let crate::Endpoint::Unix(path) = &mut config.endpoint {
+            *path = path.as_path().to_path_buf();
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
         let shared = Shared::with_spool(config, instance, spool);
         let worker = shared.clone();
         let completed = spooled::Completion::new(&shared);

@@ -29,7 +29,7 @@ impl Input {
         Ok(Object::new()
             .with("store_id", self.store.clone())
             .with("operation", "syslog_listener_get")
-            .with("listener", crate::syslog_wire::listener(listener)?)
+            .with("listener", crate::codec::render_syslog_listener(listener)?)
             .into())
     }
 }

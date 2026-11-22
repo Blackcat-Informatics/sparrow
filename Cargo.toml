@@ -3,7 +3,7 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/sparrow-limits", "crates/sparrow-helper-census", "crates/sparrow-archive", "crates/sparrow-core", "crates/sparrow-client", "crates/sparrow-server", "crates/sparrow-test-support"]
+members = ["crates/sparrow-access", "crates/sparrow-server/tests", "crates/sparrow-limits", "crates/sparrow-helper-census", "crates/sparrow-archive", "crates/sparrow-core", "crates/sparrow-client", "crates/sparrow-server", "crates/sparrow-test-support"]
 
 [workspace.package]
 edition = "2024"
@@ -13,6 +13,11 @@ publish = false
 license = "MIT OR Apache-2.0 OR MulanPSL-2.0"
 
 [workspace.dependencies]
+sparrow-test-support = { path = "crates/sparrow-test-support" }
+sparrow-server = { path = "crates/sparrow-server" }
+sparrow-core = { path = "crates/sparrow-core" }
+sparrow-client = { path = "crates/sparrow-client" }
+sparrow-access = { path = "crates/sparrow-access" }
 sparrow-limits = { path = "crates/sparrow-limits" }
 blake3 = "1"
 rocksdb = { version = "0.25", default-features = false, features = ["lz4", "zstd", "bindgen-runtime"] }

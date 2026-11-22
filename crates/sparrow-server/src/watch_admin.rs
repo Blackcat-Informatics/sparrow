@@ -114,7 +114,8 @@ pub(crate) fn failure(code: &'static str, message: impl ToString) -> sparrow_cor
     sparrow_core::Error::new(code, message.to_string())
 }
 
-pub(crate) fn decode_definition(
+/// Decode a watch definition and verify its authority and limits.
+pub fn decode_definition(
     value: crate::sparrow_capnp::watch_definition::Reader<'_>,
 ) -> Result<ConsumeWatch, sparrow_core::Error> {
     use crate::sparrow_capnp as wire;
@@ -163,7 +164,8 @@ pub(crate) fn decode_definition(
     Ok(definition)
 }
 
-pub(crate) fn encode_definition(
+/// Encode the complete validated watch definition.
+pub fn encode_definition(
     mut out: crate::sparrow_capnp::watch_definition::Builder<'_>,
     value: &ConsumeWatch,
 ) -> capnp::Result<()> {

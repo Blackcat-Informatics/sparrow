@@ -152,7 +152,7 @@ pub(crate) struct Prepared {
 pub(crate) struct Log {
     config: SpoolConfig,
     directory: File,
-    _lock: File,
+    _lock: crate::ExclusiveFileLock,
     pub(crate) head: Header,
     sizes: BTreeMap<u64, u64>,
     active: Option<(u64, File)>,
@@ -237,10 +237,13 @@ impl Header {
             let cursor = value.get_cursor()?;
             let seal = value.get_seal()?;
             let store = value.get_store()?.to_str()?.to_owned();
+            let source = value.get_source()?.to_str()?;
             let confirmed = value.get_confirmed();
             let batch = value.get_next_batch();
             let token = value.get_confirmed_token()?.to_vec();
-            if batch == 0
+            if !(1..=512).contains(&source.len())
+                || batch == 0
+                || value.get_span_epoch() == 0
                 || token.len() > 256
                 || value.has_seal()
                     && (seal.get_last_sequence() <= confirmed
@@ -250,7 +253,7 @@ impl Header {
                 return Err(Error::Protocol("inconsistent spool checkpoint or seal"));
             }
             Ok(Self {
-                source: value.get_source()?.to_str()?.to_owned(),
+                source: source.to_owned(),
                 instance: value
                     .get_instance()?
                     .try_into()
@@ -332,8 +335,19 @@ impl Log {
         source: &str,
         instance: [u8; 16],
     ) -> Result<Self, Error> {
+        Self::acquire(config, Some((source, instance)))
+    }
+
+    /// Acquire an existing spool using its verified source and persistent identity.
+    pub(crate) fn existing(config: &SpoolConfig) -> Result<Self, Error> {
+        Self::acquire(config, None)
+    }
+
+    fn acquire(config: &SpoolConfig, producer: Option<(&str, [u8; 16])>) -> Result<Self, Error> {
         config.validate()?;
-        crate::quarantine::create_dir(&config.dir)?;
+        if producer.is_some() {
+            crate::quarantine::create_dir(&config.dir)?;
+        }
         let directory = options().read(true).open(&config.dir)?;
         let metadata = directory.metadata()?;
         if !metadata.is_dir() || metadata.permissions().mode() & 0o777 != 0o700 {
@@ -344,17 +358,18 @@ impl Log {
         let lock = options()
             .read(true)
             .write(true)
-            .create(true)
+            .create(producer.is_some())
             .truncate(false)
             .open(config.dir.join("LOCK"))?;
-        lock.try_lock().map_err(|error| {
-            Error::Io(match error {
-                std::fs::TryLockError::WouldBlock => std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
+        let lock = crate::ExclusiveFileLock::acquire(lock).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                std::io::Error::new(
+                    error.kind(),
                     format!("spool already open: {}", config.dir.display()),
-                ),
-                std::fs::TryLockError::Error(error) => error,
-            })
+                )
+            } else {
+                error
+            }
         })?;
         let mut sizes = BTreeMap::new();
         for entry in fs::read_dir(&config.dir)? {
@@ -381,6 +396,9 @@ impl Log {
         let mut head = match options().read(true).open(config.dir.join("HEADER")) {
             Ok(file) => Header::read(file)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && sizes.is_empty() => {
+                let Some((source, instance)) = producer else {
+                    return Err(error.into());
+                };
                 Header {
                     source: source.to_owned(),
                     instance,
@@ -396,15 +414,17 @@ impl Log {
             }
             Err(error) => return Err(error.into()),
         };
-        if head.source != source {
+        if producer.is_some_and(|(source, _)| head.source != source) {
             return Err(Error::InvalidArgument(
                 "spool belongs to a different source",
             ));
         }
-        head.epoch = head
-            .epoch
-            .checked_add(1)
-            .ok_or(Error::Protocol("spool span epoch exhausted"))?;
+        if producer.is_some() {
+            head.epoch = head
+                .epoch
+                .checked_add(1)
+                .ok_or(Error::Protocol("spool span epoch exhausted"))?;
+        }
         let stats = SpoolStats {
             next_batch: head.batch,
             spooled_sequence: head.confirmed,
@@ -863,8 +883,10 @@ mod tests {
         };
         log.append(&event, b"first", 1).unwrap();
         let prepared = log.prepare(store, 20, limits).unwrap().unwrap();
+        let inherited = log._lock.as_ref().try_clone().unwrap();
         drop(log);
         let mut log = Log::open(&config, "app", [3; 16]).unwrap();
+        drop(inherited);
         let replacement = "store:00000000000000000000000000000002";
         assert!(
             matches!(log.prepare(replacement, 30, limits), Err(Error::Domain {code,..}) if code == "STORE_MISMATCH")

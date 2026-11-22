@@ -58,7 +58,9 @@ present commands, verified behavior and limits.
 The production deployment is the system unit in [`deploy/`](deploy/README.md),
 serving typed Cap'n Proto on `0.0.0.0:518` and a private Unix socket at
 `/SPARROW/store/rpc.sock`. Anonymous TCP peers may only discover,
-ingest and import; other TCP operations require `--secret-file` CHAP authentication. The client is `~/.local/bin/sparrow`.
+ingest and import; other TCP operations require `--secret-file` CHAP authentication.
+The `sparrow-access` package supplies the installed `~/.local/bin/sparrow`
+command and its stdio MCP adapter. Rust producers depend on `sparrow-client`.
 Graph queries use PurRDF's native semantics and governors over bounded stored
 views, with explicit admission refusals; see
 [native integration evidence](docs/purrdf-integration-gaps.md).

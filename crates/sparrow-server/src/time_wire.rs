@@ -5,7 +5,8 @@
 use crate::sparrow_capnp as wire;
 use sparrow_core::LogTimeCapture;
 
-pub(crate) fn capture(value: wire::log_time_capture::Reader<'_>) -> capnp::Result<LogTimeCapture> {
+/// Decode the log time capture descriptor.
+pub fn capture(value: wire::log_time_capture::Reader<'_>) -> capnp::Result<LogTimeCapture> {
     let pattern = value.get_pattern()?;
     let flags = value.get_flags()?;
     if pattern.len() > 4096 || flags.len() > 2 || value.get_group() > 32 {
@@ -20,7 +21,8 @@ pub(crate) fn capture(value: wire::log_time_capture::Reader<'_>) -> capnp::Resul
     })
 }
 
-pub(crate) fn encode(mut out: wire::log_time_capture::Builder<'_>, value: &LogTimeCapture) {
+/// Encode the log time capture descriptor.
+pub fn encode(mut out: wire::log_time_capture::Builder<'_>, value: &LogTimeCapture) {
     out.set_pattern(&value.pattern);
     out.set_group(value.group);
     out.set_flags(&value.flags);

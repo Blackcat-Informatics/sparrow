@@ -39,9 +39,10 @@ notifications abort only the selected tool's owned SDK connection and retain its
 four-call admission slot until the job is dropped; cancelled tools emit no reply.
 See [cooperative query cancellation](query-streaming.md#cooperative-query-cancellation).
 
-MCP and CLI adapters call the generated Cap'n Proto daemon client. They must not
-implement separate filtering, retention, pin, or query semantics. The daemon
-owns the database; the local CLI and stdio MCP adapter connect to it.
+The `sparrow-access` package provides the `sparrow` executable, its command
+dispatcher and its stdio MCP adapter. Both call the daemon through the generated
+Cap'n Proto client. The daemon owns filtering, retention, pins, query execution
+and the database. Rust applications can depend on `sparrow-client` independently.
 
 ### Cruft
 
@@ -4824,6 +4825,25 @@ The private `sparrow-spool/1` layout uses `LOCK` for exclusive ownership,
 The checkpoint records the producer identity, span epoch, confirmed cursor,
 artifact identity and any in-flight seal. Writers synchronize the replacement
 checkpoint and its directory before reclaiming segment files.
+
+Use `sparrow ENDPOINT spool-drain ABSOLUTE_DIRECTORY [--timeout-secs SECONDS]`
+to drain an inactive spool. The command acquires the existing directory's
+writer lock, reads its verified checkpoint and uses producer-profile discovery.
+It replays the original source, producer instance and sealed requests on the
+recorded store. For an offline spool that has never bound a store, `ENDPOINT`
+selects the first destination. Producer TOML role and store expectations live
+outside the checkpoint. Reopen with the producer's original `DeliveryConfig`
+to enforce those expectations. Release all producer handles first. A missing
+journal, corrupt checkpoint or active writer fails with a diagnostic and a
+nonzero exit.
+
+Success prints one JSON object with the hexadecimal `client_instance` and the
+decimal strings `required_sequence`, `durable_sequence` and `durable_events`.
+The sequences and durable count include progress from earlier runs.
+The remote wait defaults to 30 seconds
+after local recovery. A timeout preserves pending bytes and reports the last
+known delivery refusal when available. Repeating a completed drain returns
+its existing watermark.
 
 File configuration selects `mode = "lossless"` by default. Fast offers report
 `Admission::Refused` on capacity or other admission failures. In

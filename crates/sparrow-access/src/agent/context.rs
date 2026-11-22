@@ -99,7 +99,7 @@ pub(super) fn render_record(value: wire::record::Reader<'_>) -> Result<Value> {
             crate::tail_wire::render_position(value.get_tail()?)?,
         )
         .with("intake", intake)
-        .with("syslog", crate::syslog_wire::render(value.get_syslog()?)?)
+        .with("syslog", crate::codec::render_syslog(value.get_syslog()?)?)
         .with("producer", producer)
         .with("receiver", receiver)
         .with("store_id", value.get_store_id()?.to_str()?)
@@ -112,7 +112,7 @@ pub(super) fn render_record(value: wire::record::Reader<'_>) -> Result<Value> {
         .with("byte_end", value.get_byte_end().to_string())
         .with(
             "diagnostics",
-            crate::diagnostics::render_snapshot(value.get_diagnostics()?)?,
+            crate::codec::render_diagnostic_snapshot(value.get_diagnostics()?)?,
         )
         .with(
             "event_time",

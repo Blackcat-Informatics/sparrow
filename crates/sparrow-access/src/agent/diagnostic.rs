@@ -50,13 +50,13 @@ impl Input {
             let mut request = client.diagnostic_define_request();
             let mut definition = request.get().init_definition();
             definition.set_source(&self.source);
-            crate::diagnostics::encode_mappings(
+            crate::codec::encode_diagnostic_mappings(
                 definition.init_mappings(mappings.len() as u32),
                 mappings,
             );
             let response = request.send().promise.await?;
             return match response.get()?.get_result()?.which()? {
-                wire::result::Ok(value) => Ok(crate::diagnostics::render_profile(value?)?),
+                wire::result::Ok(value) => Ok(crate::codec::render_diagnostic_profile(value?)?),
                 wire::result::Error(error) => Err(failure(error?)),
             };
         }
@@ -70,7 +70,7 @@ impl Input {
         let profile = match result.which()? {
             wire::optional_diagnostic_profile::Absent(()) => Value::Null,
             wire::optional_diagnostic_profile::Value(value) => {
-                crate::diagnostics::render_profile(value?)?
+                crate::codec::render_diagnostic_profile(value?)?
             }
         };
         Ok(Object::new().with("profile", profile).into())

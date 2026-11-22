@@ -78,7 +78,7 @@ fn write_meta<T: Serialize>(dir: &Path, name: &str, value: &T) -> io::Result<()>
 pub(super) struct Journal {
     dir: PathBuf,
     pub(super) state: State,
-    owner: File,
+    owner: crate::ExclusiveFileLock,
     pub(super) faulted: bool,
 }
 
@@ -94,7 +94,7 @@ impl Journal {
             .truncate(false)
             .mode(0o600)
             .open(dir.join("owner"))?;
-        lock.try_lock().map_err(io::Error::from)?;
+        let owner = crate::ExclusiveFileLock::acquire(lock)?;
         let state = match read_meta::<State>(&dir.join("state.toml")) {
             Ok(state) => {
                 if state.id != initial.id
@@ -139,17 +139,15 @@ impl Journal {
         let journal = Self {
             dir,
             state,
-            owner: lock,
+            owner,
             faulted: false,
         };
         journal.recover_space()?;
         Ok(journal)
     }
 
-    pub(super) fn release(&self) -> io::Result<()> {
-        // File locks follow the open file description. A forked child can transiently
-        // hold another reference even with close-on-exec, so close alone is insufficient.
-        self.owner.unlock()
+    pub(super) fn release(&mut self) -> io::Result<()> {
+        self.owner.release()
     }
 
     fn recover_space(&self) -> io::Result<()> {
@@ -354,7 +352,14 @@ mod tests {
         ))
         .unwrap();
         let job = bulk.open("job", "source", Format::Log).await.unwrap();
-        let inherited = job.shared.lock().unwrap().owner.try_clone().unwrap();
+        let inherited = job
+            .shared
+            .lock()
+            .unwrap()
+            .owner
+            .as_ref()
+            .try_clone()
+            .unwrap();
         job.close().await.unwrap();
         let reopened = bulk.open("job", "source", Format::Log).await.unwrap();
         drop(inherited);

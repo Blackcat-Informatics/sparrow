@@ -3,6 +3,7 @@
 
 [package]
 name = "sparrow-server"
+autotests = false
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -13,10 +14,6 @@ license.workspace = true
 [[bin]]
 name = "sparrowd"
 path = "src/main.rs"
-
-[[bin]]
-name = "sparrow"
-path = "src/bin/sparrow.rs"
 
 [dependencies]
 sparrow-core = { path = "../sparrow-core" }
@@ -38,7 +35,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-log.workspace = true
 # Sub-second delivery timing for tests only; the production dependency above cannot reach it.
 sparrow-client = { path = "../sparrow-client", features = ["test-timing"] }
 sparrow-test-support = { path = "../sparrow-test-support" }

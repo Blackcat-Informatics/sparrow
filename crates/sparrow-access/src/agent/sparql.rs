@@ -87,9 +87,9 @@ impl Input {
                 }
                 let limits = purrdf::projections::ProjectionLimits::new(
                     1,
-                    crate::rdf_wire::MAX_BYTES,
-                    crate::rdf_wire::MAX_BYTES,
-                    crate::rdf_wire::MAX_BYTES,
+                    crate::codec::RDF_MAX_BYTES,
+                    crate::codec::RDF_MAX_BYTES,
+                    crate::codec::RDF_MAX_BYTES,
                     16,
                 )
                 .map_err(json::record::DecodeError::custom)?;
@@ -146,7 +146,7 @@ impl Input {
         layers.set_diagnostic(self.layers[1]);
         layers.set_content(self.layers[2]);
         match &self.text_relations {
-            Some(value) => crate::text_wire::encode_relations(
+            Some(value) => crate::codec::encode_text_relations(
                 query.reborrow().init_text_relations().init_value(),
                 value,
             ),
@@ -157,7 +157,7 @@ impl Input {
             .iter()
             .map(|(_, term)| term)
             .collect::<Vec<_>>();
-        let ids = crate::rdf_wire::encode(&refs, |len| query.reborrow().init_terms(len))
+        let ids = crate::codec::encode_rdf(&refs, |len| query.reborrow().init_terms(len))
             .map_err(|e| super::invalid(e.to_string()))?;
         let mut bindings = query.reborrow().init_bindings(self.bindings.len() as u32);
         for (index, (name, _)) in self.bindings.iter().enumerate() {
@@ -440,7 +440,7 @@ fn serialize(result: &SparqlResult) -> Result<Value> {
     if output.provenance_dropped {
         return Err(protocol("native result serializer dropped provenance"));
     }
-    if output.bytes.len() > crate::rdf_wire::MAX_BYTES {
+    if output.bytes.len() > crate::codec::RDF_MAX_BYTES {
         return Err(protocol("native result JSON exceeds admitted page bytes"));
     }
     // Native SRJ nests a term's type/value objects in addition to its triple
@@ -449,9 +449,9 @@ fn serialize(result: &SparqlResult) -> Result<Value> {
     json::read_slice(
         &output.bytes,
         json::Limits {
-            max_depth: 2 * crate::rdf_wire::MAX_NODES + 16,
-            max_values: crate::rdf_wire::MAX_BYTES as u64,
-            max_string_bytes: crate::rdf_wire::MAX_BYTES,
+            max_depth: 2 * crate::codec::RDF_MAX_NODES + 16,
+            max_values: crate::codec::RDF_MAX_BYTES as u64,
+            max_string_bytes: crate::codec::RDF_MAX_BYTES,
             unique_members: false,
         },
     )
@@ -492,7 +492,7 @@ fn data(value: wire::sparql_data::Reader<'_>) -> Result<Value> {
             Shape::Boolean(_) => {}
         }
     }
-    let decoded = crate::rdf_wire::decode(value.get_terms()?, &roots, false).map_err(protocol)?;
+    let decoded = crate::codec::decode_rdf(value.get_terms()?, &roots, false).map_err(protocol)?;
     let mut values = decoded.into_iter();
     let mut primary = RdfDatasetBuilder::new();
     let mut auxiliary = RdfDatasetBuilder::new();
@@ -738,7 +738,7 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
     let mut diagnostic_known = Object::new();
     let mut seen = std::collections::BTreeSet::new();
     for row in c.get_diagnostic_known()? {
-        let dimension = crate::diagnostics::dimension(row.get_dimension()?);
+        let dimension = crate::codec::diagnostic_dimension(row.get_dimension()?);
         if !seen.insert(dimension) {
             return Err(protocol("duplicate diagnostic interpretation counter"));
         }
@@ -765,7 +765,7 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
     let correlation = match value.get_correlation()?.which()? {
         wire::optional_correlation_capture::Absent(()) => None,
         wire::optional_correlation_capture::Value(capture) => Some(
-            crate::correlation_wire::decode(capture?, value.get_page()?.get_store_id()?.to_str()?)
+            crate::codec::decode_correlation(capture?, value.get_page()?.get_store_id()?.to_str()?)
                 .map_err(|error| protocol(error.to_string()))?,
         ),
     };
@@ -907,7 +907,7 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
     if let wire::optional_native_diagnostic::Value(diagnostic) = value.get_diagnostic()?.which()? {
         result = result.with(
             "diagnostic",
-            crate::rdf_wire::diagnostic::render(diagnostic?)?,
+            crate::codec::render_native_diagnostic(diagnostic?)?,
         );
     }
     let explain = value.get_operation()? == wire::NativeReadOperation::Explain;
@@ -1052,7 +1052,7 @@ mod tests {
         let mut wire = message.init_root::<wire::sparql_data::Builder<'_>>();
         wire.set_form(wire::SparqlForm::Graph);
         let refs = values.iter().collect::<Vec<_>>();
-        let ids = crate::rdf_wire::encode(&refs, |n| wire.reborrow().init_terms(n)).unwrap();
+        let ids = crate::codec::encode_rdf(&refs, |n| wire.reborrow().init_terms(n)).unwrap();
         let mut items = wire.reborrow().init_items(5);
         items.reborrow().get(0).init_graph().set_declaration(ids[3]);
         items.reborrow().get(1).init_graph().set_declaration(ids[4]);
@@ -1118,7 +1118,7 @@ mod tests {
                 o: TermBox::new(TermValue::iri("urn:o")),
             };
         }
-        let ids = crate::rdf_wire::encode(&[&value], |n| wire.reborrow().init_terms(n)).unwrap();
+        let ids = crate::codec::encode_rdf(&[&value], |n| wire.reborrow().init_terms(n)).unwrap();
         let mut cells = wire
             .reborrow()
             .init_items(1)

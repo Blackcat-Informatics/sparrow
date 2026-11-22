@@ -15,19 +15,21 @@ const HEADERS: &[(wire::SyslogHeader, &str)] = &[
     (wire::SyslogHeader::Tag, "tag"),
 ];
 
-pub(crate) fn listeners(
+/// Render the listener status list in wire order.
+pub fn listeners(
     value: capnp::struct_list::Reader<'_, wire::syslog_listener_status::Owned>,
-) -> crate::agent::AgentResult<Value> {
+) -> Result<Value, sparrow_client::Error> {
     value
         .iter()
         .map(listener)
-        .collect::<crate::agent::AgentResult<Vec<_>>>()
+        .collect::<Result<Vec<_>, sparrow_client::Error>>()
         .map(Into::into)
 }
 
-pub(crate) fn listener(
+/// Render one listener's framing, pressure, and loss counters.
+pub fn listener(
     listener: wire::syslog_listener_status::Reader<'_>,
-) -> crate::agent::AgentResult<Value> {
+) -> Result<Value, sparrow_client::Error> {
     let framing = match listener.get_framing()?.which()? {
         wire::optional_syslog_framing::Absent(()) => Value::Null,
         wire::optional_syslog_framing::Value(value) => Value::from(match value? {
@@ -236,9 +238,10 @@ pub(crate) fn snapshot(
     Ok(())
 }
 
-pub(crate) fn render(
+/// Render a parsed syslog snapshot with exact source offsets.
+pub fn render(
     value: wire::optional_syslog_snapshot::Reader<'_>,
-) -> crate::agent::AgentResult<Value> {
+) -> Result<Value, sparrow_client::Error> {
     let value = match value.which()? {
         wire::optional_syslog_snapshot::Absent(()) => return Ok(Value::Null),
         wire::optional_syslog_snapshot::Value(value) => value?,

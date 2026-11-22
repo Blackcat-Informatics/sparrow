@@ -4,8 +4,9 @@
 //! CLI and stdio MCP entry point over the shared generated daemon client.
 
 use purrdf_lex::json;
+use sparrow_access::{run_cli, run_mcp};
 use sparrow_client::{Client, Endpoint};
-use sparrow_server::{run_cli, run_mcp};
+mod drain;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -21,8 +22,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if args == ["mcp", "--stdio"] {
                 run_mcp(&endpoint).await?;
             } else {
-                let client = Client::connect_endpoint(&endpoint).await?;
-                let output = run_cli(&client, args).await?;
+                let output = match args {
+                    [command, rest @ ..] if command == "spool-drain" => {
+                        drain::run(endpoint, rest).await?
+                    }
+                    _ => {
+                        let client = Client::connect_endpoint(&endpoint).await?;
+                        run_cli(&client, args).await?
+                    }
+                };
                 println!("{}", json::write_compact(&output));
                 if output.get("execution_status").and_then(json::Value::as_str) == Some("failed") {
                     return Err("query failed; see the emitted typed failure receipt".into());

@@ -67,7 +67,7 @@ those remain performance qualification work.
 | Sparrow core | Artifact/record identity; sources and provenance; ingestion coordination; persistent storage adapters; retention, pins, recovery, and bounded operations. |
 | Storage | Persistent catalog, exact bytes, manifests, references, RDF dictionaries/indexes, text postings, and import checkpoints. |
 | Daemon | One storage owner; typed Cap'n Proto RPC ingestion and queries, syslog, watchers, worker scheduling, and operational metrics. |
-| CLI / stdio MCP adapter | Clients of the daemon's typed operations. A stdio adapter does not open a competing writer on the database. |
+| `sparrow-access` CLI and stdio MCP adapter | Execute the daemon's typed operations through `sparrow-client`. The daemon owns the database. |
 | Rust client | Structured logging and upload transport with bounded buffering, explicit delivery state, and shutdown. |
 
 ```mermaid

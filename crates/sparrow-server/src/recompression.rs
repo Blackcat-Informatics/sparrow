@@ -4,7 +4,7 @@
 //! Daemon encoding of the table-rewrite and online migration status; the agent renders
 //! them for CLI and MCP.
 
-use crate::agent::optional;
+use crate::access_wire::optional;
 use crate::sparrow_capnp as wire;
 use sparrow_core::{MigrationStatus, RecompressionPhase, RecompressionStatus};
 

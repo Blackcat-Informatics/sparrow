@@ -201,7 +201,7 @@ async fn capability_documents_share_cli_mcp_and_typed_transport_contracts() {
                     Some("INVALID_ARGUMENT")
                 );
                 mcp.close(true).await;
-                let invalid = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                let invalid = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                     .args(endpoint_args(&endpoint))
                     .args(["capabilities", "unsupported"])
                     .admitted_output()
@@ -556,7 +556,7 @@ struct Watched {
 
 impl Watched {
     fn spawn(config: &Path, notify: Option<&Path>) -> Self {
-        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrowd"));
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrowd-rpc-fixture"));
         command
             .arg("--config")
             .arg(config)
@@ -730,7 +730,7 @@ async fn typed_tail_handoff_retires_original_checkpoint_over_tcp_and_replays_thr
         let status = cli(&socket, &["status"]);
         let generation = status["consume_watches"][0]["tail_generation_ids"][0].as_str().unwrap().to_owned();
         let intent_path = dir.path().join("handoff.capnp");
-        let early = Command::new(env!("CARGO_BIN_EXE_sparrow")).arg(&socket).args([
+        let early = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture")).arg(&socket).args([
             "watch", "handoff-prepare", "tail-retire", "completed", "1", "finished.log", intent_path.to_str().unwrap(), &generation,
         ]).admitted_output().unwrap();
         assert!(!early.status.success());
@@ -875,7 +875,7 @@ async fn explicit_tail_completion_preserves_partial_bytes_retry_clocks_and_retai
             let saved = std::fs::read(&intent_path).unwrap();
             let intent = sparrow_client::TailFinishIntent::read(saved.as_slice()).unwrap();
             for destination in [intent_path.clone(), root.join("cannot-ingest-intent.capnp")] {
-                let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                let output = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                     .arg(&socket)
                     .args([
                         "file-finish-prepare",
@@ -1895,7 +1895,7 @@ async fn remote_agent_adapters_share_all_query_and_mutation_paths_and_report_con
             assert_eq!(native.artifact(&artifact).await.unwrap().id, artifact);
             drop(native);
             for invalid in ["tcp://127.0.0.1:0", "tcp://hostname:518"] {
-                let result = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                let result = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                     .args([invalid, "status"])
                     .admitted_output()
                     .unwrap();
@@ -1903,7 +1903,7 @@ async fn remote_agent_adapters_share_all_query_and_mutation_paths_and_report_con
                 assert!(result.stdout.is_empty());
             }
             drop(daemon); // Reaped by the shared daemon owner before testing refusal.
-            let result = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+            let result = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                 .args([&endpoint, "status"])
                 .admitted_output()
                 .unwrap();
@@ -1945,7 +1945,7 @@ async fn public_tcp_requires_chap_for_reads_and_administration_but_not_ingestion
             let definition = watch_definition(&root, "victim", 300, 16, 16);
             std::fs::write(&definition_file, toml::to_string(&definition).unwrap()).unwrap();
             let daemon = start(&config, &socket).await;
-            let unauthenticated = |result: Result<_, sparrow_server::AgentError>| {
+            let unauthenticated = |result: Result<_, sparrow_access::AgentError>| {
                 assert_eq!(result.unwrap_err().code, "UNAUTHENTICATED");
             };
 
@@ -1970,7 +1970,7 @@ async fn public_tcp_requires_chap_for_reads_and_administration_but_not_ingestion
                 anonymous.bytes(&receipt.id, 0, 9).await,
                 Err(sparrow_client::Error::Domain { code, .. }) if code == "UNAUTHENTICATED"
             ));
-            unauthenticated(sparrow_server::run_cli(&anonymous, &["status".into()]).await);
+            unauthenticated(sparrow_access::run_cli(&anonymous, &["status".into()]).await);
             let put = [
                 "watch",
                 "put",
@@ -1979,7 +1979,7 @@ async fn public_tcp_requires_chap_for_reads_and_administration_but_not_ingestion
                 definition_file.to_str().unwrap(),
             ]
             .map(String::from);
-            unauthenticated(sparrow_server::run_cli(&anonymous, &put).await);
+            unauthenticated(sparrow_access::run_cli(&anonymous, &put).await);
             // Claim retirement is administration: refused before CHAP (D118).
             let retire = [
                 "watch",
@@ -1989,7 +1989,7 @@ async fn public_tcp_requires_chap_for_reads_and_administration_but_not_ingestion
                 "anonymous",
             ]
             .map(String::from);
-            unauthenticated(sparrow_server::run_cli(&anonymous, &retire).await);
+            unauthenticated(sparrow_access::run_cli(&anonymous, &retire).await);
             assert!(
                 cli(&socket, &["watch", "list"])["watches"]
                     .as_array()
@@ -2036,7 +2036,7 @@ async fn public_tcp_requires_chap_for_reads_and_administration_but_not_ingestion
                 session.bytes(&receipt.id, 0, 9).await.unwrap(),
                 b"accepted\n"
             );
-            let status = sparrow_server::run_cli(&session, &["status".into()])
+            let status = sparrow_access::run_cli(&session, &["status".into()])
                 .await
                 .unwrap();
             assert_eq!(status["store_id"].as_str(), Some(receipt.store_id.as_str()));
@@ -2044,7 +2044,7 @@ async fn public_tcp_requires_chap_for_reads_and_administration_but_not_ingestion
                 status["producer_profiles"],
                 purrdf_lex::json::Value::array([sparrow_client::PRODUCER_PROFILE])
             );
-            let created = sparrow_server::run_cli(&session, &put).await.unwrap();
+            let created = sparrow_access::run_cli(&session, &put).await.unwrap();
             assert_eq!(created["watch"]["revision"].as_str(), Some("1"));
             assert_eq!(
                 cli(&socket, &["watch", "list"])["watches"]
@@ -2294,7 +2294,7 @@ async fn ingest_socket_refuses_reads_and_administration() {
                 "UNSUPPORTED"
             );
             assert_eq!(
-                sparrow_server::run_cli(&producer, &["status".into()])
+                sparrow_access::run_cli(&producer, &["status".into()])
                     .await
                     .unwrap_err()
                     .code,
@@ -3212,7 +3212,7 @@ async fn artifact_membership_scopes_share_wire_validation_and_frozen_agent_pages
                 Some("2")
             );
             std::fs::write(&scope_file, purrdf_lex::json::write_compact(&selected)).unwrap();
-            let changed = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+            let changed = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                 .arg(&socket)
                 .args([
                     "artifacts",
@@ -3254,7 +3254,7 @@ async fn artifact_membership_scopes_share_wire_validation_and_frozen_agent_pages
                 (filtered, "INVALID_ARGUMENT"),
             ] {
                 std::fs::write(&scope_file, purrdf_lex::json::write_compact(&input)).unwrap();
-                let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                let output = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                     .arg(&socket)
                     .args([
                         "artifacts",
@@ -3460,7 +3460,7 @@ async fn source_listing_exposes_declared_idle_and_occurrence_sources_through_sha
                     "INVALID_ARGUMENT",
                 ),
             ] {
-                let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                let output = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                     .arg(&socket)
                     .args(args)
                     .admitted_output()
@@ -3608,7 +3608,7 @@ async fn artifact_listing_shares_typed_pages_held_origins_and_agent_refusals() {
                 second["rows"][0]["artifact_id"],
                 first["rows"][0]["artifact_id"]
             );
-            let spent = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+            let spent = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                 .arg(&socket)
                 .args([
                     "artifacts",
@@ -3680,7 +3680,7 @@ async fn artifact_listing_shares_typed_pages_held_origins_and_agent_refusals() {
                     "CONFLICT",
                 ),
             ] {
-                let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                let output = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                     .arg(&socket)
                     .args(args)
                     .admitted_output()
@@ -3797,7 +3797,7 @@ async fn bounded_discovery_and_status_do_not_read_corrupt_evidence_and_keys_refu
                 rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(),
                 1
             );
-            let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+            let output = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                 .arg(&socket)
                 .args(["keys"])
                 .admitted_output()
@@ -3891,7 +3891,7 @@ async fn diagnostic_mappings_and_filters_share_typed_cli_and_mcp_evidence() {
             let strict=mcp.tool(request_id,tool,input.with("require_complete_index",true).into()).await;request_id+=1;
             assert_eq!(strict["structuredContent"]["error"]["code"].as_str(),Some("EVIDENCE_INCOMPLETE"));
             args.extend(["--require-complete-index","true"]);
-            let refused=Command::new(env!("CARGO_BIN_EXE_sparrow")).arg(&socket).args(&args).admitted_output().unwrap();
+            let refused=Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture")).arg(&socket).args(&args).admitted_output().unwrap();
             assert!(!refused.status.success() && refused.stdout.is_empty());
         }
         for filter in [Object::new(),Object::new().with("service",Vec::<String>::new()),Object::new().with("severity",vec![""]),Object::new().with("guess_field",vec!["worker"])] {
@@ -4615,12 +4615,12 @@ async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_a
         assert!(input.exists());
         let intent = CompletedHandoff::read(std::fs::File::open(&intent_file).unwrap()).unwrap();
         let saved_bytes = std::fs::read(&intent_file).unwrap();
-        let duplicate_prepare = Command::new(env!("CARGO_BIN_EXE_sparrow")).arg(&socket)
+        let duplicate_prepare = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture")).arg(&socket)
             .args(["watch", "handoff-prepare", "explicit-1", "completed", "1", "finished.jsonl", intent_file.to_str().unwrap()]).admitted_output().unwrap();
         assert!(!duplicate_prepare.status.success());
         assert_eq!(std::fs::read(&intent_file).unwrap(), saved_bytes);
         let unsafe_intent = root.join("must-not-consume.capnp");
-        let unsafe_prepare = Command::new(env!("CARGO_BIN_EXE_sparrow")).arg(&socket)
+        let unsafe_prepare = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture")).arg(&socket)
             .args(["watch", "handoff-prepare", "unsafe-intent", "completed", "1", "finished.jsonl", unsafe_intent.to_str().unwrap()]).admitted_output().unwrap();
         assert!(!unsafe_prepare.status.success()); assert!(!unsafe_intent.exists());
         assert!(matches!(client.handoff_get(&intent).await, Err(sparrow_client::Error::Domain { code, .. }) if code == "NOT_FOUND"));
@@ -4719,7 +4719,7 @@ async fn watch_put_refuses_a_root_inside_a_daemon_output_path() {
                 let file = dir.path().join(format!("{request}.toml"));
                 let definition = watch_definition(root, request, 30_000, 16, 16);
                 std::fs::write(&file, toml::to_string(&definition).unwrap()).unwrap();
-                Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                     .args(endpoint_args(&socket))
                     .args(["watch", "put", request, "0", file.to_str().unwrap()])
                     .admitted_output()
@@ -4801,7 +4801,7 @@ async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect
             );
             assert_eq!(updated["watch"]["revision"].as_str(), Some("2"));
             for (request, expected) in [("watch-create", "0"), ("stale-update", "1")] {
-                let failed = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                let failed = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                     .arg(&socket)
                     .args([
                         "watch",
@@ -5113,7 +5113,7 @@ async fn retire_claim_clears_only_an_unrecoverable_claim_and_lets_the_drain_reac
                 );
             }
             let retire = |claim: &str| {
-                Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                     .arg(&socket)
                     .args([
                         "watch",
@@ -5322,7 +5322,7 @@ async fn removed_watch_keeps_durable_claim_recovery_and_refuses_root_rebinding()
                 toml::to_string(&watch_definition(&other, "completed", 0, 16, 16)).unwrap(),
             )
             .unwrap();
-            let failed = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+            let failed = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                 .arg(&socket)
                 .args([
                     "watch",
@@ -5649,7 +5649,7 @@ fn query_only_and_no_intake_refuse_conflicting_configuration() {
     // `flag` selects the mode on the command line; without one the `query_only` key does.
     let refused = |extra: &str, flags: &[&str], key: &str| {
         std::fs::write(&config, format!("{base}{extra}")).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sparrowd"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sparrowd-rpc-fixture"));
         command.arg("--config").arg(&config);
         command.args(flags);
         let output = command.admitted_output().unwrap();
@@ -5737,7 +5737,7 @@ fn user_unit_upgrade_refuses_before_changing_anything() {
     let run = |args: &[&str]| {
         let output = Command::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../deploy/user-unit-upgrade.sh"
+            "/../../../deploy/user-unit-upgrade.sh"
         ))
         .args(args)
         .env("HOME", dir.path())
@@ -5797,7 +5797,7 @@ fn user_unit_upgrade_refuses_before_changing_anything() {
     std::fs::copy(
         concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../deploy/systemd/user/sparrow.service.d/limits.conf"
+            "/../../../deploy/systemd/user/sparrow.service.d/limits.conf"
         ),
         dropins.join("limits.conf"),
     )
@@ -5820,7 +5820,7 @@ fn daemon_refuses_a_soft_open_file_limit_without_room_for_the_table_cache() {
     let config = write_server_config(dir.path(), &data, &socket);
     let result = Command::new("prlimit")
         .arg("--nofile=1024:1024")
-        .arg(env!("CARGO_BIN_EXE_sparrowd"))
+        .arg(env!("CARGO_BIN_EXE_sparrowd-rpc-fixture"))
         .arg("--config")
         .arg(&config)
         .admitted_output()
@@ -5850,7 +5850,7 @@ fn corrupt_durable_watch_catalog_is_a_hard_startup_failure() {
         .watch_registry_replace(None, b"invalid durable authority")
         .unwrap();
     drop(store);
-    let result = Command::new(env!("CARGO_BIN_EXE_sparrowd"))
+    let result = Command::new(env!("CARGO_BIN_EXE_sparrowd-rpc-fixture"))
         .arg("--config")
         .arg(&config)
         .admitted_output()
@@ -6264,7 +6264,7 @@ async fn startup_waits_for_the_space_to_replay_a_left_write_ahead_log() {
         ),
     )
     .unwrap();
-    let mut daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrowd"))
+    let mut daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrowd-rpc-fixture"))
         .arg("--config")
         .arg(&config)
         .kill_on_drop(true)
@@ -6301,7 +6301,7 @@ async fn startup_waits_for_the_space_to_replay_a_left_write_ahead_log() {
 fn ship(config: &Path) -> std::process::Output {
     Command::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../deploy/libexec/sparrow-ship"
+        "/../../../deploy/libexec/sparrow-ship"
     ))
     .arg(config)
     .admitted_output()
@@ -6314,7 +6314,7 @@ fn ship(config: &Path) -> std::process::Output {
 fn shipper_reports_a_whole_file_above_the_import_bound_and_mirrors_it() {
     let script = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../deploy/libexec/sparrow-ship"
+        "/../../../deploy/libexec/sparrow-ship"
     ))
     .unwrap();
     assert!(
@@ -6513,7 +6513,7 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
                      delete_acknowledged = true\n",
                     intake,
                     dir.path().join("ship"),
-                    env!("CARGO_BIN_EXE_sparrow"),
+                    env!("CARGO_BIN_EXE_sparrow-rpc-fixture"),
                     socket,
                     spool,
                 ),
@@ -6539,7 +6539,7 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
             // A unit restart runs only the spool: no start-time command can delete a file.
             for unit in ["katamari-journal-spool", "katamari-manager-spool"] {
                 let text = std::fs::read_to_string(format!(
-                    "{}/../../deploy/systemd/user/{unit}.service",
+                    "{}/../../../deploy/systemd/user/{unit}.service",
                     env!("CARGO_MANIFEST_DIR")
                 ))
                 .unwrap();
@@ -6880,7 +6880,7 @@ async fn consume_coverage_limit_and_root_replacement_park_the_watch_without_sour
             16,
         );
         let mut daemon = Daemon(
-            Command::new(env!("CARGO_BIN_EXE_sparrowd"))
+            Command::new(env!("CARGO_BIN_EXE_sparrowd-rpc-fixture"))
                 .arg("--config")
                 .arg(&config)
                 .stdout(Stdio::null())
@@ -8825,6 +8825,79 @@ fn relay(
     (state, task)
 }
 
+/// The CLI immediately drains a closed producer with its persistent identity through
+/// producer-profile discovery. An active journal and a misspelled directory fail closed.
+#[tokio::test(flavor = "current_thread")]
+async fn cli_drains_only_an_existing_inactive_producer_spool() {
+    use sparrow_client::{Delivery, DeliveryConfig, Endpoint, SpoolConfig};
+    let test = async {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let socket = store.join("rpc.sock");
+        let config = write_server_config(dir.path(), &store, &socket);
+        let _daemon = start(&config, &socket).await;
+        let backend = connect(&socket).await.unwrap();
+        let proxy_socket = dir.path().join("profile.sock");
+        let (state, proxy) = relay(&proxy_socket, backend.client.clone());
+        state.profile.set(Some((true, 256)));
+        state.drop_first.set(false);
+        let drain = |path: &Path| {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
+                .arg(&proxy_socket)
+                .arg("spool-drain")
+                .arg(path)
+                .args(["--timeout-secs", "10"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .admitted_spawn()
+                .unwrap()
+        };
+        let path = dir.path().join("private");
+        let missing = drain(&path).wait_with_output().await.unwrap();
+        assert!(!missing.status.success() && !path.exists());
+        assert!(String::from_utf8_lossy(&missing.stderr).contains("cannot drain spool"));
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        std::fs::File::create(path.join("LOCK")).unwrap();
+        let no_header = drain(&path).wait_with_output().await.unwrap();
+        assert!(!no_header.status.success() && !path.join("HEADER").exists());
+        let offline = DeliveryConfig::lossless(
+            Endpoint::Unix(dir.path().join("absent.sock")),
+            "cli-source",
+            SpoolConfig::new(&path),
+        );
+        let producer = Delivery::start_async(offline).await.unwrap();
+        let accepted = producer
+            .send_with_token(delivery_event("kept"), b"cursor")
+            .await
+            .unwrap();
+        let locked = drain(&path).wait_with_output().await.unwrap();
+        assert!(!locked.status.success());
+        assert!(String::from_utf8_lossy(&locked.stderr).contains("already open"));
+        producer.close_local(Duration::from_secs(10)).await.unwrap();
+        for _ in 0..2 {
+            let drained = drain(&path).wait_with_output().await.unwrap();
+            assert!(drained.status.success(), "{drained:?}");
+            let proof = purrdf_lex::json::read_slice(&drained.stdout, Default::default()).unwrap();
+            assert_eq!(proof["durable_sequence"].as_str(), Some("1"));
+            assert_eq!(
+                proof["client_instance"].as_str(),
+                Some(purrdf_hash::hex::encode(&accepted.client_instance).as_str())
+            );
+        }
+        let calls = state.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].source, "cli-source");
+        assert_eq!(calls[0].client_instance, accepted.client_instance);
+        proxy.abort();
+    };
+    tokio::task::LocalSet::new().run_until(test).await;
+}
+
 /// A durable reply lost before a daemon restart keeps its sealed identity. A permanent
 /// refusal then suspends retries through appends and flushes until explicit operator retry.
 #[tokio::test(flavor = "current_thread")]
@@ -9371,7 +9444,7 @@ async fn buffered_rpc_flush_sdk_cli_mcp_and_recovery_preserve_occurrence_identit
         let second = client.ingest_with_durability("buffered-cli", "buffered-sdk", wire::Format::Log,
             b"CLI flush evidence\n", wire::Durability::Buffered).await.unwrap();
         let token = second.buffered_through.unwrap();
-        let cli = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrow"))
+        let cli = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
             .arg(&socket).args(["flush", &token.store_id, &token.session_id, &token.sequence.to_string()])
             .stdout(Stdio::piped()).stderr(Stdio::piped()).admitted_spawn().unwrap().wait_with_output().await.unwrap();
         assert!(cli.status.success(), "{}", String::from_utf8_lossy(&cli.stderr));
@@ -10260,7 +10333,7 @@ async fn killed_owner_restarts_without_socket_unlink_and_preserves_durable_evide
             );
             let tcp = tcp_client(address).await.unwrap();
             assert_eq!(tcp.discovery().store_id, receipt.store_id);
-            let old = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+            let old = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                 .arg(&socket)
                 .args(["result-next", &receipt.store_id, &cursor])
                 .admitted_output()
@@ -10333,7 +10406,7 @@ async fn endpoint_startup_preserves_files_symlinks_and_foreign_live_listeners() 
             );
             format!("{waiting}{rest}")
         } else {
-            let result = Command::new(env!("CARGO_BIN_EXE_sparrowd"))
+            let result = Command::new(env!("CARGO_BIN_EXE_sparrowd-rpc-fixture"))
                 .arg("--config")
                 .arg(&config)
                 .admitted_output()
@@ -10397,7 +10470,7 @@ async fn startup_below_the_maintenance_reserve_waits_without_opening_the_store()
     receiver
         .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
-    let mut daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrowd"))
+    let mut daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrowd-rpc-fixture"))
         .arg("--config")
         .arg(&config)
         .env("NOTIFY_SOCKET", &notify)
@@ -10449,7 +10522,7 @@ async fn interrupt_during_startup_is_retained_until_owned_teardown() {
     let (address, (reserved, guard)) = configure_tcp_listener(&config);
     drop(reserved);
     drop(guard);
-    let mut daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrowd"))
+    let mut daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrowd-rpc-fixture"))
         .arg("--config")
         .arg(&config)
         .kill_on_drop(true)
@@ -10592,7 +10665,7 @@ async fn start_with_stderr(config: &Path, socket: &Path, stderr: Stdio) -> Daemo
 
 async fn start_with(config: &Path, socket: &Path, stderr: Stdio, args: &[&str]) -> Daemon {
     let mut daemon = Daemon(
-        Command::new(env!("CARGO_BIN_EXE_sparrowd"))
+        Command::new(env!("CARGO_BIN_EXE_sparrowd-rpc-fixture"))
             .arg("--config")
             .arg(config)
             .args(args)
@@ -11411,7 +11484,7 @@ async fn exercise(endpoint: impl AsRef<std::ffi::OsStr>) -> (String, String, Str
         Some(length.as_str())
     );
     assert_eq!(std::fs::read(&exported).unwrap(), bytes);
-    let overwrite = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+    let overwrite = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
         .args(endpoint_args(endpoint))
         .args(["bytes", &store, &id, "0", "1", exported.to_str().unwrap()])
         .admitted_output()
@@ -11565,7 +11638,7 @@ async fn exercise(endpoint: impl AsRef<std::ffi::OsStr>) -> (String, String, Str
     assert!(limited["page"]["next_cursor"].as_str().is_some());
     let excluded = cli(endpoint, &["keys", "--source", "unrelated-source"]);
     assert!(excluded.get("rows").unwrap().as_array().unwrap().is_empty());
-    let invalid = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+    let invalid = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
         .args(endpoint_args(endpoint))
         .args(["keys", "--decoded", "hello"])
         .admitted_output()
@@ -11768,7 +11841,7 @@ struct Mcp {
 
 impl Mcp {
     fn start(socket: impl AsRef<std::ffi::OsStr>) -> Self {
-        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrow"))
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
             .args(endpoint_args(socket))
             .args(["mcp", "--stdio"])
             .stdin(Stdio::piped())
@@ -12627,7 +12700,7 @@ async fn mcp_exercise(
             "INVALID_ARGUMENT",
         ),
     ] {
-        let rejected = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+        let rejected = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
             .args(endpoint_args(socket))
             .args(args)
             .admitted_output()
@@ -13423,7 +13496,7 @@ async fn mcp_pin_pages(socket: &Path, store: &str, artifact: &str, record: &str)
 }
 
 fn cli(socket: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> purrdf_lex::json::Value {
-    let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+    let output = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
         .args(endpoint_args(socket))
         .args(args)
         .admitted_output()
@@ -13937,7 +14010,7 @@ async fn native_graph_queries_preserve_forms_certificates_and_leases_over_tcp_cl
                 assert_eq!(page["snapshot_id"],first["snapshot_id"]); assert_eq!(page["native_governor"],first["native_governor"]); pages+=1; assert!(pages<100);
             }
             let released = sparrow_client::release_result(client.capability(),&store,first["snapshot_id"].as_str().unwrap()).await.unwrap(); assert_eq!(released.released,first["has_more"].as_bool().unwrap());
-            if let Some(cursor) = first["next_cursor"].as_str() { assert!(sparrow_server::run_cli(&client,&["result-next".into(),store.clone(),cursor.into()]).await.is_err()); }
+            if let Some(cursor) = first["next_cursor"].as_str() { assert!(sparrow_access::run_cli(&client,&["result-next".into(),store.clone(),cursor.into()]).await.is_err()); }
         }
         for (id,query,fuel,certainty) in [(30,"SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }","0","certain"),(31,"ASK { ?s ?p ?o }","0","unknown")] {
             let response = mcp.tool(id,"sparql_query",Object::new().with("store_id",store.clone()).with("query",query).with("limits",Object::new().with("fuel",fuel)).into()).await;
@@ -13965,7 +14038,7 @@ async fn native_graph_queries_preserve_forms_certificates_and_leases_over_tcp_cl
         let receipt = &failed["structuredContent"]; assert_eq!(receipt["execution_status"].as_str(),Some("failed")); assert!(receipt["diagnostic"]["code"].as_str().is_some()); assert!(receipt.get("native_governor").is_some());
         sparrow_client::release_result(client.capability(),&store,receipt["snapshot_id"].as_str().unwrap()).await.unwrap();
         std::fs::write(&path,json::write_compact(&Object::new().with("store_id",store.clone()).with("query","SELECT WHERE {").into())).unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_sparrow")).args(endpoint_args(&endpoint)).args(["sparql",path.to_str().unwrap()]).admitted_output().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture")).args(endpoint_args(&endpoint)).args(["sparql",path.to_str().unwrap()]).admitted_output().unwrap();
         assert!(!output.status.success());let output=json::read_slice(&output.stdout,json::Limits::default()).unwrap();assert_eq!(output["execution_status"].as_str(),Some("failed"));
         sparrow_client::release_result(client.capability(),&store,output["snapshot_id"].as_str().unwrap()).await.unwrap();
         let mut bad = client.capability().sparql_query_request(); let mut query=bad.get().init_query(); query.set_store_id(&store);query.set_schema_version(sparrow_client::SCHEMA_VERSION);query.set_query("SELECT ?x WHERE {}");let mut scope = query.reborrow().init_scope(); scope.set_schema_version(sparrow_client::SCHEMA_VERSION); scope.init_received_before().set_unix_millis(u64::MAX);
@@ -14228,7 +14301,7 @@ async fn typed_queries_and_exact_bytes_survive_daemon_crash() {
             drop(daemon); // Only this test's child is terminated.
             std::fs::remove_file(&socket).unwrap(); // Its dead test endpoint, never a live listener.
             let daemon = start(&config, &socket).await;
-            let expired = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+            let expired = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                 .arg(&socket)
                 .args([
                     "pin-get",
@@ -14356,7 +14429,7 @@ async fn artifact_diagnostic_scope_reports_unknown_membership_through_cli_and_mc
                 )
                 .await;
             assert!(strict["isError"].as_bool().unwrap());
-            let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+            let output = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                 .arg(&socket)
                 .args([
                     "artifacts",
@@ -14590,7 +14663,7 @@ async fn record_pages_share_frozen_ranked_receipts_after_pin_release_in_cli_and_
                     "INVALID_ARGUMENT",
                 ),
             ] {
-                let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                let output = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                     .arg(&socket)
                     .args(arguments)
                     .admitted_output()
@@ -14676,7 +14749,7 @@ async fn record_pages_enforce_agent_byte_ceilings_and_scan_refusal() {
                 purrdf_lex::json::write_compact(&continuation).len()
                     <= sparrow_core::PIN_READ_PAGE_BYTES
             );
-            let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+            let output = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                 .arg(&socket)
                 .args(["records", "--source", "page-source", "--scan-budget", "1"])
                 .admitted_output()
@@ -14865,7 +14938,7 @@ async fn standalone_text_pages_freeze_native_ranking_and_refuse_cross_operation_
                     "INVALID_ARGUMENT",
                 ),
             ] {
-                let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                let output = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                     .arg(&socket)
                     .args(arguments)
                     .admitted_output()
@@ -15062,7 +15135,7 @@ async fn json_pages_replay_cli_mcp_counts_and_occurrences_and_bind_operations() 
                     "INVALID_ARGUMENT",
                 ),
             ] {
-                let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                let output = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                     .arg(&socket)
                     .args(args)
                     .admitted_output()
@@ -15290,7 +15363,7 @@ async fn live_artifact_continuations(
         };
         assert_ne!(next_snapshot.as_str(), Some(snapshot.as_str()));
         continued.push(rows);
-        let out = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+        let out = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
             .arg(socket)
             .args(["result-next", id, &cursor])
             .admitted_output()
@@ -15668,7 +15741,7 @@ async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page()
                 assert_eq!(released["snapshot_id"].as_str(), Some(snapshot));
                 assert_eq!(released["released"].as_bool(), Some(true));
                 assert!(!client.release_result(snapshot).await.unwrap().released);
-                let out = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                let out = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                     .arg(&socket)
                     .args(["result-next", id, cursor])
                     .admitted_output()
@@ -15681,7 +15754,7 @@ async fn result_next_cli_mcp_and_typed_union_replay_every_existing_leased_page()
                 (id, "not-a-cursor", "INVALID_ARGUMENT"),
                 (id, "record-read:unknown/1", "RESULT_EXPIRED"),
             ] {
-                let out = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                let out = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                     .arg(&socket)
                     .args(["result-next", store, cursor])
                     .admitted_output()
@@ -15896,7 +15969,7 @@ async fn context_capture_limits_and_byte_refusals_reach_typed_cli_and_mcp_caller
                 Some("RESOURCE_LIMIT")
             );
             assert!(refused["structuredContent"].get("anchor").is_none());
-            let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+            let output = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                 .arg(&socket)
                 .args([
                     "context",
@@ -16130,7 +16203,7 @@ async fn key_paths_share_native_counts_cursor_binding_and_typed_cli_mcp_admissio
                     Some("INVALID_ARGUMENT")
                 );
                 assert!(refused["structuredContent"].get("rows").is_none());
-                let output = Command::new(env!("CARGO_BIN_EXE_sparrow"))
+                let output = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
                     .arg(&socket)
                     .args(["keys", "--path", path])
                     .admitted_output()
