@@ -7904,6 +7904,7 @@ struct EventRelayState {
     drop_first: std::cell::Cell<bool>,
     corrupt_receipt: std::cell::Cell<bool>,
     corrupt_publication: std::cell::Cell<bool>,
+    withhold_publication: std::cell::Cell<bool>,
     /// Answer `importPublish` with this daemon-style refusal `(code, retryable)` instead of forwarding it.
     refuse_publish: std::cell::Cell<Option<(&'static str, bool)>>,
     /// Answer `importCancel` with this daemon refusal `(code, retryable)` instead of forwarding it.
@@ -8171,6 +8172,16 @@ impl wire::sparrow::Server for EventRelay {
         let mut request = self.0.backend.borrow().import_publish_request();
         request.get().set_import(params.get()?.get_import()?)?;
         let response = request.send().promise.await?;
+        if self.0.withhold_publication.replace(false)
+            && let wire::result::Ok(value) = response.get()?.get_result()?.which()?
+        {
+            *self.0.accepted.borrow_mut() = Some(
+                sparrow_client::ArtifactReceipt::decode(value?)
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?,
+            );
+            self.0.first_accepted.notify_one();
+            return std::future::pending().await;
+        }
         results.get().set_result(response.get()?.get_result()?)?;
         if let Some(path) = self.0.mutate_published_file.borrow().as_ref() {
             std::fs::write(path, b"changed").unwrap();
@@ -8554,6 +8565,225 @@ async fn large_ingest_held_by_the_floor_is_returned_unchanged_and_resumes() {
         .await;
 }
 
+/// Live input publishes before EOF, recovers the same occurrence after losing its
+/// publication reply, and leaves ordinary logs their own admission and worker.
+#[tokio::test(flavor = "current_thread")]
+async fn bulk_reopens_an_unacknowledged_range_and_publishes_while_input_is_open() {
+    use sparrow_client::{
+        Endpoint, Format,
+        bulk::{BulkConfig, BulkFile, BulkImporter},
+    };
+    use tokio::io::AsyncWriteExt;
+    let test = async {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let socket = store.join("rpc.sock");
+        let config = write_server_config(dir.path(), &store, &socket);
+        let _daemon = start(&config, &socket).await;
+        let backend = connect(&socket).await.unwrap();
+        let relay_path = dir.path().join("bulk.sock");
+        let (state, proxy) = relay(&relay_path, backend.client.clone());
+        state.withhold_publication.set(true);
+        let mut cfg = BulkConfig::new(Endpoint::Unix(relay_path), dir.path().join("bulk"));
+        cfg.staged_bytes = 32;
+        cfg.range_bytes = 16;
+        let bulk = BulkImporter::new(cfg).unwrap();
+        let mut job = bulk
+            .open("input-17", "bulk-stream", Format::Log)
+            .await
+            .unwrap();
+        let (mut write, mut read) = tokio::io::duplex(32);
+        write.write_all(b"head\n\xffwait").await.unwrap();
+        {
+            let staging = job.stage_stream(0, &mut read);
+            tokio::pin!(staging);
+            tokio::select! {r=&mut staging=>panic!("input closed before publication: {r:?}"),
+            ()=state.first_accepted.notified()=>{}}
+        }
+        let held = state.accepted.borrow().clone().unwrap();
+        let delivery = sparrow_client::Delivery::start_async(
+            sparrow_client::DeliveryConfig::new(&socket, "bulk-operational")
+                .with_quarantine_dir(dir.path().join("quarantine")),
+        )
+        .await
+        .unwrap();
+        admit(
+            &delivery,
+            delivery_event("progress during bulk publication"),
+        );
+        assert_eq!(
+            delivery
+                .shutdown_async(Duration::from_secs(5))
+                .await
+                .unwrap()
+                .durable_events,
+            1
+        );
+        job.close().await.unwrap();
+        let mut job = bulk
+            .open("input-17", "bulk-stream", Format::Log)
+            .await
+            .unwrap();
+        assert_eq!(job.progress().borrow().staged, 10);
+        write.write_all(b"!").await.unwrap();
+        drop(write);
+        job.stage_stream(10, &mut read).await.unwrap();
+        let summary = job.finish().await.unwrap();
+        assert_eq!((summary.bytes, summary.ranges), (11, 2));
+        let job = bulk
+            .open("input-17", "bulk-stream", Format::Log)
+            .await
+            .unwrap();
+        let first = job.receipt(0).await.unwrap();
+        let second = job.receipt(1).await.unwrap();
+        assert_eq!(first.artifact_id, held.id);
+        assert_eq!(
+            (first.start, first.end, second.start, second.end),
+            (0, 5, 5, 11)
+        );
+        let client = sparrow_client::Client::connect(&socket).await.unwrap();
+        assert_eq!(
+            client.bytes(&first.artifact_id, 0, 5).await.unwrap(),
+            b"head\n"
+        );
+        assert_eq!(
+            client.bytes(&second.artifact_id, 0, 6).await.unwrap(),
+            b"\xffwait!"
+        );
+        let r = backend
+            .client
+            .status_request()
+            .send()
+            .promise
+            .await
+            .unwrap();
+        assert_eq!(
+            rpc_ok(r.get().unwrap().get_result().unwrap()).get_live_records(),
+            4
+        );
+        job.close().await.unwrap();
+        // An unchanged completed file can be larger than the available disk credit.
+        let path = dir.path().join("complete.bin");
+        let data: Vec<u8> = (0..145).collect();
+        std::fs::write(&path, &data).unwrap();
+        let file = BulkFile {
+            id: "large-input".into(),
+            source: "bulk-file".into(),
+            format: Format::Opaque,
+            path: path.clone(),
+        };
+        let collection = bulk.import_files([file.clone()]);
+        futures::pin_mut!(collection);
+        let (_, result) = futures::StreamExt::next(&mut collection).await.unwrap();
+        let result = result.unwrap();
+        assert!(result.ranges > 1);
+        let job = bulk
+            .open(&file.id, &file.source, file.format)
+            .await
+            .unwrap();
+        let progress = job.progress().borrow().clone();
+        assert!(progress.first_local_range > 0 && progress.last_window.is_some());
+        assert!(
+            job.receipt(0).await.is_err(),
+            "published windows release their local receipt rows"
+        );
+        let mut page = Some(result.artifact_id.clone());
+        let mut groups = Vec::new();
+        while let Some(id) = page {
+            let artifact = client.artifact(&id).await.unwrap();
+            let bytes = client
+                .bytes(&id, 0, artifact.byte_length as u32)
+                .await
+                .unwrap();
+            let value =
+                purrdf_lex::json::read_slice(&bytes, purrdf_lex::json::Limits::default()).unwrap();
+            assert_eq!(value["schema"].as_str(), Some("sparrow.bulk-window/1"));
+            assert_eq!(value["complete"].as_bool(), Some(groups.is_empty()));
+            let mut group = Vec::new();
+            for part in value["parts"].as_array().unwrap() {
+                let bytes = client
+                    .bytes(
+                        part["artifact"].as_str().unwrap(),
+                        0,
+                        part["length"].as_u64().unwrap() as u32,
+                    )
+                    .await
+                    .unwrap();
+                group.extend(bytes);
+            }
+            groups.push(group);
+            page = value["previous"].as_str().map(str::to_owned);
+        }
+        let recovered: Vec<u8> = groups.into_iter().rev().flatten().collect();
+        assert_eq!(recovered, data);
+        assert_eq!(std::fs::read(path).unwrap(), data);
+        job.close().await.unwrap();
+        let offline_socket = dir.path().join("late.sock");
+        let offline = BulkImporter::new(BulkConfig::new(
+            Endpoint::Unix(offline_socket.clone()),
+            dir.path().join("disconnected"),
+        ))
+        .unwrap();
+        let snapshot = dir.path().join("snapshot.log");
+        std::fs::write(&snapshot, b"offline input").unwrap();
+        let mut job = offline
+            .open("snapshot", "offline-file", Format::Log)
+            .await
+            .unwrap();
+        job.stage_file(&snapshot).await.unwrap();
+        let p = job.progress().borrow().clone();
+        assert_eq!((p.eof, p.staged, p.confirmed), (true, 13, 0));
+        job.close().await.unwrap();
+        std::fs::write(&snapshot, b"caller changed the original").unwrap();
+        let (_, late) = relay(&offline_socket, backend.client.clone());
+        let proof = offline
+            .import_file(&BulkFile {
+                id: "snapshot".into(),
+                source: "offline-file".into(),
+                format: Format::Log,
+                path: snapshot,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            client.bytes(&proof.artifact_id, 0, 13).await.unwrap(),
+            b"offline input"
+        );
+        // A certified single range also finishes if EOF arrives after restart, offline.
+        let mut job = offline.open("sealed", "pipe", Format::Log).await.unwrap();
+        let mut progress = job.progress();
+        let (mut write, mut read) = tokio::io::duplex(16);
+        write.write_all(b"sole\n").await.unwrap();
+        {
+            let staging = job.stage_stream(0, &mut read);
+            tokio::pin!(staging);
+            tokio::select! {
+                result = &mut staging => panic!("input ended before durable receipt: {result:?}"),
+                confirmed = progress.wait_for(|p| p.confirmed == 5) => drop(confirmed.unwrap()),
+            }
+        }
+        let receipt = job.receipt(0).await.unwrap();
+        job.close().await.unwrap();
+        let unavailable = BulkImporter::new(BulkConfig::new(
+            Endpoint::Unix(dir.path().join("absent.sock")),
+            dir.path().join("disconnected"),
+        ))
+        .unwrap();
+        let mut job = unavailable
+            .open("sealed", "pipe", Format::Log)
+            .await
+            .unwrap();
+        job.stage_stream(5, tokio::io::empty()).await.unwrap();
+        assert_eq!(job.finish().await.unwrap().artifact_id, receipt.artifact_id);
+        late.abort();
+        proxy.abort();
+    };
+    tokio::task::LocalSet::new()
+        .run_until(tokio::time::timeout(Duration::from_secs(30), test))
+        .await
+        .unwrap();
+}
+
 fn relay(
     socket: &Path,
     backend: wire::sparrow::Client,
@@ -8569,6 +8799,7 @@ fn relay(
         drop_first: std::cell::Cell::new(true),
         corrupt_receipt: std::cell::Cell::new(false),
         corrupt_publication: std::cell::Cell::new(false),
+        withhold_publication: std::cell::Cell::new(false),
         refuse_publish: std::cell::Cell::new(None),
         refuse_cancel: std::cell::Cell::new(None),
         refusals: std::cell::RefCell::new(std::collections::VecDeque::new()),

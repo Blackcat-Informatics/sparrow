@@ -10,7 +10,7 @@ use purrdf_lex::json::{Object, Value};
 use std::collections::BTreeSet;
 
 /// Maximum raw packet admitted by the protocol interpreter.
-pub const SYSLOG_MESSAGE_BYTES: usize = 64 * 1024;
+pub use sparrow_limits::SYSLOG_MESSAGE_BYTES;
 /// Maximum structured elements captured in one packet.
 pub const SYSLOG_ELEMENTS: usize = 32;
 /// Maximum ordered parameter occurrences across all elements.
