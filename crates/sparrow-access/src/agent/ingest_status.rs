@@ -157,6 +157,13 @@ impl Input {
                 };
                 Object::new()
                     .with("artifact_id", a.get_artifact_id()?.to_str()?)
+                    .with(
+                        "kind",
+                        match a.get_kind()? {
+                            wire::IngestAcceptanceKind::Artifact => "artifact",
+                            wire::IngestAcceptanceKind::OrderedSet => "ordered_set",
+                        },
+                    )
                     .with("source", a.get_source()?.to_str()?)
                     .with("format", sparrow_client::format_label(a.get_format()?))
                     .with("received_at", instant(a.get_received_at()?)?)

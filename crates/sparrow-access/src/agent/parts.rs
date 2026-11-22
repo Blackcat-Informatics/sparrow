@@ -6,55 +6,64 @@
 use super::{Result, artifacts, invalid, read, wire};
 use purrdf_lex::json::{self, Object, Value, record::Record};
 use sparrow_client::{Client, Expect, parts::FILE_SET_MANIFEST_BYTES};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::{self, Read},
+};
 
 pub(crate) struct Verify {
     source: String,
     artifact: String,
+    match_stdin: bool,
 }
 
 impl Verify {
     pub(super) fn parse(args: &[String]) -> Result<Self> {
-        let [command, source, artifact] = args else {
-            return Err(invalid("usage: parts verify SOURCE MANIFEST_ARTIFACT_ID"));
+        let usage = "usage: parts verify SOURCE MANIFEST_ARTIFACT_ID [--match-stdin]";
+        let [command, source, artifact, options @ ..] = args else {
+            return Err(invalid(usage));
         };
-        if command != "verify" || source.is_empty() || source.len() > 512 || !artifact_id(artifact)
+        if command != "verify"
+            || source.is_empty()
+            || source.len() > 512
+            || !artifact_id(artifact)
+            || !(options.is_empty() || options == ["--match-stdin"])
         {
-            return Err(invalid("usage: parts verify SOURCE MANIFEST_ARTIFACT_ID"));
+            return Err(invalid(usage));
         }
         Ok(Self {
             source: source.clone(),
             artifact: artifact.clone(),
+            match_stdin: !options.is_empty(),
         })
     }
 
     pub(super) async fn execute(&self, client: &Client) -> Result<Value> {
         let mut link = CatalogLink::new(client);
-        let manifest = link
-            .read(async |client| Ok(client.artifact(&self.artifact).await?))
-            .await?;
-        if manifest.source != self.source
-            || manifest.format != wire::Format::Json
-            || manifest.byte_length > FILE_SET_MANIFEST_BYTES as u64
-        {
-            return Err(invalid(
-                "require a bounded JSON manifest in the named source",
-            ));
-        }
-        let mut bytes = Vec::with_capacity(manifest.byte_length as usize);
-        while (bytes.len() as u64) < manifest.byte_length {
-            let start = bytes.len() as u64;
-            let length = (manifest.byte_length - start).min(u64::from(read::MAX_BYTES)) as u32;
-            let chunk = link
-                .read(async |client| Ok(client.bytes(&self.artifact, start, length).await?))
-                .await?;
-            if chunk.len() != length as usize {
-                return Err(invalid("part-set manifest read returned a short range"));
+        let mut report = Object::new()
+            .with("store_id", client.discovery().store_id.clone())
+            .with("manifest_id", self.artifact.clone())
+            .with("source", self.source.clone());
+        let parts = match self.manifest(&mut link).await {
+            Err(error)
+                if self.match_stdin
+                    && matches!(error.code.as_str(), "NOT_FOUND" | "EVIDENCE_UNAVAILABLE") =>
+            {
+                return Ok(report
+                    .with("execution_status", "failed")
+                    .with("matches_input", false)
+                    .with("error", error.json())
+                    .into());
             }
-            bytes.extend(chunk);
-        }
-        let parts = decode(&bytes, &self.source, &self.artifact)
-            .map_err(|error| invalid(error.to_string()))?;
+            result => result?,
+        };
+        let matches_input = if self.match_stdin {
+            let matches = self.matches_input(&mut link, &parts).await?;
+            report = report.with("matches_input", matches);
+            matches
+        } else {
+            true
+        };
         let mut states = vec![Member::Missing; parts.len()];
         self.list_members(&mut link, &parts, &mut states).await?;
         let mut counts = [0_u64; 4];
@@ -69,11 +78,8 @@ impl Verify {
             ));
         }
         let [available, missing, unavailable, mismatched] = counts;
-        let complete = missing + unavailable + mismatched == 0;
-        Ok(Object::new()
-            .with("store_id", client.discovery().store_id.clone())
-            .with("manifest_id", self.artifact.clone())
-            .with("source", self.source.clone())
+        let complete = matches_input && missing + unavailable + mismatched == 0;
+        Ok(report
             .with(
                 "execution_status",
                 if complete { "complete" } else { "failed" },
@@ -84,6 +90,59 @@ impl Verify {
             .with("mismatched", mismatched)
             .with("parts", Value::array(rows))
             .into())
+    }
+
+    async fn manifest(&self, link: &mut CatalogLink<'_>) -> Result<Vec<Part>> {
+        let manifest = link
+            .read(async |client| Ok(client.artifact(&self.artifact).await?))
+            .await?;
+        if manifest.source != self.source
+            || manifest.format != wire::Format::Json
+            || manifest.byte_length > FILE_SET_MANIFEST_BYTES as u64
+            || (self.match_stdin && manifest.durability != wire::Durability::Durable)
+        {
+            return Err(invalid(
+                "require a bounded JSON manifest in the named source and a durable receipt when matching input",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(manifest.byte_length as usize);
+        while (bytes.len() as u64) < manifest.byte_length {
+            let start = bytes.len() as u64;
+            let length = (manifest.byte_length - start).min(u64::from(read::MAX_BYTES)) as u32;
+            let chunk = link
+                .read(async |client| Ok(client.bytes(&self.artifact, start, length).await?))
+                .await?;
+            if chunk.len() != length as usize {
+                return Err(invalid("part-set manifest read returned a short range"));
+            }
+            bytes.extend(chunk);
+        }
+        decode(&bytes, &self.source, &self.artifact).map_err(|error| invalid(error.to_string()))
+    }
+
+    async fn matches_input(&self, link: &mut CatalogLink<'_>, parts: &[Part]) -> Result<bool> {
+        let lengths = parts.iter().map(|part| part.length).collect::<Vec<_>>();
+        let digests = tokio::task::spawn_blocking(move || input_digests(&lengths))
+            .await
+            .map_err(|error| invalid(format!("read part-set input: {error}")))?
+            .map_err(sparrow_client::Error::Io)?;
+        let Some(digests) = digests else {
+            return Ok(false);
+        };
+        for (part, digest) in parts.iter().zip(digests) {
+            match link
+                .read(async |client| Ok(client.artifact(&part.id).await?))
+                .await
+            {
+                Ok(receipt)
+                    if receipt.durability == wire::Durability::Durable
+                        && receipt.payload_id == digest => {}
+                Ok(_) => return Ok(false),
+                Err(error) if error.code == "NOT_FOUND" => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(true)
     }
 
     async fn list_members(
@@ -183,6 +242,23 @@ impl Verify {
         }
         Ok(())
     }
+}
+
+/// Hash exactly the manifest ranges in order and require EOF after the final range.
+fn input_digests(lengths: &[u64]) -> io::Result<Option<Vec<String>>> {
+    let mut input = io::stdin().lock();
+    let mut digests = Vec::with_capacity(lengths.len());
+    for &length in lengths {
+        let mut digest = purrdf_hash::blake3::Hasher::new();
+        if io::copy(&mut (&mut input).take(length), &mut digest)? != length {
+            return Ok(None);
+        }
+        digests.push(format!(
+            "blake3:{}",
+            purrdf_hash::hex::encode(digest.finalize().as_bytes())
+        ));
+    }
+    Ok((input.read(&mut [0])? == 0).then_some(digests))
 }
 
 fn listed(row: wire::artifact_summary::Reader<'_>, source: &str, part: &Part) -> Result<Member> {

@@ -440,11 +440,12 @@ reflink copies, sharing extents on btrfs. Line-oriented files (`jsonl`, `log`)
 above `max_chunk_bytes` or `max_chunk_lines` are split on line boundaries into
 `NAME.partNNNNN.EXT` chunks. An unterminated final line counts as a record.
 Set `max_chunk_lines` to an integer from 1 through 32,768.
-Other formats, such as single JSON documents, are
-shipped whole up to Sparrow's 7.93 GiB import bound; a larger file is reported
-as a failed file on every run and never queued. The removed `max_whole_bytes` key must be deleted
-from the shipper configuration; a configuration that still sets it is refused
-before anything ships. The split matters for two reasons. The consume worker moves a file
+Other formats, such as single JSON documents, ship whole. A file above the
+daemon's single-import limit arrives in the watch root unchanged. The consume
+watch publishes its parts in order and publishes the manifest only after the
+parts are durable. Remove `max_whole_bytes` from the shipper configuration.
+The shipper refuses a configuration that still sets it before anything ships.
+The consume worker moves a file
 the daemon refuses at an input bound, such as one over the record limit, into a quarantine
 directory beside the watch root and retires its claim; it is never published (see
 [Quarantining a permanently refused source](interfaces.md#quarantining-a-permanently-refused-source)).
@@ -523,9 +524,23 @@ lists an artifact, which the store answers only while it holds all of that
 artifact's bytes ([Payload id index](interfaces.md#payload-id-index-store-format)).
 The shipper also accepts a matching whole-file artifact for files an earlier shipper
 sent whole because it excluded the unterminated last record from the count.
-A file that is still queued, waiting in a consume root, refused under storage
-pressure, quarantined, or held once and since retired lists nothing and stays.
-The ledger keeps its entry either way.
+
+For a whole file above the discovered import limit, the reaper finds its
+completed claim by consume root and relative path. The claim must name a durable
+ordered manifest in its source. The verifier compares the original against each
+held member's digest in manifest order and requires the lengths to cover the
+entire file. The shipper saves that manifest identity before setting the file
+aside, and verifies the manifest and current bytes again on the next run.
+If the saved receipt is missing, the shipper restores the original for a new
+two-run confirmation. Use a CLI and daemon that support exact claim lookup and input matching.
+
+An unacknowledged file stays in the spool. The ledger keeps its entry. If a
+completed claim expires before the reaper captures its manifest identity,
+re-offer a copy under its original intake name. For a file below a producer
+subdirectory, the intake name replaces each path separator with `__`. Prepare
+the copy outside the consume root on the same filesystem and rename it into
+place once the target path is free. Leave the original and ledger in place
+while the watch processes the fresh copy.
 
 The source needs the top-level keys `sparrow` (the CLI) and `socket` (the store
 socket the CLI queries), and `b3sum` on the path; the configuration is refused
