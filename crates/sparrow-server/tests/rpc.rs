@@ -7982,6 +7982,7 @@ struct EventRelayState {
     /// Daemon-style refusals `(code, retryable)` answered, in order, to the next event batches
     /// instead of forwarding them.
     refusals: std::cell::RefCell<std::collections::VecDeque<(&'static str, bool)>>,
+    refusal_after_accept: std::cell::Cell<Option<(&'static str, bool)>>,
     /// Replace the backend with this daemon when `importPublish` is next refused.
     swap_backend_after_refused_publish: std::cell::RefCell<Option<wire::sparrow::Client>>,
     /// Connections accepted by the relay.
@@ -8023,6 +8024,10 @@ impl EventRelayState {
         if let wire::result::Ok(value) = result.which()? {
             let receipt = sparrow_client::ArtifactReceipt::decode(value?)
                 .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            if let Some(refusal) = self.refusal_after_accept.take() {
+                self.refusals.borrow_mut().push_back(refusal);
+                *self.accepted.borrow_mut() = Some(receipt.clone());
+            }
             if self.drop_first.replace(false) {
                 *self.accepted.borrow_mut() = Some(receipt);
                 self.first_accepted.notify_one();
@@ -8873,6 +8878,7 @@ fn relay(
         refuse_publish: std::cell::Cell::new(None),
         refuse_cancel: std::cell::Cell::new(None),
         refusals: std::cell::RefCell::new(std::collections::VecDeque::new()),
+        refusal_after_accept: std::cell::Cell::new(None),
         swap_backend_after_refused_publish: std::cell::RefCell::new(None),
         connections: std::cell::Cell::new(0),
         mutate_file: std::cell::RefCell::new(None),
@@ -10282,20 +10288,35 @@ async fn producer_delivery_refuses_store_replacement_and_retains_unknown_pending
                 1,
                 "the queued event reaches the store now behind the socket"
             );
-            // The file replays into the original store, which answers the old identity's
-            // sequences as already accepted and takes the replay under its own identity.
+            // The original store alone can certify this lost reply. A historic v1
+            // file lacks a destination, so a miss there must be a read-only probe.
             let first_client = sparrow_client::Client::connect(&first_socket)
                 .await
                 .unwrap();
+            let legacy = dir.path().join("legacy.jsonl");
+            let (header,payload) = saved.split_once('\n').unwrap();
+            let mut header = purrdf_lex::json::read_slice(header.as_bytes(), purrdf_lex::json::Limits::default()).unwrap().as_object().unwrap().clone();
+            header.insert("profile", "sparrow.client.quarantine/1");
+            header.remove("original"); header.remove("store");
+            let legacy_data = format!("{}\n{payload}", purrdf_lex::json::write_compact(&header.into()));
+            std::fs::write(&legacy, &legacy_data).unwrap();
+            let second_client = sparrow_client::Client::connect(&second_socket).await.unwrap();
+            let uncertain = sparrow_client::replay_quarantine(&second_client, &legacy).await.unwrap_err();
+            assert!(matches!(uncertain, sparrow_client::Error::Domain {code, ..} if code == "UNCERTAIN_DELIVERY"));
+            assert_eq!(std::fs::read_to_string(&legacy).unwrap(), legacy_data);
+            assert!(sparrow_client::replay_quarantine(&second_client, &file).await.is_err());
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), saved);
+            let historical = sparrow_client::replay_quarantine(&first_client, &legacy).await.unwrap();
             let replayed = sparrow_client::replay_quarantine(&first_client, &file)
                 .await
                 .unwrap();
             assert_eq!(replayed.events, 1);
             assert!(!file.exists());
             assert_eq!(
-                state.accepted.borrow().clone().unwrap().store_id,
-                replayed.receipt.store_id
+                state.accepted.borrow().clone().unwrap(), replayed.receipt
             );
+            assert_eq!(historical.receipt, replayed.receipt);
+            assert_eq!(cli(&first_socket, &["status"])["live_records"].as_str(), Some("1"));
             let mut pinned_config = config;
             pinned_config.expect = Some(sparrow_client::Expect::store(first_client.discovery().store_id.clone()));
             pinned_config.max_queued_events = 1;
@@ -10406,13 +10427,20 @@ async fn producer_delivery_sets_aside_an_unknown_refusal_and_carries_on() {
         .await;
 }
 
-/// INVARIANT (#448): replay resends a quarantine file and removes it only once the daemon
-/// acknowledges it; a refusal that recurs leaves the file in place with the new refusal
-/// recorded in its header. The replay succeeds although the producer's later batches are
-/// already stored (a replay under the original instance would overlap accepted positions).
-/// Before, no replay existed.
+/// The operator command checkpoints its accepted prefix across a refusal, then
+/// sends the outstanding part once and removes the file after both receipts.
 #[tokio::test(flavor = "current_thread")]
 async fn quarantine_replay_removes_the_file_only_on_acknowledgment() {
+    async fn command(endpoint: &Path, file: &Path) -> std::process::Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"));
+        cmd.current_dir(file.parent().unwrap())
+            .arg(endpoint)
+            .arg("quarantine-replay")
+            .arg(file.file_name().unwrap());
+        tokio::task::spawn_blocking(move || cmd.admitted_output().unwrap())
+            .await
+            .unwrap()
+    }
     tokio::task::LocalSet::new()
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
@@ -10424,36 +10452,88 @@ async fn quarantine_replay_removes_the_file_only_on_acknowledgment() {
             let proxy_socket = dir.path().join("relay.sock");
             let (state, proxy) = relay(&proxy_socket, backend.client.clone());
             state.drop_first.set(false);
-            state.refusals.borrow_mut().push_back(("INVALID_ARGUMENT", false));
             let mut config = sparrow_client::DeliveryConfig::new(&proxy_socket, "replay").with_quarantine_dir(dir.path().join("quarantine"));
-            config.batch_events = 1;
+            config.batch_events = 2;
             let config = config.with_test_timing(Duration::from_secs(2), Duration::from_millis(20), Duration::from_millis(20));
             let delivery = sparrow_client::Delivery::start(config).unwrap();
-            admit(&delivery, delivery_event("refused once"));
-            admit(&delivery, delivery_event("delivered after the refusal"));
+            admit(&delivery, delivery_event("prime discovery"));
+            delivery.flush_async(Duration::from_secs(5)).await.unwrap();
+            state.refusals.borrow_mut().push_back(("INVALID_ARGUMENT", false));
+            admit(&delivery, delivery_event("first quarantined observation"));
+            admit(&delivery, delivery_event("second quarantined observation"));
             assert!(matches!(delivery_barrier(&delivery, false, Duration::from_secs(5)).await, Err(sparrow_client::FlushError::Dropped(_))));
             let file = delivery.stats().unwrap().last_quarantine_file.clone().unwrap();
-            // A recurring refusal keeps the file and records itself in the header.
-            let through_proxy = sparrow_client::Client::connect(&proxy_socket).await.unwrap();
-            state.refusals.borrow_mut().push_back(("CONFLICT", false));
-            let refused = sparrow_client::replay_quarantine(&through_proxy, &file).await.unwrap_err();
-            assert!(matches!(&refused, sparrow_client::Error::Domain { code, .. } if code == "CONFLICT"), "{refused:?}");
+            let stem = file.file_name().unwrap().to_str().unwrap().strip_suffix(".quarantine.jsonl").unwrap();
+            let scratch = file.with_file_name(format!(".{stem}.{}.tmp", std::process::id()));
+            // A producer can die after linking the published name but before unlinking its scratch.
+            std::fs::hard_link(&file, &scratch).unwrap();
+            state.profile.set(Some((true, 1)));
+            state.refusal_after_accept.set(Some(("CONFLICT", false)));
+            let refused = command(&proxy_socket, &file).await;
+            let stderr = String::from_utf8(refused.stderr).unwrap();
+            assert!(!refused.status.success() && stderr.contains("CONFLICT"), "{stderr}");
             let kept_text = std::fs::read_to_string(&file).unwrap();
             let header = kept_text.lines().next().unwrap();
             assert!(header.contains("\"last_replay_code\":\"CONFLICT\"") && header.contains("\"replay_attempts\":1"), "{header}");
-            assert!(kept_text.contains("refused once"));
-            // The daemon acknowledges the replay: the file goes and the event is stored.
+            let json = purrdf_lex::json::read_slice(header.as_bytes(), purrdf_lex::json::Limits::default()).unwrap();
+            assert_eq!(json["certificates"].as_array().unwrap().len(), 1);
+            assert!(json.get("replay_attempt").is_none(), "a definitive first refusal permits a fresh deadline");
+            assert!(!scratch.exists(), "recover the writer's second link");
+            // Simulate process loss while appending the next attempt. No RPC was authorized.
+            use std::io::Write;
+            std::fs::OpenOptions::new().append(true).open(&file).unwrap().write_all(br#"{"part":1,"attempt":"#).unwrap();
+            let held = state.accepted.borrow().clone().unwrap();
             let direct = sparrow_client::Client::connect(&socket).await.unwrap();
-            let replayed = sparrow_client::replay_quarantine(&direct, &file).await.unwrap();
-            assert_eq!(replayed.events, 1);
-            assert!(!file.exists());
-            let response = backend.client.status_request().send().promise.await.unwrap();
-            assert_eq!(rpc_ok(response.get().unwrap().get_result().unwrap()).get_live_records(), 2);
+            assert_eq!(cli(&socket, &["status"])["live_records"].as_str(), Some("2"));
+            let calls = state.calls.borrow().len();
+            let replayed = command(&proxy_socket, &file).await;
+            let stdout = String::from_utf8(replayed.stdout).unwrap();
+            assert!(replayed.status.success() && !file.exists(), "{}", String::from_utf8_lossy(&replayed.stderr));
+            assert_eq!(state.calls.borrow().len(), calls+1, "only the second part was submitted on recovery");
+            assert_eq!(direct.artifact(&held.id).await.unwrap(), held);
+            assert_eq!(cli(&socket, &["status"])["live_records"].as_str(), Some("3"));
+            eprintln!("quarantine-replay first exit={} stderr={} retained=true certified_parts=1 store_records=2", refused.status, stderr.trim());
+            eprintln!("quarantine-replay second exit={} stdout={} first_artifact={} store_records=3", replayed.status, stdout.trim(), held.id);
             proxy.abort();
             assert!(proxy.await.unwrap_err().is_cancelled());
-            drop((delivery, through_proxy, direct, backend, daemon));
+            drop((delivery, direct, backend, daemon));
         })
         .await;
+}
+
+/// A file-backed producer reauthenticates after secret rotation and certifies its
+/// held sequence. An explicitly captured credential remains a static snapshot.
+#[tokio::test(flavor = "current_thread")]
+async fn rotating_a_tcp_credential_recovers_the_same_pending_delivery() {
+    use sparrow_client::{Delivery, DeliveryConfig, Endpoint, TcpSecret};
+    tokio::task::LocalSet::new().run_until(async {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let socket = store.join("rpc.sock");
+        let config = write_server_config(dir.path(), &store, &socket);
+        let (address, reservation) = configure_tcp_listener(&config);
+        drop(reservation);
+        let _daemon = start(&config, &socket).await;
+        let path = dir.path().join("producer.secret");
+        std::fs::copy(config.with_file_name("tcp.secret"), &path).unwrap();
+        std::fs::write(&path, [17u8; 32]).unwrap();
+        let frozen = Endpoint::AuthenticatedTcp(address, TcpSecret::read(&path).unwrap());
+        let endpoint = Endpoint::Tcp(address).with_secret_file(&path).unwrap();
+        let mut config = DeliveryConfig::for_endpoint(endpoint, "rotated-producer").with_test_timing(Duration::from_secs(1), Duration::from_millis(20), Duration::from_millis(50));
+        config.batch_events = 1;
+        let handle = Delivery::start_async(config).await.unwrap();
+        let sequence = admit(&handle, delivery_event("held through authentication"));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(handle.stats().unwrap().last_transient_failure.as_deref(), Some(sparrow_client::Error::Domain {code, ..}) if code == "UNAUTHENTICATED") { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let replacement = dir.path().join("current.secret");
+        std::fs::copy(dir.path().join("tcp.secret"), &replacement).unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        let result = handle.shutdown_async(Duration::from_secs(5)).await.unwrap();
+        assert_eq!((result.durable_sequence, result.durable_events), (sequence, 1));
+        assert!(matches!(sparrow_client::Client::connect_producer(&frozen).await, Err(sparrow_client::Error::Domain {code, ..}) if code == "UNAUTHENTICATED"));
+        assert_eq!(cli(&socket, &["status"])["live_records"].as_str(), Some("1"));
+    }).await;
 }
 
 #[tokio::test(flavor = "current_thread")]

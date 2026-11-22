@@ -11,6 +11,7 @@
 use crate::EventBatch;
 use purrdf_lex::json::{self, Object};
 use std::{
+    fs::File,
     io::Write,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
@@ -42,6 +43,41 @@ pub(crate) fn default_dir() -> PathBuf {
 pub(crate) struct SaveFailure {
     pub(crate) error: std::io::Error,
     pub(crate) created: Option<PathBuf>,
+    pub(crate) published: Option<Published>,
+}
+
+/// The complete quarantine file already appeared. Finish only these local effects.
+#[derive(Clone, Debug)]
+pub(crate) struct Published {
+    pub(crate) path: PathBuf,
+    pub(crate) scratch: Option<PathBuf>,
+}
+
+impl Published {
+    pub(crate) fn finish(&self) -> Result<(PathBuf, bool), SaveFailure> {
+        let result = (|| {
+            let parent = self
+                .path
+                .parent()
+                .ok_or_else(|| std::io::Error::other("quarantine file missing parent"))?;
+            let directory = crate::ExclusiveFileLock::acquire(File::open(parent)?)?;
+            if let Some(scratch) = &self.scratch {
+                match std::fs::remove_file(scratch) {
+                    Ok(()) => (),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(e) => return Err(e),
+                }
+            }
+            directory.as_ref().sync_all()
+        })();
+        result
+            .map(|()| (self.path.clone(), false))
+            .map_err(|error| SaveFailure {
+                error,
+                created: None,
+                published: Some(self.clone()),
+            })
+    }
 }
 
 impl From<std::io::Error> for SaveFailure {
@@ -49,6 +85,29 @@ impl From<std::io::Error> for SaveFailure {
         Self {
             error,
             created: None,
+            published: None,
+        }
+    }
+}
+
+/// What is known about publication under the producer's original request identity.
+#[derive(Clone, Copy, Default)]
+pub(crate) enum Original {
+    #[default]
+    Unsent,
+    Refused,
+    Submitted,
+}
+impl Original {
+    pub(crate) fn definitively_refused(error: &crate::Error) -> bool {
+        matches!(error, crate::Error::Domain { code, .. } if matches!(code.as_str(),
+            "INVALID_ARGUMENT" | "CONFLICT" | "RESOURCE_LIMIT" | "UNAUTHENTICATED" | "PERMISSION_DENIED" | "READ_ONLY"))
+    }
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Unsent => "unsent",
+            Self::Refused => "refused",
+            Self::Submitted => "submitted",
         }
     }
 }
@@ -65,8 +124,10 @@ pub(crate) fn save(
     batch: &EventBatch,
     code: &str,
     reason: &str,
+    original: Original,
+    store: Option<&str>,
 ) -> Result<(PathBuf, bool), SaveFailure> {
-    save_with(dir, batch, code, reason, |scratch| {
+    save_with(dir, batch, code, reason, original, store, |scratch| {
         std::fs::remove_file(scratch)
     })
 }
@@ -77,15 +138,23 @@ fn save_with(
     batch: &EventBatch,
     code: &str,
     reason: &str,
+    original: Original,
+    store: Option<&str>,
     remove_scratch: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> Result<(PathBuf, bool), SaveFailure> {
     let (Some(first), Some(last)) = (batch.events.first(), batch.events.last()) else {
         return Err(std::io::Error::other("quarantine of an empty batch").into());
     };
     create_dir(dir)?;
+    let directory = crate::ExclusiveFileLock::acquire(File::open(dir)?)?;
     let payload = batch.quarantine_bytes();
     let header = Object::new()
-        .with("profile", "sparrow.client.quarantine/1")
+        .with("profile", "sparrow.client.quarantine/2")
+        .with("original", original.label())
+        .with(
+            "store",
+            store.map_or(json::Value::Null, |id| id.to_owned().into()),
+        )
         .with("reason_code", code)
         .with("reason", reason)
         .with("request_id", batch.request_id.clone())
@@ -104,11 +173,7 @@ fn save_with(
     let mut bytes = bytes.into_bytes();
     bytes.extend_from_slice(&payload);
 
-    let name: String = batch
-        .request_id
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
+    let name = filename_stem(&batch.request_id);
     let scratch = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     // A scratch name left by an earlier failed cleanup is a second link to a quarantine file:
     // opening it for writing would rewrite that file. Drop the name first; the file stays.
@@ -134,7 +199,7 @@ fn save_with(
             match std::fs::hard_link(&scratch, &path) {
                 Ok(()) => return Ok((path, true)),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if holds_payload(&std::fs::read(&path)?, &payload) {
+                    if holds_payload(&std::fs::read(&path)?, &payload, batch) {
                         return Ok((path, false));
                     }
                 }
@@ -149,23 +214,103 @@ fn save_with(
     if let Err(error) = cleaned {
         return Err(SaveFailure {
             error,
-            created: created.then_some(path),
+            created: created.then(|| path.clone()),
+            published: Some(Published {
+                path,
+                scratch: Some(scratch),
+            }),
         });
     }
-    std::fs::File::open(dir)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|error| SaveFailure {
-            error,
-            created: created.then(|| path.clone()),
-        })?;
+    directory.as_ref().sync_all().map_err(|error| SaveFailure {
+        error,
+        created: created.then(|| path.clone()),
+        published: Some(Published {
+            path: path.clone(),
+            scratch: None,
+        }),
+    })?;
     Ok((path, created))
 }
 
+fn filename_stem(request: &str) -> String {
+    request
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// The writer published a complete file but died before unlinking its temporary
+/// hard link. Under directory ownership, establish the final entry's durability
+/// before removing the matching scratch name. Other aliases require inspection.
+pub(crate) fn recover_scratch(
+    path: &Path,
+    batch: &EventBatch,
+    metadata: &std::fs::Metadata,
+    directory: &File,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "quarantine file has a second link outside its writer scratch protocol",
+        )
+    };
+    let stem = filename_stem(&batch.request_id);
+    let Some(published) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".quarantine.jsonl"))
+        .and_then(|name| name.strip_prefix(&stem))
+    else {
+        return Err(invalid());
+    };
+    if !published.is_empty()
+        && !published
+            .strip_prefix('-')
+            .is_some_and(|s| s.parse::<u64>().is_ok())
+    {
+        return Err(invalid());
+    }
+    let prefix = format!(".{stem}.");
+    for entry in std::fs::read_dir(path.parent().ok_or_else(invalid)?)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|s| s.strip_prefix(&prefix))
+            .and_then(|s| s.strip_suffix(".tmp"))
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == 0 {
+            continue;
+        }
+        let candidate = entry.metadata()?;
+        if candidate.is_file()
+            && candidate.dev() == metadata.dev()
+            && candidate.ino() == metadata.ino()
+        {
+            directory.sync_all()?;
+            std::fs::remove_file(entry.path())?;
+            return directory.sync_all();
+        }
+    }
+    Err(invalid())
+}
+
 /// Whether a quarantine file holds exactly this payload after its header line.
-fn holds_payload(file: &[u8], payload: &[u8]) -> bool {
-    file.iter()
-        .position(|byte| *byte == b'\n')
-        .is_some_and(|end| &file[end + 1..] == payload)
+fn holds_payload(file: &[u8], payload: &[u8], batch: &EventBatch) -> bool {
+    let Some(end) = file.iter().position(|byte| *byte == b'\n') else {
+        return false;
+    };
+    let Ok(header) = json::read_slice(&file[..end], json::Limits::default()) else {
+        return false;
+    };
+    header.get("request_id").and_then(json::Value::as_str) == Some(batch.request_id.as_str())
+        && header.get("source").and_then(json::Value::as_str) == Some(batch.source.as_str())
+        && header.get("payload_bytes").and_then(json::Value::as_u64) == Some(payload.len() as u64)
+        && file[end + 1..].get(..payload.len()) == Some(payload)
 }
 
 /// Create the directory with mode 0700 and make every directory entry this call created
@@ -220,7 +365,15 @@ mod tests {
     fn file_holds_reason_count_and_every_event_line() {
         let dir = tempfile::tempdir().unwrap();
         let batch = batch("events:abc:1", &[3, 4]);
-        let (path, created) = save(dir.path(), &batch, "INVALID_ARGUMENT", "too odd").unwrap();
+        let (path, created) = save(
+            dir.path(),
+            &batch,
+            "INVALID_ARGUMENT",
+            "too odd",
+            Original::Unsent,
+            None,
+        )
+        .unwrap();
         assert!(created);
         let text = std::fs::read_to_string(&path).unwrap();
         let mut lines = text.lines();
@@ -249,8 +402,24 @@ mod tests {
     fn saving_the_same_batch_again_keeps_the_first_file_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let batch = batch("events:abc:2", &[1]);
-        let (first, made) = save(dir.path(), &batch, "CONFLICT", "first").unwrap();
-        let (second, again) = save(dir.path(), &batch, "CONFLICT", "second").unwrap();
+        let (first, made) = save(
+            dir.path(),
+            &batch,
+            "CONFLICT",
+            "first",
+            Original::Unsent,
+            None,
+        )
+        .unwrap();
+        let (second, again) = save(
+            dir.path(),
+            &batch,
+            "CONFLICT",
+            "second",
+            Original::Unsent,
+            None,
+        )
+        .unwrap();
         assert_eq!((first.clone(), made, again), (second, true, false));
         assert!(std::fs::read_to_string(&first).unwrap().contains("first"));
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
@@ -263,7 +432,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("file");
         std::fs::write(&blocker, b"x").unwrap();
-        assert!(save(&blocker, &batch("events:abc:3", &[1]), "CONFLICT", "r").is_err());
+        assert!(
+            save(
+                &blocker,
+                &batch("events:abc:3", &[1]),
+                "CONFLICT",
+                "r",
+                Original::Unsent,
+                None
+            )
+            .is_err()
+        );
     }
 
     /// INVARIANT: two different batches whose identities sanitize to one file name each get
@@ -271,8 +450,24 @@ mod tests {
     #[test]
     fn a_name_collision_with_different_bytes_gets_its_own_file() {
         let dir = tempfile::tempdir().unwrap();
-        let (one, _) = save(dir.path(), &batch("events:abc:4", &[1]), "CONFLICT", "r").unwrap();
-        let (two, made) = save(dir.path(), &batch("events-abc-4", &[2]), "CONFLICT", "r").unwrap();
+        let (one, _) = save(
+            dir.path(),
+            &batch("events:abc:4", &[1]),
+            "CONFLICT",
+            "r",
+            Original::Unsent,
+            None,
+        )
+        .unwrap();
+        let (two, made) = save(
+            dir.path(),
+            &batch("events-abc-4", &[2]),
+            "CONFLICT",
+            "r",
+            Original::Unsent,
+            None,
+        )
+        .unwrap();
         assert!(made && one != two);
         assert!(std::fs::read_to_string(&two).unwrap().contains("event 2"));
         assert!(std::fs::read_to_string(&one).unwrap().contains("event 1"));
@@ -285,7 +480,15 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let leaf = dir.path().join("a/b");
-        save(&leaf, &batch("events:abc:5", &[1]), "CONFLICT", "r").unwrap();
+        save(
+            &leaf,
+            &batch("events:abc:5", &[1]),
+            "CONFLICT",
+            "r",
+            Original::Unsent,
+            None,
+        )
+        .unwrap();
         let mode = std::fs::metadata(&leaf).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
     }
@@ -297,9 +500,24 @@ mod tests {
     #[test]
     fn a_payload_equal_to_the_tail_of_another_file_is_not_reused() {
         let dir = tempfile::tempdir().unwrap();
-        let (whole, _) =
-            save(dir.path(), &batch("events:abc:6", &[1, 2]), "CONFLICT", "r").unwrap();
-        let (tail, made) = save(dir.path(), &batch("events-abc-6", &[2]), "CONFLICT", "r").unwrap();
+        let (whole, _) = save(
+            dir.path(),
+            &batch("events:abc:6", &[1, 2]),
+            "CONFLICT",
+            "r",
+            Original::Unsent,
+            None,
+        )
+        .unwrap();
+        let (tail, made) = save(
+            dir.path(),
+            &batch("events-abc-6", &[2]),
+            "CONFLICT",
+            "r",
+            Original::Unsent,
+            None,
+        )
+        .unwrap();
         assert!(made && whole != tail);
         let kept = std::fs::read_to_string(&tail).unwrap();
         assert!(kept.contains("event 2") && !kept.contains("event 1"));
@@ -314,9 +532,15 @@ mod tests {
     fn a_failed_scratch_cleanup_after_the_link_still_names_the_created_file() {
         let dir = tempfile::tempdir().unwrap();
         let batch = batch("events:abc:7", &[1]);
-        let failure = save_with(dir.path(), &batch, "CONFLICT", "first", |_| {
-            Err(std::io::Error::other("scratch removal refused"))
-        })
+        let failure = save_with(
+            dir.path(),
+            &batch,
+            "CONFLICT",
+            "first",
+            Original::Unsent,
+            None,
+            |_| Err(std::io::Error::other("scratch removal refused")),
+        )
         .unwrap_err();
         let created = failure.created.expect("the linked file is named");
         assert!(
@@ -325,7 +549,15 @@ mod tests {
                 .to_string()
                 .contains("scratch removal refused")
         );
-        let (again, made) = save(dir.path(), &batch, "CONFLICT", "second").unwrap();
+        let (again, made) = save(
+            dir.path(),
+            &batch,
+            "CONFLICT",
+            "second",
+            Original::Unsent,
+            None,
+        )
+        .unwrap();
         assert_eq!((again, made), (created.clone(), false));
         let text = std::fs::read_to_string(&created).unwrap();
         assert!(text.contains("\"reason\":\"first\""), "{text}");

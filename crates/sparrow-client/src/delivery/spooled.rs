@@ -612,6 +612,7 @@ pub(super) async fn deliver(shared: &Shared) -> Result<(), Error> {
                 let mut state = state(shared)?;
                 state.spool = Some(log.stats.clone());
                 state.pending = Some(Pending {
+                    original: Default::default(),
                     batch: prepared.batch.clone(),
                     bytes: 0,
                     at: Instant::now(),

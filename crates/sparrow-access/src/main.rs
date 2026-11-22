@@ -27,7 +27,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         drain::run(endpoint, rest).await?
                     }
                     _ => {
-                        let client = Client::connect_endpoint(&endpoint).await?;
+                        let client = if args.first().is_some_and(|arg| arg == "quarantine-replay") {
+                            Client::connect_producer(&endpoint).await?
+                        } else {
+                            Client::connect_endpoint(&endpoint).await?
+                        };
                         run_cli(&client, args).await?
                     }
                 };

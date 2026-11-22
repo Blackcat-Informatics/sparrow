@@ -2396,6 +2396,21 @@ fingerprints = []
 names = ['^(create_spool_dirs|create_quarantine_dirs)$']
 
 [[job]]
+id = "quarantine-replay-checkpoint"
+summary = "Persist guarded replay attempts and their certified wire receipts under the quarantine directory lock."
+home = "sparrow_client::replay::journal::Journal::reconcile"
+entry_points = ["sparrow_client::replay::replay_quarantine", "sparrow_client::replay::journal::Journal::save"]
+spec = "docs/interfaces.md: Memory delivery and shared event capture."
+vectors = ["crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(resume_quarantine_prefix|checkpoint_quarantine_receipt)$']
+
+[[job]]
 id = "sealed-producer-publication"
 summary = "Compare the exact retained receipt and fence a missing receipt against the server deadline and persistent retirement watermark before first publication."
 home = "sparrow_core::storage::Store::ingest_events_before"

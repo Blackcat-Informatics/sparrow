@@ -231,6 +231,17 @@ impl Client {
         durability: Durability,
         seal: Option<u64>,
     ) -> Result<ArtifactReceipt, Error> {
+        self.submit_events_receipt(batch, durability, seal, |receipt, _| Ok(receipt))
+            .await
+    }
+
+    async fn submit_events_receipt<T>(
+        &self,
+        batch: &EventBatch,
+        durability: Durability,
+        seal: Option<u64>,
+        finish: impl FnOnce(ArtifactReceipt, sparrow_capnp::artifact::Reader<'_>) -> Result<T, Error>,
+    ) -> Result<T, Error> {
         self.discovery.require(receipt::Contract::Producer)?;
         let bytes = batch
             .source_bytes_with_limits(self.discovery.event_limits())
@@ -258,7 +269,7 @@ impl Client {
             batch.encode(request.get().init_batch())?;
             let response = request.send().promise.await?;
             return receipt::certify_result(response.get()?.get_result()?, |value| {
-                expected.certify(ArtifactReceipt::decode(value)?)
+                finish(expected.certify(ArtifactReceipt::decode(value)?)?, value)
             });
         }
         let mut request = self.capability().events_ingest_request();
@@ -266,7 +277,10 @@ impl Client {
         batch.encode(request.get().init_batch())?;
         let response = request.send().promise.await?;
         match response.get()?.get_result()?.which()? {
-            sparrow_capnp::result::Ok(value) => expected.certify(ArtifactReceipt::decode(value?)?),
+            sparrow_capnp::result::Ok(value) => {
+                let value = value?;
+                finish(expected.certify(ArtifactReceipt::decode(value)?)?, value)
+            }
             sparrow_capnp::result::Error(error) => Err(Error::domain(error?)),
         }
     }

@@ -5100,8 +5100,10 @@ closed, failed and counter-exhausted admission each have visible drop counters.
 A batch the daemon refuses for a reason about the batch (a non-retryable `INVALID_ARGUMENT`,
 `CONFLICT` or unknown code) is written to a quarantine file with its reason and count, then counted,
 reported as not delivered at the next flush, and later events proceed. `replay_quarantine` and
-`sparrow ENDPOINT quarantine-replay FILE` resend a file and remove it once the daemon acknowledges
-it. If a file cannot be written the batch stays pending. A failure
+`sparrow ENDPOINT quarantine-replay FILE` reconcile the original receipt or
+resume the certified prefix of a checkpointed replay. The file is removed once
+every part has an exact durable receipt. Expired evidence preserves the file.
+If a file cannot be written the batch stays pending. A failure
 about the connection or daemon holds the batch and retries it, and a replaced store sets the
 pending batch aside and continues against the new store; the worker never stops on a refusal. A source whose time
 mapping conflicts refuses every later batch, so each becomes one file (about one per
