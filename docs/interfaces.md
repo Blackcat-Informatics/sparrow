@@ -4792,6 +4792,38 @@ and uses the same private-file rules as the CLI. Other optional keys are
 `batch_bytes`, `flush_interval_ms`, `rpc_timeout_ms`, `retry_interval_ms`,
 and `retry_max_interval_ms`. All bounds and defaults come from `DeliveryConfig`.
 
+### Startup destination discovery
+
+`DeliveryConfig::discover(source).await?` returns an optional configuration.
+`Console::install_auto(source).await?` starts the same bounded console in both
+modes and attaches a delivery worker when discovery selects a destination.
+Resolution runs once during setup on Tokio's blocking pool.
+
+1. `SPARROW_CLIENT_CONFIG` selects a required TOML file. A relative path resolves
+   from the process working directory.
+2. Otherwise, look for `$XDG_CONFIG_HOME/sparrow/client.toml`. If the variable is
+   absent, empty or relative, use `$HOME/.config/sparrow/client.toml` when
+   `HOME` is absolute.
+3. With no selected file, inspect the directory entry for
+   `/run/sparrow-ingest/ingest.sock`. A Unix socket selects the default spooled
+   producer. A missing entry selects standalone display. A stale socket selects
+   the same spooled producer and the delivery worker retries on demand.
+
+Discovery inspects metadata without opening a connection. Standalone display
+starts no delivery worker, creates no spool and emits no connection warning.
+A selected file must be regular and valid. Unreadable configuration or credentials,
+a dangling selected link and an unexpected socket file type produce setup errors.
+The config file may specify an endpoint whose server is down. To buffer from
+startup while the local server is offline and its socket is absent, place an
+empty `client.toml` at the selected location or explicitly use
+`DeliveryConfig::configured_local(source)`.
+
+A discovered file may omit `source`. The caller's source then determines
+the default spool directory. A `source` or `spool_dir` in the file overrides
+that default, so give simultaneous producers distinct spool directories.
+Direct `DeliveryConfig::from_file(path)` requires a source in the file.
+Explicit console and typed delivery constructors bypass discovery.
+
 ### Configured spool
 
 Use `DeliveryConfig::configured(endpoint, source)` for Unix or TCP, or
@@ -5061,7 +5093,10 @@ subscriber's own bookkeeping remain application-controlled; the layer bounds its
 own buffers and uses nonblocking access to its snapshot and delivery state.
 ### Developer console
 
-Start a bounded console with `Console::start(None)` for local output or
+Install the automatically configured console with `Console::install_auto(source).await?`.
+Applications that own their subscriber can call `DeliveryConfig::discover(source)`,
+start any selected delivery with `Delivery::start_async`, and attach `console.layer()`.
+Use `Console::start(None)` for explicitly local output or
 `Console::start(Some(delivery.clone()))` to send the same structured observations to
 Sparrow. Standalone operation opens stdout and stderr for display and starts one output
 thread. All socket, spool and retry activity belongs to a configured delivery handle.
@@ -5069,14 +5104,17 @@ The application owns its subscriber and selects its filters.
 
 ```rust
 use sparrow_client::{Console, sparrow_eprintln};
-let console = Console::install(None)?;
+let console = Console::install_auto("build.worker").await?;
 let files = 12;
 sparrow_eprintln!("Reading {files} files");
 tracing::info!(files, bytes = 847216_u64, "Import complete");
 let local = console.flush().await?;
 ```
 
-`Console::install` explicitly installs the application's global tracing subscriber.
+`console.flush().await` waits for local output. A configured console exposes its
+handle through `console.delivery()` for spool or remote acknowledgement barriers.
+
+Both installation methods set the application's global tracing subscriber.
 An existing subscriber returns `AlreadyExists`. Compose `console.layer()` with
 an existing subscriber during application setup. The process logger is a separate choice.
 

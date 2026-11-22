@@ -3,13 +3,15 @@
 
 //! Typed Sparrow producer access over Unix or public TCP, without a database dependency.
 //!
-//! A Rust application can start with a local console and configure delivery by passing
-//! `Some(delivery)` to [`Console::install`]. An application composing its own subscriber
-//! can attach [`Console::layer`] instead.
+//! [`Console::install_auto`] displays local diagnostics and adds structured delivery
+//! when it discovers a destination at startup. For explicit configuration, pass a
+//! delivery handle to [`Console::install`]. Applications composing their own subscriber
+//! can attach [`Console::layer`]. [`Console::flush`] waits for local output.
+//! Use [`Console::delivery`] for a spool or remote acknowledgement barrier.
 //!
 //! ```no_run
-//! # async fn example() -> std::io::Result<()> {
-//! let console = sparrow_client::Console::install(None)?;
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let console = sparrow_client::Console::install_auto("build.worker").await?;
 //! let files = 12;
 //! sparrow_client::sparrow_eprintln!("Read {files} files");
 //! console.flush().await?;
@@ -100,7 +102,7 @@ mod logging;
 mod quarantine;
 mod replay;
 mod spool;
-pub use console::{Console, ConsoleStats, ConsoleStream, ConsoleWriter};
+pub use console::{Console, ConsoleInitError, ConsoleStats, ConsoleStream, ConsoleWriter};
 pub use delivery::{
     Admission, Delivery, DeliveryConfig, DeliveryStats, DeliveryWatermark, DropReason, FlushError,
     Refusal, SendError, SpoolReceipt,

@@ -67,8 +67,9 @@ views, with explicit admission refusals; see
 
 ## Operating model
 
-Rust applications can use the [developer console](docs/interfaces.md#developer-console)
-with local display alone or send structured observations to Sparrow. The
+Rust applications can call `Console::install_auto("build.worker").await?` to start the
+[developer console](docs/interfaces.md#developer-console). It displays events locally and
+adds structured delivery when a client configuration or local ingest socket is present. The
 [console example](crates/sparrow-client/examples/console.rs) shows a print-style
 call, typed tracing fields and a `log` record in one span.
 

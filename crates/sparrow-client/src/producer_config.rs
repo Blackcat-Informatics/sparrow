@@ -6,10 +6,13 @@
 use crate::{DeliveryConfig, Endpoint, Expect, RequiredRole};
 use std::{
     error::Error as StdError,
-    io::Read,
+    io::{ErrorKind, Read},
+    os::unix::fs::{FileTypeExt, OpenOptionsExt},
     path::{Path, PathBuf},
     time::Duration,
 };
+
+pub(crate) const LOCAL_INGEST_SOCKET: &str = "/run/sparrow-ingest/ingest.sock";
 
 type Cause = Box<dyn StdError + Send + Sync>;
 
@@ -18,6 +21,15 @@ type Cause = Box<dyn StdError + Send + Sync>;
 pub struct ConfigError {
     path: PathBuf,
     cause: Cause,
+}
+
+impl ConfigError {
+    fn at(path: &Path, cause: impl Into<Cause>) -> Self {
+        Self {
+            path: path.to_owned(),
+            cause: cause.into(),
+        }
+    }
 }
 
 impl std::fmt::Display for ConfigError {
@@ -41,7 +53,7 @@ struct FileConfig {
     spool_segment_bytes: Option<u64>,
     spool_sync_interval_ms: Option<u64>,
     spool_max_wait_ms: Option<u64>,
-    source: String,
+    source: Option<String>,
     endpoint: Option<String>,
     secret_file: Option<PathBuf>,
     expected_role: Option<RequiredRole>,
@@ -73,23 +85,101 @@ impl DeliveryConfig {
     pub async fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref().to_path_buf();
         let reader_path = path.clone();
-        tokio::task::spawn_blocking(move || FileConfig::read(&reader_path))
+        tokio::task::spawn_blocking(move || FileConfig::read(&reader_path, None))
             .await
-            .map_err(|cause| ConfigError {
-                path: path.clone(),
-                cause: Box::new(cause),
-            })?
-            .map_err(|cause| ConfigError { path, cause })
+            .map_err(|cause| ConfigError::at(&path, cause))?
+            .map_err(|cause| ConfigError::at(&path, cause))
+    }
+
+    /// Resolve startup configuration without connecting or creating state. A file named
+    /// by `SPARROW_CLIENT_CONFIG` takes precedence over the user's `sparrow/client.toml`.
+    /// A file may override the caller's source. With neither file, the local ingest
+    /// socket selects default spooled delivery if present. Its absence returns `None`.
+    pub async fn discover(source: impl Into<String>) -> Result<Option<Self>, ConfigError> {
+        let source = source.into();
+        tokio::task::spawn_blocking(move || {
+            let env_path = |key| std::env::var_os(key).map(PathBuf::from);
+            discover_config(
+                source,
+                env_path("SPARROW_CLIENT_CONFIG"),
+                env_path("XDG_CONFIG_HOME"),
+                env_path("HOME"),
+                Path::new(LOCAL_INGEST_SOCKET),
+            )
+        })
+        .await
+        .map_err(|cause| ConfigError::at(Path::new("producer discovery"), cause))?
+    }
+}
+
+fn discover_config(
+    source: String,
+    explicit: Option<PathBuf>,
+    config_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    socket: &Path,
+) -> Result<Option<DeliveryConfig>, ConfigError> {
+    let read = |path: &Path| {
+        FileConfig::read(path, Some(source.as_str()))
+            .map(Some)
+            .map_err(|cause| ConfigError::at(path, cause))
+    };
+    if let Some(path) = explicit {
+        if path.as_os_str().is_empty() {
+            return Err(ConfigError::at(
+                Path::new("SPARROW_CLIENT_CONFIG"),
+                "expected a configuration file path",
+            ));
+        }
+        return read(&path);
+    }
+    let config_dir = config_home
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.filter(|p| p.is_absolute()).map(|p| p.join(".config")));
+    if let Some(dir) = config_dir {
+        let path = dir.join("sparrow/client.toml");
+        if entry_metadata(&path)?.is_some() {
+            return read(&path);
+        }
+    }
+    let Some(mut meta) = entry_metadata(socket)? else {
+        return Ok(None);
+    };
+    if meta.is_symlink() {
+        meta = std::fs::metadata(socket).map_err(|cause| ConfigError::at(socket, cause))?;
+    }
+    if !meta.file_type().is_socket() {
+        return Err(ConfigError::at(socket, "expected a Unix ingest socket"));
+    }
+    let config = DeliveryConfig::configured(Endpoint::Unix(socket.to_owned()), source);
+    config
+        .validate()
+        .map_err(|cause| ConfigError::at(socket, cause))?;
+    Ok(Some(config))
+}
+
+// Inspect the directory entry first. A dangling selected symlink and a missing
+// secret referenced by a selected file both produce configuration errors.
+fn entry_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, ConfigError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(ConfigError::at(path, e)),
     }
 }
 
 impl FileConfig {
-    fn read(path: &Path) -> Result<DeliveryConfig, Cause> {
+    fn read(path: &Path, caller_source: Option<&str>) -> Result<DeliveryConfig, Cause> {
         const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+        let input = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+            .open(path)?;
+        if !input.metadata()?.is_file() {
+            return Err("expected a regular producer configuration file".into());
+        }
         let mut text = String::new();
-        std::fs::File::open(path)?
-            .take(MAX_CONFIG_BYTES + 1)
-            .read_to_string(&mut text)?;
+        input.take(MAX_CONFIG_BYTES + 1).read_to_string(&mut text)?;
         if text.len() as u64 > MAX_CONFIG_BYTES {
             return Err("producer configuration exceeds 64 KiB".into());
         }
@@ -98,7 +188,12 @@ impl FileConfig {
         let dir = absolute
             .parent()
             .ok_or("configuration path requires a parent directory")?;
-        let mut config = DeliveryConfig::configured_local(file.source);
+        let source = file
+            .source
+            .as_deref()
+            .or(caller_source)
+            .ok_or("producer configuration requires source")?;
+        let mut config = DeliveryConfig::configured_local(source);
         if let Some(value) = file.endpoint {
             config.endpoint = match Endpoint::parse(&value)? {
                 Endpoint::Unix(socket) => Endpoint::Unix(dir.join(socket)),
@@ -172,6 +267,95 @@ impl FileConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Startup retains explicit configuration errors, supports a shared destination
+    /// with independent source spools, and recognizes a defunct socket as an outage.
+    #[tokio::test]
+    async fn discovery_preserves_source_ownership_and_distinguishes_absence_from_failure() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let socket = home.join("ingest.sock");
+        let select = |source: &str, explicit: Option<&Path>, xdg: &Path| {
+            discover_config(
+                source.into(),
+                explicit.map(Path::to_owned),
+                Some(xdg.into()),
+                Some(home.into()),
+                &socket,
+            )
+        };
+        let relative = Path::new("relative-config-home");
+        assert!(select("app", None, relative).unwrap().is_none());
+
+        std::fs::write(&socket, b"wrong file type").unwrap();
+        assert!(
+            select("app", None, relative)
+                .unwrap_err()
+                .to_string()
+                .contains("Unix ingest socket")
+        );
+        std::fs::remove_file(&socket).unwrap();
+        drop(UnixListener::bind(&socket).unwrap());
+        let offline = select("app", None, relative).unwrap().unwrap();
+        assert!(matches!(
+            offline.mode,
+            crate::DeliveryMode::LosslessConfirmed(_)
+        ));
+
+        let user_dir = home.join(".config/sparrow");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        let user_file = user_dir.join("client.toml");
+        std::fs::write(&user_file, r#"endpoint = "chosen.sock""#).unwrap();
+        let a = select("app.a", None, relative).unwrap().unwrap();
+        let b = select("app.b", None, relative).unwrap().unwrap();
+        assert_eq!(a.endpoint, Endpoint::Unix(user_dir.join("chosen.sock")));
+        assert_eq!((a.source.as_str(), b.source.as_str()), ("app.a", "app.b"));
+        assert_ne!(a.mode.spool().unwrap().dir, b.mode.spool().unwrap().dir);
+        assert!(
+            DeliveryConfig::from_file(&user_file)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("requires source")
+        );
+
+        let xdg = home.join("xdg");
+        let dir = xdg.join("sparrow");
+        std::fs::create_dir_all(&dir).unwrap();
+        let xdg_file = dir.join("client.toml");
+        symlink("missing.toml", &xdg_file).unwrap();
+        assert!(
+            select("app", None, &xdg)
+                .unwrap_err()
+                .to_string()
+                .contains(xdg_file.to_str().unwrap())
+        );
+        std::fs::remove_file(&xdg_file).unwrap();
+        std::fs::write(
+            &xdg_file,
+            "endpoint = 'tcp://127.0.0.1:518'\nsecret_file = 'missing.secret'",
+        )
+        .unwrap();
+        assert!(
+            select("app", None, &xdg)
+                .unwrap_err()
+                .to_string()
+                .contains("missing.secret")
+        );
+
+        let explicit = home.join("explicit.toml");
+        assert!(
+            select("app", Some(&explicit), &xdg)
+                .unwrap_err()
+                .to_string()
+                .contains("explicit.toml")
+        );
+        std::fs::write(&explicit, "source = 'pinned.app'\nendpoint = 'down.sock'").unwrap();
+        let pinned = select("app", Some(&explicit), &xdg).unwrap().unwrap();
+        assert_eq!(pinned.source, "pinned.app");
+        assert_eq!(pinned.endpoint, Endpoint::Unix(home.join("down.sock")));
+    }
 
     /// A remote producer file selects authenticated TCP and a store pin. A misspelled
     /// destination or an impossible limit fails at setup with its configuration path.
