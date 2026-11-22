@@ -64,6 +64,8 @@ RULES = ("daily", "sealed", "settled")
 # sparrow_core::MAX_IMPORT_BYTES: the largest input one retirement pass can read back
 # as an artifact. A Rust test asserts that this literal equals the constant.
 MAX_IMPORT_BYTES = 8515420160
+# The store's sealed-import record bound, derived from source context admission.
+MAX_CHUNK_LINES = 32768
 LINE_FORMATS = ("jsonl", "log")
 
 
@@ -97,6 +99,9 @@ def load_config(path):
                 "max_files_per_run", "max_pending_bytes", "max_queue_bytes"):
         if key not in config:
             fail(f"{path}: missing required key `{key}`")
+    max_lines = config["max_chunk_lines"]
+    if type(max_lines) is not int or not 1 <= max_lines <= MAX_CHUNK_LINES:
+        fail(f"{path}: `max_chunk_lines` must be an integer from 1 to {MAX_CHUNK_LINES}")
     names = set()
     for source in config.get("source", []):
         for key in ("name", "dir", "pattern", "rule", "format", "settle_seconds"):
@@ -224,15 +229,23 @@ def chunks(path, max_bytes, max_lines):
 
 
 def pieces(source, path, stat, config):
-    """Return None when the file ships whole, else an iterator of its line-bounded parts."""
+    """Return the parts (None for whole) and whether an old shipper could have sent it whole."""
     max_bytes, max_lines = config["max_chunk_bytes"], config["max_chunk_lines"]
     if source["format"] not in LINE_FORMATS:
-        return None
+        return None, False
+    legacy_whole = False
     if stat.st_size <= max_bytes:
         with open(path, "rb") as handle:
-            if handle.read().count(b"\n") <= max_lines:
-                return None
-    return chunks(path, max_bytes, max_lines)
+            payload = handle.read(stat.st_size + 1)
+        if len(payload) == stat.st_size:
+            newlines = payload.count(b"\n")
+            has_tail = bool(payload) and not payload.endswith(b"\n")
+            if newlines + has_tail <= max_lines:
+                return None, False
+            # The old whole-file path counted only delimiters. Such a file could
+            # already be held when its extra record fits under the store bound.
+            legacy_whole = newlines == max_lines and max_lines < MAX_CHUNK_LINES
+    return chunks(path, max_bytes, max_lines), legacy_whole
 
 
 def enqueue(source, path, stat, config, queue, staging):
@@ -241,7 +254,7 @@ def enqueue(source, path, stat, config, queue, staging):
     Queue names carry an order prefix; the name fed into the consume root drops it.
     """
     flat = str(path.relative_to(source["dir"])).replace("/", "__")
-    parts = pieces(source, path, stat, config)
+    parts, _ = pieces(source, path, stat, config)
     whole = parts is None
     if whole and stat.st_size > MAX_IMPORT_BYTES:
         raise RuntimeError(f"{stat.st_size} bytes exceeds Sparrow's {MAX_IMPORT_BYTES}-byte "
@@ -353,12 +366,14 @@ def blake3(data=None, path=None):
 REAP_PREFIX = ".reaping-"
 
 
-def digests_of(source, path, stat, config):
-    """The BLAKE3 digest of each part the file ships as, cut exactly as the queue cuts it."""
-    parts = pieces(source, path, stat, config)
+def acknowledged(source, path, stat, config, store):
+    """Check the exact whole file or each of its parts against the store's payload index."""
+    parts, legacy_whole = pieces(source, path, stat, config)
     if parts is None:
-        return [blake3(path=path)]
-    return [blake3(data=b"".join(lines)) for lines in parts]
+        return store.holds(blake3(path=path))
+    if legacy_whole and store.holds(blake3(path=path)):
+        return True
+    return all(store.holds(blake3(data=b"".join(lines))) for lines in parts)
 
 
 def late_name(original):
@@ -382,7 +397,7 @@ def settle_set_aside(source, config, store):
     directory = Path(source["dir"])
     for aside in sorted(directory.glob(f"**/{REAP_PREFIX}*")):
         stat = aside.lstat()
-        if not all(store.holds(digest) for digest in digests_of(source, aside, stat, config)):
+        if not acknowledged(source, aside, stat, config, store):
             original = aside.with_name(aside.name[len(REAP_PREFIX):])
             try:
                 os.link(aside, original)
@@ -407,7 +422,7 @@ def reap(source, config, store, now):
     deleted = settle_set_aside(source, config, store)
     set_aside = unacknowledged = 0
     for path, stat in finished(source, now):
-        if not all(store.holds(digest) for digest in digests_of(source, path, stat, config)):
+        if not acknowledged(source, path, stat, config, store):
             unacknowledged += 1
             continue
         aside = path.with_name(REAP_PREFIX + path.name)

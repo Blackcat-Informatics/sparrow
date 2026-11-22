@@ -6308,6 +6308,55 @@ fn ship(config: &Path) -> std::process::Output {
     .unwrap()
 }
 
+/// A file with the maximum number of delimiters and a final unterminated
+/// record must be split without losing bytes. A file at the record limit
+/// ships whole, and an out-of-range setting is rejected before queue creation.
+#[test]
+fn shipper_counts_an_unterminated_record_before_queueing() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let intake = dir.path().join("intake");
+    let root = intake.join("logs");
+    let state = dir.path().join("ship");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    let lines = b"event\n".repeat(32_768);
+    let tail = b"unterminated";
+    let with_tail = [lines.as_slice(), tail].concat();
+    std::fs::write(source.join("exact.log"), &lines).unwrap();
+    std::fs::write(source.join("tail.log"), &with_tail).unwrap();
+    let config = dir.path().join("ship.toml");
+    let settings = format!(
+        "intake_root = {intake:?}\nstate_dir = {state:?}\nmax_chunk_bytes = 1048576\n\
+         max_files_per_run = 64\nmax_pending_bytes = 16777216\nmax_queue_bytes = 1073741824\n\n\
+         [[source]]\nname = \"logs\"\ndir = {source:?}\npattern = \"*.log\"\n\
+         rule = \"settled\"\nformat = \"log\"\nsettle_seconds = 0\n",
+    );
+    std::fs::write(&config, format!("max_chunk_lines = 32769\n{settings}")).unwrap();
+    let rejected = ship(&config);
+    assert!(!rejected.status.success(), "{rejected:?}");
+    let error = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        error.contains("`max_chunk_lines`") && error.contains("32768"),
+        "{error}"
+    );
+    assert!(!state.exists());
+    std::fs::write(&config, format!("max_chunk_lines = 32768\n{settings}")).unwrap();
+    let shipped = ship(&config);
+    assert!(shipped.status.success(), "{shipped:?}");
+    assert_eq!(std::fs::read(root.join("exact.log")).unwrap(), lines);
+    assert_eq!(
+        std::fs::read(root.join("tail.part00000.log")).unwrap(),
+        lines
+    );
+    assert_eq!(
+        std::fs::read(root.join("tail.part00001.log")).unwrap(),
+        tail
+    );
+    assert!(!root.join("tail.log").exists());
+    assert_eq!(std::fs::read(source.join("tail.log")).unwrap(), with_tail);
+}
+
 /// INVARIANT: the shipper never queues a whole file the store would refuse before
 /// upload, and its literal bound is the store's `MAX_IMPORT_BYTES`.
 #[test]
@@ -6339,7 +6388,7 @@ fn shipper_reports_a_whole_file_above_the_import_bound_and_mirrors_it() {
         &config,
         format!(
             "intake_root = {:?}\nstate_dir = {:?}\nmax_chunk_bytes = 1048576\n\
-             max_chunk_lines = 50000\nmax_files_per_run = 64\n\
+             max_chunk_lines = 32768\nmax_files_per_run = 64\n\
              max_pending_bytes = 16777216\nmax_queue_bytes = 1073741824\n\n\
              [[source]]\nname = \"reports\"\ndir = {:?}\npattern = \"*.json\"\n\
              rule = \"settled\"\nformat = \"json\"\nsettle_seconds = 0\n",
@@ -6388,7 +6437,7 @@ fn shipper_never_reships_a_file_whose_device_number_alone_changed() {
         &config,
         format!(
             "intake_root = {:?}\nstate_dir = {:?}\nmax_chunk_bytes = 1048576\n\
-             max_chunk_lines = 50000\nmax_files_per_run = 64\n\
+             max_chunk_lines = 32768\nmax_files_per_run = 64\n\
              max_pending_bytes = 16777216\nmax_queue_bytes = 1073741824\n\n\
              [[source]]\nname = \"reports\"\ndir = {:?}\npattern = \"*.json\"\n\
              rule = \"settled\"\nformat = \"json\"\nsettle_seconds = 0\n",
@@ -6442,7 +6491,7 @@ fn shipper_refuses_a_source_overlapping_its_intake_or_state_tree() {
             &config,
             format!(
                 "intake_root = {intake:?}\nstate_dir = {state:?}\nmax_chunk_bytes = 1048576\n\
-                 max_chunk_lines = 50000\nmax_files_per_run = 64\n\
+                 max_chunk_lines = 32768\nmax_files_per_run = 64\n\
                  max_pending_bytes = 16777216\nmax_queue_bytes = 1073741824\n\n\
                  [[source]]\nname = \"s\"\ndir = {source:?}\npattern = \"*.json\"\n\
                  rule = \"settled\"\nformat = \"json\"\nsettle_seconds = 0\n",
@@ -6505,7 +6554,7 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
                 &ship_config,
                 format!(
                     "intake_root = {:?}\nstate_dir = {:?}\nmax_chunk_bytes = 64\n\
-                     max_chunk_lines = 50000\nmax_files_per_run = 64\n\
+                     max_chunk_lines = 1\nmax_files_per_run = 64\n\
                      max_pending_bytes = 16777216\nmax_queue_bytes = 1073741824\n\
                      sparrow = {:?}\nsocket = {:?}\n\n\
                      [[source]]\nname = \"spool\"\ndir = {:?}\npattern = \"katamari-*.jsonl\"\n\
@@ -6562,6 +6611,15 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
             append_consume_config(&config, &intake.join("spool"), 0, 16, 16);
             let _daemon = start(&config, &socket).await;
             let producer = sparrow_client::Client::connect(&socket).await.unwrap();
+            // An old shipper saw one delimiter and sent the file whole. The reaper
+            // must still recognize that exact artifact under the corrected limit.
+            let legacy = spool.join(".reaping-katamari-stored-legacy.jsonl");
+            let legacy_bytes = b"{\"legacy\":1}\n{\"legacy\":2}";
+            std::fs::write(&legacy, legacy_bytes).unwrap();
+            producer
+                .ingest("legacy-whole", "spool", wire::Format::Jsonl, legacy_bytes)
+                .await
+                .unwrap();
             watch_until(producer.capability(), |watch| {
                 watch.get_completed_claims() == fed && watch.get_pending_claims() == 0
             })
@@ -6570,11 +6628,12 @@ async fn shipper_deletes_a_spool_file_only_once_the_store_holds_every_part() {
             // two acknowledged files are set aside, not deleted.
             let shipped = report(ship(&ship_config));
             assert!(
-                shipped.contains("deleted 0 acknowledged, set aside 2, not yet acknowledged 1"),
+                shipped.contains("deleted 1 acknowledged, set aside 2, not yet acknowledged 1"),
                 "{shipped}"
             );
             let restored = spool.join("katamari-stored-c.jsonl");
             assert_eq!(std::fs::read(&restored).unwrap(), leftover_bytes);
+            assert!(!legacy.exists());
             assert!(!leftover.exists() && !whole.exists() && !split.exists());
             let whole_aside = spool.join(".reaping-katamari-stored-a.jsonl");
             let split_aside = spool.join(".reaping-katamari-stored-b.jsonl");
@@ -6654,7 +6713,7 @@ async fn oversized_single_json_ships_whole_ingests_and_reads_back_exactly() {
             let ship_config = dir.path().join("ship.toml");
             let settings = format!(
                 "intake_root = {:?}\nstate_dir = {:?}\nmax_chunk_bytes = 1048576\n\
-                 max_chunk_lines = 50000\nmax_files_per_run = 64\n\
+                 max_chunk_lines = 32768\nmax_files_per_run = 64\n\
                  max_pending_bytes = 16777216\nmax_queue_bytes = 1073741824\n\n\
                  [[source]]\nname = \"reports\"\ndir = {:?}\npattern = \"*.json\"\n\
                  rule = \"settled\"\nformat = \"json\"\nsettle_seconds = 0\n",
