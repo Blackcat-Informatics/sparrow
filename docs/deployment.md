@@ -569,8 +569,17 @@ ships like any finished file, so those lines appear twice at most. A file whose
 parts the store held and has since retired goes back too and stays in the spool.
 The run reports how many files it deleted, set aside, and did not find
 acknowledged. The parts are cut with the shipper's current `max_chunk_bytes` and
-`max_chunk_lines`; after a change of either, a file queued earlier hashes
-differently, is reported as not acknowledged and stays.
+`max_chunk_lines`. A change can make the reaper hash a different partition from
+the one originally queued. The ledger still skips the unchanged original.
+
+For a quarantined spool file, find the retired claim with `watch list` and
+read its `.refusal` sidecar. Correct the source format or chunk limits as
+needed. Prepare parts that match the corrected shipper settings outside the
+watch root on the same filesystem. Rename the completed parts into the
+matching consume root under fresh names. Keep the original and its ledger
+entry. Verify each part through the payload lookup. Until all current parts
+are held, the shipper reports the original as `not yet acknowledged` on each
+run. Once they are held, the two-run deletion applies.
 
 ## Katamari's journal in the spool
 
