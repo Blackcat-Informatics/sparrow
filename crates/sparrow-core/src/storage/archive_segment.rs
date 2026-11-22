@@ -20,9 +20,7 @@ const HORIZON_FLOOR_MS: u64 = 10 * 60 * 1000;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 /// Records above this are held: neither archived nor deleted. The GTS writer holds the whole
 /// segment resident and costs about three times a record while it writes; 128 MiB is the size
-/// measured (`.stage/archive/probe/result.md`). It is a memory limit that relaxes when PurRDF
-/// issue 1257 (a streaming writer) lands. The format for payloads above it is undecided and
-/// with the operator.
+/// measured (`.stage/archive/probe/result.md`). This bound applies to the in-memory encoder.
 const HOLD_BYTES: u64 = 128 * 1024 * 1024;
 const FORMAT: &[u8] = b"sparrow-archive/1";
 

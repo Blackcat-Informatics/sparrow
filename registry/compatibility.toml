@@ -4,12 +4,12 @@
 # The census reference tree, not a compiled Sparrow dependency lock.
 # Advance deliberately, record the reason, and run make check at the new revision.
 manifest_version = 1
-recorded = "2026-11-11"
+recorded = "2026-11-21"
 
 [[supplier]]
 name = "purrdf"
-version = "4.0.2"
-git_revision = "f48977d3fe6f15be473fd344562ca95f48310923"
+version = "5.0.0"
+git_revision = "732c0b5e17825ed6cb61760dd0a65af5e30a299b"
 repository = "../purrdf"
 role = "Reference tree for structural helper discovery and PurRDF-owned ledger jobs."
 
@@ -54,3 +54,9 @@ date = "2026-11-11"
 supplier = "purrdf"
 revision = "f48977d3fe6f15be473fd344562ca95f48310923"
 reason = "Repin to the released purrdf =4 (exactly =4, no patch form; issue 164). Cargo.lock resolves 4.0.2 from crates.io, tag rust-v4.0.2 is this revision, and no git, revision, path or patch source remains. The census reference and the text lexicons (which the registry crates exclude) move to the same revision; the lexicon tree is identical to the one at c6d670c."
+
+[[event]]
+date = "2026-11-21"
+supplier = "purrdf"
+revision = "732c0b5e17825ed6cb61760dd0a65af5e30a299b"
+reason = "Align the runtime, text lexicon bundle and helper census with the released PurRDF 5.0.0 source at tag rust-v5.0.0 for issue 312."

@@ -12875,7 +12875,7 @@ fn stored_native_queries_preserve_occurrences_scope_and_pinned_evidence() {
                     result.result.graph().unwrap(),
                     graph.as_ref(),
                     &mut purrdf_core::CanonicalizationControl::new(
-                        purrdf_core::RDFC_V2_CORPUS_POLICY,
+                        purrdf_core::CANON_CORPUS_POLICY,
                         None,
                     ),
                 )

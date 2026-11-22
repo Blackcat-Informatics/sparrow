@@ -5,8 +5,7 @@
 //!
 //! This is the only module that knows the segment format. PurRDF's GTS `Writer` is called at
 //! exactly one place, `write_gts`; it holds the whole file resident, so the segment cap
-//! (`ARCHIVE_MAX_SEGMENT_BYTES`) and the hold bound are memory limits. They relax when PurRDF
-//! issue 1257 (a streaming writer) lands, which is a repin plus that one call. GTS binds no
+//! (`ARCHIVE_MAX_SEGMENT_BYTES`) and the hold bound are memory limits. GTS binds no
 //! resource to a blob, so the record to blob links are written here as quads in
 //! `urn:sparrow:graph:archive-links`; they go when PurRDF offers the link.
 

@@ -149,8 +149,10 @@ evicted or retired before the fence is counted in `retired_records` and is absen
 no graph, blob or link quad. The count of held records and the bytes waiting behind the first are not
 scanned, because that would read every record row on each pass.
 
-The 256 MiB ceiling and the hold bound are memory limits of the GTS writer. They
-relax when PurRDF's streaming writer (issue 1257) lands.
+The 256 MiB ceiling and the hold bound apply to Sparrow's use of PurRDF's
+in-memory GTS writer. Adopting PurRDF's streaming writer for single oversized
+records is tracked in #301. Qualifying a larger segment target, including its
+peak memory and verified readback, is tracked in #125.
 Encoding needs memory of roughly three to four times the segment size. That
 figure is an estimate to measure.
 

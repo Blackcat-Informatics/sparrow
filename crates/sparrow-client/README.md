@@ -16,17 +16,23 @@ Build on Linux with Rust 1.98 or later and the Cap'n Proto compiler
 Sparrow's storage engine. Add the SDK from crates.io.
 
 ```sh
-cargo add sparrow-client@0.1.0
+cargo add sparrow-client@0.2.0
 ```
 
 The console example below uses these dependencies in your application's `Cargo.toml`.
 
 ```toml
 [dependencies]
-sparrow-client = "0.1.0"
+sparrow-client = "0.2.0"
 tokio = { version = "1", features = ["macros", "rt"] }
 tracing = "0.1"
 ```
+
+When upgrading from 0.1, keep your existing `Console::install_auto`,
+`sparrow_eprintln!` and `tracing` calls. The SDK's public generated wire types
+now use Cap'n Proto 0.28. If your code passes `capnp` builders or readers, or
+uses `capnp-rpc` capabilities with those types, update those dependencies to
+0.28 as well.
 
 ## Write to the console
 
@@ -156,6 +162,6 @@ can run alongside application logging.
   count and range count. To stop locally and resume later, use `job.close().await?`.
 
 The package includes runnable examples for the
-[console](https://docs.rs/crate/sparrow-client/0.1.0/source/examples/console.rs),
-[configured delivery](https://docs.rs/crate/sparrow-client/0.1.0/source/examples/configured.rs)
-and [bulk files or stdin](https://docs.rs/crate/sparrow-client/0.1.0/source/examples/bulk.rs).
+[console](https://docs.rs/crate/sparrow-client/0.2.0/source/examples/console.rs),
+[configured delivery](https://docs.rs/crate/sparrow-client/0.2.0/source/examples/configured.rs)
+and [bulk files or stdin](https://docs.rs/crate/sparrow-client/0.2.0/source/examples/bulk.rs).
