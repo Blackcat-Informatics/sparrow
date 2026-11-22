@@ -1,0 +1,19 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 89f3e78d1194cefbb0844fdade8dcc3b63b2c173
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 496
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/496
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 25b12ac18655ce9b64863c42fb0a8fdb23156d5c
+GhpRsq-Head-Ref: paudley/492-apply-the-staged-record-ceiling-when
+GhpRsq-Head-OID: 89f3e78d1194cefbb0844fdade8dcc3b63b2c173
+GhpRsq-Result-Tree: d4088dbb67c5b526b0664206f7abc4a104562fc9
+GhpRsq-Result-Commit: aaed8a844bbfd07d670e840f0d397bbab88d9ca9
+GhpRsq-Parent-Hashes: 89f3e78d1194cefbb0844fdade8dcc3b63b2c173
+GhpRsq-Squash-Notes-SHA256: 0288699141fd7e000bbc74a308c26406ba12cccb25af8f89cc72d380dd2f8cc2
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
