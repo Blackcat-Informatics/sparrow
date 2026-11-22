@@ -52,6 +52,7 @@ parts the store once held but has since retired also stays.
 import fcntl
 import filecmp
 import json
+import locale
 import os
 import shutil
 import subprocess
@@ -143,21 +144,29 @@ def identity(stat):
 def ledger_keys(ledger_path):
     """Return the identities a ledger records, reading legacy `dev:` lines as the same entry."""
     keys = set()
-    # The writer ends lines with "\n" only. Neither splitlines() nor universal-newline
-    # reading may split a file name that holds a carriage return or another separator.
-    with open(ledger_path, newline="") as handle:
-        lines = handle.read().split("\n")
-    if lines[-1] == "":
-        lines.pop()
-    for number, line in enumerate(lines, 1):
-        key = line.split("\t", 1)[0]
-        fields = key.split(":")
-        if len(fields) == 4:
-            fields = fields[1:]
-        elif len(fields) != 3:
-            fail(f"{ledger_path}:{number}: ledger key {key!r} must be inode:size:mtime_ns "
-                 "(or the older dev:inode:size:mtime_ns); repair or remove the line")
-        keys.add(":".join(fields))
+    encoding = locale.getpreferredencoding(False)
+    # Only LF terminates a ledger entry. A carriage return can be part of its filename.
+    with open(ledger_path, "rb") as handle:
+        for number, raw in enumerate(handle, 1):
+            try:
+                line = raw.decode(encoding)
+            except UnicodeDecodeError as error:
+                raise ValueError(f"line {number}: {error}") from error
+            key, separator, filename = line.removesuffix("\n").partition("\t")
+            fields = key.split(":")
+            numbers = fields[:-1] + [fields[-1].removeprefix("-")]
+            if (
+                not line.endswith("\n")
+                or not separator
+                or not filename
+                or len(fields) not in (3, 4)
+                or not all(field.isascii() and field.isdecimal() for field in numbers)
+            ):
+                raise ValueError(
+                    f"line {number}: expected a complete inode:size:mtime_ns entry "
+                    "or legacy dev:inode:size:mtime_ns entry followed by a tab and a filename"
+                )
+            keys.add(":".join(fields[-3:]))
     return keys
 
 
@@ -478,12 +487,25 @@ def run(config):
     queued = sum(size for queue in queues.values() for _, size in waiting(queue))
     now = time.time()
     failures = 0
-    reaped = [source for source in config["source"] if source.get("delete_acknowledged", False)]
+    blocked_ledgers = 0
+    reaped = []
     for source in config["source"]:
-        ledger_path = state / f"{source['name']}.ledger"
-        shipped = set()
-        if ledger_path.exists():
+        name = source["name"]
+        ledger_path = state / f"{name}.ledger"
+        try:
             shipped = ledger_keys(ledger_path)
+        except FileNotFoundError:
+            shipped = set()
+        except (OSError, ValueError) as error:
+            blocked_ledgers += 1
+            print(
+                f"sparrow-ship: {name}: cannot read ledger {ledger_path}: {error}. "
+                "Restore a valid ledger to resume queueing and reaping this source",
+                file=sys.stderr,
+            )
+            continue
+        if source.get("delete_acknowledged", False):
+            reaped.append(source)
         count = 0
         with open(ledger_path, "a") as ledger:
             for path, stat in finished(source, now):
@@ -519,6 +541,8 @@ def run(config):
                       f"set aside {set_aside}, not yet acknowledged {kept}")
         except StoreUnreachable as error:
             print(f"sparrow-ship: store unreachable ({error}); no further spool file deleted")
+    if blocked_ledgers:
+        fail(f"{blocked_ledgers} source ledger(s) need repair. {failures} file(s) failed to queue")
     if failures:
         fail(f"{failures} file(s) failed; originals are untouched and will be retried")
 

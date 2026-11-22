@@ -6474,6 +6474,82 @@ fn shipper_never_reships_a_file_whose_device_number_alone_changed() {
     assert!(report(&ship(&config)).contains("reports: queued 1"));
 }
 
+/// A bad ledger pauses its source without withholding already staged data or
+/// intake for healthy sources. Repair resumes the blocked source on the next run.
+#[test]
+fn shipper_keeps_feeding_when_one_source_ledger_is_corrupt() {
+    let dir = tempfile::tempdir().unwrap();
+    let intake = dir.path().join("intake");
+    let state = dir.path().join("ship");
+    let staged = state.join("queue/blocked");
+    std::fs::create_dir_all(&staged).unwrap();
+    std::fs::write(
+        staged.join("00000000000000000001-00000-staged.log"),
+        b"previously staged\n",
+    )
+    .unwrap();
+    let ledger = state.join("blocked.ledger");
+    let mut settings = format!(
+        "intake_root = {intake:?}\nstate_dir = {state:?}\nmax_chunk_bytes = 1048576\n\
+         max_chunk_lines = 32768\nmax_files_per_run = 64\n\
+         max_pending_bytes = 16777216\nmax_queue_bytes = 1073741824\n",
+    );
+    for (name, bytes) in [("blocked", b"blocked\n"), ("healthy", b"healthy\n")] {
+        use std::fmt::Write as _;
+        let source = dir.path().join(name);
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir_all(intake.join(name)).unwrap();
+        std::fs::write(source.join("new.log"), bytes).unwrap();
+        write!(
+            settings,
+            "\n[[source]]\nname = {name:?}\ndir = {source:?}\npattern = \"*.log\"\n\
+             rule = \"settled\"\nformat = \"log\"\nsettle_seconds = 0\n",
+        )
+        .unwrap();
+    }
+    let config = dir.path().join("ship.toml");
+    std::fs::write(&config, settings).unwrap();
+    for malformed in [
+        b"not:an:identity\tstaged.log\n".as_slice(),
+        b"1:2:3\n",
+        b"1:2:3\tstaged.log",
+    ] {
+        std::fs::write(&ledger, malformed).unwrap();
+        let partial = ship(&config);
+        assert!(!partial.status.success(), "{partial:?}");
+        let error = String::from_utf8_lossy(&partial.stderr);
+        assert!(
+            error.contains("blocked.ledger: line 1") && error.contains("Restore a valid ledger"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&ledger).unwrap(), malformed);
+        assert_eq!(
+            std::fs::read(intake.join("blocked/staged.log")).unwrap(),
+            b"previously staged\n"
+        );
+        assert!(!intake.join("blocked/new.log").exists());
+        assert_eq!(
+            std::fs::read(intake.join("healthy/new.log")).unwrap(),
+            b"healthy\n"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("blocked/new.log")).unwrap(),
+            b"blocked\n"
+        );
+    }
+
+    // Supply a valid empty ledger for the blocked source. The healthy ledger is
+    // already committed, so the next run queues only the repaired source's file.
+    std::fs::write(&ledger, b"").unwrap();
+    let recovered = ship(&config);
+    assert!(recovered.status.success(), "{recovered:?}");
+    assert!(String::from_utf8_lossy(&recovered.stdout).contains("healthy: queued 0"));
+    assert_eq!(
+        std::fs::read(intake.join("blocked/new.log")).unwrap(),
+        b"blocked\n"
+    );
+}
+
 /// INVARIANT: the shipper refuses at configuration load, naming both paths, a source
 /// directory that equals, contains or lies inside `intake_root` or `state_dir`, including
 /// through a symlink, because it would otherwise ship its own queue and ledgers forever.
