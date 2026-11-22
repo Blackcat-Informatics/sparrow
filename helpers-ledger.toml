@@ -396,8 +396,8 @@ names = ['^(turnover_expire_records|turnover_decode_json|turnover_project_rdf)$'
 [[job]]
 id = "typed-load-capture-traversal"
 summary = "One dev-only workload capture traverses and releases all record/text/key/value pages through production CLI renderers and generated cursor operations; no local matcher, renderer or evaluator."
-home = "sparrow_server::example_crate::load::capture"
-entry_points = ["sparrow_server::example_crate::load::main"]
+home = "sparrow_access::example_crate::load::capture"
+entry_points = ["sparrow_access::example_crate::load::main"]
 spec = "docs/load-qualification.md: concurrent typed workload."
 vectors = ["crates/sparrow-access/examples/load.rs"]
 bench = []
