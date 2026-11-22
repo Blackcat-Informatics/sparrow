@@ -78,7 +78,7 @@ fn write_meta<T: Serialize>(dir: &Path, name: &str, value: &T) -> io::Result<()>
 pub(super) struct Journal {
     dir: PathBuf,
     pub(super) state: State,
-    _lock: File,
+    owner: File,
     pub(super) faulted: bool,
 }
 
@@ -139,11 +139,17 @@ impl Journal {
         let journal = Self {
             dir,
             state,
-            _lock: lock,
+            owner: lock,
             faulted: false,
         };
         journal.recover_space()?;
         Ok(journal)
+    }
+
+    pub(super) fn release(&self) -> io::Result<()> {
+        // File locks follow the open file description. A forked child can transiently
+        // hold another reference even with close-on-exec, so close alone is insufficient.
+        self.owner.unlock()
     }
 
     fn recover_space(&self) -> io::Result<()> {
@@ -328,5 +334,30 @@ impl CutSource for Blocks {
             bytes = tail;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Closing an idle job permits immediate reacquisition even while a child retains a
+    /// duplicate of the owner's file description between fork and exec.
+    #[tokio::test]
+    async fn close_releases_an_inherited_owner_description() {
+        use crate::{
+            Endpoint, Format,
+            bulk::{BulkConfig, BulkImporter},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let bulk = BulkImporter::new(BulkConfig::new(
+            Endpoint::Unix(dir.path().join("absent.sock")),
+            dir.path().join("bulk"),
+        ))
+        .unwrap();
+        let job = bulk.open("job", "source", Format::Log).await.unwrap();
+        let inherited = job.shared.lock().unwrap().owner.try_clone().unwrap();
+        job.close().await.unwrap();
+        let reopened = bulk.open("job", "source", Format::Log).await.unwrap();
+        drop(inherited);
+        reopened.close().await.unwrap();
     }
 }

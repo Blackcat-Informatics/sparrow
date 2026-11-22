@@ -329,6 +329,15 @@ impl BulkJob {
         Ok(())
     }
 
+    /// The caller and uploader have finished their work. Release the kernel lock before
+    /// reporting completion even if another task still holds a read-only journal reference.
+    async fn release(&self) -> Result<(), Error> {
+        let shared = self.shared.clone();
+        tokio::task::spawn_blocking(move || Ok(shared.lock()?.release()?))
+            .await
+            .map_err(io::Error::other)?
+    }
+
     /// Read a confirmed range receipt by ordinal without collecting the full stream.
     pub async fn receipt(&self, index: u32) -> Result<RangeReceipt, Error> {
         let shared = self.shared.clone();
@@ -507,6 +516,7 @@ impl BulkJob {
         if let Some(handle) = self.handle.take() {
             handle.await.map_err(io::Error::other)??;
         }
+        self.release().await?;
         let j = self.shared.lock()?;
         Ok(BulkSummary {
             store_id: j
@@ -531,6 +541,6 @@ impl BulkJob {
         if let Some(handle) = self.handle.take() {
             handle.await.map_err(io::Error::other)??;
         }
-        Ok(())
+        self.release().await
     }
 }
