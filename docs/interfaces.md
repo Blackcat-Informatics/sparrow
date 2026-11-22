@@ -756,8 +756,8 @@ the last pass, a signed decimal string that is negative once the store is over t
 An optional `[archive]` server table makes the store archive evidence before it
 deletes it. The format, schedule and write protocol are in
 [the archive format](archive-format.md). Phase P1 implements the store side:
-the deletion gate, the watermark and the writer fence. The daemon's archive
-worker (`sparrow-archive` thread) takes each prepared segment, writes its files
+the deletion gate, the watermark and the writer fence. The daemon's process-wide
+filesystem worker (`sparrow-archive-io`) takes each prepared segment, writes its files
 under `<dir>/<store_id>/` as `<from>-<through>.gts`, never anywhere else in `dir` except
 the `STORE_ID` file below.
 Each file is written as `.gts.partial`, synced, renamed into place and the directory
@@ -793,16 +793,16 @@ stall_warn_secs = 120                   # 0 < stall_warn_secs < io_timeout_secs
 io_timeout_secs = 900
 ```
 
-A watchdog thread watches the archive step in flight, because a hung NFS mount blocks
-the archive thread inside the syscall. Once a step (a read of `STORE_ID`, a write, a
-sync, a read-back) has run `stall_warn_secs`, the journal gets one whole line naming the
-step, the path and the seconds elapsed (`sparrowd: archive stalled step=... path=...
-elapsed_secs=...`) and a `tracing` warning, repeated every `stall_warn_secs` while it
-lasts. A blocked call cannot be cancelled, so `io_timeout_secs` does not interrupt it. A
-step that ran that long makes the pass fail with "an archive step ran past
-io_timeout_secs" once it returns: the segment is not committed on that pass, its files
-stay, and the next pass verifies them and commits. The worker starts no other step
-meanwhile, and nothing is marked archived because of a timeout.
+The store worker observes the filesystem step in flight. After `stall_warn_secs`
+it journals the step, path and elapsed seconds and emits a `tracing` warning.
+It repeats the warning at that interval until the step ends or reaches
+`io_timeout_secs`. At the deadline or on shutdown it stops waiting for the
+result and reports `ARCHIVE_OVERRAN` with the step and path. The store worker
+can release the store while the system call is blocked. The filesystem thread
+keeps the single slot until its job returns, so other passes report the hold
+without starting a competing write. The intent and any completed files stay
+available for the next verified pass. Only the store worker that receives a
+verified result can advance the watermark.
 
 The archive worker writes `STORE_ID`, holding this store's id, into `dir` on its first pass when
 `dir` is on its mount and empty. A directory that has content but no `STORE_ID` is refused, not
@@ -811,9 +811,10 @@ mount, and is never overwritten.
 
 Unknown fields are refused. Configuration checks are lexical: `dir` must be
 absolute, contain no `..`, and neither contain nor sit inside `data_dir`. The
-device and writability probes run at startup on the archive thread, because a
-hung NAS must not block startup. An unreachable archive starts the daemon
-degraded. Core `Config.archive` carries the store-side `ArchivePolicy`; the
+device and writability checks run on the archive filesystem thread for a pass
+with a prepared segment. An empty backlog leaves the mount unchecked at
+startup. An unreachable archive degrades archiving when a segment is due.
+Core `Config.archive` carries the store-side `ArchivePolicy`; the
 destination and timers stay in the daemon.
 
 The first open with a policy fences the store at formats 99 to 109. These keep

@@ -315,14 +315,17 @@ from a store is not supported in this version.
 
 ## 8. Write protocol
 
-The worker runs every archive operation on one dedicated thread, `sparrow-archive`, with at
-most one operation in flight, and a second thread watches the step in flight. For each
-prepared segment it:
+The store worker, `sparrow-archive`, reserves the process's single archive filesystem
+slot before preparing a segment and recording its durable intent. It gives the
+prepared bytes and their destination to `sparrow-archive-io`. That thread holds
+no store handle. It:
 
 1. Checks that `<root>` is a directory on its own mount (a different device from `/`, and a
    network filesystem type or a type different from `/`'s), and that it holds this store's
    `STORE_ID`, writing it on the first pass into an empty root (section 1).
-2. Creates `<root>/<store-id>` if it is missing and syncs `<root>`.
+2. Creates `<root>/<store-id>` if it is missing. It syncs `<root>` on each
+   attempt to make the store directory and `STORE_ID` links durable, including
+   when a prior attempt created them and stopped before the sync completed.
 3. Writes each segment file as `<name>.partial`, syncs it and renames it to `<name>`. A file
    already at `<name>` is kept as is. Then it syncs the store directory.
 4. Reads every file back and requires it byte-equal to what it prepared, then decodes the
@@ -331,10 +334,14 @@ prepared segment it:
    PurRDF's GTS reader reports no diagnostic (which covers the frame hash chain), the record
    and artifact metadata is well formed, and each record's bytes hash to the digest its link
    quad names. A blob corrupted before the write is refused here, before the commit.
-5. Refuses to commit if any step ran at least `io_timeout_secs`: the files stay, and the
-   next pass verifies and commits them.
-6. Commits: `archive_commit` names the segment identity and advances the watermark
+5. Returns the verification result to the store worker. The store worker calls
+   `archive_commit` with the verified segment identity and advances the watermark
    (section 7).
+
+If a step reaches `io_timeout_secs` or the store worker stops, the store worker
+abandons its reply and leaves the intent in place. The filesystem thread retains
+its slot until its job returns. The next pass verifies any existing files before
+it can advance the watermark, and the abandoned reply cannot commit.
 
 If the target already exists and equals the prepared bytes, the write counts as done. If
 it exists and differs, the pass fails with a verify error and the watermark does not move.
