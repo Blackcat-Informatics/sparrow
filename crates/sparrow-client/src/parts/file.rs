@@ -10,6 +10,7 @@ use super::{
 use crate::{
     ArtifactReceipt, Client, CompletedFileIdentity, Durability, Error, ExclusiveFileLock, Expect,
     Format, bulk, format_label,
+    import_progress::read_import_progress,
     imports::{self, Checkpoint, CompletedInput, StagedInput},
     parse_format,
     receipt::ExpectedArtifact,
@@ -147,10 +148,16 @@ struct ManifestReceipt {
     records: Vec<String>,
 }
 
+enum Publication {
+    Part,
+    Manifest,
+}
+
 struct Submission<'a, T: ?Sized> {
     bytes: &'a T,
     dir: &'a Path,
     request: &'a str,
+    publication: Publication,
     expected: ExpectedArtifact<'a>,
 }
 
@@ -191,6 +198,8 @@ impl<T: StagedInput + ?Sized> StagedInput for Submission<'_, T> {
 impl<T: StagedInput + ?Sized> Submission<'_, T> {
     async fn send(&self, client: &Client) -> Result<ArtifactReceipt, Error> {
         self.unchanged()?;
+        let store = &client.discovery().store_id;
+        let mut checkpoint = Checkpoint::default();
         if let Some(ticket) = read::<Publishing>(self.dir, "publishing")?
             && ticket.request == self.request
         {
@@ -199,20 +208,30 @@ impl<T: StagedInput + ?Sized> Submission<'_, T> {
                     "file-set bytes changed after preparation",
                 ));
             }
-            // The first publish may have committed and lost its reply. Retry only that
-            // native import. A receipt outside its retry window cannot start a replacement.
-            let receipt = imports::publish(
-                client.capability(),
-                &client.discovery().store_id,
-                &ticket.import,
-                &self.expected,
-            )
-            .await?;
-            self.unchanged()?;
-            return Ok(receipt);
+            // A lost reply retries the native publication before sending more bytes.
+            match imports::publish(client.capability(), store, &ticket.import, &self.expected).await
+            {
+                Ok(receipt) => {
+                    self.unchanged()?;
+                    return Ok(receipt);
+                }
+                Err(error)
+                    if matches!(self.publication, Publication::Part)
+                        && matches!(&error, Error::Domain { code, .. } if code == "NOT_FOUND") =>
+                {
+                    // Publication can also report a missing private record. A read of the
+                    // staging identity distinguishes that failure from a reclaimed attempt.
+                    match read_import_progress(client.capability(), store, &ticket.import).await {
+                        Err(Error::Domain { code, .. }) if code == "NOT_FOUND" => {
+                            checkpoint = Checkpoint::expecting_import(ticket.import);
+                        }
+                        Ok(_) => return Err(error),
+                        Err(refusal) => return Err(refusal),
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
-        // Once a publication ticket is durable, retry needs the native import to remain
-        // addressable. Canceling it could strand that ticket even if publication failed.
         imports::upload(
             client.capability(),
             client.discovery(),
@@ -220,7 +239,7 @@ impl<T: StagedInput + ?Sized> Submission<'_, T> {
             self.expected.source,
             self.expected.format,
             self,
-            &mut Checkpoint::default(),
+            &mut checkpoint,
         )
         .await
     }
@@ -369,6 +388,7 @@ async fn publish_file_set(
                     bytes: &input,
                     dir: &dir,
                     request: &part_request(&set, index),
+                    publication: Publication::Part,
                     expected,
                 }
                 .publish(client)
@@ -432,6 +452,7 @@ async fn publish_file_set(
             bytes: body.as_slice(),
             dir: &dir,
             request,
+            publication: Publication::Manifest,
             expected,
         }
         .publish(client)
