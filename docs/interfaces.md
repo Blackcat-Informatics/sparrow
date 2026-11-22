@@ -469,31 +469,28 @@ Eligible duties are selected fairly, including when a short flush interval
 remains due; stop admission takes priority. An expiry refusal reports its error
 and returns to the ordinary tick rather than repeatedly retrying a busy loop.
 
-Shutdown prevents further maintenance admission and joins an already admitted
-native job. Teardown joins intake and maintenance before reserving the complete
-operation budget for the final WAL fence. An admitted native job is never aborted
-because its worker caller disappears. This scheduling contract is not a bound
-on sustained turnover, query latency or native shutdown duration.
+Shutdown prevents further maintenance admission and joins work that has already
+entered storage. Teardown joins the archive coordinator, intake and maintenance
+before closing storage dispatch. A blocked archive filesystem job holds no
+store handle and cannot commit.
 
-After intake workers join, teardown reserves all configured operation slots
-through Tokio's fair admission queue. Fresh storage dispatch cannot overtake
-that reservation; admitted workers retain their slots until they finish, even
-when their caller disappears. Once the reservation completes, admission closes
-and remains reserved through the final store flush and endpoint cleanup.
+Teardown reserves the entire operation and diagnostic budgets through their
+fair admission queues. Native workers retain their slots until they finish,
+even when their caller disappears. Both budgets close permanently before the
+final store flush and endpoint cleanup.
 After the final flush succeeds, teardown asks RocksDB to cancel its background flushes
 and compactions (`Store::cancel_background_work`) before the store drops. The flush has
 made every acknowledged write durable, and a cancelled compaction leaves its input files
 live, so cancellation loses no evidence. Teardown reads the store after the call for the
-closing count and uses it for nothing else. The archive worker is not joined, so a pass
-already running can still write after the call: RocksDB accepts the write into the
-write-ahead log, or refuses it with a shutdown error when writes are stalled, and the pass
-journals a failed pass and runs again at the next start.
-Closed storage admission returns retryable `SHUTTING_DOWN`; preserve the same
-immutable intent when reconnecting. When the reservation begins, every waiting
-writer and every later one is answered `SHUTTING_DOWN` at once. A failed admission drain is reported
-and withholds the final flush rather than claiming a fence over active workers.
+closing count and uses it for nothing else.
+Once the drain begins, fresh authorized storage requests and writers still
+waiting for a permit receive retryable `SHUTTING_DOWN`. Preserve the same
+immutable intent when reconnecting. Endpoint permissions and query-only
+refusals still apply. A failed admission drain is reported and withholds the
+final flush.
 During intake joins, existing RPC connections remain available for completing
-owned producer work. This establishes ordering, not a worst-case drain deadline.
+owned producer work. Drain time depends on the work still owned by admitted
+tasks.
 
 ### Pressure retirement recovery
 
@@ -3380,16 +3377,16 @@ Three limits that used to refuse at once now wait, and every wait is counted.
   daemon's own consume and syslog workers) that finds none free waits in arrival
   order, as Tokio's fair semaphore queue serves, for 3 seconds, which is inside the
   client's default `rpc_timeout` of 5 seconds, then receives the same retryable
-  `RESOURCE_LIMIT`. A reader (queries, status, gets) takes a permit only if one is
+  `RESOURCE_LIMIT`. A reader (queries and gets) takes a permit only if one is
   free and is first limited to the budget minus the writer reserve, a quarter of it
   rounded up and never so much that no reader can run, so a query storm cannot take
   the last permits. A reader never waits, because it would queue ahead of a later
   writer; beyond its share it is refused at once and counted. `status` is the exception
   to the permit rule: it takes no operation permit (as many status reads run at once
   as readers may, one more is refused and counted), so a budget saturated by writers
-  still answers the counters that explain it. It answers `SHUTTING_DOWN` once shutdown
-  begins; a read already running is not drained, because it reads a snapshot and
-  writes nothing. The UDP syslog
+  still answers the counters that explain it. Teardown drains this diagnostic
+  budget as well because a status task can revalidate and synchronize a
+  poisoned writer. The UDP syslog
   listener keeps its instant try, which it counts as a refusal, because it must keep
   reading its socket: a wait there lets the kernel drop datagrams uncounted. The
   MCP four-call limit is a per-session cap of that adapter, not this budget, and is

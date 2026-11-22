@@ -927,11 +927,11 @@ names = ['^(run_new_claim_worker|run_recovery_claim_worker)$']
 
 [[job]]
 id = "query-only-write-refusal"
-summary = "One gate classifies every typed operation as a read it forwards or a write it forwards or, on a query-only daemon, refuses with READ_ONLY. Unix connections, CHAP sessions and the anonymous TCP gate all forward through it, so no handler checks the mode itself."
+summary = "One gate screens typed storage dispatch for shutdown. It first refuses writes in query-only mode with READ_ONLY. Unix connections and requests allowed by the producer endpoint gate share this decision."
 home = "sparrow_server::query_only::WriteGate"
-entry_points = ["sparrow_server::rpc::Rpc::into_gate", "sparrow_server::rpc::Rpc::into_client", "sparrow_server::rpc::Rpc::query_only", "sparrow_server::config::ServerConfig::into_query_only", "sparrow_server::watches::WatchRegistry::stored"]
+entry_points = ["sparrow_server::rpc::Rpc::into_gate", "sparrow_server::rpc::Rpc::into_client", "sparrow_server::rpc::Rpc::query_only", "sparrow_server::rpc::Rpc::require_admission", "sparrow_server::config::ServerConfig::into_query_only", "sparrow_server::watches::WatchRegistry::stored"]
 spec = "docs/interfaces.md: query-only daemon (schema 66)."
-vectors = ["crates/sparrow-server/tests/rpc.rs"]
+vectors = ["crates/sparrow-server/tests/rpc.rs", "crates/sparrow-server/src/rpc.rs"]
 bench = []
 enforced = true
 [job.forbidden]
@@ -4049,11 +4049,11 @@ names = ['^(unlink_stale_socket_elsewhere|replace_local_endpoint)$']
 
 [[job]]
 id = "complete-daemon-teardown"
-summary = "One teardown owner joins intake and maintenance workers, reserves and closes the complete native operation admission budget before the final flush, and cleans only the owned endpoint while retaining primary and cleanup failures; main retains one native interrupt subscription through startup and serving."
+summary = "The teardown owner joins archive, intake and maintenance workers before draining and closing ordinary and diagnostic admission. It then fences the store and cleans only owned endpoints, retaining primary and cleanup failures. Main retains one interrupt subscription through startup and serving."
 home = "sparrowd::shutdown::finish"
-entry_points = ["sparrowd::shutdown::record_failure", "sparrowd::shutdown::drain", "sparrowd::main"]
+entry_points = ["sparrowd::shutdown::record_failure", "sparrow_server::admission::Admission::drain", "sparrowd::main"]
 spec = "docs/interfaces.md: daemon teardown."
-vectors = ["crates/sparrow-server/tests/rpc.rs", "crates/sparrow-server/src/shutdown.rs", "crates/sparrow-server/src/rpc.rs"]
+vectors = ["crates/sparrow-server/tests/rpc.rs", "crates/sparrow-server/src/shutdown.rs", "crates/sparrow-server/src/rpc.rs", "crates/sparrow-server/src/admission.rs"]
 bench = []
 enforced = true
 [job.forbidden]

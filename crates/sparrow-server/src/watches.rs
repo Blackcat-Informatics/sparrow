@@ -2181,9 +2181,13 @@ async fn pass(
                         }
                     })
                 });
-                if result.is_ok() {
+                let result = result.map(|watch| {
                     roster.sync(catalog);
-                }
+                    watch_admin::MutationReceipt {
+                        watch,
+                        retired: store.consumption_retired(),
+                    }
+                });
                 acknowledge(reply, result, store, registry, roster)?;
             }
             watch_admin::Command::Handoff { intent, reply } => {

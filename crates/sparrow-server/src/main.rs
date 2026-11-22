@@ -242,7 +242,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let admission = admission.clone();
         move || admission.import_slot_freed()
     })));
-    let operation_slots = u32::try_from(config.max_concurrent_requests)?;
     // A query-only or no-intake daemon owns no watch root: it reports the stored catalog and
     // claims nothing.
     let (watches, mut consumer) = if config.query_only || !intake {
@@ -285,7 +284,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &store,
                 &[],
                 &admission,
-                operation_slots,
             )
             .await;
         }
@@ -318,7 +316,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &store,
                         &[&endpoint],
                         &admission,
-                        operation_slots,
                     )
                     .await;
                 }
@@ -348,7 +345,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             &store,
             &endpoints,
             &admission,
-            operation_slots,
         )
         .await;
     }
@@ -385,7 +381,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &store,
                     &endpoints,
                     &admission,
-                    operation_slots,
                 )
                 .await;
             }
@@ -500,7 +495,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &store,
                 &endpoints,
                 &admission,
-                operation_slots,
             )
             .await
         })
