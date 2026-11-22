@@ -155,8 +155,10 @@ def ledger_keys(ledger_path):
         if len(fields) == 4:
             fields = fields[1:]
         elif len(fields) != 3:
-            fail(f"{ledger_path}:{number}: ledger key {key!r} must be inode:size:mtime_ns "
-                 "(or the older dev:inode:size:mtime_ns); repair or remove the line")
+            raise ValueError(
+                f"line {number}: ledger key {key!r} must be inode:size:mtime_ns "
+                "or the older dev:inode:size:mtime_ns"
+            )
         keys.add(":".join(fields))
     return keys
 
@@ -478,12 +480,25 @@ def run(config):
     queued = sum(size for queue in queues.values() for _, size in waiting(queue))
     now = time.time()
     failures = 0
-    reaped = [source for source in config["source"] if source.get("delete_acknowledged", False)]
+    blocked_ledgers = 0
+    reaped = []
     for source in config["source"]:
-        ledger_path = state / f"{source['name']}.ledger"
-        shipped = set()
-        if ledger_path.exists():
+        name = source["name"]
+        ledger_path = state / f"{name}.ledger"
+        try:
             shipped = ledger_keys(ledger_path)
+        except FileNotFoundError:
+            shipped = set()
+        except (OSError, ValueError) as error:
+            blocked_ledgers += 1
+            print(
+                f"sparrow-ship: {name}: cannot read ledger {ledger_path}: {error}. "
+                "Restore a valid ledger to resume queueing and reaping this source",
+                file=sys.stderr,
+            )
+            continue
+        if source.get("delete_acknowledged", False):
+            reaped.append(source)
         count = 0
         with open(ledger_path, "a") as ledger:
             for path, stat in finished(source, now):
@@ -519,6 +534,8 @@ def run(config):
                       f"set aside {set_aside}, not yet acknowledged {kept}")
         except StoreUnreachable as error:
             print(f"sparrow-ship: store unreachable ({error}); no further spool file deleted")
+    if blocked_ledgers:
+        fail(f"{blocked_ledgers} source ledger(s) need repair. {failures} file(s) failed to queue")
     if failures:
         fail(f"{failures} file(s) failed; originals are untouched and will be retried")
 

@@ -516,6 +516,11 @@ identity and is shipped again whole, so its earlier records appear twice.
 over successive runs. Failures exit nonzero and leave originals untouched for
 the next run.
 
+If a source ledger cannot be read or has a malformed entry, the shipper names
+the source and ledger and pauses queueing and reaping for that source. It still
+feeds previously staged items and processes healthy sources. Restore the
+affected ledger before the next run to resume queueing and reaping.
+
 `state_dir` must be on the same filesystem as `intake_root`, because each
 queued item is renamed into its root; production keeps both under `/SPARROW`.
 The daemon runs as its own user and reads each item through its group, so the
