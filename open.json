@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 8,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/8-make-lossy-aspirational-delivery-an",
+  "branch": "paudley/8-make-lossy-aspirational-delivery-an",
+  "slug": "make-lossy-aspirational-delivery-an",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/8-make-lossy-aspirational-delivery-an/.stage/make-lossy-aspirational-delivery-an",
+  "stage_tracked": true,
+  "base": "refs/remotes/origin/main",
+  "base_oid": "e2f9af93b031c8a45c1dd168e318cae725c23a02",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/8-make-lossy-aspirational-delivery-an",
+    "branch:paudley/8-make-lossy-aspirational-delivery-an",
+    "ignored:4 files (4 reflinked, 0 written)",
+    "rust-caches:skipping busy source /opt/.cargo/6b/06b5f2a2dd32c0: /opt/.cargo/6b/06b5f2a2dd32c0/release/.cargo-build-lock; skipping busy source /opt/.cargo/6b/06b5f2a2dd32c0: /opt/.cargo/6b/06b5f2a2dd32c0/release/.cargo-build-lock; reflinked /home/paudley/Active/sparrow/.worktrees/459-prepare-sparrow-for-public-github caches into /home/paudley/Active/sparrow/.worktrees/8-make-lossy-aspirational-delivery-an plus 0 dependency units from 0 other checkouts in 2.7s; 220 unchanged files keep their built mtimes; 118 other files take the seed time and rebuild; 8 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/8-make-lossy-aspirational-delivery-an/.stage/make-lossy-aspirational-delivery-an",
+    "issue:/home/paudley/Active/sparrow/.worktrees/8-make-lossy-aspirational-delivery-an/.stage/make-lossy-aspirational-delivery-an/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-21T18:58:40-0600",
+  "seed_error": ""
+}

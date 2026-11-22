@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/8-make-lossy-aspirational-delivery-an",
+  "branch": "paudley/8-make-lossy-aspirational-delivery-an",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "7ef0929161ad2172338c3b161824e4b0701ea6dd",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/8-make-lossy-aspirational-delivery-an/.stage/make-lossy-aspirational-delivery-an/sync/20261122T013220-84cf77d58c7b42c1b79c70f6ef5d35b1",
+  "conflicts": [],
+  "status": "completed",
+  "base": "89740d13c245cdff1fc8a7c546d05c649854f12d",
+  "merge_bases": [
+    "e2f9af93b031c8a45c1dd168e318cae725c23a02"
+  ],
+  "merge_index": "234fe7a8feb62c52e26760f3b2b02f44dc996baf839166934af9dc4e2a1f5bbd",
+  "candidate_tree": "6c99c482bff48e021a700b22f660a55fcd9549d6",
+  "candidate_patch": "candidate-9fa724aecc7445d7b59e9cd99191bc86.patch",
+  "stdout_log": "commit-9fa724aecc7445d7b59e9cd99191bc86.stdout.log",
+  "stderr_log": "commit-9fa724aecc7445d7b59e9cd99191bc86.stderr.log",
+  "validation_records": [],
+  "commit_duration_seconds": 16.93484809799702,
+  "commit": "6104377b435cfcd4aa8a91482ea24c08559d033e",
+  "tree": "6c99c482bff48e021a700b22f660a55fcd9549d6",
+  "exit_code": 0
+}

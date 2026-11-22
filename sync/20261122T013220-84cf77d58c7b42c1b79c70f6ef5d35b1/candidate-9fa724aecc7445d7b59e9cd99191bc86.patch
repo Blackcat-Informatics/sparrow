@@ -1,0 +1,2023 @@
+diff --git Cargo.lock Cargo.lock
+index eb1dcab..d7a343c 100644
+--- Cargo.lock
++++ Cargo.lock
+@@ -1390,6 +1390,7 @@ dependencies = [
+  "purrdf-lex",
+  "rustix",
+  "serde",
++ "sparrow-limits",
+  "sparrow-test-support",
+  "tempfile",
+  "tokio",
+@@ -1410,6 +1411,7 @@ dependencies = [
+  "purrdf-lex",
+  "rocksdb",
+  "rustix",
++ "sparrow-limits",
+  "sparrow-test-support",
+  "tempfile",
+  "tracing",
+@@ -1425,6 +1427,10 @@ dependencies = [
+  "syn 2.0.119",
+ ]
+ 
++[[package]]
++name = "sparrow-limits"
++version = "0.1.0"
++
+ [[package]]
+ name = "sparrow-server"
+ version = "0.1.0"
+diff --git Cargo.toml Cargo.toml
+index b189896..03f8395 100644
+--- Cargo.toml
++++ Cargo.toml
+@@ -3,7 +3,7 @@
+ 
+ [workspace]
+ resolver = "3"
+-members = ["crates/sparrow-helper-census", "crates/sparrow-archive", "crates/sparrow-core", "crates/sparrow-client", "crates/sparrow-server", "crates/sparrow-test-support"]
++members = ["crates/sparrow-limits", "crates/sparrow-helper-census", "crates/sparrow-archive", "crates/sparrow-core", "crates/sparrow-client", "crates/sparrow-server", "crates/sparrow-test-support"]
+ 
+ [workspace.package]
+ edition = "2024"
+@@ -13,6 +13,7 @@ publish = false
+ license = "MIT OR Apache-2.0 OR MulanPSL-2.0"
+ 
+ [workspace.dependencies]
++sparrow-limits = { path = "crates/sparrow-limits" }
+ blake3 = "1"
+ rocksdb = { version = "0.25", default-features = false, features = ["lz4", "zstd", "bindgen-runtime"] }
+ purrdf = "=4"
+diff --git Makefile Makefile
+index 5d8da38..b950e55 100644
+--- Makefile
++++ Makefile
+@@ -57,6 +57,7 @@ test:
+ # hides warnings a shipped build hits. Check each shipped crate on its own, one cargo invocation
+ # per crate so no other package's features unify in, with warnings denied and no test-support.
+ check-shipped:
++	cargo clippy --locked --release -p sparrow-limits --lib -- -D warnings
+ 	cargo clippy --locked --release -p sparrow-core --lib -- -D warnings
+ 	cargo clippy --locked --release -p sparrow-client --lib -- -D warnings
+ 	cargo clippy --locked --release -p sparrow-server --lib --bins -- -D warnings
+diff --git crates/sparrow-client/Cargo.toml crates/sparrow-client/Cargo.toml
+index 84004c2..120acef 100644
+--- crates/sparrow-client/Cargo.toml
++++ crates/sparrow-client/Cargo.toml
+@@ -11,6 +11,7 @@ publish.workspace = true
+ license.workspace = true
+ 
+ [dependencies]
++sparrow-limits.workspace = true
+ capnp.workspace = true
+ capnp-rpc.workspace = true
+ futures.workspace = true
+diff --git crates/sparrow-client/examples/bulk.rs crates/sparrow-client/examples/bulk.rs
+new file mode 100644
+index 0000000..751d2e4
+--- /dev/null
++++ crates/sparrow-client/examples/bulk.rs
+@@ -0,0 +1,41 @@
++// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++//! Import a completed log file, or read stdin incrementally when FILE is omitted.
++use sparrow_client::{
++    Endpoint, Format,
++    bulk::{BulkConfig, BulkImporter},
++};
++use std::{io, path::PathBuf};
++
++#[tokio::main(flavor = "current_thread")]
++async fn main() -> Result<(), Box<dyn std::error::Error>> {
++    let args: Vec<_> = std::env::args().skip(1).collect();
++    let [endpoint, directory, job_id, rest @ ..] = args.as_slice() else {
++        return Err("usage: bulk ENDPOINT ABSOLUTE_SPOOL JOB_ID [FILE]".into());
++    };
++    let bulk = BulkImporter::new(BulkConfig::new(
++        Endpoint::parse(endpoint)?,
++        PathBuf::from(directory),
++    ))?;
++    let mut job = bulk.open(job_id, "import", Format::Log).await?;
++    match rest {
++        [file] => job.stage_file(file).await?,
++        [] => {
++            let p = job.progress().borrow().clone();
++            if !p.eof {
++                if p.staged > 0 {
++                    return Err(io::Error::other(format!("resume stdin from source offset {} with stage_stream, or pass the original file",p.staged)).into());
++                }
++                job.stage_stream(0, tokio::io::stdin()).await?;
++            }
++        }
++        _ => return Err("bulk accepts at most one completed file".into()),
++    }
++    let result = job.finish().await?;
++    println!(
++        "{} {} {} bytes",
++        result.store_id, result.artifact_id, result.bytes
++    );
++    Ok(())
++}
+diff --git crates/sparrow-client/src/bulk.rs crates/sparrow-client/src/bulk.rs
+new file mode 100644
+index 0000000..f67be55
+--- /dev/null
++++ crates/sparrow-client/src/bulk.rs
+@@ -0,0 +1,546 @@
++// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++mod disk;
++mod worker;
++
++use crate::{
++    CompletedFileIdentity, Endpoint, Error, Format, IMPORT_CHUNK_BYTES, format_label,
++    open_completed_file,
++};
++use disk::{Journal, State};
++use futures::{Stream, StreamExt};
++use serde::{Deserialize, Serialize};
++use std::{
++    io,
++    os::unix::fs::FileExt,
++    path::{Path, PathBuf},
++    sync::{Arc, Mutex, MutexGuard},
++};
++use tokio::{
++    io::{AsyncRead, AsyncReadExt},
++    sync::{Notify, Semaphore, oneshot, watch},
++};
++
++/// Maximum number of recent range receipts carried in a single journal transaction.
++const RECEIPT_WINDOW: u32 = 8;
++
++/// Per-job disk and prefetch bounds. Jobs use separate connections and admission from log delivery.
++#[derive(Debug, Clone)]
++pub struct BulkConfig {
++    /// Producer endpoint, used only by background workers.
++    pub endpoint: Endpoint,
++    /// Optional role or store requirement checked before any network mutation.
++    pub expect: Option<crate::Expect>,
++    /// Private persistent directory. Reopen the same job ID here to recover it.
++    pub directory: PathBuf,
++    /// Maximum simultaneously open inputs on this importer, from one to sixteen.
++    pub concurrency: usize,
++    /// Maximum unconfirmed input bytes per job. Larger files wait for room between ranges.
++    pub staged_bytes: u64,
++    /// Target maximum raw bytes in a remote stream range.
++    pub range_bytes: u64,
++}
++impl BulkConfig {
++    /// Configure two workers, 128 MiB of staged input per job and 256 KiB stream ranges.
++    #[must_use]
++    pub fn new(endpoint: Endpoint, directory: impl Into<PathBuf>) -> Self {
++        Self {
++            endpoint,
++            expect: None,
++            directory: directory.into(),
++            concurrency: 2,
++            staged_bytes: 128 * 1024 * 1024,
++            range_bytes: 256 * 1024,
++        }
++    }
++}
++
++/// One completed file's stable input identity and original format.
++#[derive(Clone, Debug)]
++pub struct BulkFile {
++    /// Distinct application-owned request key that survives process restarts.
++    pub id: String,
++    /// Sparrow source label.
++    pub source: String,
++    /// Original file format.
++    pub format: Format,
++    /// Caller-owned completed file.
++    pub path: PathBuf,
++}
++
++/// Client handle for importing files and incremental byte streams from any Tokio runtime.
++#[derive(Clone)]
++pub struct BulkImporter {
++    config: Arc<BulkConfig>,
++    workers: Arc<Semaphore>,
++}
++
++impl BulkImporter {
++    /// Validate the bounds. Opening a job creates its local journal without waiting for Sparrow.
++    pub fn new(config: BulkConfig) -> Result<Self, Error> {
++        config.endpoint.validate()?;
++        if let Some(expected) = &config.expect {
++            expected.validate()?;
++        }
++        if !(1..=16).contains(&config.concurrency)
++            || config.range_bytes == 0
++            || config.range_bytes > config.staged_bytes
++            || config.staged_bytes > i64::MAX as u64
++            || !config.directory.is_absolute()
++        {
++            return Err(Error::InvalidArgument(
++                "bulk requires an absolute directory, 1..16 workers and positive range_bytes <= staged_bytes <= i64::MAX",
++            ));
++        }
++        Ok(Self {
++            workers: Arc::new(Semaphore::new(config.concurrency)),
++            config: Arc::new(config),
++        })
++    }
++
++    /// Create or reopen a durable job. One active writer owns its ID across processes.
++    pub async fn open(&self, id: &str, source: &str, format: Format) -> Result<BulkJob, Error> {
++        if id.is_empty() || id.len() > 128 || source.is_empty() || source.len() > 512 {
++            return Err(Error::InvalidArgument(
++                "bulk requires a 1..128-byte job ID and 1..512-byte source",
++            ));
++        }
++        let permit = self
++            .workers
++            .clone()
++            .acquire_owned()
++            .await
++            .map_err(io::Error::other)?;
++        let initial = State {
++            id: id.into(),
++            source: source.into(),
++            format: format_label(format).into(),
++            staged: 0,
++            boundary: 0,
++            confirmed: 0,
++            count: 0,
++            receipts: Vec::new(),
++            page_start: 0,
++            page_offset: 0,
++            previous: None,
++            eof: false,
++            store: None,
++            pending: None,
++            completed: None,
++            file: None,
++        };
++        let root = self.config.directory.clone();
++        let (permit, journal) =
++            tokio::task::spawn_blocking(move || Journal::open(&root, initial).map(|j| (permit, j)))
++                .await
++                .map_err(io::Error::other)??;
++        let (status, progress) = watch::channel(BulkProgress::from_state(&journal.state));
++        let shared = Arc::new(Shared {
++            _permit: permit,
++            journal: Mutex::new(journal),
++            upload: Arc::default(),
++            status,
++            wake: Notify::new(),
++            config: self.config.clone(),
++        });
++        let (stop, stopped) = oneshot::channel();
++        let worker = shared.clone();
++        let (done, handle) = oneshot::channel();
++        std::thread::Builder::new()
++            .name("sparrow-bulk".into())
++            .spawn(move || {
++                let result = (|| {
++                    let runtime = tokio::runtime::Builder::new_current_thread()
++                        .enable_all()
++                        .build()?;
++                    tokio::task::LocalSet::new().block_on(&runtime, async {
++                        tokio::select! { r=worker::run(&worker)=>r, _=stopped=>Ok(()) }
++                    })
++                })();
++                drop(worker);
++                let _ = done.send(result);
++            })?;
++        Ok(BulkJob {
++            shared,
++            progress,
++            stop: Some(stop),
++            handle: Some(handle),
++            staging: None,
++        })
++    }
++
++    /// Snapshot and import a completed file, returning its durable artifact or manifest receipt.
++    pub async fn import_file(&self, input: &BulkFile) -> Result<BulkSummary, Error> {
++        let mut job = self.open(&input.id, &input.source, input.format).await?;
++        let sealed_file = {
++            let progress = job.progress.borrow();
++            progress.eof && progress.file.is_some()
++        };
++        if !sealed_file {
++            job.stage_file(&input.path).await?;
++        }
++        job.finish().await
++    }
++
++    /// Import several files with bounded open descriptors and upload workers. Each result names
++    /// its input, including on failure. Results arrive in completion order.
++    pub fn import_files<'a>(
++        &'a self,
++        files: impl IntoIterator<Item = BulkFile> + 'a,
++    ) -> impl Stream<Item = (BulkFile, Result<BulkSummary, Error>)> + 'a {
++        futures::stream::iter(files)
++            .map(move |input| async move {
++                let result = self.import_file(&input).await;
++                (input, result)
++            })
++            .buffer_unordered(self.config.concurrency)
++    }
++}
++
++/// One acknowledged range. Its half-open offsets identify the original bytes across retries.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct RangeReceipt {
++    /// Part ordinal.
++    pub index: u32,
++    /// First byte in the input.
++    pub start: u64,
++    /// First byte after this range.
++    pub end: u64,
++    /// Stored format, including opaque for a split record.
++    pub format: String,
++    /// Persistent destination store.
++    pub store_id: String,
++    /// Certified artifact occurrence.
++    pub artifact_id: String,
++    /// Certified whole-part BLAKE3 digest.
++    pub payload_id: String,
++}
++
++/// Snapshot of independently advancing local and remote offsets.
++#[derive(Debug, Clone)]
++pub struct BulkProgress {
++    file: Option<CompletedFileIdentity>,
++    /// Bytes durably admitted locally, including those subsequently confirmed remotely.
++    pub staged: u64,
++    /// End of the contiguous remotely durable prefix.
++    pub confirmed: u64,
++    /// Number of certified data ranges, including those in earlier manifest windows.
++    pub ranges: u32,
++    /// First range whose detailed receipt is retained locally.
++    pub first_local_range: u32,
++    /// Most recently published manifest window, covering all earlier ranges through its links.
++    pub last_window: Option<String>,
++    /// Whether EOF has been durably recorded.
++    pub eof: bool,
++    /// Most recent retry or terminal failure, cleared when delivery advances.
++    pub diagnostic: Option<String>,
++    /// Certified final artifact or part-set manifest ID.
++    pub artifact_id: Option<String>,
++}
++impl BulkProgress {
++    fn from_state(state: &State) -> Self {
++        Self {
++            file: state.file,
++            staged: state.staged,
++            confirmed: state.confirmed,
++            ranges: state.count,
++            first_local_range: state.page_start,
++            last_window: state.previous.clone(),
++            eof: state.eof,
++            diagnostic: None,
++            artifact_id: state.completed.clone(),
++        }
++    }
++}
++
++/// Durable result for one complete input.
++#[derive(Debug, Clone)]
++pub struct BulkSummary {
++    /// Persistent destination store.
++    pub store_id: String,
++    /// Whole-file artifact or ordered part-set manifest.
++    pub artifact_id: String,
++    /// Exact input length.
++    pub bytes: u64,
++    /// Number of data artifacts.
++    pub ranges: u32,
++}
++
++struct Shared {
++    _permit: tokio::sync::OwnedSemaphorePermit,
++    journal: Mutex<Journal>,
++    upload: Arc<crate::parts::PartsProgress>,
++    status: watch::Sender<BulkProgress>,
++    wake: Notify,
++    config: Arc<BulkConfig>,
++}
++impl Shared {
++    fn lock(&self) -> Result<MutexGuard<'_, Journal>, Error> {
++        let guard = self
++            .journal
++            .lock()
++            .map_err(|_| Error::Protocol("bulk journal lock poisoned"))?;
++        if guard.faulted {
++            return Err(Error::Protocol(
++                "bulk metadata transaction failed; reopen the job before resuming",
++            ));
++        }
++        Ok(guard)
++    }
++    fn changed(&self, state: &State) {
++        self.status.send_modify(|p| {
++            let diagnostic = p.diagnostic.take();
++            *p = BulkProgress::from_state(state);
++            p.diagnostic = diagnostic;
++        });
++        self.wake.notify_one();
++    }
++}
++
++/// An exclusively open job. Dropping the handle stops the uploader and leaves durable data
++/// for the next open. Use `close` to wait for the worker to release the job.
++pub struct BulkJob {
++    shared: Arc<Shared>,
++    progress: watch::Receiver<BulkProgress>,
++    stop: Option<oneshot::Sender<()>>,
++    handle: Option<oneshot::Receiver<Result<(), Error>>>,
++    staging: Option<tokio::task::JoinHandle<Result<(), Error>>>,
++}
++impl BulkJob {
++    /// Observe byte offsets and receipts without waiting for EOF.
++    #[must_use]
++    pub fn progress(&self) -> watch::Receiver<BulkProgress> {
++        self.progress.clone()
++    }
++
++    /// Native staged-upload checkpoints for the current range.
++    #[must_use]
++    pub fn upload_progress(&self) -> crate::parts::ProgressMark {
++        self.shared.upload.mark()
++    }
++
++    async fn settle_staging(&mut self) -> Result<(), Error> {
++        if let Some(inflight) = &mut self.staging {
++            let result = inflight.await;
++            self.staging.take();
++            result.map_err(io::Error::other)??;
++        }
++        Ok(())
++    }
++
++    /// The caller and uploader have finished their work. Release the kernel lock before
++    /// reporting completion even if another task still holds a read-only journal reference.
++    async fn release(&self) -> Result<(), Error> {
++        let shared = self.shared.clone();
++        tokio::task::spawn_blocking(move || Ok(shared.lock()?.release()?))
++            .await
++            .map_err(io::Error::other)?
++    }
++
++    /// Read a confirmed range receipt by ordinal without collecting the full stream.
++    pub async fn receipt(&self, index: u32) -> Result<RangeReceipt, Error> {
++        let shared = self.shared.clone();
++        tokio::task::spawn_blocking(move || {
++            let j = shared.lock()?;
++            if index < j.state.page_start {
++                return Err(Error::InvalidArgument(
++                    "range was published in a manifest window; follow the last_window artifact",
++                ));
++            }
++            if index >= j.state.count {
++                return Err(Error::InvalidArgument("range has not been confirmed"));
++            }
++            j.state
++                .receipts
++                .get((index - j.state.page_start) as usize)
++                .cloned()
++                .ok_or(Error::Protocol("bulk journal lost a confirmed range"))
++        })
++        .await
++        .map_err(io::Error::other)?
++    }
++
++    /// Snapshot a completed file, retaining its caller-owned descriptor generation across
++    /// reads. Files larger than the staging allowance wait for published ranges to make room.
++    /// Supply the same unchanged file to continue a partially staged snapshot after restart.
++    pub async fn stage_file(&mut self, path: impl AsRef<Path>) -> Result<(), Error> {
++        self.settle_staging().await?;
++        let path = path.as_ref().to_owned();
++        let shared = self.shared.clone();
++        let (opened, descriptor) = oneshot::channel();
++        self.staging = Some(tokio::task::spawn_blocking(move || {
++            let file = open_completed_file(&path)?;
++            let identity = CompletedFileIdentity::capture(&file.metadata()?);
++            let mut j = shared.lock()?;
++            match j.state.file {
++                Some(old) if old != identity => {
++                    return Err(Error::InvalidArgument(
++                        "completed input changed since the job began",
++                    ));
++                }
++                Some(_) => {}
++                None if j.state.staged != 0 || j.state.eof => {
++                    return Err(Error::InvalidArgument("bulk job already owns stream input"));
++                }
++                None => j.change(|s| s.file = Some(identity))?,
++            }
++            shared.changed(&j.state);
++            let _ = opened.send((Arc::new(file), identity));
++            Ok(())
++        }));
++        self.settle_staging().await?;
++        let (input, identity) = descriptor.await.map_err(io::Error::other)?;
++        loop {
++            let progress = self.progress.borrow().clone();
++            if progress.eof {
++                return Ok(());
++            }
++            let remaining = identity
++                .length
++                .checked_sub(progress.staged)
++                .ok_or(Error::Protocol("bulk file offset exceeds input length"))?;
++            let take = if remaining == 0 {
++                0
++            } else {
++                remaining.min(self.capacity().await? as u64)
++            };
++            let shared = self.shared.clone();
++            let input = input.clone();
++            self.staging = Some(tokio::task::spawn_blocking(move || {
++                identity.require(&input)?;
++                let mut bytes = vec![0; take as usize];
++                input.read_exact_at(&mut bytes, progress.staged)?;
++                identity.require(&input)?;
++                let mut j = shared.lock()?;
++                if j.state.staged != progress.staged {
++                    return Err(Error::Protocol("bulk file offset changed"));
++                }
++                if take != 0 {
++                    j.append(&bytes)?;
++                }
++                if take == remaining {
++                    identity.require(&input)?;
++                    j.change(|s| s.eof = true)?;
++                }
++                shared.changed(&j.state);
++                Ok(())
++            }));
++            self.settle_staging().await?;
++        }
++    }
++
++    async fn capacity(&mut self) -> Result<usize, Error> {
++        loop {
++            let p = self.progress.borrow_and_update().clone();
++            let available = self
++                .shared
++                .config
++                .staged_bytes
++                .saturating_sub(p.staged - p.confirmed);
++            if available > 0 {
++                return Ok(available.min(IMPORT_CHUNK_BYTES as u64) as usize);
++            }
++            let handle = self
++                .handle
++                .as_mut()
++                .ok_or(Error::Protocol("bulk worker closed"))?;
++            tokio::select! {
++                result = handle => {
++                    self.handle.take();
++                    result.map_err(io::Error::other)??;
++                    return Err(Error::Protocol("bulk upload stopped before EOF"));
++                }
++                change = self.progress.changed() => change.map_err(io::Error::other)?,
++            }
++        }
++    }
++
++    /// Read exactly from the specified durable input offset. Supply upstream bytes beginning
++    /// there when reattaching after a crash. Backpressure stops polling the reader at quota.
++    /// EOF seals the job locally and `finish` waits for the remote receipt.
++    pub async fn stage_stream(
++        &mut self,
++        offset: u64,
++        mut reader: impl AsyncRead + Unpin,
++    ) -> Result<(), Error> {
++        self.settle_staging().await?;
++        let initial = self.progress.borrow().clone();
++        if initial.eof || offset != initial.staged || initial.file.is_some() {
++            return Err(Error::InvalidArgument(
++                "stream must resume at its current staged offset before EOF",
++            ));
++        }
++        let mut buf = vec![0; IMPORT_CHUNK_BYTES];
++        loop {
++            let size = self.capacity().await?;
++            let handle = self
++                .handle
++                .as_mut()
++                .ok_or(Error::Protocol("bulk worker closed"))?;
++            let count = tokio::select! {
++                result = handle => {
++                    self.handle.take();
++                    result.map_err(io::Error::other)??;
++                    return Err(Error::Protocol("bulk worker ended before EOF"));
++                }
++                read = reader.read(&mut buf[..size]) => read?,
++            };
++            let shared = self.shared.clone();
++            let chunk = buf[..count].to_vec();
++            self.staging = Some(tokio::task::spawn_blocking(move || {
++                let mut j = shared.lock()?;
++                if count == 0 {
++                    j.change(|s| s.eof = true)?;
++                } else {
++                    j.append(&chunk)?;
++                }
++                shared.changed(&j.state);
++                Ok(())
++            }));
++            self.settle_staging().await?;
++            if count == 0 {
++                return Ok(());
++            }
++        }
++    }
++
++    /// Wait for the final certified remote receipt after EOF.
++    pub async fn finish(mut self) -> Result<BulkSummary, Error> {
++        self.settle_staging().await?;
++        if !self.progress.borrow().eof {
++            return Err(Error::InvalidArgument(
++                "stage a completed file or reach stream EOF before finish",
++            ));
++        }
++        if let Some(handle) = self.handle.take() {
++            handle.await.map_err(io::Error::other)??;
++        }
++        self.release().await?;
++        let j = self.shared.lock()?;
++        Ok(BulkSummary {
++            store_id: j
++                .state
++                .store
++                .clone()
++                .ok_or(Error::Protocol("bulk completion omitted store"))?,
++            artifact_id: j
++                .state
++                .completed
++                .clone()
++                .ok_or(Error::Protocol("bulk completion omitted receipt"))?,
++            bytes: j.state.confirmed,
++            ranges: j.state.count,
++        })
++    }
++
++    /// Stop this worker and wait until all active network work has ended.
++    pub async fn close(mut self) -> Result<(), Error> {
++        self.settle_staging().await?;
++        self.stop.take();
++        if let Some(handle) = self.handle.take() {
++            handle.await.map_err(io::Error::other)??;
++        }
++        self.release().await
++    }
++}
+diff --git crates/sparrow-client/src/bulk/disk.rs crates/sparrow-client/src/bulk/disk.rs
+new file mode 100644
+index 0000000..a1c2e1a
+--- /dev/null
++++ crates/sparrow-client/src/bulk/disk.rs
+@@ -0,0 +1,363 @@
++// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++use super::{RECEIPT_WINDOW, RangeReceipt};
++use crate::{Error, IMPORT_CHUNK_BYTES, parts::CutSource};
++use serde::{Deserialize, Serialize};
++use std::{
++    fs::{self, File, OpenOptions},
++    io::{self, Read, Write},
++    os::unix::fs::{FileExt, OpenOptionsExt},
++    path::{Path, PathBuf},
++};
++
++const BLOCK: u64 = IMPORT_CHUNK_BYTES as u64;
++
++#[derive(Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub(super) struct State {
++    pub(super) id: String,
++    pub(super) source: String,
++    pub(super) format: String,
++    pub(super) staged: u64,
++    pub(super) boundary: u64,
++    pub(super) confirmed: u64,
++    pub(super) count: u32,
++    pub(super) receipts: Vec<RangeReceipt>,
++    pub(super) page_start: u32,
++    pub(super) page_offset: u64,
++    pub(super) previous: Option<String>,
++    pub(super) eof: bool,
++    pub(super) file: Option<crate::CompletedFileIdentity>,
++    pub(super) store: Option<String>,
++    pub(super) pending: Option<Pending>,
++    pub(super) completed: Option<String>,
++}
++
++#[derive(Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub(super) struct Pending {
++    pub(super) length: u64,
++    pub(super) format: String,
++    pub(super) digest: String,
++    pub(super) page_end: Option<u32>,
++    pub(super) final_page: bool,
++    pub(super) import: Option<String>,
++}
++
++fn read_meta<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
++    let mut bytes = String::new();
++    File::open(path)?
++        .take(64 * 1024 + 1)
++        .read_to_string(&mut bytes)?;
++    if bytes.len() > 64 * 1024 {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            "bulk journal entry exceeds 64 KiB",
++        ));
++    }
++
++    toml::from_str(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
++}
++
++fn write_meta<T: Serialize>(dir: &Path, name: &str, value: &T) -> io::Result<()> {
++    let bytes = toml::to_string(value).map_err(io::Error::other)?;
++    let scratch = dir.join("transaction.tmp");
++    let mut file = OpenOptions::new()
++        .create(true)
++        .truncate(true)
++        .write(true)
++        .mode(0o600)
++        .open(&scratch)?;
++    file.write_all(bytes.as_bytes())?;
++    file.sync_all()?;
++    fs::rename(scratch, dir.join(name))?;
++    File::open(dir)?.sync_all()
++}
++
++pub(super) struct Journal {
++    dir: PathBuf,
++    pub(super) state: State,
++    owner: File,
++    pub(super) faulted: bool,
++}
++
++impl Journal {
++    pub(super) fn open(root: &Path, initial: State) -> io::Result<Self> {
++        let key = purrdf_hash::blake3::hash(initial.id.as_bytes());
++        let dir = root.join(purrdf_hash::hex::encode(key.as_bytes()));
++        crate::quarantine::create_dir(&dir)?;
++        let lock = OpenOptions::new()
++            .read(true)
++            .write(true)
++            .create(true)
++            .truncate(false)
++            .mode(0o600)
++            .open(dir.join("owner"))?;
++        lock.try_lock().map_err(io::Error::from)?;
++        let state = match read_meta::<State>(&dir.join("state.toml")) {
++            Ok(state) => {
++                if state.id != initial.id
++                    || state.format != initial.format
++                    || state.source != initial.source
++                    || state.confirmed > state.staged
++                    || state.boundary > state.staged
++                    || state.page_start > state.count
++                    || state.page_offset > state.confirmed
++                    || !state.valid_receipts()
++                    || (state.page_start != 0) != state.previous.is_some()
++                    || state.completed.is_some()
++                        && (!state.eof
++                            || state.confirmed != state.staged
++                            || state.pending.is_some())
++                    || state.pending.as_ref().is_some_and(|p| {
++                        p.page_end.is_none() && p.length > state.staged - state.confirmed
++                    })
++                {
++                    return Err(io::Error::new(
++                        io::ErrorKind::InvalidData,
++                        "bulk job identity or durable offsets disagree",
++                    ));
++                }
++                state
++            }
++            Err(e) if e.kind() == io::ErrorKind::NotFound => {
++                for entry in fs::read_dir(&dir)? {
++                    let name = entry?.file_name();
++                    if name != "owner" && name != "transaction.tmp" {
++                        return Err(io::Error::new(
++                            io::ErrorKind::InvalidData,
++                            "bulk journal is missing its state while retained data remains",
++                        ));
++                    }
++                }
++                write_meta(&dir, "state.toml", &initial)?;
++                initial
++            }
++            Err(e) => return Err(e),
++        };
++        let journal = Self {
++            dir,
++            state,
++            owner: lock,
++            faulted: false,
++        };
++        journal.recover_space()?;
++        Ok(journal)
++    }
++
++    pub(super) fn release(&self) -> io::Result<()> {
++        // File locks follow the open file description. A forked child can transiently
++        // hold another reference even with close-on-exec, so close alone is insufficient.
++        self.owner.unlock()
++    }
++
++    fn recover_space(&self) -> io::Result<()> {
++        // A receipt can survive a crash before its input blocks were unlinked.
++        for item in fs::read_dir(&self.dir)? {
++            let item = item?;
++            let name = item.file_name();
++            let block = name
++                .to_str()
++                .and_then(|n| n.strip_prefix("data-"))
++                .and_then(|n| n.parse::<u64>().ok());
++            if block.is_some_and(|n| self.reclaimable(n)) {
++                fs::remove_file(item.path())?;
++            }
++        }
++        Ok(())
++    }
++
++    pub(super) fn complete(&mut self, artifact: String) -> io::Result<()> {
++        self.change(|s| {
++            s.completed = Some(artifact);
++            s.pending = None;
++        })
++    }
++
++    pub(super) fn window(&mut self, artifact: String, end: u32, offset: u64) -> io::Result<()> {
++        self.change(|s| {
++            s.previous = Some(artifact);
++            s.page_start = end;
++            s.page_offset = offset;
++            s.receipts.retain(|r| r.index >= end);
++            s.pending = None;
++        })
++    }
++
++    pub(super) fn change(&mut self, edit: impl FnOnce(&mut State)) -> io::Result<()> {
++        let mut state = self.state.clone();
++        edit(&mut state);
++        // EOF and the first range's acknowledgment can arrive in either order. The later
++        // transaction already has the complete certificate and can finish without discovery.
++        if state.completed.is_none()
++            && state.eof
++            && state.confirmed == state.staged
++            && state.count == 1
++        {
++            let range = state.receipts.first().ok_or_else(|| {
++                io::Error::new(
++                    io::ErrorKind::InvalidData,
++                    "missing sole bulk range receipt",
++                )
++            })?;
++            state.completed = Some(range.artifact_id.clone());
++        }
++        let completed = self.state.completed.is_none() && state.completed.is_some();
++        if let Err(error) = write_meta(&self.dir, "state.toml", &state) {
++            // A failed directory sync can follow a successful rename. Reopen to establish
++            // which transaction is present before permitting another append or RPC.
++            self.faulted = true;
++            return Err(error);
++        }
++        self.state = state;
++        if completed {
++            self.recover_space()?;
++        }
++        Ok(())
++    }
++
++    pub(super) fn append(&mut self, data: &[u8]) -> Result<(), Error> {
++        let start = self.state.staged;
++        let end = start
++            .checked_add(data.len() as u64)
++            .ok_or(Error::InvalidArgument("bulk offset exhausted"))?;
++        self.blocks().write_at(data, start)?;
++        let boundary = data
++            .iter()
++            .rposition(|b| *b == b'\n')
++            .map(|n| start + n as u64 + 1);
++        self.change(|s| {
++            s.staged = end;
++            if let Some(boundary) = boundary {
++                s.boundary = boundary;
++            }
++        })?;
++        Ok(())
++    }
++
++    pub(super) fn blocks(&self) -> Blocks {
++        Blocks(self.dir.clone())
++    }
++
++    fn reclaimable(&self, block: u64) -> bool {
++        // The planner needs the byte preceding its next position to recognize line boundaries.
++        self.state.completed.is_some() || block < self.state.confirmed.saturating_sub(1) / BLOCK
++    }
++
++    pub(super) fn certify(&mut self, receipt: RangeReceipt) -> Result<(), Error> {
++        let old = self.state.confirmed;
++        let end = receipt.end;
++        let next = self
++            .state
++            .count
++            .checked_add(1)
++            .ok_or(Error::InvalidArgument("bulk range ordinals exhausted"))?;
++        self.change(|s| {
++            s.confirmed = end;
++            s.receipts.push(receipt);
++            s.count = next;
++            s.pending = None;
++        })?;
++        if self.state.completed.is_some() {
++            return Ok(());
++        }
++        // Start one block earlier because the previous range retained its boundary byte.
++        for n in old.saturating_sub(1) / BLOCK..=end / BLOCK {
++            if self.reclaimable(n) {
++                match fs::remove_file(self.blocks().path(n)) {
++                    Ok(()) => {}
++                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
++                    Err(e) => return Err(e.into()),
++                }
++            }
++        }
++        Ok(())
++    }
++}
++
++impl State {
++    fn valid_receipts(&self) -> bool {
++        let Some(count) = self.count.checked_sub(self.page_start) else {
++            return false;
++        };
++        if count > RECEIPT_WINDOW || self.receipts.len() != count as usize {
++            return false;
++        }
++        let mut offset = self.page_offset;
++        for (index, receipt) in (self.page_start..self.count).zip(&self.receipts) {
++            if receipt.index != index
++                || receipt.start != offset
++                || receipt.end < offset
++                || self.store.as_ref() != Some(&receipt.store_id)
++            {
++                return false;
++            }
++            offset = receipt.end;
++        }
++        offset == self.confirmed
++    }
++}
++
++#[derive(Clone)]
++pub(super) struct Blocks(PathBuf);
++impl Blocks {
++    fn path(&self, n: u64) -> PathBuf {
++        self.0.join(format!("data-{n:020}"))
++    }
++    fn write_at(&self, mut data: &[u8], mut offset: u64) -> io::Result<()> {
++        while !data.is_empty() {
++            let at = offset % BLOCK;
++            let take = data.len().min((BLOCK - at) as usize);
++            let file = OpenOptions::new()
++                .write(true)
++                .create(true)
++                .truncate(false)
++                .mode(0o600)
++                .open(self.path(offset / BLOCK))?;
++            file.write_all_at(&data[..take], at)?;
++            file.sync_data()?;
++            offset += take as u64;
++            data = &data[take..];
++        }
++        File::open(&self.0)?.sync_all()
++    }
++}
++impl CutSource for Blocks {
++    fn read_at(&self, mut bytes: &mut [u8], mut offset: u64) -> Result<(), Error> {
++        while !bytes.is_empty() {
++            let at = offset % BLOCK;
++            let take = bytes.len().min((BLOCK - at) as usize);
++            let (head, tail) = bytes.split_at_mut(take);
++            File::open(self.path(offset / BLOCK))?.read_exact_at(head, at)?;
++            offset += take as u64;
++            bytes = tail;
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    /// Closing an idle job permits immediate reacquisition even while a child retains a
++    /// duplicate of the owner's file description between fork and exec.
++    #[tokio::test]
++    async fn close_releases_an_inherited_owner_description() {
++        use crate::{
++            Endpoint, Format,
++            bulk::{BulkConfig, BulkImporter},
++        };
++        let dir = tempfile::tempdir().unwrap();
++        let bulk = BulkImporter::new(BulkConfig::new(
++            Endpoint::Unix(dir.path().join("absent.sock")),
++            dir.path().join("bulk"),
++        ))
++        .unwrap();
++        let job = bulk.open("job", "source", Format::Log).await.unwrap();
++        let inherited = job.shared.lock().unwrap().owner.try_clone().unwrap();
++        job.close().await.unwrap();
++        let reopened = bulk.open("job", "source", Format::Log).await.unwrap();
++        drop(inherited);
++        reopened.close().await.unwrap();
++    }
++}
+diff --git crates/sparrow-client/src/bulk/worker.rs crates/sparrow-client/src/bulk/worker.rs
+new file mode 100644
+index 0000000..c77fb94
+--- /dev/null
++++ crates/sparrow-client/src/bulk/worker.rs
+@@ -0,0 +1,434 @@
++// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++use super::{
++    RECEIPT_WINDOW, RangeReceipt, Shared,
++    disk::{Blocks, Pending, State},
++};
++use crate::{
++    Client, Durability, Error, Expect, Format, IMPORT_CHUNK_BYTES, format_label,
++    imports::{self, Checkpoint, StagedInput},
++    parse_format,
++    parts::{self, CutSource, PartLimits, PartSpan},
++    receipt::ExpectedArtifact,
++};
++use std::{io, time::Duration};
++
++enum Body {
++    Data(Blocks, u64),
++    Manifest(Vec<u8>),
++}
++
++struct Input<'a> {
++    body: Body,
++    length: u64,
++    digest: Option<String>,
++    shared: &'a Shared,
++}
++
++impl StagedInput for Input<'_> {
++    fn length(&self) -> u64 {
++        self.length
++    }
++    fn unchanged(&self) -> Result<(), Error> {
++        Ok(())
++    }
++    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<(), Error> {
++        match &self.body {
++            Body::Data(blocks, start) => blocks.read_at(buf, start + offset),
++            Body::Manifest(bytes) => CutSource::read_at(bytes.as_slice(), buf, offset),
++        }
++    }
++    fn payload_hint(&self) -> Option<&str> {
++        self.digest.as_deref()
++    }
++    fn before_publish(&self, store: &str, import: &str) -> Result<(), Error> {
++        let mut j = self.shared.lock()?;
++        if j.state.store.as_deref() != Some(store) || j.state.pending.is_none() {
++            return Err(Error::Protocol("publication changed bulk store or range"));
++        }
++        j.change(|s| {
++            if let Some(part) = &mut s.pending {
++                part.import = Some(import.into());
++            }
++        })?;
++        Ok(())
++    }
++}
++
++fn set_id(state: &State) -> String {
++    format!(
++        "bulk:{}",
++        purrdf_hash::hex::encode(purrdf_hash::blake3::hash(state.id.as_bytes()).as_bytes())
++    )
++}
++
++struct Page {
++    bytes: Vec<u8>,
++    end: u32,
++    offset: u64,
++    final_page: bool,
++}
++
++fn manifest(
++    s: &State,
++    limits: &PartLimits,
++    mut end: u32,
++    mut final_page: bool,
++    sealed: bool,
++) -> Result<Page, Error> {
++    use purrdf_lex::json::{self, Object, Value};
++    if end < s.page_start || end > s.count || end - s.page_start > RECEIPT_WINDOW {
++        return Err(Error::Protocol(
++            "bulk manifest window outside receipt ledger",
++        ));
++    }
++    let mut offset = s.page_offset;
++    let mut rows = Vec::new();
++    for r in s.receipts.iter().take((end - s.page_start) as usize) {
++        rows.push((
++            PartSpan {
++                index: r.index,
++                start: r.start,
++                length: r.end - r.start,
++                format: parse_format(&r.format)?,
++            },
++            r.artifact_id.clone(),
++        ));
++        offset = r.end;
++    }
++    let format = parse_format(&s.format)?;
++    loop {
++        let bytes = if final_page && s.previous.is_none() {
++            parts::manifest_body(&set_id(s), &s.source, format, offset, &rows)
++        } else {
++            let value: Value = Object::new()
++                .with("schema", "sparrow.bulk-window/1")
++                .with("set", set_id(s))
++                .with("source", s.source.clone())
++                .with("format", s.format.clone())
++                .with(
++                    "previous",
++                    s.previous.clone().map_or(Value::Null, Value::from),
++                )
++                .with("first_index", u64::from(s.page_start))
++                .with("start", s.page_offset)
++                .with("end", offset)
++                .with("complete", final_page)
++                .with(
++                    "parts",
++                    Value::array(rows.iter().map(|(span, id)| parts::manifest_part(span, id))),
++                )
++                .into();
++            json::write_compact(&value).into_bytes()
++        };
++        let length = bytes.len() as u64;
++        if sealed
++            || (length <= limits.raw_split_bytes
++                && parts::is_one_part(bytes.as_slice(), length, Format::Json, limits)?)
++        {
++            return Ok(Page {
++                bytes,
++                end,
++                offset,
++                final_page,
++            });
++        }
++        if rows.len() <= 1 {
++            return Err(Error::InvalidArgument(
++                "store limits cannot admit one bulk manifest window; retained receipts are available locally",
++            ));
++        }
++        let (last, _) = rows
++            .pop()
++            .ok_or(Error::Protocol("empty bulk manifest window"))?;
++        offset = last.start;
++        end -= 1;
++        final_page = false;
++    }
++}
++
++fn part(
++    state: &State,
++    blocks: &Blocks,
++    limits: &PartLimits,
++    range: u64,
++) -> Result<Option<PartSpan>, Error> {
++    let start = state.confirmed;
++    let format = parse_format(&state.format)?;
++    if start == 0
++        && state.eof
++        && (state.staged == 0
++            || (state.file.is_some() || state.staged <= range)
++                && parts::is_one_part(blocks, state.staged, format, limits)?)
++    {
++        return Ok(Some(PartSpan {
++            index: state.count,
++            start,
++            length: state.staged,
++            format,
++        }));
++    }
++    if start == state.staged {
++        return Ok(None);
++    }
++    // A short read is a prefix. Only a real EOF, or the last complete newline, can end a
++    // structured record. One virtual lookahead byte prevents next_cut treating a full
++    // range of unfinished text as the original input's last record.
++    let mut limits = *limits;
++    limits.max_bytes = limits.max_bytes.min(range);
++    let length = if state.eof {
++        state.staged
++    } else if matches!(format, Format::Log | Format::Jsonl) {
++        if state.boundary > start {
++            state.boundary
++        } else if state.staged - start >= limits.max_bytes {
++            start + limits.max_bytes + 1
++        } else {
++            return Ok(None);
++        }
++    } else {
++        state.staged
++    };
++    parts::next_cut(blocks, length, start, state.count, format, &limits).map(Some)
++}
++
++async fn advance(shared: &Shared, client: &Client) -> Result<bool, Error> {
++    let (s, blocks) = {
++        let j = shared.lock()?;
++        (j.state.clone(), j.blocks())
++    };
++    if s.completed.is_some() {
++        return Ok(true);
++    }
++    let finishing = s.eof && s.confirmed == s.staged && s.count > 0;
++    let set = set_id(&s);
++    let limits = PartLimits::from_discovery(
++        client.discovery(),
++        sparrow_limits::SYSLOG_MESSAGE_BYTES as u64,
++    )
++    .map_err(|_| {
++        Error::Unsupported("bulk splitting requires discovered import and retirement limits")
++    })?;
++    let page = match &s.pending {
++        Some(p) => p
++            .page_end
++            .map(|end| manifest(&s, &limits, end, p.final_page, true))
++            .transpose()?,
++        None if finishing || s.count - s.page_start >= RECEIPT_WINDOW => {
++            Some(manifest(&s, &limits, s.count, finishing, false)?)
++        }
++        None => None,
++    };
++    let page_result = page.as_ref().map(|p| (p.end, p.offset, p.final_page));
++    let (body, format, length, request) = if let Some(page) = page {
++        let length = page.bytes.len() as u64;
++        (
++            Body::Manifest(page.bytes),
++            Format::Json,
++            length,
++            format!("{set}.window{:010}", s.page_start),
++        )
++    } else {
++        if s.count == u32::MAX {
++            return Err(Error::InvalidArgument(
++                "bulk job exhausted its range ordinals",
++            ));
++        }
++        let (format, length) = match &s.pending {
++            Some(p) => (parse_format(&p.format)?, p.length),
++            None => {
++                let Some(span) = part(&s, &blocks, &limits, shared.config.range_bytes)? else {
++                    return Ok(false);
++                };
++                (span.format, span.length)
++            }
++        };
++        (
++            Body::Data(blocks, s.confirmed),
++            format,
++            length,
++            parts::part_request(&set, s.count),
++        )
++    };
++    let mut input = Input {
++        body,
++        length,
++        digest: None,
++        shared,
++    };
++    let digest = imports::payload_id(&input, &mut vec![0; IMPORT_CHUNK_BYTES])?;
++    input.digest = Some(digest.clone());
++    if let Some(p) = &s.pending {
++        if p.digest != digest
++            || p.length != length
++            || p.page_end != page_result.map(|r| r.0)
++            || p.format != format_label(format)
++        {
++            return Err(Error::Protocol(
++                "staged bulk bytes or request changed after sealing",
++            ));
++        }
++    } else {
++        let mut j = shared.lock()?;
++        j.change(|s| {
++            s.pending = Some(Pending {
++                length,
++                format: format_label(format).into(),
++                digest: digest.clone(),
++                page_end: page_result.map(|r| r.0),
++                final_page: page_result.is_some_and(|r| r.2),
++                import: None,
++            })
++        })?;
++    }
++    let receipt = if let Some(id) = s.pending.as_ref().and_then(|p| p.import.as_ref()) {
++        // An earlier publication may already have committed. Publishing only its original
++        // native import can retrieve or finish it; it cannot begin a replacement journal.
++        let expected = ExpectedArtifact {
++            discovery: client.discovery(),
++            source: &s.source,
++            format,
++            byte_length: length,
++            payload_id: digest,
++            durability: Durability::Durable,
++            record_count: None,
++        };
++        imports::publish(
++            client.capability(),
++            &client.discovery().store_id,
++            id,
++            &expected,
++        )
++        .await?
++    } else {
++        imports::upload(
++            client.capability(),
++            client.discovery(),
++            &request,
++            &s.source,
++            format,
++            &input,
++            &mut Checkpoint::reporting(Some(shared.upload.clone()), s.count),
++        )
++        .await?
++    };
++    let mut j = shared.lock()?;
++    if let Some((end, offset, final_page)) = page_result {
++        if final_page {
++            j.complete(receipt.id)?;
++        } else {
++            j.window(receipt.id, end, offset)?;
++        }
++    } else {
++        let range = RangeReceipt {
++            index: s.count,
++            start: s.confirmed,
++            end: s.confirmed + length,
++            format: format_label(format).into(),
++            store_id: receipt.store_id,
++            artifact_id: receipt.id,
++            payload_id: receipt.payload_id,
++        };
++        j.certify(range)?;
++    }
++    shared.status.send_modify(|p| p.diagnostic = None);
++    shared.changed(&j.state);
++    Ok(true)
++}
++
++fn retry(error: &Error, connecting: bool) -> bool {
++    if error.retryable() || (connecting && crate::delivery::reconnectable(error)) {
++        return true;
++    }
++    match error {
++        Error::Io(e) => e.kind() == io::ErrorKind::TimedOut,
++        Error::Domain { code, .. } => matches!(
++            code.as_str(),
++            "READ_ONLY" | "UNAUTHENTICATED" | "PERMISSION_DENIED" | "INSTANCE_MISMATCH"
++        ),
++        _ => false,
++    }
++}
++
++pub(super) async fn run(shared: &Shared) -> Result<(), Error> {
++    let mut connection = None;
++    let mut delay = Duration::from_millis(100);
++    loop {
++        let state = shared.lock()?.state.clone();
++        if state.completed.is_some() {
++            return Ok(());
++        }
++        if !state.eof
++            && state.count - state.page_start < RECEIPT_WINDOW
++            && (state.staged == state.confirmed
++                || state
++                    .file
++                    .is_some_and(|file| file.length <= shared.config.staged_bytes))
++        {
++            connection = None;
++            shared.wake.notified().await;
++            continue;
++        }
++        let attempt = async {
++            if connection.is_none() {
++                let connected = match &shared.config.expect {
++                    Some(expected) => {
++                        Client::connect_producer_expecting(&shared.config.endpoint, expected)
++                            .await?
++                    }
++                    None => Client::connect_producer(&shared.config.endpoint).await?,
++                };
++                if let Some(store) = state.store {
++                    Expect::store(store).require(connected.discovery())?;
++                }
++                if shared.lock()?.state.store.is_none() {
++                    shared
++                        .lock()?
++                        .change(|s| s.store = Some(connected.discovery().store_id.clone()))?;
++                }
++                connection = Some(connected);
++            }
++            advance(
++                shared,
++                connection
++                    .as_ref()
++                    .ok_or(Error::Protocol("bulk connection missing"))?,
++            )
++            .await
++        };
++        let result = tokio::time::timeout(Duration::from_secs(30), attempt)
++            .await
++            .unwrap_or_else(|_| {
++                Err(Error::Io(io::Error::new(
++                    io::ErrorKind::TimedOut,
++                    "bulk RPC attempt timed out",
++                )))
++            });
++        match result {
++            Ok(true) => delay = Duration::from_millis(100),
++            Ok(false) => {
++                connection = None;
++                shared.wake.notified().await;
++            }
++            Err(e) => {
++                shared
++                    .status
++                    .send_modify(|p| p.diagnostic = Some(e.to_string()));
++                let draft_expired = matches!(&e,Error::Domain{code,..} if code=="IMPORT_EXPIRED")
++                    && shared
++                        .lock()?
++                        .state
++                        .pending
++                        .as_ref()
++                        .is_some_and(|p| p.import.is_none());
++                if !draft_expired && !retry(&e, connection.is_none()) {
++                    return Err(e);
++                }
++                connection = None;
++                tokio::time::sleep(delay).await;
++                delay = (delay * 2).min(Duration::from_secs(5));
++            }
++        }
++    }
++}
+diff --git crates/sparrow-client/src/imports.rs crates/sparrow-client/src/imports.rs
+index 8a7ebcf..39477e8 100644
+--- crates/sparrow-client/src/imports.rs
++++ crates/sparrow-client/src/imports.rs
+@@ -383,6 +383,10 @@ pub(crate) trait StagedInput {
+     fn read_at(&self, buffer: &mut [u8], offset: u64) -> Result<(), Error>;
+     /// Refuse an input that changed since its length was captured.
+     fn unchanged(&self) -> Result<(), Error>;
++    /// Persist the native identity before publication when this input survives process loss.
++    fn before_publish(&self, _store: &str, _import: &str) -> Result<(), Error> {
++        Ok(())
++    }
+     /// The payload identity already computed for these exact bytes, so `upload` need not
+     /// read them again; `unchanged` still guards the input before begin.
+     fn payload_hint(&self) -> Option<&str> {
+@@ -592,17 +596,25 @@ pub(crate) async fn upload(
+         }
+     }
+     staged.unchanged()?;
++    staged.before_publish(&store, &id)?;
++    let receipt = publish(client, &store, &id, &acceptance).await?;
++    staged.unchanged()?;
++    Ok(receipt)
++}
++
++/// Publish this existing native import. This operation cannot begin a replacement journal.
++pub(crate) async fn publish(
++    client: &wire::sparrow::Client,
++    store: &str,
++    id: &str,
++    acceptance: &crate::receipt::ExpectedArtifact<'_>,
++) -> Result<ArtifactReceipt, Error> {
+     let mut request = client.import_publish_request();
+-    import_reference(request.get().init_import(), &store, &id);
++    import_reference(request.get().init_import(), store, id);
+     let response = request.send().promise.await?;
+-    match response.get()?.get_result()?.which()? {
+-        wire::result::Ok(value) => {
+-            let receipt = acceptance.certify(ArtifactReceipt::decode(value?)?)?;
+-            staged.unchanged()?;
+-            Ok(receipt)
+-        }
+-        wire::result::Error(error) => Err(Error::domain(error?)),
+-    }
++    crate::receipt::certify_result(response.get()?.get_result()?, |value| {
++        acceptance.certify(ArtifactReceipt::decode(value)?)
++    })
+ }
+ 
+ /// Canonical payload identity of the whole staged input, read positionally in `buffer`.
+@@ -636,7 +648,7 @@ fn import_reference(mut out: wire::import_ref::Builder<'_>, store: &str, id: &st
+ /// and for same-boot checks against a live descriptor, but it is never identity: it changes
+ /// across a reboot on btrfs subvolumes, network, overlay and re-enumerated mounts, so an
+ /// observation persisted before a restart must still equal the same file observed after it.
+-#[derive(Clone, Copy, Debug)]
++#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+ pub struct CompletedFileIdentity {
+     /// Filesystem device number, informational only; never compared.
+     pub device: u64,
+diff --git crates/sparrow-client/src/lib.rs crates/sparrow-client/src/lib.rs
+index 87a0e02..23a98ad 100644
+--- crates/sparrow-client/src/lib.rs
++++ crates/sparrow-client/src/lib.rs
+@@ -88,6 +88,8 @@ pub use events::{
+     MAX_EVENT_BYTES, MAX_EVENT_FIELDS, MAX_EVENT_SPANS, ProducerEvent,
+     read_wide as decode_wide_integer, wide as encode_wide_integer,
+ };
++/// Durable file and byte-stream imports for ordinary Tokio tasks.
++pub mod bulk;
+ mod console;
+ mod delivery;
+ mod producer_config;
+diff --git crates/sparrow-client/src/parts.rs crates/sparrow-client/src/parts.rs
+index 49306dc..c82ac22 100644
+--- crates/sparrow-client/src/parts.rs
++++ crates/sparrow-client/src/parts.rs
+@@ -630,30 +630,30 @@ pub fn manifest_body(
+     byte_length: u64,
+     parts: &[(PartSpan, String)],
+ ) -> Vec<u8> {
+-    let parts = parts
++    let rows = parts
+         .iter()
+-        .map(|(span, artifact)| {
+-            Value::from(
+-                Object::new()
+-                    .with("index", u64::from(span.index))
+-                    .with("start", span.start)
+-                    .with("length", span.length)
+-                    .with("format", crate::format_label(span.format))
+-                    .with("artifact", artifact.clone()),
+-            )
+-        })
+-        .collect::<Vec<_>>();
++        .map(|(span, artifact)| manifest_part(span, artifact));
+     let body: Value = Object::new()
+         .with("schema", "sparrow.parts/1")
+         .with("set", set)
+         .with("source", source)
+         .with("format", crate::format_label(format))
+         .with("byte_length", byte_length)
+-        .with("parts", Value::array(parts))
++        .with("parts", Value::array(rows))
+         .into();
+     json::write_compact(&body).into_bytes()
+ }
+ 
++pub(crate) fn manifest_part(span: &PartSpan, artifact: &str) -> Value {
++    Object::new()
++        .with("index", u64::from(span.index))
++        .with("start", span.start)
++        .with("length", span.length)
++        .with("format", crate::format_label(span.format))
++        .with("artifact", artifact.to_owned())
++        .into()
++}
++
+ /// What the first index with no kept receipt says (#285).
+ #[derive(Debug)]
+ pub enum Next {
+diff --git crates/sparrow-core/Cargo.toml crates/sparrow-core/Cargo.toml
+index 8ecbe74..8f74cb8 100644
+--- crates/sparrow-core/Cargo.toml
++++ crates/sparrow-core/Cargo.toml
+@@ -14,6 +14,7 @@ license.workspace = true
+ test-support = []
+ 
+ [dependencies]
++sparrow-limits.workspace = true
+ rocksdb.workspace = true
+ purrdf.workspace = true
+ purrdf-hash.workspace = true
+diff --git crates/sparrow-core/src/storage/syslog.rs crates/sparrow-core/src/storage/syslog.rs
+index a35916b..9a31670 100644
+--- crates/sparrow-core/src/storage/syslog.rs
++++ crates/sparrow-core/src/storage/syslog.rs
+@@ -10,7 +10,7 @@ use purrdf_lex::json::{Object, Value};
+ use std::collections::BTreeSet;
+ 
+ /// Maximum raw packet admitted by the protocol interpreter.
+-pub const SYSLOG_MESSAGE_BYTES: usize = 64 * 1024;
++pub use sparrow_limits::SYSLOG_MESSAGE_BYTES;
+ /// Maximum structured elements captured in one packet.
+ pub const SYSLOG_ELEMENTS: usize = 32;
+ /// Maximum ordered parameter occurrences across all elements.
+diff --git crates/sparrow-limits/Cargo.toml crates/sparrow-limits/Cargo.toml
+new file mode 100644
+index 0000000..ca391ca
+--- /dev/null
++++ crates/sparrow-limits/Cargo.toml
+@@ -0,0 +1,14 @@
++# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++[package]
++name = "sparrow-limits"
++version = "0.1.0"
++edition.workspace = true
++rust-version.workspace = true
++authors.workspace = true
++publish.workspace = true
++license.workspace = true
++
++[lints]
++workspace = true
+diff --git crates/sparrow-limits/src/lib.rs crates/sparrow-limits/src/lib.rs
+new file mode 100644
+index 0000000..84690ae
+--- /dev/null
++++ crates/sparrow-limits/src/lib.rs
+@@ -0,0 +1,9 @@
++// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++//! Fixed admission limits shared by Sparrow storage and producers.
++
++#![no_std]
++
++/// Largest raw message admitted as a single syslog packet.
++pub const SYSLOG_MESSAGE_BYTES: usize = 64 * 1024;
+diff --git crates/sparrow-server/tests/rpc.rs crates/sparrow-server/tests/rpc.rs
+index 7834bcf..8829007 100644
+--- crates/sparrow-server/tests/rpc.rs
++++ crates/sparrow-server/tests/rpc.rs
+@@ -7974,6 +7974,7 @@ struct EventRelayState {
+     drop_first: std::cell::Cell<bool>,
+     corrupt_receipt: std::cell::Cell<bool>,
+     corrupt_publication: std::cell::Cell<bool>,
++    withhold_publication: std::cell::Cell<bool>,
+     /// Answer `importPublish` with this daemon-style refusal `(code, retryable)` instead of forwarding it.
+     refuse_publish: std::cell::Cell<Option<(&'static str, bool)>>,
+     /// Answer `importCancel` with this daemon refusal `(code, retryable)` instead of forwarding it.
+@@ -8241,6 +8242,16 @@ impl wire::sparrow::Server for EventRelay {
+         let mut request = self.0.backend.borrow().import_publish_request();
+         request.get().set_import(params.get()?.get_import()?)?;
+         let response = request.send().promise.await?;
++        if self.0.withhold_publication.replace(false)
++            && let wire::result::Ok(value) = response.get()?.get_result()?.which()?
++        {
++            *self.0.accepted.borrow_mut() = Some(
++                sparrow_client::ArtifactReceipt::decode(value?)
++                    .map_err(|e| capnp::Error::failed(e.to_string()))?,
++            );
++            self.0.first_accepted.notify_one();
++            return std::future::pending().await;
++        }
+         results.get().set_result(response.get()?.get_result()?)?;
+         if let Some(path) = self.0.mutate_published_file.borrow().as_ref() {
+             std::fs::write(path, b"changed").unwrap();
+@@ -8624,6 +8635,225 @@ async fn large_ingest_held_by_the_floor_is_returned_unchanged_and_resumes() {
+         .await;
+ }
+ 
++/// Live input publishes before EOF, recovers the same occurrence after losing its
++/// publication reply, and leaves ordinary logs their own admission and worker.
++#[tokio::test(flavor = "current_thread")]
++async fn bulk_reopens_an_unacknowledged_range_and_publishes_while_input_is_open() {
++    use sparrow_client::{
++        Endpoint, Format,
++        bulk::{BulkConfig, BulkFile, BulkImporter},
++    };
++    use tokio::io::AsyncWriteExt;
++    let test = async {
++        let dir = tempfile::tempdir().unwrap();
++        let store = dir.path().join("store");
++        let socket = store.join("rpc.sock");
++        let config = write_server_config(dir.path(), &store, &socket);
++        let _daemon = start(&config, &socket).await;
++        let backend = connect(&socket).await.unwrap();
++        let relay_path = dir.path().join("bulk.sock");
++        let (state, proxy) = relay(&relay_path, backend.client.clone());
++        state.withhold_publication.set(true);
++        let mut cfg = BulkConfig::new(Endpoint::Unix(relay_path), dir.path().join("bulk"));
++        cfg.staged_bytes = 32;
++        cfg.range_bytes = 16;
++        let bulk = BulkImporter::new(cfg).unwrap();
++        let mut job = bulk
++            .open("input-17", "bulk-stream", Format::Log)
++            .await
++            .unwrap();
++        let (mut write, mut read) = tokio::io::duplex(32);
++        write.write_all(b"head\n\xffwait").await.unwrap();
++        {
++            let staging = job.stage_stream(0, &mut read);
++            tokio::pin!(staging);
++            tokio::select! {r=&mut staging=>panic!("input closed before publication: {r:?}"),
++            ()=state.first_accepted.notified()=>{}}
++        }
++        let held = state.accepted.borrow().clone().unwrap();
++        let delivery = sparrow_client::Delivery::start_async(
++            sparrow_client::DeliveryConfig::new(&socket, "bulk-operational")
++                .with_quarantine_dir(dir.path().join("quarantine")),
++        )
++        .await
++        .unwrap();
++        admit(
++            &delivery,
++            delivery_event("progress during bulk publication"),
++        );
++        assert_eq!(
++            delivery
++                .shutdown_async(Duration::from_secs(5))
++                .await
++                .unwrap()
++                .durable_events,
++            1
++        );
++        job.close().await.unwrap();
++        let mut job = bulk
++            .open("input-17", "bulk-stream", Format::Log)
++            .await
++            .unwrap();
++        assert_eq!(job.progress().borrow().staged, 10);
++        write.write_all(b"!").await.unwrap();
++        drop(write);
++        job.stage_stream(10, &mut read).await.unwrap();
++        let summary = job.finish().await.unwrap();
++        assert_eq!((summary.bytes, summary.ranges), (11, 2));
++        let job = bulk
++            .open("input-17", "bulk-stream", Format::Log)
++            .await
++            .unwrap();
++        let first = job.receipt(0).await.unwrap();
++        let second = job.receipt(1).await.unwrap();
++        assert_eq!(first.artifact_id, held.id);
++        assert_eq!(
++            (first.start, first.end, second.start, second.end),
++            (0, 5, 5, 11)
++        );
++        let client = sparrow_client::Client::connect(&socket).await.unwrap();
++        assert_eq!(
++            client.bytes(&first.artifact_id, 0, 5).await.unwrap(),
++            b"head\n"
++        );
++        assert_eq!(
++            client.bytes(&second.artifact_id, 0, 6).await.unwrap(),
++            b"\xffwait!"
++        );
++        let r = backend
++            .client
++            .status_request()
++            .send()
++            .promise
++            .await
++            .unwrap();
++        assert_eq!(
++            rpc_ok(r.get().unwrap().get_result().unwrap()).get_live_records(),
++            4
++        );
++        job.close().await.unwrap();
++        // An unchanged completed file can be larger than the available disk credit.
++        let path = dir.path().join("complete.bin");
++        let data: Vec<u8> = (0..145).collect();
++        std::fs::write(&path, &data).unwrap();
++        let file = BulkFile {
++            id: "large-input".into(),
++            source: "bulk-file".into(),
++            format: Format::Opaque,
++            path: path.clone(),
++        };
++        let collection = bulk.import_files([file.clone()]);
++        futures::pin_mut!(collection);
++        let (_, result) = futures::StreamExt::next(&mut collection).await.unwrap();
++        let result = result.unwrap();
++        assert!(result.ranges > 1);
++        let job = bulk
++            .open(&file.id, &file.source, file.format)
++            .await
++            .unwrap();
++        let progress = job.progress().borrow().clone();
++        assert!(progress.first_local_range > 0 && progress.last_window.is_some());
++        assert!(
++            job.receipt(0).await.is_err(),
++            "published windows release their local receipt rows"
++        );
++        let mut page = Some(result.artifact_id.clone());
++        let mut groups = Vec::new();
++        while let Some(id) = page {
++            let artifact = client.artifact(&id).await.unwrap();
++            let bytes = client
++                .bytes(&id, 0, artifact.byte_length as u32)
++                .await
++                .unwrap();
++            let value =
++                purrdf_lex::json::read_slice(&bytes, purrdf_lex::json::Limits::default()).unwrap();
++            assert_eq!(value["schema"].as_str(), Some("sparrow.bulk-window/1"));
++            assert_eq!(value["complete"].as_bool(), Some(groups.is_empty()));
++            let mut group = Vec::new();
++            for part in value["parts"].as_array().unwrap() {
++                let bytes = client
++                    .bytes(
++                        part["artifact"].as_str().unwrap(),
++                        0,
++                        part["length"].as_u64().unwrap() as u32,
++                    )
++                    .await
++                    .unwrap();
++                group.extend(bytes);
++            }
++            groups.push(group);
++            page = value["previous"].as_str().map(str::to_owned);
++        }
++        let recovered: Vec<u8> = groups.into_iter().rev().flatten().collect();
++        assert_eq!(recovered, data);
++        assert_eq!(std::fs::read(path).unwrap(), data);
++        job.close().await.unwrap();
++        let offline_socket = dir.path().join("late.sock");
++        let offline = BulkImporter::new(BulkConfig::new(
++            Endpoint::Unix(offline_socket.clone()),
++            dir.path().join("disconnected"),
++        ))
++        .unwrap();
++        let snapshot = dir.path().join("snapshot.log");
++        std::fs::write(&snapshot, b"offline input").unwrap();
++        let mut job = offline
++            .open("snapshot", "offline-file", Format::Log)
++            .await
++            .unwrap();
++        job.stage_file(&snapshot).await.unwrap();
++        let p = job.progress().borrow().clone();
++        assert_eq!((p.eof, p.staged, p.confirmed), (true, 13, 0));
++        job.close().await.unwrap();
++        std::fs::write(&snapshot, b"caller changed the original").unwrap();
++        let (_, late) = relay(&offline_socket, backend.client.clone());
++        let proof = offline
++            .import_file(&BulkFile {
++                id: "snapshot".into(),
++                source: "offline-file".into(),
++                format: Format::Log,
++                path: snapshot,
++            })
++            .await
++            .unwrap();
++        assert_eq!(
++            client.bytes(&proof.artifact_id, 0, 13).await.unwrap(),
++            b"offline input"
++        );
++        // A certified single range also finishes if EOF arrives after restart, offline.
++        let mut job = offline.open("sealed", "pipe", Format::Log).await.unwrap();
++        let mut progress = job.progress();
++        let (mut write, mut read) = tokio::io::duplex(16);
++        write.write_all(b"sole\n").await.unwrap();
++        {
++            let staging = job.stage_stream(0, &mut read);
++            tokio::pin!(staging);
++            tokio::select! {
++                result = &mut staging => panic!("input ended before durable receipt: {result:?}"),
++                confirmed = progress.wait_for(|p| p.confirmed == 5) => drop(confirmed.unwrap()),
++            }
++        }
++        let receipt = job.receipt(0).await.unwrap();
++        job.close().await.unwrap();
++        let unavailable = BulkImporter::new(BulkConfig::new(
++            Endpoint::Unix(dir.path().join("absent.sock")),
++            dir.path().join("disconnected"),
++        ))
++        .unwrap();
++        let mut job = unavailable
++            .open("sealed", "pipe", Format::Log)
++            .await
++            .unwrap();
++        job.stage_stream(5, tokio::io::empty()).await.unwrap();
++        assert_eq!(job.finish().await.unwrap().artifact_id, receipt.artifact_id);
++        late.abort();
++        proxy.abort();
++    };
++    tokio::task::LocalSet::new()
++        .run_until(tokio::time::timeout(Duration::from_secs(30), test))
++        .await
++        .unwrap();
++}
++
+ fn relay(
+     socket: &Path,
+     backend: wire::sparrow::Client,
+@@ -8639,6 +8869,7 @@ fn relay(
+         drop_first: std::cell::Cell::new(true),
+         corrupt_receipt: std::cell::Cell::new(false),
+         corrupt_publication: std::cell::Cell::new(false),
++        withhold_publication: std::cell::Cell::new(false),
+         refuse_publish: std::cell::Cell::new(None),
+         refuse_cancel: std::cell::Cell::new(None),
+         refusals: std::cell::RefCell::new(std::collections::VecDeque::new()),
+diff --git docs/interfaces.md docs/interfaces.md
+index ab4db30..fe117d2 100644
+--- docs/interfaces.md
++++ docs/interfaces.md
+@@ -1107,6 +1107,66 @@ stderr, one event per line with no timestamp (the journal adds one) and with lin
+ a field written as `\n`. The daemon's own warnings are not written by it; they have the
+ `sparrowd:` lines above.
+ 
++### Bulk producer imports
++
++Use `sparrow_client::bulk::BulkImporter` from an ordinary Tokio runtime. Give
++`BulkConfig::new` the producer endpoint and an absolute private staging
++directory. A job ID identifies one input and its source and format across
++process restarts. One process at a time holds its journal. Use distinct IDs for
++distinct occurrences, including two files with identical bytes.
++
++`import_file` imports a completed file. `import_files` accepts an iterator and
++yields each input and its result as it finishes, with bounded concurrency.
++`open` exposes the same per-input job for progress, local staging and recovery.
++`stage_file` keeps the caller's file and verifies its original inode, length
++and mutation clocks around reads. A file within the staging allowance can be
++fully staged while Sparrow is offline. Larger files stop reading at the allowance
++and continue as Sparrow confirms ranges. Reopen a partial file job with the same
++unchanged file. Once EOF is staged, repeating `import_file` with that job ID
++uses the retained snapshot. Published ranges remain visible if a later source read fails.
++
++`stage_stream(offset, reader)` accepts Tokio `AsyncRead`. Reattach an upstream
++source at the job's durably staged offset after interruption. The process can
++recover bytes through that offset. A pipe's upstream must supply any bytes it
++handed the reader past that boundary. Complete lines can reach Sparrow before
++EOF. Long lines split into opaque fragments under the range bound. Only EOF
++finishes a final unterminated line. The input retains its original bytes,
++including binary values, and each range receipt identifies its source offsets.
++
++`BulkJob::progress` observes locally staged bytes, the contiguous remote durable
++prefix, receipt count, and the latest retry or refusal. `upload_progress`
++exposes the native received, prepared and raw-chunk checkpoints for an active
++upload. `receipt(index)` returns one durable range receipt. `finish` waits for
++the whole input and returns its store, artifact, byte length and range count.
++Small multipart inputs produce a `sparrow.parts/1` manifest. Longer inputs
++publish bounded `sparrow.bulk-window/1` manifests during the import. Each
++window names its previous window's artifact, absolute byte range, first part
++ordinal, and ordered `parts`. The final window sets `complete`. Follow the
++previous links and concatenate the data artifacts in ascending source-offset
++order. Each window and data artifact follows the store's retention policy from
++its own publication time. Window sizing obeys the discovered manifest bounds.
++
++The local journal keeps at most eight current range receipts. After a window
++is certified, `last_window` points to its artifact and `first_local_range`
++marks the start of the remaining local receipts. Each range receipt and its
++confirmed offset commit in one local transaction. When EOF follows a single
++certified range, the job can finish offline. The input's completion
++record and the final window's local receipts survive reopening. `close` stops
++a worker and waits for it to release the input for another process.
++
++Bulk jobs have their own worker threads, connections and byte quotas. The
++defaults are two active jobs, 128 MiB of outstanding bytes per job and a
++256 KiB stream range. Each reader prefetches up to 64 KiB after reserving room.
++Bulk operations leave ordinary log admission and its queue available. Once
++discovery succeeds the journal binds the persistent store. Before sending
++`importPublish` the uploader syncs the native import identity. An unknown
++publication retries that same native import on the same store. If its receipt
++has expired, the job retains its pending input and reports the refusal. Input
++blocks become reclaimable after their certified range receipt is on disk.
++
++Run `cargo run -p sparrow-client --example bulk -- ENDPOINT ABSOLUTE_SPOOL JOB_ID [FILE]`
++for a completed file or a new input arriving on stdin.
++
+ ### Part sets for consume roots (#280)
+ 
+ A consume-root file above what one artifact can hold is published as a part set
+diff --git helpers-ledger.toml helpers-ledger.toml
+index 6e0255b..627e0df 100644
+--- helpers-ledger.toml
++++ helpers-ledger.toml
+@@ -1429,6 +1429,20 @@ constants = []
+ fingerprints = []
+ names = ['^(capture_direct_tracing_event|capture_alternate_span_context)$']
+ 
++[[job]]
++id = "bulk-import-journal"
++summary = "File and stream imports persist exact local byte offsets and synchronize the native import identity before publication."
++home = "sparrow_client::bulk::disk::Journal"
++entry_points = ["sparrow_client::bulk::BulkJob::stage_file", "sparrow_client::bulk::BulkJob::stage_stream"]
++spec = "docs/interfaces.md: Bulk producer imports."
++vectors = ["crates/sparrow-server/tests/rpc.rs"]
++bench = []
++enforced = true
++[job.forbidden]
++constants = []
++fingerprints = []
++names = ['^(publish_bulk_replacement_import|encode_alternate_bulk_manifest)$']
++
+ [[job]]
+ id = "developer-console-display"
+ summary = "Structured producers share one human-readable severity, message and field formatter on the bounded console output thread."
