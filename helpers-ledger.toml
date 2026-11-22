@@ -2337,18 +2337,18 @@ names = ['^(render_staging_progress|encode_upload_progress)$']
 
 [[job]]
 id = "typed-producer-discovery"
-summary = "Decode and validate the dedicated bounded typed daemon discovery before CLI/MCP queries and SDK mutations; never scan status for admission."
+summary = "Decode and validate the dedicated bounded typed daemon discovery before CLI/MCP queries and SDK mutations; never scan status for admission. The private unit-test fixture sparrow_client::receipt::client_discovery supplies discovery to the SDK acceptance, ingestion status and retention certificate tests."
 home = "sparrow_client::receipt::Discovery::decode_for"
 entry_points = ["sparrow_client::receipt::Discovery::decode", "sparrow_client::receipt::Discovery::decode_producer", "sparrow_client::receipt::Contract::discover"]
 spec = "docs/development-runtime.md: standalone typed Rust producer client."
-vectors = ["crates/sparrow-client/src/receipt.rs", "crates/sparrow-server/tests/rpc.rs"]
+vectors = ["crates/sparrow-client/src/receipt.rs", "crates/sparrow-client/src/ingest_status.rs", "crates/sparrow-client/src/retention_metrics.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
 enforced = true
 
 [job.forbidden]
 constants = []
 fingerprints = []
-names = ['^(validate_cli_discovery|validate_producer_discovery)$']
+names = ['^(validate_cli_discovery|validate_producer_discovery)$', '^(another_sdk_discovery_fixture|copy_discovery_test_store)$']
 
 [[job]]
 id = "producer-spool"
@@ -4298,20 +4298,6 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(repeat_ingestion_status_agent_fixture|copy_ingestion_status_parity)$']
-
-[[job]]
-id = "sdk-discovery-test-fixture"
-summary = "One dev-only discovered-store fixture supplies SDK acceptance, ingestion status and retention account certificate tests."
-home = "sparrow_test_support::client_discovery"
-entry_points = []
-spec = "AGENTS.md: shared dev-only scaffolding."
-vectors = ["crates/sparrow-client/src/receipt.rs", "crates/sparrow-client/src/ingest_status.rs", "crates/sparrow-client/src/retention_metrics.rs"]
-bench = []
-enforced = true
-[job.forbidden]
-constants = []
-fingerprints = []
-names = ['^(another_sdk_discovery_fixture|copy_discovery_test_store)$']
 
 [[job]]
 id = "logical-retention-account"

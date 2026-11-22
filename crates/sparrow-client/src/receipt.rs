@@ -500,12 +500,34 @@ pub async fn flush_through(
     Ok(reached)
 }
 
+/// One discovered store for SDK acceptance, ingestion status and retention certificates.
+#[cfg(test)]
+pub(crate) fn client_discovery() -> capnp::message::Builder<capnp::message::HeapAllocator> {
+    let mut message = capnp::message::Builder::new_default();
+    let mut out = message.init_root::<wire::discovery::Builder<'_>>();
+    out.set_store_id("store:test");
+    out.set_schema_version(crate::SCHEMA_VERSION);
+    out.set_max_inline_artifact_bytes(1024);
+    out.set_max_records_per_artifact(2);
+    out.set_text_analyzer("native");
+    out.set_text_profile("text");
+    out.set_rdf_profile("rdf");
+    out.set_max_event_batch_bytes(crate::MAX_EVENT_BATCH_BYTES as u32);
+    out.set_max_event_batch_events(crate::MAX_EVENT_BATCH_EVENTS as u32);
+    let mut durability = out.init_durability_status();
+    durability.set_session_id("session:test");
+    durability.set_max_pending_writes(256);
+    durability.set_max_pending_bytes(64 * 1024 * 1024);
+    durability.set_flush_interval_ms(2000);
+    message
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn acceptance_refuses_unrelated_content_scope_durability_and_membership() {
         use super::*;
-        let message = sparrow_test_support::client_discovery();
+        let message = client_discovery();
         let discovery = Discovery::decode(message.get_root_as_reader().unwrap()).unwrap();
         let expected = ExpectedArtifact::bytes(
             &discovery,

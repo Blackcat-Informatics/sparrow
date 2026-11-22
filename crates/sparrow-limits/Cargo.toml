@@ -4,10 +4,12 @@
 [package]
 name = "sparrow-limits"
 version = "0.1.0"
+description = "Shared admission limits for Sparrow producers and storage"
+repository = "http://lillith:7555/fleet/sparrow"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-publish.workspace = true
+publish = ["sparrow-lab"]
 license.workspace = true
 
 [lints]

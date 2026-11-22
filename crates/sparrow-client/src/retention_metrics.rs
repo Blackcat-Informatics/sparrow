@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn certificate_refuses_changed_identity_false_ownership_and_window() {
-        let fixture = sparrow_test_support::client_discovery();
+        let fixture = crate::receipt::client_discovery();
         let discovery = crate::Discovery::decode(fixture.get_root_as_reader().unwrap()).unwrap();
         for fault in 0..10 {
             let mut message = capnp::message::Builder::new_default();

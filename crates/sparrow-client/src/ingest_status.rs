@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn status_certificate_rejects_changed_identity_counts_and_false_removal() {
-        let message = sparrow_test_support::client_discovery();
+        let message = crate::receipt::client_discovery();
         let discovery = crate::Discovery::decode(message.get_root_as_reader().unwrap()).unwrap();
         let selector = IngestSelector::Request("original".into());
         for fault in 0..9 {
