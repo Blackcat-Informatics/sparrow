@@ -88,7 +88,7 @@ impl DeliveryConfig {
     }
     /// Send to the local group-accessible producer socket.
     pub fn local(source: impl Into<String>) -> Self {
-        Self::new("/run/sparrow-ingest/ingest.sock", source)
+        Self::new(crate::producer_config::LOCAL_INGEST_SOCKET, source)
     }
 
     /// Default bounded queue, two-second batching, and finite RPC/retry deadlines.
@@ -146,7 +146,7 @@ impl DeliveryConfig {
     /// Default-spooled producer for the local ingest socket.
     pub fn configured_local(source: impl Into<String>) -> Self {
         Self::configured(
-            crate::Endpoint::Unix("/run/sparrow-ingest/ingest.sock".into()),
+            crate::Endpoint::Unix(crate::producer_config::LOCAL_INGEST_SOCKET.into()),
             source,
         )
     }

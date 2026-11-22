@@ -57,10 +57,41 @@ pub struct ConsoleStats {
     pub write_errors: u64,
 }
 
+/// The startup step that prevented an automatically configured console from installing.
+#[derive(Debug)]
+pub enum ConsoleInitError {
+    /// Reading or validating the selected producer configuration failed.
+    Configuration(crate::ConfigError),
+    /// Starting the configured delivery worker failed.
+    Delivery(crate::Error),
+    /// Starting local output or installing its global subscriber failed.
+    Console(io::Error),
+}
+
+impl std::fmt::Display for ConsoleInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configuration(error) => write!(f, "{error}"),
+            Self::Delivery(error) => write!(f, "starting producer delivery: {error}"),
+            Self::Console(error) => write!(f, "installing the console: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ConsoleInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Configuration(error) => Some(error),
+            Self::Delivery(error) => Some(error),
+            Self::Console(error) => Some(error),
+        }
+    }
+}
+
 /// A bounded, off-thread console with an optional structured delivery destination.
 ///
-/// A standalone console opens no socket, spool or configuration file. Attach
-/// `layer()` to the application's subscriber. Use `flush().await` before exiting
+/// `start(None)` and `install(None)` select local display directly and skip
+/// configuration discovery. Attach `layer()` to the application's subscriber. Use `flush().await` before exiting
 /// a short-lived process to wait for already admitted local output.
 #[derive(Clone)]
 pub struct Console {
@@ -71,6 +102,23 @@ pub struct Console {
 }
 
 impl Console {
+    /// Install local tracing and attach delivery when [`crate::DeliveryConfig::discover`]
+    /// selects a destination. Use [`Self::delivery`] for local spool or remote barriers.
+    pub async fn install_auto(source: impl Into<String>) -> Result<Self, ConsoleInitError> {
+        let delivery = match crate::DeliveryConfig::discover(source)
+            .await
+            .map_err(ConsoleInitError::Configuration)?
+        {
+            None => None,
+            Some(config) => Some(
+                Delivery::start_async(config)
+                    .await
+                    .map_err(ConsoleInitError::Delivery)?,
+            ),
+        };
+        Self::install(delivery).map_err(ConsoleInitError::Console)
+    }
+
     /// Start local display and install its tracing subscriber for this application.
     /// Returns `AlreadyExists` when another global subscriber owns tracing. Applications
     /// composing multiple layers can use `start` and `layer` instead.

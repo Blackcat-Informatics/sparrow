@@ -1,20 +1,19 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
-//! Run without arguments for local display, or pass an explicit destination to also deliver events.
+//! Discover a destination at startup, or pass an endpoint to explicitly enable delivery.
 use sparrow_client::{Console, Delivery, DeliveryConfig, Endpoint, sparrow_eprintln};
 use std::time::Duration;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let delivery = match std::env::args().nth(1) {
+    let console = match std::env::args().nth(1) {
         Some(value) => {
             let config = DeliveryConfig::configured(Endpoint::parse(&value)?, "console-example");
-            Some(Delivery::start_async(config).await?)
+            Console::install(Some(Delivery::start_async(config).await?))?
         }
-        None => None,
+        None => Console::install_auto("console-example").await?,
     };
-    let console = Console::install(delivery.clone())?;
     log::set_boxed_logger(Box::new(console.clone()))?;
     log::set_max_level(log::LevelFilter::Info);
 
@@ -32,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::io::Error::other(format!("console refused observations: {stats:?}")).into(),
         );
     }
-    if let Some(delivery) = delivery {
+    if let Some(delivery) = console.delivery() {
         delivery.shutdown_async(Duration::from_secs(5)).await?;
     }
     Ok(())
