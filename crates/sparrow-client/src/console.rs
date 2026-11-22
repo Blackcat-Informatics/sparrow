@@ -211,7 +211,7 @@ impl Console {
             }
         }
         if let Some(remote) = &self.delivery {
-            remote.try_send(event);
+            remote.observe(event);
         }
     }
 }

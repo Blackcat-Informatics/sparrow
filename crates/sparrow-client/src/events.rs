@@ -224,30 +224,7 @@ impl EventBatch {
         out.set_client_instance(&self.client_instance);
         let mut events = out.init_events(self.events.len() as u32);
         for (index, event) in self.events.iter().enumerate() {
-            let mut out = events.reborrow().get(index as u32);
-            out.set_sequence(event.sequence);
-            out.reborrow()
-                .init_event_time()
-                .set_unix_millis(event.event_time);
-            out.set_kind(event.kind);
-            out.set_level(event.level);
-            out.set_name(&event.name);
-            out.set_target(&event.target);
-            encode_fields(
-                &event.fields,
-                out.reborrow().init_fields(event.fields.len() as u32),
-            );
-            optional_span(out.reborrow().init_span(), event.span);
-            optional_span(out.reborrow().init_follows_from(), event.follows_from);
-            let mut context = out.init_context(event.context.len() as u32);
-            for (index, span) in event.context.iter().enumerate() {
-                let mut out = context.reborrow().get(index as u32);
-                out.set_id(span.id);
-                optional_span(out.reborrow().init_parent(), span.parent);
-                out.set_name(&span.name);
-                out.set_target(&span.target);
-                encode_fields(&span.fields, out.init_fields(span.fields.len() as u32));
-            }
+            event.encode(events.reborrow().get(index as u32));
         }
         Ok(())
     }
@@ -266,36 +243,9 @@ impl EventBatch {
         check_count(list.len() as usize)?;
         let mut events = Vec::with_capacity(list.len() as usize);
         for value in list.iter() {
-            let mut budget = Budget::new(batch.left.min(MAX_EVENT_BYTES));
-            budget.charge(1024)?;
-            let name = budget.read_text(value.get_name()?)?;
-            let target = budget.read_text(value.get_target()?)?;
-            let fields = decode_fields(value.get_fields()?, &mut budget)?;
-            let spans = value.get_context()?;
-            budget.context(spans.len() as usize)?;
-            let mut context = Vec::with_capacity(spans.len() as usize);
-            for span in spans.iter() {
-                context.push(EventSpan {
-                    id: span.get_id(),
-                    parent: read_span(span.get_parent()?)?,
-                    name: budget.read_text(span.get_name()?)?,
-                    target: budget.read_text(span.get_target()?)?,
-                    fields: decode_fields(span.get_fields()?, &mut budget)?,
-                });
-            }
-            batch.charge(budget.used())?;
-            events.push(ProducerEvent {
-                sequence: value.get_sequence(),
-                event_time: value.get_event_time()?.get_unix_millis(),
-                kind: value.get_kind()?,
-                level: value.get_level()?,
-                name,
-                target,
-                fields,
-                context,
-                span: read_span(value.get_span()?)?,
-                follows_from: read_span(value.get_follows_from()?)?,
-            });
+            let (event, charge) = ProducerEvent::decode(value, batch.left)?;
+            batch.charge(charge)?;
+            events.push(event);
         }
         let result = Self {
             request_id,
@@ -309,6 +259,69 @@ impl EventBatch {
 }
 
 impl ProducerEvent {
+    pub(crate) fn encode(&self, mut out: wire::producer_event::Builder<'_>) {
+        out.set_sequence(self.sequence);
+        out.reborrow()
+            .init_event_time()
+            .set_unix_millis(self.event_time);
+        out.set_kind(self.kind);
+        out.set_level(self.level);
+        out.set_name(&self.name);
+        out.set_target(&self.target);
+        encode_fields(
+            &self.fields,
+            out.reborrow().init_fields(self.fields.len() as u32),
+        );
+        optional_span(out.reborrow().init_span(), self.span);
+        optional_span(out.reborrow().init_follows_from(), self.follows_from);
+        let mut context = out.init_context(self.context.len() as u32);
+        for (index, span) in self.context.iter().enumerate() {
+            let mut out = context.reborrow().get(index as u32);
+            out.set_id(span.id);
+            optional_span(out.reborrow().init_parent(), span.parent);
+            out.set_name(&span.name);
+            out.set_target(&span.target);
+            encode_fields(&span.fields, out.init_fields(span.fields.len() as u32));
+        }
+    }
+
+    pub(crate) fn decode(
+        value: wire::producer_event::Reader<'_>,
+        limit: usize,
+    ) -> Result<(Self, usize), Error> {
+        let mut budget = Budget::new(limit.min(MAX_EVENT_BYTES));
+        budget.charge(1024)?;
+        let name = budget.read_text(value.get_name()?)?;
+        let target = budget.read_text(value.get_target()?)?;
+        let fields = decode_fields(value.get_fields()?, &mut budget)?;
+        let spans = value.get_context()?;
+        budget.context(spans.len() as usize)?;
+        let mut context = Vec::with_capacity(spans.len() as usize);
+        for span in spans.iter() {
+            context.push(EventSpan {
+                id: span.get_id(),
+                parent: read_span(span.get_parent()?)?,
+                name: budget.read_text(span.get_name()?)?,
+                target: budget.read_text(span.get_target()?)?,
+                fields: decode_fields(span.get_fields()?, &mut budget)?,
+            });
+        }
+        Ok((
+            Self {
+                sequence: value.get_sequence(),
+                event_time: value.get_event_time()?.get_unix_millis(),
+                kind: value.get_kind()?,
+                level: value.get_level()?,
+                name,
+                target,
+                fields,
+                context,
+                span: read_span(value.get_span()?)?,
+                follows_from: read_span(value.get_follows_from()?)?,
+            },
+            budget.used(),
+        ))
+    }
     /// Conservative source expansion and owned allocation charge, independent of sequence assignment.
     /// Unused container/string capacity is admitted too, so a tiny value cannot retain an oversized allocation.
     pub fn admission_bytes(&self) -> Result<usize, Error> {

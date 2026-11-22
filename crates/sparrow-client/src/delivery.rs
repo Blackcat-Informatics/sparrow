@@ -16,10 +16,13 @@ use std::{
     },
     time::{Duration, Instant},
 };
+mod spooled;
 
 /// Explicit producer resource and timing bounds.
 #[derive(Debug, Clone)]
 pub struct DeliveryConfig {
+    /// Admission and persistence semantics for this handle.
+    pub mode: crate::DeliveryMode,
     /// Explicit Unix or public TCP daemon destination.
     pub endpoint: crate::Endpoint,
     /// Optional store identity or role required at discovery on every connection.
@@ -79,6 +82,7 @@ impl DeliveryConfig {
     /// One default resource/timing law for every supported transport.
     pub fn for_endpoint(endpoint: crate::Endpoint, source: impl Into<String>) -> Self {
         Self {
+            mode: crate::DeliveryMode::LossyAspirational,
             endpoint,
             expect: None,
             source: source.into(),
@@ -93,6 +97,36 @@ impl DeliveryConfig {
             quarantine_dir: crate::quarantine::default_dir(),
             interval_floor: MIN_INTERVAL,
         }
+    }
+
+    /// Configure durable offline delivery to an explicit endpoint and spool directory.
+    pub fn lossless(
+        endpoint: crate::Endpoint,
+        source: impl Into<String>,
+        spool: crate::SpoolConfig,
+    ) -> Self {
+        let mut config = Self::for_endpoint(endpoint, source);
+        config.mode = crate::DeliveryMode::LosslessConfirmed(spool);
+        config
+    }
+
+    /// Configure durable offline delivery under the application state directory.
+    /// One source owns one spool. Set an explicit directory for simultaneous instances.
+    pub fn configured(endpoint: crate::Endpoint, source: impl Into<String>) -> Self {
+        let source = source.into();
+        let id = purrdf_hash::hex::encode(purrdf_hash::blake3::hash(source.as_bytes()).as_bytes());
+        let path = crate::quarantine::default_dir()
+            .parent()
+            .map_or_else(PathBuf::new, |parent| parent.join("spool").join(id));
+        Self::lossless(endpoint, source, crate::SpoolConfig::new(path))
+    }
+
+    /// Default-spooled producer for the local ingest socket.
+    pub fn configured_local(source: impl Into<String>) -> Self {
+        Self::configured(
+            crate::Endpoint::Unix("/run/sparrow-ingest/ingest.sock".into()),
+            source,
+        )
     }
 
     /// Sub-second batching and retry intervals for tests that must not wait whole seconds.
@@ -121,11 +155,14 @@ impl DeliveryConfig {
         self
     }
     pub(crate) fn validate(&self) -> Result<(), Error> {
+        if let Some(spool) = self.mode.spool() {
+            spool.validate()?;
+        }
         self.endpoint.validate()?;
         if let Some(expect) = &self.expect {
             expect.validate()?;
         }
-        if !self.quarantine_dir.is_absolute() {
+        if self.mode.spool().is_none() && !self.quarantine_dir.is_absolute() {
             return Err(Error::InvalidArgument(
                 "quarantine_dir must be an absolute directory: set DeliveryConfig::quarantine_dir, or provide an absolute XDG_STATE_HOME or HOME for the default",
             ));
@@ -201,6 +238,11 @@ pub enum DropReason {
 /// section, so a briefly held lock never discards an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
+    /// Local confirmation was refused and no durable acceptance is claimed.
+    Refused {
+        /// Machine-readable refusal reason.
+        reason: Refusal,
+    },
     /// The event is retained under the queue quota, with this assigned sequence.
     Queued {
         /// Client sequence within this producer instance.
@@ -214,6 +256,71 @@ pub enum Admission {
         sequence: Option<u64>,
     },
 }
+
+/// Refusal of a disk-confirmed offer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum Refusal {
+    /// The bounded disk spool has no room for this entry.
+    SpoolFull,
+    /// The bounded memory intake remained occupied through the caller's wait.
+    Busy,
+    /// Invalid event, oversized cursor, or confirmed send on a memory-only handle.
+    Invalid,
+    /// Shutdown has closed this producer.
+    Closed,
+    /// Disk intake failed. The underlying failure is visible in delivery stats.
+    SpoolFailed,
+}
+
+impl Refusal {
+    fn drop_reason(self) -> DropReason {
+        match self {
+            Self::Busy | Self::SpoolFull => DropReason::Full,
+            Self::Invalid => DropReason::Invalid,
+            Self::Closed => DropReason::Closed,
+            Self::SpoolFailed => DropReason::Failed,
+        }
+    }
+}
+
+/// Locally synchronized acceptance of a producer event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpoolReceipt {
+    /// Persistent instance owning the spool.
+    pub client_instance: [u8; 16],
+    /// Locally synchronized event sequence.
+    pub sequence: u64,
+}
+
+/// A refused offer retains its input. A failed post-admission write has an unknown outcome.
+#[derive(Debug)]
+pub enum SendError {
+    /// No sequence assigned. The application can retry the original input.
+    Refused {
+        /// Reason for the refusal.
+        reason: Refusal,
+        /// Original event with its fields intact.
+        event: Box<ProducerEvent>,
+    },
+    /// A sequence was assigned but disk acknowledgement was lost. Consult the recovered cursor.
+    Uncertain {
+        /// Assigned spool sequence.
+        sequence: u64,
+    },
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused { reason, .. } => write!(f, "spool refused event: {reason:?}"),
+            Self::Uncertain { sequence } => {
+                write!(f, "spool append outcome unknown for sequence {sequence}")
+            }
+        }
+    }
+}
+impl std::error::Error for SendError {}
 
 /// Durable accepted progress at an explicit flush/shutdown fence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,6 +391,13 @@ impl std::error::Error for FlushError {
 /// Queue and delivery diagnostics. These counters are not an RSS measurement.
 #[derive(Debug, Clone)]
 pub struct DeliveryStats {
+    /// Configured disk intake and recovery progress.
+    pub spool: Option<crate::SpoolStats>,
+    /// Confirmed-offer refusals indexed by [`Refusal`]. These never represent lost accepted events.
+    pub refused_by_reason: [u64; 5],
+    /// Failure currently holding the disk prefix pending. Its request number is in
+    /// [`SpoolStats::sealed_batch`](crate::SpoolStats::sealed_batch) after sealing.
+    pub held: Option<Arc<Error>>,
     /// Offers observed by the producer handle, including refused input.
     pub offered_events: u64,
     /// Offers admitted into retained delivery state.
@@ -294,7 +408,7 @@ pub struct DeliveryStats {
     pub dropped_by_reason: [u64; 5],
     /// Queued plus in-flight observations.
     pub pending_events: usize,
-    /// Conservative queued plus in-flight byte charge.
+    /// Conservative in-memory event charge. Disk occupancy is reported by `spool.bytes`.
     pub pending_bytes: usize,
     /// Monotonic age of the oldest retained observation, including in-flight retries.
     pub oldest_pending_age: Option<Duration>,
@@ -349,6 +463,8 @@ pub struct DeliveryStats {
 }
 
 struct Queued {
+    token: Vec<u8>,
+    ack: Option<tokio::sync::oneshot::Sender<()>>,
     event: ProducerEvent,
     bytes: usize,
     at: Instant,
@@ -359,6 +475,11 @@ struct Pending {
     at: Instant,
 }
 struct State {
+    released_workers: u8,
+    held: Option<Arc<Error>>,
+    force_local: u64,
+    spool: Option<crate::SpoolStats>,
+    reserved_disk: u64,
     queue: VecDeque<Queued>,
     pending: Option<Pending>,
     bytes: usize,
@@ -392,15 +513,22 @@ struct State {
     held_unsaved_events: u64,
 }
 struct Shared {
+    spool: Option<Arc<Mutex<crate::spool::Log>>>,
+    intake_work: Condvar,
+    intake_room: Arc<tokio::sync::Notify>,
+    refusals: [AtomicU64; 5],
+    span_limit: u64,
     config: DeliveryConfig,
     instance: [u8; 16],
-    state: Mutex<State>,
-    changed: Condvar,
-    async_changed: tokio::sync::Notify,
+    state: Arc<Mutex<State>>,
+    changed: Arc<Condvar>,
+    async_changed: Arc<tokio::sync::Notify>,
     wake: tokio::sync::Notify,
     /// Signalled by every flush or shutdown so a waiting retry delay ends at once. Kept apart
     /// from `wake`, which each admitted event signals and would otherwise cut the backoff short.
     retry_wake: tokio::sync::Notify,
+    /// Explicit operator retry for a permanently held spool prefix.
+    operator_retry: tokio::sync::Notify,
     /// Flush and shutdown calls currently waiting. A `retry_wake` signal ends a retry delay only
     /// while this is nonzero, so a signal left by a barrier that already returned cannot shorten
     /// the first delay of a later outage.
@@ -430,9 +558,12 @@ impl Clone for Delivery {
 impl Drop for Delivery {
     fn drop(&mut self) {
         if self.shared.owners.fetch_sub(1, Ordering::SeqCst) == 1 {
+            let state = self.shared.state.lock();
             self.shared.aborted.store(true, Ordering::SeqCst);
+            drop(state);
             self.shared.abort_wake.notify_one();
             self.shared.wake.notify_one();
+            self.shared.intake_work.notify_all();
         }
     }
 }
@@ -458,17 +589,33 @@ impl Delivery {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let shared = Shared::new(config, instance);
+        let spool = config
+            .mode
+            .spool()
+            .map(|settings| crate::spool::Log::open(settings, &config.source, instance))
+            .transpose()?;
+        let shared = Shared::with_spool(config, instance, spool);
         let worker = shared.clone();
+        let completed = spooled::Completion::new(&shared);
         std::thread::Builder::new()
             .name("sparrow-delivery".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    runtime.block_on(tokio::task::LocalSet::new().run_until(run(&worker)))
+                    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+                        if worker.spool.is_some() {
+                            spooled::deliver(&worker).await
+                        } else {
+                            run(&worker).await
+                        }
+                    }))
                 }));
                 match result {
                     Ok(Ok(())) => {}
+                    Ok(Err(error)) if worker.spool.is_some() => worker.fail(error),
                     Ok(Err(error)) => worker.settle_failure(&runtime, error),
+                    Err(_) if worker.spool.is_some() => {
+                        worker.fail(Error::Protocol("spool sender panicked"))
+                    }
                     Err(_) => worker.settle_failure(
                         &runtime,
                         Error::Protocol(
@@ -478,13 +625,28 @@ impl Delivery {
                 }
                 drop(runtime);
                 worker.finished();
+                drop(worker);
+                if let Some(completed) = completed {
+                    completed.release();
+                }
             })?;
+        if shared.spool.is_some()
+            && let Err(error) = spooled::start_intake(&shared)
+        {
+            shared.aborted.store(true, Ordering::Release);
+            shared.abort_wake.notify_one();
+            shared.wake.notify_one();
+            return Err(error);
+        }
         Ok(Self { shared })
     }
 
     /// Offer a bounded event, assigning its sequence without waiting for I/O.
     pub fn try_send(&self, mut event: ProducerEvent) -> Admission {
         let shared = &self.shared;
+        if shared.spool.is_some() {
+            return self.spool_offer(event);
+        }
         if !shared.bump(&shared.offered) {
             return shared.reject(DropReason::CounterExhausted, None);
         }
@@ -521,6 +683,8 @@ impl Delivery {
         state.admitted += 1;
         state.admitted_sequence = sequence;
         state.queue.push_back(Queued {
+            token: Vec::new(),
+            ack: None,
             event,
             bytes,
             at: Instant::now(),
@@ -530,9 +694,20 @@ impl Delivery {
         Admission::Queued { sequence }
     }
 
+    /// A capture adapter has no caller to reclaim a refused event. Report that loss at its fence.
+    pub(crate) fn observe(&self, event: ProducerEvent) {
+        if let Admission::Refused { reason } = self.try_send(event) {
+            self.shared.reject(reason.drop_reason(), None);
+        }
+    }
+
     /// Account for an observation refused before an event could be constructed.
     /// Capture adapters use this same drop accounting and durable fence law.
     pub(crate) fn capture_failed(&self) {
+        if self.shared.spool.is_some() {
+            self.shared
+                .bump(&self.shared.refusals[Refusal::Invalid as usize]);
+        }
         if self.shared.bump(&self.shared.offered) {
             self.shared.reject(DropReason::Invalid, None);
         } else {
@@ -547,7 +722,9 @@ impl Delivery {
         self.shared
             .spans
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
-                value.checked_add(1)
+                value
+                    .checked_add(1)
+                    .filter(|id| *id <= self.shared.span_limit)
             })
             .map(|value| value + 1)
             .map_err(|_| {
@@ -676,7 +853,14 @@ impl Fence<'_> {
             return Some(Err(FlushError::Delivery(error.clone())));
         }
         if state.durable_sequence.max(state.quarantined_sequence) < self.target
-            || (self.closing && !self.shared.stopped.load(Ordering::SeqCst))
+            || state
+                .spool
+                .as_ref()
+                .is_some_and(|spool| spool.cleanup_pending)
+                && self.target >= state.durable_sequence
+            || self.closing
+                && (!self.shared.stopped.load(Ordering::SeqCst)
+                    || state.spool.is_some() && !spooled::Completion::both_released(state))
         {
             return expired.then(|| Err(FlushError::TimedOut(Box::new(self.shared.stats(state)))));
         }
@@ -724,6 +908,7 @@ impl Shared {
         state.closing |= closing;
         state.force_through = state.force_through.max(fence.target);
         drop(state);
+        self.intake_work.notify_all();
         self.wake.notify_one();
         self.retry_wake.notify_one();
         Ok(fence)
@@ -735,20 +920,47 @@ impl Shared {
             self.async_changed.notify_one();
         }
     }
+    #[cfg(test)]
     fn new(config: DeliveryConfig, instance: [u8; 16]) -> Arc<Self> {
+        Self::with_spool(config, instance, None)
+    }
+    fn with_spool(
+        config: DeliveryConfig,
+        mut instance: [u8; 16],
+        spool: Option<crate::spool::Log>,
+    ) -> Arc<Self> {
+        let (mut sequence, mut confirmed, mut span, mut span_limit) = (0, 0, 0, u64::MAX);
+        let stats = spool.as_ref().map(|log| {
+            instance = log.head.instance;
+            sequence = log.stats.spooled_sequence;
+            confirmed = log.head.confirmed;
+            span = u64::from(log.head.epoch - 1) << 32;
+            span_limit = span + u64::from(u32::MAX);
+            log.stats.clone()
+        });
         Arc::new(Self {
+            spool: spool.map(|log| Arc::new(Mutex::new(log))),
+            intake_work: Condvar::new(),
+            intake_room: Arc::default(),
+            refusals: std::array::from_fn(|_| AtomicU64::new(0)),
+            span_limit,
             config,
             instance,
-            state: Mutex::new(State {
+            state: Arc::new(Mutex::new(State {
+                released_workers: 0,
+                held: None,
+                force_local: 0,
+                spool: stats,
+                reserved_disk: 0,
                 queue: VecDeque::new(),
                 pending: None,
                 bytes: 0,
                 count: 0,
-                sequence: 0,
-                admitted_sequence: 0,
-                admitted: 0,
-                durable_sequence: 0,
-                durable: 0,
+                sequence,
+                admitted_sequence: sequence,
+                admitted: sequence,
+                durable_sequence: confirmed,
+                durable: confirmed,
                 batch_number: 0,
                 retries: 0,
                 floor_refusals: 0,
@@ -767,16 +979,17 @@ impl Shared {
                 reported_drops: 0,
                 reported_quarantined: 0,
                 held_unsaved_events: 0,
-            }),
-            changed: Condvar::new(),
-            async_changed: tokio::sync::Notify::new(),
+            })),
+            changed: Arc::default(),
+            async_changed: Arc::default(),
             wake: tokio::sync::Notify::new(),
             retry_wake: tokio::sync::Notify::new(),
+            operator_retry: tokio::sync::Notify::new(),
             barrier_active: AtomicBool::new(false),
             abort_wake: tokio::sync::Notify::new(),
             owners: AtomicUsize::new(1),
             offered: AtomicU64::new(0),
-            spans: AtomicU64::new(0),
+            spans: AtomicU64::new(span),
             drops: std::array::from_fn(|_| AtomicU64::new(0)),
             exhausted: AtomicBool::new(false),
             aborted: AtomicBool::new(false),
@@ -789,6 +1002,7 @@ impl Shared {
         self.stopped.store(true, Ordering::SeqCst);
         drop(guard);
         self.notify_barrier();
+        self.intake_room.notify_waiters();
     }
     fn bump(&self, counter: &AtomicU64) -> bool {
         let ok = counter
@@ -820,13 +1034,25 @@ impl Shared {
             .or_else(|| state.queue.front().map(|queued| queued.at))
             .map(|at| at.elapsed());
         DeliveryStats {
+            spool: state.spool.clone(),
+            refused_by_reason: std::array::from_fn(|i| self.refusals[i].load(Ordering::Relaxed)),
+            held: state.held.clone(),
             dropped_by_reason: std::array::from_fn(|index| {
                 self.drops[index].load(Ordering::SeqCst)
             }),
             offered_events: self.offered.load(Ordering::SeqCst),
             admitted_events: state.admitted,
             durable_events: state.durable,
-            pending_events: state.count,
+            pending_events: if state.spool.is_some() {
+                usize::try_from(
+                    state
+                        .admitted_sequence
+                        .saturating_sub(state.durable_sequence),
+                )
+                .unwrap_or(usize::MAX)
+            } else {
+                state.count
+            },
             pending_bytes: state.bytes,
             oldest_pending_age,
             flush_lag: oldest_pending_age.map_or(Duration::ZERO, |age| {
@@ -858,6 +1084,8 @@ impl Shared {
             state.failure = Some(Arc::new(error));
         }
         self.notify_barrier();
+        self.intake_work.notify_all();
+        self.intake_room.notify_waiters();
     }
     fn next(&self, advertised: Option<crate::events::BatchLimits>) -> Result<Action, Error> {
         let mut state = self
@@ -1213,7 +1441,7 @@ impl Shared {
         self.notify_barrier();
         Ok(())
     }
-    fn retry(&self, error: Error) -> Result<(), Error> {
+    fn retry(&self, error: Error, manual: bool) -> Result<(), Error> {
         let mut state = self
             .state
             .lock()
@@ -1225,7 +1453,9 @@ impl Shared {
         if error.is_free_space_floor() {
             state.floor_refusals = state.floor_refusals.saturating_add(1);
         }
-        state.transient = Some(Arc::new(error));
+        let error = Arc::new(error);
+        state.held = manual.then(|| error.clone());
+        state.transient = Some(error);
         drop(state);
         self.notify_barrier();
         Ok(())
@@ -1348,9 +1578,7 @@ async fn run(shared: &Shared) -> Result<(), Error> {
                         Err(error @ Error::InvalidArgument(_)) => {
                             may_have_sent = previous_attempt;
                             return Err(if previous_attempt {
-                                Error::Unsupported(
-                                    "current producer ceilings cannot admit the immutable batch with an unknown delivery outcome",
-                                )
+                                Error::Unsupported(IMMUTABLE_BATCH_LIMIT)
                             } else {
                                 error
                             });
@@ -1419,7 +1647,7 @@ async fn run(shared: &Shared) -> Result<(), Error> {
                         } else {
                             backoff.take()
                         };
-                        shared.retry(error)?;
+                        shared.retry(error, false)?;
                         if wait_out_retry_delay(
                             &shared.abort_wake,
                             &shared.retry_wake,
@@ -1438,6 +1666,8 @@ async fn run(shared: &Shared) -> Result<(), Error> {
 }
 
 const STORE_MISMATCH: &str = "STORE_MISMATCH";
+pub(crate) const IMMUTABLE_BATCH_LIMIT: &str =
+    "current producer ceilings cannot admit the immutable batch with an unknown delivery outcome";
 
 /// What the worker does with one failed attempt. It never ends delivery: a failure is either
 /// about this batch, which is set aside durably so later batches proceed, or about the
@@ -1961,6 +2191,8 @@ mod tests {
         {
             let mut state = shared.state.lock().unwrap();
             state.queue.push_back(Queued {
+                token: Vec::new(),
+                ack: None,
                 event: ProducerEvent {
                     sequence: 1,
                     ..event()
@@ -2171,6 +2403,8 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .queue
             .push_back(Queued {
+                token: Vec::new(),
+                ack: None,
                 event: ProducerEvent {
                     sequence: 2,
                     ..event()

@@ -50,7 +50,7 @@ WAL flush controls, and helper-census tooling are implemented. Active tailing
 with explicit completed-generation retirement, typed public TCP
 ingestion, and syslog are implemented. Stored-view SELECT, ASK, CONSTRUCT,
 DESCRIBE, measured EXPLAIN and native stored-text rank/span relations are
-implemented. The wire schema is version 72. Producers negotiate the
+implemented. The wire schema is version 73. Producers negotiate the
 `sparrow-producer/1` profile across compatible schema versions. The archive is implemented and not
 yet running on the live daemon ([Archive status](docs/archive-format.md#archive-status)). See [Development runtime](docs/development-runtime.md) for
 present commands, verified behavior and limits.
@@ -69,6 +69,29 @@ Rust applications can use the [developer console](docs/interfaces.md#developer-c
 with local display alone or send structured observations to Sparrow. The
 [console example](crates/sparrow-client/examples/console.rs) shows a print-style
 call, typed tracing fields and a `log` record in one span.
+
+For an application that sends logs to the local daemon, start a configured
+producer and attach the console once during startup. Printing an observation
+queues it in memory. A background worker appends it to a bounded private spool
+and replays the spool when the daemon returns.
+
+```rust
+use sparrow_client::{Console, Delivery, DeliveryConfig, sparrow_eprintln};
+use std::time::Duration;
+
+let delivery = Delivery::start_async(DeliveryConfig::configured_local("build.worker")).await?;
+let console = Console::install(Some(delivery.clone()))?;
+let targets = 12;
+sparrow_eprintln!("Compiled {targets} targets");
+console.flush().await?;
+delivery.close_local(Duration::from_secs(5)).await?;
+```
+
+Use `send_with_token(event, cursor).await?` when advancing an upstream cursor
+requires a local disk receipt. Use `shutdown_async(timeout).await?` when the
+caller requires a durable receipt from Sparrow. TCP endpoints, file-backed
+configuration, limits and recovery are covered in the
+[Rust client contract](docs/interfaces.md#7-rust-client-and-logging-integration).
 
 Sparrow runs as a Rust service on one Linux server with local storage. The
 initial workload is under 10 GiB of new, uncompressed data per day, including

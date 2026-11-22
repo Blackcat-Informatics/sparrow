@@ -706,6 +706,8 @@ struct Writer {
     pressure: writer_queue::Observed<pressure::State>,
     eviction: std::cell::RefCell<eviction::Cursor>,
     expiry: std::cell::RefCell<expiry::Cursor>,
+    /// Greatest expiry among event receipts physically deleted since sealed replay was enabled.
+    retry_gc_clock: std::cell::Cell<Option<u64>>,
     recompression: writer_queue::Observed<recompression::State>,
     /// Dev-only: how long each migration page holds the writer before it commits.
     #[cfg(feature = "test-support")]
@@ -1810,6 +1812,7 @@ impl Store {
         // Schema 69's backfills and a stale source-context cache's rebuild run online, one
         // page per maintenance admission.
         migration::fence(&db)?;
+        let retry_gc = writer_format::retry_watermark(&db)?;
         timer.lap("migration_fence");
         let archive = archive::open(&db, config.archive.as_ref())?;
         if db.get(producer_stream::KEY)?.is_none() {
@@ -1879,6 +1882,7 @@ impl Store {
                 writer_recoveries: std::sync::atomic::AtomicU64::new(0),
             }),
             inner: Arc::new(Mutex::new(Writer {
+                retry_gc_clock: std::cell::Cell::new(retry_gc),
                 db,
                 id,
                 config,
@@ -2111,13 +2115,38 @@ impl Store {
         now: u64,
         mode: durability::Durability,
     ) -> Result<Artifact, Error> {
+        self.ingest_events_before(request_id, source, bytes, producer, intake, now, mode, None)
+    }
+
+    /// Server-clock upper bound on first submission, strictly inside receipt retention.
+    #[must_use]
+    pub fn sealed_event_deadline(now: u64) -> u64 {
+        now.saturating_add(RETRY_WINDOW / 2)
+    }
+
+    /// Accept an exact retry, or publish for the first time only within the sealed deadline.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "event provenance, WAL boundary and immutable retry deadline"
+    )]
+    pub fn ingest_events_before(
+        &self,
+        request_id: &str,
+        source: &str,
+        bytes: &[u8],
+        producer: &producer_stream::ProducerBatch,
+        intake: Option<intake::Intake>,
+        now: u64,
+        mode: durability::Durability,
+        deadline: Option<u64>,
+    ) -> Result<Artifact, Error> {
         producer.validate()?;
         self.ingest_input(
             request_id,
             source,
             "jsonl",
             bytes,
-            ingest::Origin::Event(producer),
+            ingest::Origin::Event(producer, deadline),
             intake,
             now,
             mode,
@@ -2209,6 +2238,20 @@ impl Store {
             now,
         )? {
             return writer.receipt(receipt, mode);
+        }
+        if let ingest::Origin::Event(_, Some(deadline)) = origin {
+            if now.max(writer.retry_gc_clock.get().unwrap_or(0)) >= deadline
+                || deadline > Self::sealed_event_deadline(now)
+            {
+                return Err(Error::new(
+                    "UNCERTAIN_DELIVERY",
+                    "no exact retained event receipt at the sealed submission deadline",
+                ));
+            }
+            if writer.retry_gc_clock.get().is_none() {
+                writer_format::activate_sealed(&writer.db)?;
+                writer.retry_gc_clock.set(Some(0));
+            }
         }
         if writer.db.get(import::import_id(request_id))?.is_some() {
             return Err(Error::new(
@@ -3543,7 +3586,7 @@ mod atomic_bound_tests {
             sequences: vec![1],
         };
         check_atomic_batch(Origin::Producer(&batch), ATOMIC_BATCH_BYTES).unwrap();
-        let producer = check_atomic_batch(Origin::Event(&batch), ATOMIC_BATCH_BYTES + 1);
+        let producer = check_atomic_batch(Origin::Event(&batch, None), ATOMIC_BATCH_BYTES + 1);
         assert_eq!(producer.unwrap_err().code, "INVALID_ARGUMENT");
         let other = check_atomic_batch(Origin::Ordinary, ATOMIC_BATCH_BYTES + 1);
         assert_eq!(other.unwrap_err().code, "RESOURCE_LIMIT");

@@ -3771,7 +3771,17 @@ async fn bounded_discovery_and_status_do_not_read_corrupt_evidence_and_keys_refu
             let discovery = sparrow_client::Discovery::fetch(client.capability())
                 .await
                 .unwrap();
-            assert_eq!(discovery, client.discovery().clone());
+            // Each discovery samples its own server-clock deadline. The negotiated
+            // capabilities and identities are stable across both reads.
+            let cached = client.discovery();
+            assert!(cached.sealed_event_deadline_ms > 0 && discovery.sealed_event_deadline_ms > 0);
+            assert_eq!(
+                discovery,
+                sparrow_client::Discovery {
+                    sealed_event_deadline_ms: discovery.sealed_event_deadline_ms,
+                    ..cached.clone()
+                }
+            );
             assert_eq!(
                 Some(discovery.store_id.as_str()),
                 properties["store_id"].as_str()
@@ -7742,6 +7752,93 @@ impl Drop for Daemon {
     }
 }
 
+/// Both spool modes preserve acknowledged offline input, cursor and span identity across
+/// SIGKILL. A new producer drains the exact prefix to a real daemon and reclaims its disk.
+#[tokio::test(flavor = "current_thread")]
+async fn configured_spools_recover_after_producer_sigkill_and_drain_once() {
+    use sparrow_client::{
+        Admission, Delivery, DeliveryConfig, DeliveryMode, Endpoint, SpoolConfig,
+    };
+    const CHILD: &str = "SPARROW_TEST_OFFLINE_SPOOL";
+    if let Some(path) = std::env::var_os(CHILD) {
+        let path = std::path::PathBuf::from(path);
+        let name = std::env::var("SPARROW_TEST_SPOOL_MODE").unwrap();
+        let spool = SpoolConfig::new(path.join(&name));
+        let mut config = DeliveryConfig::lossless(
+            Endpoint::Unix(path.join("unavailable.sock")),
+            &name,
+            spool.clone(),
+        );
+        if name == "lossy" {
+            config.mode = DeliveryMode::LossySpooled(spool);
+        }
+        let delivery = Delivery::start_async(config).await.unwrap();
+        assert_eq!(delivery.next_span_id().unwrap(), 1);
+        for index in 1..=12u64 {
+            let event = delivery_event("crash recovery");
+            if index % 2 == 0 {
+                assert_eq!(
+                    delivery
+                        .send_with_token(event, &index.to_le_bytes())
+                        .await
+                        .unwrap()
+                        .sequence,
+                    index
+                );
+            } else {
+                assert_eq!(
+                    delivery.try_send(event),
+                    Admission::Queued { sequence: index }
+                );
+            }
+        }
+        delivery.flush_local(Duration::from_secs(5)).await.unwrap();
+        sparrow_test_support::crash::checkpoint("spooled");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    let socket = store.join("rpc.sock");
+    let cfg = write_server_config(dir.path(), &store, &socket);
+    let _daemon = start(&cfg, &socket).await;
+    for mode in ["lossless", "lossy"] {
+        let marker = dir.path().join(format!("{mode}-ready"));
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "configured_spools_recover_after_producer_sigkill_and_drain_once",
+                "--nocapture",
+            ])
+            .env(CHILD, dir.path())
+            .env("SPARROW_TEST_SPOOL_MODE", mode)
+            .env("SPARROW_TEST_CRASH_POINT", "spooled")
+            .env("SPARROW_TEST_CRASH_READY", &marker);
+        sparrow_test_support::crash::kill_at_checkpoint(&mut child, &marker, "spooled").unwrap();
+        let settings = SpoolConfig::new(dir.path().join(mode));
+        let mut config =
+            DeliveryConfig::lossless(Endpoint::Unix(socket.clone()), mode, settings.clone());
+        if mode == "lossy" {
+            config.mode = DeliveryMode::LossySpooled(settings);
+        }
+        let delivery = Delivery::start_async(config).await.unwrap();
+        assert!(delivery.next_span_id().unwrap() > u64::from(u32::MAX));
+        assert_eq!(delivery.accepted_token().unwrap(), 12u64.to_le_bytes());
+        let fence = delivery
+            .shutdown_async(Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(fence.durable_events, 12);
+        assert_eq!(delivery.confirmed_token().unwrap(), 12u64.to_le_bytes());
+        let disk = delivery.stats().unwrap().spool.unwrap();
+        assert_eq!((disk.bytes, disk.segments), (0, 0));
+    }
+    assert_eq!(
+        cli(&socket, &["status"])["live_records"].as_str(),
+        Some("24")
+    );
+}
+
 fn delivery_event(text: &str) -> sparrow_client::ProducerEvent {
     sparrow_client::ProducerEvent {
         sequence: 0,
@@ -7822,10 +7919,54 @@ struct EventRelayState {
     mutate_file: std::cell::RefCell<Option<std::path::PathBuf>>,
     mutate_published_file: std::cell::RefCell<Option<std::path::PathBuf>>,
     first_accepted: tokio::sync::Notify,
+    obstruct_checkpoint: std::cell::RefCell<Option<std::path::PathBuf>>,
     discovered: tokio::sync::Notify,
 }
 struct EventRelay(std::rc::Rc<EventRelayState>);
 impl EventRelayState {
+    fn refuse_event(
+        &self,
+        batch: wire::event_batch::Reader<'_>,
+        out: wire::result::Builder<'_, wire::artifact::Owned>,
+    ) -> capnp::Result<bool> {
+        let input = sparrow_client::EventBatch::decode(batch)
+            .map_err(|error| capnp::Error::failed(error.to_string()))?;
+        assert!(
+            self.calls.borrow().len() < 8,
+            "retry fixture exceeded its request bound"
+        );
+        self.calls.borrow_mut().push(input);
+        if let Some((code, retryable)) = self.refusals.borrow_mut().pop_front() {
+            let mut failure = out.init_error();
+            failure.set_code(code);
+            failure.set_message("injected refusal");
+            failure.set_retryable(retryable);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn accepted_event(
+        &self,
+        result: wire::result::Reader<'_, wire::artifact::Owned>,
+    ) -> capnp::Result<()> {
+        if let wire::result::Ok(value) = result.which()? {
+            let receipt = sparrow_client::ArtifactReceipt::decode(value?)
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            if self.drop_first.replace(false) {
+                *self.accepted.borrow_mut() = Some(receipt);
+                self.first_accepted.notify_one();
+                // The real daemon committed. Only the reply is lost.
+                std::future::pending::<()>().await;
+            }
+            if let Some(path) = self.obstruct_checkpoint.borrow_mut().take() {
+                std::fs::create_dir(path)?;
+                self.first_accepted.notify_one();
+            }
+        }
+        Ok(())
+    }
+
     fn corrupt(&self, mut artifact: wire::artifact::Builder<'_>, enabled: bool) {
         if enabled {
             artifact.set_payload_id(format!("blake3:{}", purrdf_hash::hex::encode(&[0; 32])));
@@ -7915,40 +8056,41 @@ impl wire::sparrow::Server for EventRelay {
         params: wire::sparrow::EventsIngestParams,
         mut results: wire::sparrow::EventsIngestResults,
     ) -> capnp::Result<()> {
-        let input = sparrow_client::EventBatch::decode(params.get()?.get_batch()?)
-            .map_err(|error| capnp::Error::failed(error.to_string()))?;
-        assert!(
-            self.0.calls.borrow().len() < 8,
-            "retry fixture exceeded its request bound"
-        );
-        self.0.calls.borrow_mut().push(input.clone());
-        if let Some((code, retryable)) = self.0.refusals.borrow_mut().pop_front() {
-            let mut failure = results.get().init_result().init_error();
-            failure.set_code(code);
-            failure.set_message("injected refusal");
-            failure.set_retryable(retryable);
+        let input = params.get()?.get_batch()?;
+        if self.0.refuse_event(input, results.get().init_result())? {
             return Ok(());
         }
         let backend = self.0.backend.borrow().clone();
         let mut request = backend.events_ingest_request();
-        input
-            .encode(request.get().init_batch())
-            .map_err(|error| capnp::Error::failed(error.to_string()))?;
+        request.get().set_batch(input)?;
         let response = request.send().promise.await?;
-        if let wire::result::Ok(value) = response.get()?.get_result()?.which()? {
-            let receipt = sparrow_client::ArtifactReceipt::decode(value?)
-                .map_err(|error| capnp::Error::failed(error.to_string()))?;
-            if self.0.drop_first.replace(false) {
-                *self.0.accepted.borrow_mut() = Some(receipt);
-                self.0.first_accepted.notify_one();
-                // The real daemon committed. Withhold its reply until the worker's finite deadline closes this connection.
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
-        }
+        self.0.accepted_event(response.get()?.get_result()?).await?;
         results.get().set_result(response.get()?.get_result()?)?;
         if let wire::result::Ok(value) = results.get().get_result()?.which()? {
             self.0.corrupt(value?, self.0.corrupt_receipt.get());
         }
+        Ok(())
+    }
+
+    async fn sealed_events_ingest(
+        self: std::rc::Rc<Self>,
+        params: wire::sparrow::SealedEventsIngestParams,
+        mut results: wire::sparrow::SealedEventsIngestResults,
+    ) -> capnp::Result<()> {
+        let input = params.get()?;
+        if self
+            .0
+            .refuse_event(input.get_batch()?, results.get().init_result())?
+        {
+            return Ok(());
+        }
+        let mut request = self.0.backend.borrow().sealed_events_ingest_request();
+        request.get().set_batch(input.get_batch()?)?;
+        request.get().set_store_id(input.get_store_id()?);
+        request.get().set_deadline_ms(input.get_deadline_ms());
+        let response = request.send().promise.await?;
+        self.0.accepted_event(response.get()?.get_result()?).await?;
+        results.get().set_result(response.get()?.get_result()?)?;
         Ok(())
     }
 
@@ -8666,6 +8808,7 @@ fn relay(
         mutate_file: std::cell::RefCell::new(None),
         mutate_published_file: std::cell::RefCell::new(None),
         first_accepted: tokio::sync::Notify::new(),
+        obstruct_checkpoint: std::cell::RefCell::new(None),
         discovered: tokio::sync::Notify::new(),
     });
     let capability: wire::sparrow::Client = capnp_rpc::new_client(EventRelay(state.clone()));
@@ -8680,6 +8823,134 @@ fn relay(
         }
     });
     (state, task)
+}
+
+/// A durable reply lost before a daemon restart keeps its sealed identity. A permanent
+/// refusal then suspends retries through appends and flushes until explicit operator retry.
+#[tokio::test(flavor = "current_thread")]
+async fn sealed_spool_holds_across_fences_and_retries_the_original_receipt_after_restart() {
+    use sparrow_client::{Delivery, DeliveryConfig, Endpoint, Error, FlushError, SpoolConfig};
+    let test = async {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let socket = store.join("rpc.sock");
+        let server = write_server_config(dir.path(), &store, &socket);
+        let daemon = start(&server, &socket).await;
+        let proxy_socket = dir.path().join("relay.sock");
+        let backend = connect(&socket).await.unwrap();
+        let (state, proxy) = relay(&proxy_socket, backend.client.clone());
+        let config = DeliveryConfig::lossless(
+            Endpoint::Unix(proxy_socket),
+            "sealed-restart",
+            SpoolConfig::new(dir.path().join("private")),
+        )
+        .with_test_timing(
+            Duration::from_millis(20),
+            Duration::from_millis(30),
+            Duration::from_millis(30),
+        );
+        let deadline = Duration::from_secs(10);
+        let delivery = Delivery::start_async(config.clone()).await.unwrap();
+        delivery
+            .send_with_token(delivery_event("lost reply"), b"one")
+            .await
+            .unwrap();
+        tokio::time::timeout(deadline, state.first_accepted.notified())
+            .await
+            .unwrap();
+        delivery.close_local(deadline).await.unwrap();
+        drop(backend);
+        drop(daemon);
+        let _daemon = start(&server, &socket).await;
+        let restarted = connect(&socket).await.unwrap();
+        *state.backend.borrow_mut() = restarted.client.clone();
+        state.refusals.borrow_mut().push_back(("CONFLICT", false));
+        state.profile.set(Some((true, 256)));
+        state.artifact_limits.set(Some((256, 1)));
+        let delivery = Delivery::start_async(config.clone()).await.unwrap();
+        let short = Duration::from_millis(350);
+        assert!(matches!(
+            delivery.flush_async(short).await,
+            Err(FlushError::TimedOut(_))
+        ));
+        let stats = delivery.stats().unwrap();
+        assert!(stats.held.is_none());
+        assert!(
+            matches!(stats.last_transient_failure.as_deref(), Some(Error::Unsupported(message)) if message.contains("immutable batch"))
+        );
+        assert_eq!(state.calls.borrow().len(), 1);
+        state.artifact_limits.set(None);
+        assert!(matches!(
+            delivery.flush_async(short).await,
+            Err(FlushError::TimedOut(_))
+        ));
+        assert!(
+            matches!(delivery.stats().unwrap().held.as_deref(),Some(Error::Domain{code,..}) if code=="CONFLICT")
+        );
+        delivery
+            .send_with_token(delivery_event("held intake"), b"two")
+            .await
+            .unwrap();
+        assert!(matches!(
+            delivery.flush_async(short).await,
+            Err(FlushError::TimedOut(_))
+        ));
+        assert_eq!(state.calls.borrow().len(), 2);
+        let checkpoint = dir.path().join("private/HEADER.new");
+        *state.obstruct_checkpoint.borrow_mut() = Some(checkpoint.clone());
+        delivery.retry_held();
+        tokio::time::timeout(deadline, state.first_accepted.notified())
+            .await
+            .unwrap();
+        state.refuse_discovery.set(true);
+        assert!(matches!(
+            delivery.flush_async(short).await,
+            Err(FlushError::TimedOut(_))
+        ));
+        assert!(matches!(
+            delivery.stats().unwrap().last_transient_failure.as_deref(),
+            Some(Error::Io(_))
+        ));
+        std::fs::remove_dir(checkpoint).unwrap();
+        // Only the second batch still needs the daemon. The first checkpoints offline
+        // using its already certified receipt, even when a new discovery is refused.
+        assert!(matches!(
+            delivery.flush_async(short).await,
+            Err(FlushError::TimedOut(_))
+        ));
+        assert_eq!(delivery.confirmed_token().unwrap(), b"one");
+        assert_eq!(state.calls.borrow().len(), 3);
+        state.refuse_discovery.set(false);
+        assert_eq!(
+            delivery
+                .shutdown_async(deadline)
+                .await
+                .unwrap()
+                .durable_events,
+            2
+        );
+        assert_eq!(delivery.confirmed_token().unwrap(), b"two");
+        assert_eq!(delivery.stats().unwrap().spool.unwrap().bytes, 0);
+        drop(delivery);
+        let empty = Delivery::start(config.clone()).unwrap();
+        assert_eq!(empty.shutdown(deadline).unwrap().durable_events, 2);
+        drop(empty);
+        Delivery::start(config)
+            .unwrap()
+            .close_local(deadline)
+            .await
+            .unwrap();
+        let calls = state.calls.borrow();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0], calls[1]);
+        assert_eq!(calls[0], calls[2]);
+        assert_eq!(
+            cli(&socket, &["status"])["live_records"].as_str(),
+            Some("2")
+        );
+        proxy.abort();
+    };
+    tokio::task::LocalSet::new().run_until(test).await;
 }
 
 /// A newer daemon can acquire the producer profile while a worker is running. Limits apply

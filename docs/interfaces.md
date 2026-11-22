@@ -3106,12 +3106,21 @@ count. The canonical JSONL must fit `maxInlineArtifactBytes`. The worker
 groups events using a conservative byte estimate and checks the actual
 encoded length before sending a singleton.
 
+Schema 73 adds `sealedEventsIngest` on each producer endpoint. Its
+`storeId` and `deadlineMs` bind first publication to a particular store and
+server-clock deadline. Discovery supplies `sealedEventDeadlineMs` for new
+batches. Zero means the daemon lacks this operation. A previously accepted
+request with a live matching receipt returns the same durable artifact.
+Absent that receipt, the daemon permits first publication only before the
+deadline, inside half its retry window, and above its persisted receipt-GC
+watermark. An expired or ambiguous request returns `UNCERTAIN_DELIVERY`.
+
 Keep the request identity across transport failures, timeouts, overload and
 retryable daemon refusals such as `STORAGE_PRESSURE`, `SHUTTING_DOWN` and a
 busy `RESOURCE_LIMIT`. Retry an unknown outcome with the same data. If the
 new ceiling cannot admit a possibly committed batch, delivery holds it
-until a compatible daemon returns. A permanent input refusal or store
-replacement ends retries for that batch after quarantine, as described in
+until a compatible daemon returns. The memory worker quarantines permanent
+input refusals. Spooled delivery holds the original batch, as described in
 section 7.
 
 Extend the profile with trailing Cap'n Proto fields or new operations.
@@ -4749,11 +4758,12 @@ The delivery worker retains its pending event on a daemon that lacks
 `sparrow-producer/1`. It exposes the missing profile as
 `last_transient_failure` and retries discovery every 30 seconds.
 An explicit flush or shutdown can wake the retry early. Admission stays
-bounded while the daemon upgrades. The worker prepares a singleton before
+bounded while the daemon upgrades. The memory worker prepares a singleton before
 its first successful discovery and batches subsequent events within the
 advertised ceilings.
 
-`DeliveryConfig::local(source)` selects `/run/sparrow-ingest/ingest.sock`.
+`DeliveryConfig::configured_local(source)` selects `/run/sparrow-ingest/ingest.sock`
+and a bounded private disk spool.
 Supply a Unix path or TCP endpoint in Rust, or load a producer TOML file with
 `DeliveryConfig::from_file(path).await?`. A file requires `source`; omitting
 `endpoint` selects the local ingest socket. Relative paths resolve beside the
@@ -4765,6 +4775,8 @@ source = "example.worker"
 endpoint = "tcp://192.0.2.10:518"
 expected_role = "production"
 secret_file = "tcp.secret"
+mode = "lossless"
+spool_dir = "spool"
 ```
 
 `expected_role` accepts `production` or `scratch`. `expected_store` takes the
@@ -4778,6 +4790,72 @@ and uses the same private-file rules as the CLI. Other optional keys are
 `quarantine_dir`, `max_queued_events`, `max_queued_bytes`, `batch_events`,
 `batch_bytes`, `flush_interval_ms`, `rpc_timeout_ms`, `retry_interval_ms`,
 and `retry_max_interval_ms`. All bounds and defaults come from `DeliveryConfig`.
+
+### Configured spool
+
+Use `DeliveryConfig::configured(endpoint, source)` for Unix or TCP, or
+`DeliveryConfig::lossless(endpoint, source, SpoolConfig::new(directory))` to
+select the spool directory. The default lives under
+`$XDG_STATE_HOME/sparrow-client/spool/<source-digest>`, with
+`$HOME/.local/state` as the default state directory. Concurrent processes
+sharing a source require separate spool directories. Each directory holds
+an exclusive lock and binds one persistent producer instance to its source.
+
+| Call | What success establishes |
+| --- | --- |
+| `try_send(event)` | `Admission::Queued` assigns a sequence and transfers the event to bounded RAM without file or socket I/O. |
+| `send(event).await` or `send_with_token(event, cursor).await` | A local disk sync covers the event and its optional application cursor of up to 256 bytes, even offline. |
+| `flush_local(timeout).await` | All admitted events through the captured sequence have reached synchronized local disk. |
+| `close_local(timeout).await` | Local flush completes and both workers stop. Release other producer handles before reopening its directory. |
+| `flush_async(timeout).await` or `shutdown_async(timeout).await` | Sparrow has durably acknowledged the captured prefix. Shutdown also closes admission and stops delivery. |
+
+Read `accepted_token()` for the synchronized local cursor and
+`confirmed_token()` for the remotely acknowledged cursor. Both survive restart
+and segment cleanup. A fast offer can be lost on process death before the disk
+worker appends it. A host failure can lose unsynchronized writes. The confirmed
+send returns the original event in `SendError::Refused` if admission fails.
+`SendError::Uncertain` names the assigned sequence if a disk acknowledgement
+was lost. Recover the cursor before resuming that input. Cancelling an
+already queued send leaves its append running.
+
+The private `sparrow-spool/1` layout uses `LOCK` for exclusive ownership,
+`HEADER` for the checksummed Cap'n Proto checkpoint and
+`seg-<20-digit-index>` files for checksummed, length-framed Cap'n Proto events.
+The checkpoint records the producer identity, span epoch, confirmed cursor,
+artifact identity and any in-flight seal. Writers synchronize the replacement
+checkpoint and its directory before reclaiming segment files.
+
+File configuration selects `mode = "lossless"` by default. Fast offers report
+`Admission::Refused` on capacity or other admission failures. In
+`"lossy_spooled"` they report counted drops and successful admissions follow
+the same disk path. `"memory"` enables bounded RAM delivery and quarantine.
+`spool_max_bytes` defaults to 1 GiB of segment bytes and
+`spool_segment_bytes` to 16 MiB. Leave filesystem space for the checkpoint,
+lock and filesystem metadata. `spool_sync_interval_ms` defaults to 1,000 for
+ordinary offers. `spool_max_wait_ms` defaults to 20 for obtaining memory
+intake capacity on a confirmed send. Disk sync time is additional. A full
+spool refuses new confirmed sends immediately.
+
+The sender groups entries within the configured and discovered ceilings and
+syncs the exact batch identity, range, store and deadline before its first
+transmission. Reconnect and process restart preserve them. Receipt
+certification and a synchronized local checkpoint precede segment removal.
+After a certified reply, the sender retains the receipt in memory and retries
+a failed local checkpoint even if the daemon goes offline.
+An incomplete final append is truncated on recovery. Interior corruption
+stops startup. A missing compatible daemon, a replaced store, a permanent
+input refusal or an uncertain receipt retains the prefix on disk.
+Connection and discovery failures retry on backoff and appear in
+`last_transient_failure`. A permanent refusal or store replacement stops
+transmission until an explicit retry or rebind. `stats().held` identifies
+the cause and `spool.next_batch` identifies the request. Local intake
+continues while space remains. Inspect the spool statistics for byte
+and segment counts, progress, pending cleanup, oldest event time and sealed
+batch number. `retry_held()` wakes the sender after remediation.
+`rebind(store_id).await` can move an unsealed prefix. An unresolved seal
+requires its original store and exact receipt evidence.
+
+### Memory delivery and shared event capture
 
 The separate `sparrow-client` crate keeps producers independent of the database
 or semantic engine. The public surface includes:
@@ -4855,11 +4933,11 @@ or semantic engine. The public surface includes:
   error. Durable flush cannot certify events already dropped before enqueue.
 
 Use stable client request/batch identities across retries. Reconnection preserves
-pending event identity; application restart is a new client instance. Preserve
+pending event identity. A memory producer starts a new instance on restart.
+The spool recovers its instance and reserves a fresh span identity range. Preserve
 Rust event field types through the shared wire contract without substituting
 formatted JSON strings for already structured fields. A bridge from the `log`
-facade can compose through tracing. A persistent client spool is a later
-extension; the initial layer does not promise survival of producer-process loss.
+facade can compose through tracing.
 The layer follows the public [tracing subscriber layer contract](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/layer/index.html).
 
 `DeliveryConfig::tcp(SocketAddr, source)` selects public Cap'n Proto for the
