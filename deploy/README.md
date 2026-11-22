@@ -214,13 +214,17 @@ lays out `/var/lib/sparrow` with its modes and ACLs, creates `/etc/sparrow` and
 installs the configuration templates where no file exists, then installs the
 units, loads the AppArmor profile, installs the helpers, images, lexicons and
 these documents, reloads systemd and enables the service and shipper timer. It
-starts nothing. Run it again at any time: it changes only what differs and
-prints what it changed. Add the administrator to the group (`sudo usermod -aG sparrow ADMIN`) and log in again so the
+starts nothing. A repeat install changes only what differs and prints what
+it changed. Stop the daemon through its drain before installing a changed
+AppArmor profile. Move an existing store or shipper layout to the example
+paths before installing these units and profile. See [Moving a store](#moving-a-store).
+Add the administrator to the group (`sudo usermod -aG sparrow ADMIN`) and log in again so the
 membership applies. Grant `sparrow-ship` read access to each producer directory.
 
 Every check that can refuse runs before the first change: the image pair and
 lexicon bundle in `./bin`, an installed image or bundle of the same name that
-differs, the secret's owner and mode. A
+differs, the installed layout, the daemon state before a profile replacement,
+and the secret's owner and mode. A
 refusal lists every problem and changes nothing. A failure after that point
 lists what had changed.
 

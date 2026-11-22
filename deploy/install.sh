@@ -50,6 +50,49 @@ fi
 # refusal leaves the host as it was. A substitution is captured before use, because a die inside
 # <(...) or inside a command's arguments would end only a subshell.
 problems=()
+if ! layout_check=$(python3 -I - "$DEST/etc/sparrow" "$DEPLOY_DIR/config" <<'PY'
+from pathlib import Path
+import sys
+import tomllib
+
+installed, examples = map(Path, sys.argv[1:])
+layouts = {
+    "server.toml": ("data_dir", "socket_path"),
+    "ship.toml": ("intake_root", "state_dir"),
+}
+problems = []
+try:
+    server = tomllib.loads((examples / "server.toml.example").read_text())
+    for name, keys in layouts.items():
+        path = installed / name
+        if not path.exists():
+            continue
+        config = tomllib.loads(path.read_text())
+        example = tomllib.loads((examples / (name + ".example")).read_text())
+        expected = {key: example[key] for key in keys}
+        if name == "ship.toml" and "socket" in config:
+            expected["socket"] = server["socket_path"]
+        for key, value in expected.items():
+            actual = config.get(key)
+            if not isinstance(actual, str) or Path(actual) != Path(value):
+                problems.append(f"{path} sets a different layout for {key}")
+except (OSError, ValueError, KeyError) as error:
+    problems.append(f"cannot verify the installed layout: {error}")
+if problems:
+    print("\n  ".join(problems))
+    print('  Follow deploy/README.md, "Moving a store", before installing the stock units and profile.')
+    sys.exit(1)
+PY
+); then
+    problems+=("${layout_check:-could not verify the installed layout with Python 3.11 or newer}")
+fi
+if [[ -z $DEST && -e /etc/apparmor.d/sparrow ]] &&
+    ! cmp -s -- "$DEPLOY_DIR/apparmor/sparrow" /etc/apparmor.d/sparrow; then
+    if ! state=$(systemctl show -p ActiveState --value sparrow.service) ||
+        [[ $state != inactive && $state != failed ]]; then
+        problems+=("stop sparrow.service through its drain before replacing its AppArmor profile")
+    fi
+fi
 images=$(select_images "$REV") || exit 1
 read -r daemon cli <<<"$images"
 verify_image "$daemon" 'usage: sparrowd --config'
