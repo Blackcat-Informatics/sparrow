@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/499-import-and-verify-ordered-part-sets",
+  "branch": "paudley/499-import-and-verify-ordered-part-sets",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "d3a893690eeee675ea81404e2272c497b5f7ea4c",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/499-import-and-verify-ordered-part-sets/.stage/import-and-verify-ordered-part-sets/sync/20261122T203601-261e186add0d4bcebeafd377a03a1ad9",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "30bda524b3e8e3720e4080a598ce0f7e99bacda9",
+  "merge_bases": [
+    "d3a893690eeee675ea81404e2272c497b5f7ea4c"
+  ],
+  "commit": "30bda524b3e8e3720e4080a598ce0f7e99bacda9"
+}

@@ -1,0 +1,112 @@
+{
+  "issue": 499,
+  "pr_number": 502,
+  "branch": "paudley/499-import-and-verify-ordered-part-sets",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/499-import-and-verify-ordered-part-sets/.stage/import-and-verify-ordered-part-sets",
+  "observed_at": "2026-11-22T21:01:44.387157+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews",
+    "merge_candidate"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/499-import-and-verify-ordered-part-sets/.stage/import-and-verify-ordered-part-sets/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/499-import-and-verify-ordered-part-sets/.stage/import-and-verify-ordered-part-sets/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/499-import-and-verify-ordered-part-sets/.stage/import-and-verify-ordered-part-sets/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/499-import-and-verify-ordered-part-sets/.stage/import-and-verify-ordered-part-sets/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/499-import-and-verify-ordered-part-sets/.stage/import-and-verify-ordered-part-sets/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict.",
+    "Preflight does not sign, fetch, push or mutate forge state. API permission and read access do not prove Git push authorization or protected-branch admission."
+  ],
+  "pr": {
+    "number": 502,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Import and verify ordered part sets through the CLI",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/502",
+    "baseRefName": "main",
+    "baseRefOid": "30bda524b3e8e3720e4080a598ce0f7e99bacda9",
+    "headRefName": "paudley/499-import-and-verify-ordered-part-sets",
+    "headRefOid": "9a0a486cc56e2684778aca01b03bc7d46fa7d9b6",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/505/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "9a0a486cc56e2684778aca01b03bc7d46fa7d9b6",
+    "branch": "paudley/499-import-and-verify-ordered-part-sets",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 502,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #502 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  },
+  "preflight": {
+    "git": "/usr/bin/git",
+    "python3": "/home/paudley/stage/root/bin/python3",
+    "stagectl": "/home/paudley/stage/root/bin/stagectl",
+    "bash": "/usr/bin/bash",
+    "readlink": "/home/paudley/stage/root/bin/readlink",
+    "sed": "/usr/bin/sed",
+    "awk": "/usr/bin/awk",
+    "ghprsq": "/home/paudley/stage/agents/bin/ghprsq",
+    "archive": {
+      "files": 12,
+      "bytes": 12140,
+      "errors": [],
+      "limits": "Read-only selected-evidence admission; full newly reachable Git object closure is checked by ghprsq before push."
+    },
+    "signing": {
+      "format": "openpgp",
+      "key_configured": true,
+      "limits": "Configuration inspected; no signing operation was performed."
+    },
+    "forge_permissions": {
+      "admin": true,
+      "push": true,
+      "pull": true
+    },
+    "merge_candidate": {
+      "base": "30bda524b3e8e3720e4080a598ce0f7e99bacda9",
+      "head": "9a0a486cc56e2684778aca01b03bc7d46fa7d9b6",
+      "status": "clean"
+    }
+  }
+}

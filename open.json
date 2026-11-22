@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 499,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/499-import-and-verify-ordered-part-sets",
+  "branch": "paudley/499-import-and-verify-ordered-part-sets",
+  "slug": "import-and-verify-ordered-part-sets",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/499-import-and-verify-ordered-part-sets/.stage/import-and-verify-ordered-part-sets",
+  "stage_tracked": true,
+  "base": "refs/remotes/origin/main",
+  "base_oid": "d3a893690eeee675ea81404e2272c497b5f7ea4c",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/499-import-and-verify-ordered-part-sets",
+    "branch:paudley/499-import-and-verify-ordered-part-sets",
+    "ignored:3 files (3 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow/.worktrees/459-prepare-sparrow-for-public-github caches into /home/paudley/Active/sparrow/.worktrees/499-import-and-verify-ordered-part-sets plus 0 dependency units from 0 other checkouts in 10.6s; 140 unchanged files keep their built mtimes; 219 other files take the seed time and rebuild; 8 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/499-import-and-verify-ordered-part-sets/.stage/import-and-verify-ordered-part-sets",
+    "issue:/home/paudley/Active/sparrow/.worktrees/499-import-and-verify-ordered-part-sets/.stage/import-and-verify-ordered-part-sets/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-22T11:05:02-0600",
+  "seed_error": ""
+}
