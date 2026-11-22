@@ -77,6 +77,21 @@ seed only a missing catalog; typed watch administration controls later
 changes. Never add production sample directories as destructive watches merely
 because they were sample inputs.
 
+Configure producer spools on local storage outside every consume root.
+Each writer requires its own private directory (mode `0700`). Size
+`spool_max_bytes` for the expected offline interval and retain free space for
+metadata and checkpoint replacement. Resume with the same source and spool
+directory. The SDK drains and removes confirmed segments automatically.
+For an explicit drain, run the `sparrow-client` example
+`producer ENDPOINT SOURCE lossless SPOOL_DIR 0 1 drain` after the previous
+writer releases the directory. Inspect its final JSON progress and exit code.
+
+The first conditional sealed request eligible for new publication enables the receipt-retirement
+watermark and its raw writer format. Use a daemon that supports store writer
+families 407 through 461 when reopening an upgraded store. To roll back to an
+older binary, restore a compatible pre-upgrade store snapshot. See
+[publication and durability](architecture.md#61-publication-and-durability).
+
 `instance_role` (`"production"` or `"scratch"`, optional) fixes the role of a
 store when the daemon creates it, and `discover` and `status` report it as
 `instanceRole` (`unspecified` for a store with no role). At startup a configured

@@ -116,6 +116,7 @@ classify! {
     writes {
         ingest: IngestParams, IngestResults;
         events_ingest: EventsIngestParams, EventsIngestResults;
+        sealed_events_ingest: SealedEventsIngestParams, SealedEventsIngestResults;
         import_begin: ImportBeginParams, ImportBeginResults;
         import_append: ImportAppendParams, ImportAppendResults;
         import_seal: ImportSealParams, ImportSealResults;

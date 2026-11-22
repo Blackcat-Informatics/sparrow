@@ -135,6 +135,7 @@ decide! {
         import_publish: ImportPublishParams, ImportPublishResults;
         import_cancel: ImportCancelParams, ImportCancelResults;
         events_ingest: EventsIngestParams, EventsIngestResults;
+        sealed_events_ingest: SealedEventsIngestParams, SealedEventsIngestResults;
         flush: FlushParams, FlushResults;
         discover: DiscoverParams, DiscoverResults;
     }

@@ -35,6 +35,12 @@ impl StdError for ConfigError {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
+    mode: Option<FileMode>,
+    spool_dir: Option<PathBuf>,
+    spool_max_bytes: Option<u64>,
+    spool_segment_bytes: Option<u64>,
+    spool_sync_interval_ms: Option<u64>,
+    spool_max_wait_ms: Option<u64>,
     source: String,
     endpoint: Option<String>,
     secret_file: Option<PathBuf>,
@@ -49,6 +55,14 @@ struct FileConfig {
     rpc_timeout_ms: Option<u64>,
     retry_interval_ms: Option<u64>,
     retry_max_interval_ms: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FileMode {
+    Memory,
+    LossySpooled,
+    Lossless,
 }
 
 impl DeliveryConfig {
@@ -83,7 +97,7 @@ impl FileConfig {
         let dir = absolute
             .parent()
             .ok_or("configuration path requires a parent directory")?;
-        let mut config = DeliveryConfig::local(file.source);
+        let mut config = DeliveryConfig::configured_local(file.source);
         if let Some(value) = file.endpoint {
             config.endpoint = match Endpoint::parse(&value)? {
                 Endpoint::Unix(socket) => Endpoint::Unix(dir.join(socket)),
@@ -105,6 +119,29 @@ impl FileConfig {
             (Some(role), Some(id)) => Some(Expect::new(role).with_store_id(id)),
             (Some(role), None) => Some(Expect::new(role)),
             (None, store) => store.map(Expect::store),
+        };
+        let crate::DeliveryMode::LosslessConfirmed(mut spool) = config.mode else {
+            return Err("configured producer lacks its default spool".into());
+        };
+        if let Some(path) = file.spool_dir {
+            spool.dir = dir.join(path);
+        }
+        if let Some(n) = file.spool_max_bytes {
+            spool.max_bytes = n;
+        }
+        if let Some(n) = file.spool_segment_bytes {
+            spool.segment_bytes = n;
+        }
+        if let Some(n) = file.spool_sync_interval_ms {
+            spool.sync_interval = Duration::from_millis(n);
+        }
+        if let Some(n) = file.spool_max_wait_ms {
+            spool.max_wait = Duration::from_millis(n);
+        }
+        config.mode = match file.mode.unwrap_or(FileMode::Lossless) {
+            FileMode::Memory => crate::DeliveryMode::LossyAspirational,
+            FileMode::LossySpooled => crate::DeliveryMode::LossySpooled(spool),
+            FileMode::Lossless => crate::DeliveryMode::LosslessConfirmed(spool),
         };
         if let Some(path) = file.quarantine_dir {
             config.quarantine_dir = dir.join(path);

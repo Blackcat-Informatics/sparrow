@@ -387,6 +387,88 @@ mod tests {
     use super::*;
     use crate::Config;
 
+    /// A sealed producer can submit the missing prefix after reopening the store. Once
+    /// GC retires its exact receipt, a backward clock can never admit it as new again.
+    #[test]
+    fn sealed_event_watermark_survives_restart_gc_and_clock_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = sparrow_test_support::storage_config!(Config);
+        let now = 10_000;
+        let deadline = Store::sealed_event_deadline(now);
+        let producer = ProducerBatch {
+            instance: [42; 16],
+            sequences: vec![1],
+        };
+        let submit = |store: &Store, id, t, deadline, batch: &ProducerBatch| {
+            store.ingest_events_before(
+                id,
+                "source",
+                b"{}\n",
+                batch,
+                None,
+                t,
+                crate::Durability::Durable,
+                Some(deadline),
+            )
+        };
+        let store = Store::open(dir.path(), config.clone()).unwrap();
+        drop(store);
+        let store = Store::open(dir.path(), config.clone()).unwrap();
+        let original =
+            |store: &Store, t| submit(store, "events:sealed:test", t, deadline, &producer);
+        let first = original(&store, now).unwrap();
+        drop(store);
+        let store = Store::open(dir.path(), config.clone()).unwrap();
+        assert_eq!(original(&store, now + 1).unwrap().id, first.id);
+        let later = now + super::super::RETRY_WINDOW + 10;
+        assert_eq!(
+            original(&store, later).unwrap_err().code,
+            "UNCERTAIN_DELIVERY"
+        );
+        store.expire(later).unwrap();
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .db
+                .get("request:ingest:events:sealed:test")
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+        let store = Store::open(dir.path(), config.clone()).unwrap();
+        assert_eq!(
+            original(&store, now + 1).unwrap_err().code,
+            "UNCERTAIN_DELIVERY"
+        );
+        assert_eq!(store.artifacts(now + 1).unwrap().len(), 1);
+        let next = ProducerBatch {
+            instance: producer.instance,
+            sequences: vec![2],
+        };
+        submit(
+            &store,
+            "events:sealed:next",
+            later,
+            Store::sealed_event_deadline(later),
+            &next,
+        )
+        .unwrap();
+        assert_eq!(store.artifacts(later).unwrap().len(), 2);
+        // An upgraded writer cannot make a fresh assumption about missing GC evidence.
+        store
+            .lock()
+            .unwrap()
+            .db
+            .delete(super::super::writer_format::RETRY_GC)
+            .unwrap();
+        drop(store);
+        assert_eq!(
+            Store::open(dir.path(), config).err().unwrap().code,
+            "STORAGE_FAILURE"
+        );
+    }
+
     /// INVARIANT (#215): a registry at its byte bound never refuses a batch. An existing
     /// window first sheds its own oldest gap intervals; with none left, the batch is taken
     /// without a window update (`None`, counted by the caller). The old code answered

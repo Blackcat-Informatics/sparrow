@@ -493,6 +493,9 @@ struct Discovery {
   # Additive (#371): the store's role; `unspecified` from an older daemon or a store with none.
   instanceRole @16 :InstanceRole;
   producerProfiles @17 :List(Text);
+  # Latest suggested last instant for first admission of a sealed event request.
+  # Zero when the server lacks conditional durable replay.
+  sealedEventDeadlineMs @18 :UInt64;
 }
 
 enum PressurePhase { ready @0; requested @1; awaitingReclamation @2; blocked @3; awaitingArchive @4; }
@@ -1071,6 +1074,8 @@ interface Sparrow {
   # Schema 71 additive (#323): the held artifacts of one payload digest, read-only. A daemon
   # without this method answers the protocol's unimplemented error.
   payloadLookup @56 (query :PayloadLookupQuery) -> (result :Result(PayloadLookupPage));
+  # After the deadline, only a previously accepted, exactly matching request can succeed.
+  sealedEventsIngest @57 (batch :EventBatch, storeId :Text, deadlineMs :UInt64) -> (result :Result(Artifact));
 }
 
 struct TcpChallenge { nonce @0 :Data; }

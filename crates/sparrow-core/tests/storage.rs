@@ -10,6 +10,8 @@ use sparrow_test_support::{catalog_db, remove_artifact_rdf_upgrade, remove_tail_
 
 const DAY: u64 = 86_400_000;
 const HOUR: u64 = 60 * 60 * 1000;
+/// A syntactically valid future identity outside all allocated writer families.
+const UNKNOWN_WRITER_FORMAT: &[u8] = b"sparrow.store/4294967295";
 
 /// Hang deadline for the two load-sensitive event-driven tests. The slowest measured
 /// run was 44.41 s (sigkill test under load 33-43, .stage/flaky-tests/s1.log), so five
@@ -21873,7 +21875,7 @@ fn archive_fence_refuses_unconfigured_open_and_older_writers() {
     // The log time law is removed so the format identity alone decides the refusal.
     let db = catalog_db(dir.path()).unwrap();
     db.put("archive:through", through).unwrap();
-    db.put("store_format", b"sparrow.store/407").unwrap();
+    db.put("store_format", UNKNOWN_WRITER_FORMAT).unwrap();
     db.delete("log-time-profile-law").unwrap();
     drop(db);
     assert_eq!(
@@ -24643,7 +24645,7 @@ fn source_index_migration_seeds_exact_counters_and_fences_older_writers() {
     // these families refuses this store.
     let db = catalog_db(dir.path()).unwrap();
     db.put("source-summary-upgrade", checkpoint).unwrap();
-    db.put("store_format", b"sparrow.store/407").unwrap();
+    db.put("store_format", UNKNOWN_WRITER_FORMAT).unwrap();
     drop(db);
     assert_eq!(
         Store::open(dir.path(), large_config()).err().unwrap().code,

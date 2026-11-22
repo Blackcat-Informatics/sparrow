@@ -413,6 +413,18 @@ flush are available. It is an intended buffering interval, not a guarantee that 
 failing disk will complete synchronization on schedule. Expose flush lag and stop
 admitting buffered writes when the durability queue cannot remain bounded.
 
+Configured SDKs acknowledge local disk acceptance independently of remote
+publication. When a producer first uses conditional sealed ingestion, the
+store atomically lifts its raw writer identity from the corresponding
+`sparrow.store/352` through `406` family to `407` through `461` and initializes
+`producer:sealed-receipt-gc`. The eight-byte watermark is the greatest
+expiration time of any subsequently retired inline ingestion receipt.
+Retirement advances it in the same durable write as deletion. A missing
+receipt permits first publication only for a seal whose deadline exceeds the
+watermark and falls within the server's current admission interval. A server
+clock rollback after retirement therefore cannot republish the batch.
+Receipt comparison and first publication share the ordinary writer lock.
+
 A failed write or WAL sync latches durability uncertain: the store refuses writes
 and fences with a retryable refusal naming the latch and certifies nothing it accepted
 after the last successful sync. Reads are served; an artifact read reports its pending

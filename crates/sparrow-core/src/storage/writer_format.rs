@@ -537,10 +537,127 @@ fn position(families: &[[&'static [u8]; 11]; 5], format: &[u8]) -> Option<(usize
         })
 }
 
+// Sealed producer replay requires every writer that retires an event receipt to
+// advance the durable GC watermark. Preserve the five payload-index families.
+const SEALED: [[&[u8]; 11]; 5] = [
+    [
+        b"sparrow.store/407",
+        b"sparrow.store/408",
+        b"sparrow.store/409",
+        b"sparrow.store/410",
+        b"sparrow.store/411",
+        b"sparrow.store/412",
+        b"sparrow.store/413",
+        b"sparrow.store/414",
+        b"sparrow.store/415",
+        b"sparrow.store/416",
+        b"sparrow.store/417",
+    ],
+    [
+        b"sparrow.store/418",
+        b"sparrow.store/419",
+        b"sparrow.store/420",
+        b"sparrow.store/421",
+        b"sparrow.store/422",
+        b"sparrow.store/423",
+        b"sparrow.store/424",
+        b"sparrow.store/425",
+        b"sparrow.store/426",
+        b"sparrow.store/427",
+        b"sparrow.store/428",
+    ],
+    [
+        b"sparrow.store/429",
+        b"sparrow.store/430",
+        b"sparrow.store/431",
+        b"sparrow.store/432",
+        b"sparrow.store/433",
+        b"sparrow.store/434",
+        b"sparrow.store/435",
+        b"sparrow.store/436",
+        b"sparrow.store/437",
+        b"sparrow.store/438",
+        b"sparrow.store/439",
+    ],
+    [
+        b"sparrow.store/440",
+        b"sparrow.store/441",
+        b"sparrow.store/442",
+        b"sparrow.store/443",
+        b"sparrow.store/444",
+        b"sparrow.store/445",
+        b"sparrow.store/446",
+        b"sparrow.store/447",
+        b"sparrow.store/448",
+        b"sparrow.store/449",
+        b"sparrow.store/450",
+    ],
+    [
+        b"sparrow.store/451",
+        b"sparrow.store/452",
+        b"sparrow.store/453",
+        b"sparrow.store/454",
+        b"sparrow.store/455",
+        b"sparrow.store/456",
+        b"sparrow.store/457",
+        b"sparrow.store/458",
+        b"sparrow.store/459",
+        b"sparrow.store/460",
+        b"sparrow.store/461",
+    ],
+];
+pub(super) const RETRY_GC: &str = "producer:sealed-receipt-gc";
+
+fn sealed(format: &[u8]) -> Option<&'static [u8]> {
+    position(&SEALED, format).map(|(family, i)| SEALED[family][i])
+}
+
+fn enable_sealed(format: &[u8]) -> Result<&'static [u8], Error> {
+    position(&PAYLOAD_INDEX, format)
+        .or_else(|| position(&SEALED, format))
+        .map(|(family, i)| SEALED[family][i])
+        .ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "sealed events require a payload-index authority family",
+            )
+        })
+}
+
+pub(super) fn retry_watermark(db: &DB) -> Result<Option<u64>, Error> {
+    let format = db
+        .get("store_format")?
+        .ok_or_else(|| Error::new("STORAGE_FAILURE", "missing store format"))?;
+    match (sealed(&format), db.get(RETRY_GC)?) {
+        (None, None) => Ok(None),
+        (Some(_), Some(bytes)) if bytes.len() == 8 => Ok(Some(u64::from_be_bytes(
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::new("STORAGE_FAILURE", "invalid sealed receipt watermark"))?,
+        ))),
+        _ => Err(Error::new(
+            "STORAGE_FAILURE",
+            "sealed receipt watermark contradicts writer format",
+        )),
+    }
+}
+
+pub(super) fn activate_sealed(db: &DB) -> Result<(), Error> {
+    let format = db
+        .get("store_format")?
+        .ok_or_else(|| Error::new("STORAGE_FAILURE", "missing store format"))?;
+    let mut batch = WriteBatch::default();
+    batch.put("store_format", enable_sealed(&format)?);
+    batch.put(RETRY_GC, 0u64.to_be_bytes());
+    super::catalog_upgrade::commit(db, batch)
+}
+
 /// The pre-fallback identity a store-counter, source-summary, owner-graph or fallback-fenced
 /// format lifts;
 /// other formats are unchanged.
 fn lower(format: &[u8]) -> &[u8] {
+    let format = position(&SEALED, format).map_or(format, |(family, i)| PAYLOAD_INDEX[family][i]);
     let format = position(&PAYLOAD_INDEX, format)
         .map_or(format, |(family, index)| STORE_COUNTERS[family][index]);
     let format = position(&STORE_COUNTERS, format)
@@ -575,7 +692,9 @@ fn relift<'a>(current: &[u8], next: &'a [u8]) -> Result<&'a [u8], Error> {
     } else {
         next
     };
-    if has_payload_index(current) {
+    if sealed(current).is_some() {
+        enable_sealed(enable_payload_index(next)?)
+    } else if has_payload_index(current) {
         enable_payload_index(next)
     } else {
         Ok(next)
@@ -609,6 +728,7 @@ pub(super) fn lower_store_counters(format: &[u8]) -> &[u8] {
 /// The store counter identity a payload index family lifts; other formats are unchanged.
 #[cfg(feature = "test-support")]
 pub(super) fn lower_payload_index(format: &[u8]) -> &[u8] {
+    let format = position(&SEALED, format).map_or(format, |(family, i)| PAYLOAD_INDEX[family][i]);
     position(&PAYLOAD_INDEX, format).map_or(format, |(family, index)| STORE_COUNTERS[family][index])
 }
 
@@ -621,11 +741,14 @@ pub(super) fn has_store_counters(format: &[u8]) -> bool {
 }
 
 pub(super) fn has_payload_index(format: &[u8]) -> bool {
-    position(&PAYLOAD_INDEX, format).is_some()
+    position(&PAYLOAD_INDEX, format).is_some() || sealed(format).is_some()
 }
 
 /// Fence a current store counter family for the payload id index (#323); idempotent.
 pub(super) fn enable_payload_index(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some(identity) = sealed(format) {
+        return Ok(identity);
+    }
     position(&PAYLOAD_INDEX, format)
         .or_else(|| position(&STORE_COUNTERS, format))
         .map(|(family, index)| PAYLOAD_INDEX[family][index])
@@ -639,6 +762,9 @@ pub(super) fn enable_payload_index(format: &[u8]) -> Result<&'static [u8], Error
 
 /// Fence a current source summary family for the store counters; idempotent.
 pub(super) fn enable_store_counters(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some(identity) = sealed(format) {
+        return Ok(identity);
+    }
     if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {
         return Ok(PAYLOAD_INDEX[family][index]);
     }
@@ -656,6 +782,9 @@ pub(super) fn enable_store_counters(format: &[u8]) -> Result<&'static [u8], Erro
 /// Fence a current owner graph family for the per-source counters and artifact index;
 /// idempotent.
 pub(super) fn enable_source_summary(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some(identity) = sealed(format) {
+        return Ok(identity);
+    }
     if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {
         return Ok(PAYLOAD_INDEX[family][index]);
     }
@@ -675,6 +804,9 @@ pub(super) fn enable_source_summary(format: &[u8]) -> Result<&'static [u8], Erro
 
 /// Fence a current event fallback family for the owner-to-graph index; idempotent.
 pub(super) fn enable_owner_graphs(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some(identity) = sealed(format) {
+        return Ok(identity);
+    }
     if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {
         return Ok(PAYLOAD_INDEX[family][index]);
     }
@@ -697,6 +829,9 @@ pub(super) fn enable_owner_graphs(format: &[u8]) -> Result<&'static [u8], Error>
 
 /// Fence a current tracing-or-later family for receipt-time fallback RDF; idempotent.
 pub(super) fn enable_event_fallback(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some(identity) = sealed(format) {
+        return Ok(identity);
+    }
     if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {
         return Ok(PAYLOAD_INDEX[family][index]);
     }
@@ -738,6 +873,7 @@ fn families() -> impl Iterator<Item = &'static &'static [u8]> {
         .chain(SOURCE_SUMMARY.iter().flatten())
         .chain(STORE_COUNTERS.iter().flatten())
         .chain(PAYLOAD_INDEX.iter().flatten())
+        .chain(SEALED.iter().flatten())
 }
 
 fn base_index(format: &[u8], purpose: &str) -> Result<usize, Error> {
@@ -887,6 +1023,7 @@ pub(super) fn read(db: &DB) -> Result<Option<Vec<u8>>, Error> {
             .chain(SOURCE_SUMMARY.iter().flatten())
             .chain(STORE_COUNTERS.iter().flatten())
             .chain(PAYLOAD_INDEX.iter().flatten())
+            .chain(SEALED.iter().flatten())
             .position(|identity| *identity == raw)
             .map_or(raw.clone(), |index| BASE[index % BASE.len()].to_vec())
     }))
@@ -990,6 +1127,11 @@ mod tests {
             PAYLOAD_INDEX_ARCHIVE,
             PAYLOAD_INDEX_INTAKE,
             PAYLOAD_INDEX_INTAKE_ARCHIVE,
+            SEALED[0],
+            SEALED[1],
+            SEALED[2],
+            SEALED[3],
+            SEALED[4],
         ] {
             for (base, format) in BASE.into_iter().zip(family) {
                 db.put("store_format", format).unwrap();

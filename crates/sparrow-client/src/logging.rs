@@ -89,7 +89,7 @@ impl TracingLayer {
             Ok(event) => match &self.output {
                 Output::Console(console) => console.emit(event),
                 Output::Remote(delivery) => {
-                    delivery.try_send(event);
+                    delivery.observe(event);
                 }
             },
             Err(()) => self.capture_failed(),

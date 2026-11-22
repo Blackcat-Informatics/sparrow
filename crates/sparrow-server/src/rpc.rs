@@ -185,6 +185,70 @@ enum Next {
 }
 
 impl Rpc {
+    async fn accept_events(
+        &self,
+        batch: wire::event_batch::Reader<'_>,
+        mode: sparrow_core::Durability,
+        guard: Option<(String, u64)>,
+        out: wire::result::Builder<'_, wire::artifact::Owned>,
+    ) -> capnp::Result<()> {
+        let input = match sparrow_client::EventBatch::decode(batch) {
+            Ok(input) => input,
+            Err(error) => {
+                failure(out, invalid(error));
+                return Ok(());
+            }
+        };
+        // Batch validation bounds normalization by MAX_EVENT_BATCH_EVENTS and
+        // MAX_EVENT_BATCH_BYTES, well inside the store's inline ingest bound.
+        let bytes = match input.source_bytes().map_err(invalid) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                failure(out, error);
+                return Ok(());
+            }
+        };
+        let intake = self.intake;
+        match self
+            .work(move |store, now| {
+                // The store binds the source's /event_time mapping; a full source registry
+                // stores the batch with unknown time and counts it (#227).
+                if let Some((id, _)) = &guard
+                    && store.store_id()? != *id
+                {
+                    return Err(sparrow_core::Error::new(
+                        "STORE_MISMATCH",
+                        "sealed request belongs to another store",
+                    ));
+                }
+                store.ingest_events_before(
+                    &input.request_id,
+                    &input.source,
+                    &bytes,
+                    &sparrow_core::ProducerBatch {
+                        instance: input.client_instance,
+                        sequences: input.events.iter().map(|event| event.sequence).collect(),
+                    },
+                    intake,
+                    now,
+                    mode,
+                    guard.map(|(_, deadline)| deadline),
+                )
+            })
+            .await
+        {
+            Ok(value) => artifact(
+                out.init_ok(),
+                value,
+                &self
+                    .store
+                    .store_id()
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?,
+            )?,
+            Err(error) => failure(out, error),
+        }
+        Ok(())
+    }
     /// Construct the one typed adapter with explicit admission limits.
     pub fn new(store: Store, requests: Arc<Semaphore>, max_pin_members: usize) -> Self {
         Self {
@@ -2149,53 +2213,35 @@ impl wire::sparrow::Server for Rpc {
         mut results: wire::sparrow::EventsIngestResults,
     ) -> capnp::Result<()> {
         let mode = durability_mode(params.get()?.get_durability()?);
-        let input = match sparrow_client::EventBatch::decode(params.get()?.get_batch()?) {
-            Ok(input) => input,
-            Err(error) => {
-                failure(results.get().init_result(), invalid(error));
-                return Ok(());
-            }
-        };
-        // Batch validation bounds normalization by MAX_EVENT_BATCH_EVENTS and
-        // MAX_EVENT_BATCH_BYTES, well inside the store's inline ingest bound.
-        let bytes = match input.source_bytes().map_err(invalid) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                failure(results.get().init_result(), error);
-                return Ok(());
-            }
-        };
-        let intake = self.intake;
-        match self
-            .work(move |store, now| {
-                // The store binds the source's /event_time mapping; a full source registry
-                // stores the batch with unknown time and counts it (#227).
-                store.ingest_events_with_intake(
-                    &input.request_id,
-                    &input.source,
-                    &bytes,
-                    &sparrow_core::ProducerBatch {
-                        instance: input.client_instance,
-                        sequences: input.events.iter().map(|event| event.sequence).collect(),
-                    },
-                    intake,
-                    now,
-                    mode,
-                )
-            })
-            .await
-        {
-            Ok(value) => artifact(
-                results.get().init_result().init_ok(),
-                value,
-                &self
-                    .store
-                    .store_id()
-                    .map_err(|error| capnp::Error::failed(error.to_string()))?,
-            )?,
-            Err(error) => failure(results.get().init_result(), error),
+        self.accept_events(
+            params.get()?.get_batch()?,
+            mode,
+            None,
+            results.get().init_result(),
+        )
+        .await
+    }
+    async fn sealed_events_ingest(
+        self: Rc<Self>,
+        params: wire::sparrow::SealedEventsIngestParams,
+        mut results: wire::sparrow::SealedEventsIngestResults,
+    ) -> capnp::Result<()> {
+        let input = params.get()?;
+        let store = input.get_store_id()?.to_str()?;
+        if store.len() > 128 {
+            failure(
+                results.get().init_result(),
+                invalid("sealed store id exceeds its limit"),
+            );
+            return Ok(());
         }
-        Ok(())
+        self.accept_events(
+            input.get_batch()?,
+            sparrow_core::Durability::Durable,
+            Some((store.to_owned(), input.get_deadline_ms())),
+            results.get().init_result(),
+        )
+        .await
     }
     async fn import_begin(
         self: Rc<Self>,
@@ -3155,13 +3201,20 @@ impl wire::sparrow::Server for Rpc {
     ) -> capnp::Result<()> {
         let paused = self.pause.paused();
         let discovered = self
-            .work(|store, _| Ok((store.properties()?, store.durability_status()?)))
+            .work(|store, now| {
+                Ok((
+                    store.properties()?,
+                    store.durability_status()?,
+                    sparrow_core::Store::sealed_event_deadline(now),
+                ))
+            })
             .await;
         self.pause.read_finished(paused, &discovered);
         match discovered {
             Err(error) => failure(results.get().init_result(), error),
-            Ok((value, durability)) => {
+            Ok((value, durability, deadline)) => {
                 let mut out = results.get().init_result().init_ok();
+                out.set_sealed_event_deadline_ms(deadline);
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
                 out.reborrow()
