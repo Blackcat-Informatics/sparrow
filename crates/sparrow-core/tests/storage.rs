@@ -24051,17 +24051,32 @@ fn a_poisoned_writer_is_recovered_by_the_next_operation() {
     assert_eq!(store.durability_status().unwrap().writer_recoveries, 2);
 }
 
-/// INVARIANT (#447): a writer poisoned while durability is latched is not stranded: recovering
-/// the lock re-establishes durability first, so the latch and the poison clear together and the
-/// next write is accepted without a reopen.
+/// A diagnostic read observes combined poison and a latch, and an ordinary writer gets a
+/// retryable refusal. The explicit proof returns the original cause and clears both.
 #[test]
-fn a_poisoned_writer_under_a_durability_latch_recovers_and_clears_it() {
+fn a_poisoned_writer_waits_for_the_explicit_durability_proof() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
-    store
-        .latch_durability_for_tests("injected WAL sync failure")
-        .unwrap();
+    let cause = "injected WAL sync failure";
+    store.latch_durability_for_tests(cause).unwrap();
     store.poison_writer_for_tests();
+    store.status_report(1).unwrap();
+    store.pressure_status().unwrap();
+    store.recompression_status().unwrap();
+    store.consumption_retired().unwrap();
+    let refused = store
+        .ingest("after", "source", "log", b"accepted\n", 1)
+        .unwrap_err();
+    assert_eq!(refused.code, "STORAGE_PRESSURE", "{refused}");
+    assert!(refused.is_retryable() && refused.message.contains(cause));
+    let status = store.durability_status().unwrap();
+    assert_eq!(status.failure.as_deref(), Some(cause));
+    assert_eq!((status.writer_recoveries, status.recoveries), (0, 0));
+
+    assert_eq!(
+        store.reestablish_durability().unwrap().as_deref(),
+        Some(cause)
+    );
     let status = store.durability_status().unwrap();
     assert!(status.failure.is_none(), "{status:?}");
     assert_eq!(
