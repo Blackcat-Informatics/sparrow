@@ -8,6 +8,9 @@
 //! `consumeset:{H}.part{k:010}`. The manifest `consumeset:{H}.manifest` lists the parts in
 //! order and alone defines the set.
 
+mod file;
+pub use file::{FILE_SET_MANIFEST_BYTES, FileImport, import_file_or_set};
+
 use crate::imports::{Checkpoint, StagedInput, payload_id, upload};
 use crate::ingest_status::PartGate;
 use crate::{

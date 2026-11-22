@@ -1291,6 +1291,33 @@ fixed 1 MiB window. The archive's `max_segment_bytes` is a closing target from
 1 MiB to 256 MiB, and an entry larger than the target is archived in a segment
 of its own; see [the archive format](archive-format.md).
 
+### CLI ingestion and verification of ordered part sets
+
+`sparrow SOCKET ingest REQUEST_ID SOURCE FORMAT FILE` returns the ordinary
+artifact receipt when a completed file fits in one import. When it needs
+several imports, the CLI uses the shared part planner and returns a
+`manifest` receipt followed by a `parts` array in byte order. Each entry
+contains `index`, `start`, `byte_length`, `format` and `artifact_id`. The
+manifest uses the original request ID and source. The CLI publishes it only
+after receiving durable receipts for all parts. The file stays at its original
+path on success, refusal and interruption.
+
+Resume with the same request, source, format, original file and local state
+directory. The per-store journal lives under
+`${XDG_STATE_HOME}/sparrow-client/file-sets`, with `~/.local/state` as the
+default state root. It preserves the completed prefix and the original
+publication identity. Retry an uncertain publication within the daemon's
+48-hour retry window. After that receipt expires, the CLI reports the refusal
+and keeps the source and journal. A completed journal returns the same
+original receipt on repetition, while each artifact remains subject to the
+store's independent retention rules.
+
+Run `sparrow SOCKET parts verify SOURCE MANIFEST_ARTIFACT_ID` for a
+`sparrow.parts/1` manifest. It checks each member against the current artifact
+listing and reports its ordinal and ID with a status of available, missing,
+unavailable or mismatched. A partial set produces the report and a nonzero
+exit status. Retention can run between verification and readback.
+
 ### Query-only daemon (schema 67)
 
 `sparrowd --config FILE --query-only`, or `query_only = true` in the server

@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 println!("{}", json::write_compact(&output));
                 if output.get("execution_status").and_then(json::Value::as_str) == Some("failed") {
-                    return Err("query failed; see the emitted typed failure receipt".into());
+                    return Err("command failed; see the emitted JSON result".into());
                 }
             }
             Ok::<(), Box<dyn std::error::Error>>(())

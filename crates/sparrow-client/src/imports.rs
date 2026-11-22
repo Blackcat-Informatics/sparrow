@@ -54,24 +54,47 @@ async fn import_checked(
     format: wire::Format,
     path: &Path,
 ) -> Result<ArtifactReceipt, Error> {
-    let mut file = open_completed_file(path)?;
+    import_open_checked(
+        endpoint,
+        expect,
+        request_id,
+        source,
+        format,
+        &CompletedInput::capture(&open_completed_file(path)?)?,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn import_open_checked(
+    endpoint: &Endpoint,
+    expect: Option<&Expect>,
+    request_id: &str,
+    source: &str,
+    format: wire::Format,
+    input: &CompletedInput<'_>,
+    mut first_connection: Option<Client>,
+) -> Result<ArtifactReceipt, Error> {
     let mut checkpoint = Checkpoint::default();
-    let attempt = async |file: &mut File, checkpoint: &mut Checkpoint| {
-        let client = reconnect(endpoint, expect).await?;
+    let attempt = async |first: Option<Client>, checkpoint: &mut Checkpoint| {
+        let client = match first {
+            Some(client) => client,
+            None => reconnect(endpoint, expect).await?,
+        };
         upload(
             client.capability(),
             client.discovery(),
             request_id,
             source,
             format,
-            &CompletedInput::capture(file)?,
+            input,
             checkpoint,
         )
         .await
     };
     let error = loop {
         let before = checkpoint.progress;
-        match attempt(&mut file, &mut checkpoint).await {
+        match attempt(first_connection.take(), &mut checkpoint).await {
             Ok(receipt) => return Ok(receipt),
             Err(error) if error.retryable() && checkpoint.progress > before => {}
             Err(error) => break error,
@@ -105,7 +128,7 @@ async fn import_checked(
         checkpoint.import.clone(),
         Session::Replaceable,
         async |store: &str, id: &str| cancel(endpoint, expect, store, id).await,
-        async || attempt(&mut file, &mut checkpoint).await,
+        async || attempt(None, &mut checkpoint).await,
     )
     .await
 }
@@ -289,7 +312,10 @@ impl Checkpoint {
 }
 
 /// Connect, waiting a bounded time while a restarting daemon is not yet accepting.
-async fn reconnect(endpoint: &Endpoint, expect: Option<&Expect>) -> Result<Client, Error> {
+pub(crate) async fn reconnect(
+    endpoint: &Endpoint,
+    expect: Option<&Expect>,
+) -> Result<Client, Error> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let connected = Client::open(endpoint, expect, crate::receipt::Contract::Producer).await;
@@ -396,8 +422,8 @@ pub(crate) trait StagedInput {
 
 /// A completed regular file, bound to the identity observed before upload.
 pub(crate) struct CompletedInput<'a> {
-    file: &'a File,
-    identity: CompletedFileIdentity,
+    pub(crate) file: &'a File,
+    pub(crate) identity: CompletedFileIdentity,
 }
 
 impl<'a> CompletedInput<'a> {

@@ -336,6 +336,13 @@ impl ArtifactReceipt {
                 .collect::<Result<_, Error>>()?,
             durability: value.get_durability()?,
         };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    /// Validate a decoded receipt, including one recovered from a local publication journal.
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        let receipt = self;
         if (receipt.durability == wire::Durability::Buffered) != receipt.buffered_through.is_some()
             || receipt
                 .buffered_through
@@ -374,7 +381,7 @@ impl ArtifactReceipt {
                 "artifact receipt contains invalid or duplicate record identities",
             ));
         }
-        Ok(receipt)
+        Ok(())
     }
 }
 

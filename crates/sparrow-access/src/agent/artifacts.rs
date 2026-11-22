@@ -66,6 +66,14 @@ impl Input {
 
     pub(super) async fn execute(&self, client: &wire::sparrow::Client) -> Result<Value> {
         sparrow_client::Discovery::fetch(client).await?;
+        self.read_page(client, render).await
+    }
+
+    pub(super) async fn read_page<T>(
+        &self,
+        client: &wire::sparrow::Client,
+        read: impl FnOnce(wire::artifact_list_page::Reader<'_>) -> Result<T>,
+    ) -> Result<T> {
         let mut request = client.artifacts_list_request();
         let mut query = request.get().init_query();
         query.set_store_id(&self.store);
@@ -106,7 +114,7 @@ impl Input {
             wire::result::Ok(value) => value?,
             wire::result::Error(error) => return Err(failure(error?)),
         };
-        render(page)
+        read(page)
     }
 }
 

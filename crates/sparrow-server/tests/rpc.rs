@@ -8026,7 +8026,7 @@ struct EventRelayState {
     drop_first: std::cell::Cell<bool>,
     corrupt_receipt: std::cell::Cell<bool>,
     corrupt_publication: std::cell::Cell<bool>,
-    withhold_publication: std::cell::Cell<bool>,
+    withhold_publication: std::cell::Cell<Option<usize>>,
     /// Answer `importPublish` with this daemon-style refusal `(code, retryable)` instead of forwarding it.
     refuse_publish: std::cell::Cell<Option<(&'static str, bool)>>,
     /// Answer `importCancel` with this daemon refusal `(code, retryable)` instead of forwarding it.
@@ -8299,15 +8299,18 @@ impl wire::sparrow::Server for EventRelay {
         let mut request = self.0.backend.borrow().import_publish_request();
         request.get().set_import(params.get()?.get_import()?)?;
         let response = request.send().promise.await?;
-        if self.0.withhold_publication.replace(false)
-            && let wire::result::Ok(value) = response.get()?.get_result()?.which()?
+        if let wire::result::Ok(value) = response.get()?.get_result()?.which()?
+            && let Some(remaining) = self.0.withhold_publication.get()
         {
-            *self.0.accepted.borrow_mut() = Some(
-                sparrow_client::ArtifactReceipt::decode(value?)
-                    .map_err(|e| capnp::Error::failed(e.to_string()))?,
-            );
-            self.0.first_accepted.notify_one();
-            return std::future::pending().await;
+            self.0.withhold_publication.set(remaining.checked_sub(1));
+            if remaining == 0 {
+                *self.0.accepted.borrow_mut() = Some(
+                    sparrow_client::ArtifactReceipt::decode(value?)
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?,
+                );
+                self.0.first_accepted.notify_one();
+                return std::future::pending().await;
+            }
         }
         results.get().set_result(response.get()?.get_result()?)?;
         if let Some(path) = self.0.mutate_published_file.borrow().as_ref() {
@@ -8710,7 +8713,7 @@ async fn bulk_reopens_an_unacknowledged_range_and_publishes_while_input_is_open(
         let backend = connect(&socket).await.unwrap();
         let relay_path = dir.path().join("bulk.sock");
         let (state, proxy) = relay(&relay_path, backend.client.clone());
-        state.withhold_publication.set(true);
+        state.withhold_publication.set(Some(0));
         let mut cfg = BulkConfig::new(Endpoint::Unix(relay_path), dir.path().join("bulk"));
         cfg.staged_bytes = 32;
         cfg.range_bytes = 16;
@@ -8926,7 +8929,7 @@ fn relay(
         drop_first: std::cell::Cell::new(true),
         corrupt_receipt: std::cell::Cell::new(false),
         corrupt_publication: std::cell::Cell::new(false),
-        withhold_publication: std::cell::Cell::new(false),
+        withhold_publication: std::cell::Cell::new(None),
         refuse_publish: std::cell::Cell::new(None),
         refuse_cancel: std::cell::Cell::new(None),
         refusals: std::cell::RefCell::new(std::collections::VecDeque::new()),
@@ -17712,6 +17715,186 @@ async fn over_bound_consume_file_is_split_into_ordered_parts_and_removed() {
                     .join(&journal.import_id)
                     .exists()
             );
+        })
+        .await;
+}
+
+/// INVARIANT (#499): the shipped CLI retains the completed file, resumes after an
+/// interrupted publication without duplicating parts, and returns one reconstructible manifest.
+#[tokio::test]
+async fn cli_ingest_resumes_ordered_parts_and_keeps_ordinary_receipts() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let harness = set_harness(dir.path()).await;
+            let relay_path = dir.path().join("ingest.sock");
+            let (relay_state, proxy) = relay(&relay_path, harness.client.capability().clone());
+            let state_dir = dir.path().join("state");
+            let source = "set-source";
+            let run = |socket: &Path, request: &str, format: &str, input: &Path| {
+                tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
+                    .arg(socket)
+                    .args(["ingest", request, source, format])
+                    .arg(input)
+                    .env("XDG_STATE_HOME", &state_dir)
+                    .kill_on_drop(true)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .admitted_spawn()
+                    .unwrap()
+            };
+            let receipt = async |child: tokio::process::Child| {
+                let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                purrdf_lex::json::read_slice(&output.stdout, purrdf_lex::json::Limits::default())
+                    .unwrap()
+            };
+            let file = dir.path().join("events.jsonl");
+            let one = chunk_lines(0, 1, b'x');
+            std::fs::write(&file, &one).unwrap();
+            let single = receipt(run(&harness.socket, "single", "jsonl", &file)).await;
+            assert_eq!(single["format"].as_str(), Some("jsonl"));
+            assert_eq!(single["durability"].as_str(), Some("durable"));
+            assert_eq!(
+                harness.read(single["artifact_id"].as_str().unwrap(), one.len() as u64),
+                one
+            );
+
+            let input = chunk_lines(0, 45, b'b');
+            std::fs::write(&file, &input).unwrap();
+            relay_state.withhold_publication.set(Some(1));
+            let mut interrupted = run(&relay_path, "large", "jsonl", &file);
+            tokio::select! {
+                () = relay_state.first_accepted.notified() => {}
+                result = interrupted.wait() => panic!("CLI ended before interruption: {result:?}"),
+                () = tokio::time::sleep(Duration::from_secs(30)) => panic!("no durable part reached the relay"),
+            }
+            interrupted.kill().await.unwrap();
+            let second = relay_state.accepted.borrow().as_ref().unwrap().id.clone();
+            assert_eq!(std::fs::read(&file).unwrap(), input);
+
+            let accepted = receipt(run(&harness.socket, "large", "jsonl", &file)).await;
+            let manifest = &accepted["manifest"];
+            assert_eq!(manifest["durability"].as_str(), Some("durable"));
+            let id = manifest["artifact_id"].as_str().unwrap();
+            let parts = harness.parts(id, "jsonl", &input);
+            assert_eq!(parts.len(), 3);
+            assert_eq!(parts[1].1, second);
+            for (part, (_, artifact)) in accepted["parts"].as_array().unwrap().iter().zip(parts) {
+                assert_eq!(part["artifact_id"].as_str(), Some(artifact.as_str()));
+            }
+            assert_eq!(receipt(run(&harness.socket, "large", "jsonl", &file)).await, accepted);
+            assert_eq!(std::fs::read(&file).unwrap(), input);
+
+            let large_packet = vec![b's'; sparrow_core::SYSLOG_MESSAGE_BYTES + 1];
+            std::fs::write(&file, &large_packet).unwrap();
+            let published = receipt(run(&harness.socket, "packet", "syslog", &file)).await;
+            let manifest = published["manifest"]["artifact_id"].as_str().unwrap();
+            let parts = harness.parts(manifest, "syslog", &large_packet);
+            assert_eq!(parts.len(), 2);
+            assert!(parts.iter().all(|(format, _)| format == "opaque"));
+            proxy.abort();
+        })
+        .await;
+}
+
+/// INVARIANT (#499): the shipped verifier reports each unavailable, missing or mismatched
+/// member and returns a failing exit status for the set while a complete set succeeds.
+#[tokio::test]
+async fn the_cli_reports_the_current_availability_of_ordered_part_sets() {
+    use sparrow_client::parts::{PartSpan, manifest_body};
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let harness = set_harness(dir.path()).await;
+            let now = sparrow_server::now().unwrap();
+            let source = "verify-parts";
+            let store = &harness.store;
+            let available = store
+                .ingest("available", source, "opaque", b"1", now)
+                .unwrap();
+            let expired = store.ingest("expired", source, "opaque", b"2", 1).unwrap();
+            let mismatched = store
+                .ingest("mismatched", source, "opaque", b"34", now)
+                .unwrap();
+            let verify = async |request: &str, members: &[(&str, u64, wire::Format)]| {
+                let mut end = 0_u64;
+                let parts = members
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (id, length, format))| {
+                        let row = (
+                            PartSpan {
+                                index: i as u32,
+                                start: end,
+                                length: *length,
+                                format: *format,
+                            },
+                            (*id).to_owned(),
+                        );
+                        end += length;
+                        row
+                    })
+                    .collect::<Vec<_>>();
+                let bytes = manifest_body(request, source, wire::Format::Opaque, end, &parts);
+                let manifest = store.ingest(request, source, "json", &bytes, now).unwrap();
+                let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
+                    .arg(&harness.socket)
+                    .args(["parts", "verify", source, &manifest.id])
+                    .kill_on_drop(true)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .admitted_spawn()
+                    .unwrap();
+                let output =
+                    tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let value = purrdf_lex::json::read_slice(
+                    &output.stdout,
+                    purrdf_lex::json::Limits::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "verify output did not contain a report: {error}\n{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                });
+                (output.status.success(), value)
+            };
+            let first = (available.id.as_str(), 1, wire::Format::Opaque);
+            let (success, complete) = verify("complete", &[first]).await;
+            assert!(success, "{complete:?}");
+            assert_eq!(complete["execution_status"].as_str(), Some("complete"));
+
+            let missing = "artifact:00000000000000000000000000000000";
+            let parts = [
+                first,
+                (expired.id.as_str(), 1, wire::Format::Opaque),
+                (missing, 1, wire::Format::Opaque),
+                (mismatched.id.as_str(), 1, wire::Format::Opaque),
+            ];
+            let (success, partial) = verify("partial", &parts).await;
+            assert!(!success, "{partial:?}");
+            assert_eq!(partial["execution_status"].as_str(), Some("failed"));
+            let rows = partial["parts"].as_array().unwrap();
+            assert_eq!(rows.len(), parts.len());
+            for (index, ((id, _, _), status)) in parts
+                .into_iter()
+                .zip(["available", "unavailable", "missing", "mismatched"])
+                .enumerate()
+            {
+                assert_eq!(
+                    rows[index]["index"],
+                    purrdf_lex::json::Value::from(index as u64)
+                );
+                assert_eq!(rows[index]["artifact_id"].as_str(), Some(id));
+                assert_eq!(rows[index]["status"].as_str(), Some(status));
+            }
         })
         .await;
 }

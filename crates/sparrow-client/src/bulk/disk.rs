@@ -45,7 +45,7 @@ pub(super) struct Pending {
     pub(super) import: Option<String>,
 }
 
-fn read_meta<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
+pub(crate) fn read_meta<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
     let mut bytes = String::new();
     File::open(path)?
         .take(64 * 1024 + 1)
@@ -53,14 +53,14 @@ fn read_meta<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
     if bytes.len() > 64 * 1024 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "bulk journal entry exceeds 64 KiB",
+            "journal entry exceeds 64 KiB",
         ));
     }
 
     toml::from_str(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-fn write_meta<T: Serialize>(dir: &Path, name: &str, value: &T) -> io::Result<()> {
+pub(crate) fn write_meta<T: Serialize>(dir: &Path, name: &str, value: &T) -> io::Result<()> {
     let bytes = toml::to_string(value).map_err(io::Error::other)?;
     let scratch = dir.join("transaction.tmp");
     let mut file = OpenOptions::new()
