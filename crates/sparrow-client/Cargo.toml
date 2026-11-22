@@ -4,10 +4,13 @@
 [package]
 name = "sparrow-client"
 version = "0.1.0"
+description = "Async Sparrow producer SDK for structured logs, terminal output and bulk imports"
+repository = "http://lillith:7555/fleet/sparrow"
+readme = "README.md"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-publish.workspace = true
+publish = ["sparrow-lab"]
 license.workspace = true
 
 [dependencies]
@@ -39,7 +42,6 @@ test-timing = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-sparrow-test-support = { path = "../sparrow-test-support" }
 
 [lints]
 workspace = true

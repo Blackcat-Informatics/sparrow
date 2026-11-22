@@ -4302,7 +4302,7 @@ names = ['^(repeat_ingestion_status_agent_fixture|copy_ingestion_status_parity)$
 [[job]]
 id = "sdk-discovery-test-fixture"
 summary = "One dev-only discovered-store fixture supplies SDK acceptance, ingestion status and retention account certificate tests."
-home = "sparrow_test_support::client_discovery"
+home = "sparrow_client::receipt::client_discovery"
 entry_points = []
 spec = "AGENTS.md: shared dev-only scaffolding."
 vectors = ["crates/sparrow-client/src/receipt.rs", "crates/sparrow-client/src/ingest_status.rs", "crates/sparrow-client/src/retention_metrics.rs"]

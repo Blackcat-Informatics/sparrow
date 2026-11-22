@@ -4687,10 +4687,12 @@ caller cuts the input (see
 resend). The 32,768-record bound is checked while the layout is prepared, before
 any record is prepared.
 
-`sparrow_client` is the producer interface. It depends on no `sparrow-core`, and a crate
-outside this workspace depends on it by git revision (`publish = false`). It builds with
-the `capnp` compiler on the host and Rust 1.98, and the Cap'n Proto schema travels in the
-crate. The ingest socket carries `discover`, `ingest`, `import` (begin, append, seal,
+`sparrow-client` is the producer SDK. An application can depend on its version in
+the lab Cargo registry. The [SDK guide](../crates/sparrow-client/README.md) covers
+registry setup, console output, local spooling and bulk imports. The package
+includes the Cap'n Proto schemas and builds with the host `capnp` compiler and
+Rust 1.98 on Linux, independently of Sparrow storage. The ingest socket carries
+`discover`, `ingest`, `import` (begin, append, seal,
 layout, prepare, publish, get and cancel), `eventsIngest` and `flush`
 (`crates/sparrow-server/src/ingest_gate.rs`). A producer that writes its own client speaks
 the same schema and owns every rule the crate holds: resuming from the durable checkpoint,

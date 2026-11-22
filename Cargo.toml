@@ -18,7 +18,9 @@ sparrow-server = { path = "crates/sparrow-server" }
 sparrow-core = { path = "crates/sparrow-core" }
 sparrow-client = { path = "crates/sparrow-client" }
 sparrow-access = { path = "crates/sparrow-access" }
-sparrow-limits = { path = "crates/sparrow-limits" }
+# Use the registry URL recorded in packaged manifests. Applications consuming
+# the SDK by path or Git can resolve the sibling crate without a registry alias.
+sparrow-limits = { path = "crates/sparrow-limits", version = "0.1.0", registry-index = "sparse+http://lillith:7555/api/packages/fleet/cargo/" }
 blake3 = "1"
 rocksdb = { version = "0.25", default-features = false, features = ["lz4", "zstd", "bindgen-runtime"] }
 purrdf = "=4"
