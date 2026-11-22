@@ -401,10 +401,15 @@ pub(super) fn start_intake(shared: &Arc<Shared>) -> Result<(), Error> {
                 Err(_) => Some(Error::Protocol("spool intake panicked")),
             } {
                 worker.fail(error);
-                if let Ok(mut state) = worker.state.lock() {
-                    for queued in &mut state.queue {
-                        queued.ack.take();
-                    }
+                // Intake has stopped. Even a poisoned queue retains its ack
+                // senders; release them so assigned offers learn their outcome
+                // is uncertain. Leave admission closed on the poisoned state.
+                let mut state = worker
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for queued in &mut state.queue {
+                    queued.ack.take();
                 }
             }
             worker.intake_room.notify_waiters();

@@ -2735,21 +2735,61 @@ mod tests {
         }
     }
 
+    fn poison_queue(shared: Arc<Shared>) {
+        std::thread::spawn(move || {
+            let _held = shared.state.lock().unwrap();
+            panic!("poison the state lock on purpose");
+        })
+        .join()
+        .unwrap_err();
+    }
+
+    /// If intake fails with admitted offers behind a detached append, both kinds of
+    /// disk confirmation must wake their callers and name the assigned sequences.
+    #[tokio::test]
+    async fn a_poisoned_spool_wakes_confirmed_senders_with_uncertain_sequences() {
+        use futures::FutureExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = DeliveryConfig::lossy_spooled(
+            crate::Endpoint::Unix(dir.path().join("absent.sock")),
+            "terminal-spool",
+            crate::SpoolConfig::new(dir.path().join("spool")),
+        );
+        config.batch_events = 1;
+        let delivery = Delivery::start_async(config).await.unwrap();
+        let first = delivery.offer_spooled(event());
+        let second = delivery.send(event());
+        tokio::pin!(first, second);
+        {
+            let _disk = delivery.shared.spool.as_ref().unwrap().lock().unwrap();
+            assert!(first.as_mut().now_or_never().is_none());
+            assert!(second.as_mut().now_or_never().is_none());
+            assert_eq!(delivery.stats().unwrap().admitted_events, 2);
+            poison_queue(delivery.shared.clone());
+        }
+        let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(first, second)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(first, Err(SendError::Uncertain { sequence: 1 })));
+        assert!(matches!(second, Err(SendError::Uncertain { sequence: 2 })));
+        assert!(matches!(
+            delivery.offer_spooled(event()).await,
+            Err(SendError::Refused {
+                reason: Refusal::SpoolFailed,
+                ..
+            })
+        ));
+    }
+
     /// A poisoned queue still exposes terminal settlement: quarantine mode reports its
     /// saved files and disk-free mode publishes the cause and counts remaining admissions.
     #[test]
     fn a_poisoned_queue_reports_saved_or_discarded_events_under_its_delivery_policy() {
         let dir = tempfile::tempdir().unwrap();
         let shared = shared(&dir.path().join("quarantine"));
-        let poison = |poisoner: Arc<Shared>| {
-            std::thread::spawn(move || {
-                let _held = poisoner.state.lock().unwrap();
-                panic!("poison the state lock on purpose");
-            })
-            .join()
-            .unwrap_err();
-        };
-        poison(shared.clone());
+        poison_queue(shared.clone());
         assert!(shared.state.is_poisoned());
         let path = shared
             .save(&batch_of("events:poison:1", 1), &Error::Protocol("refused"))
@@ -2787,7 +2827,7 @@ mod tests {
             disk_free.try_send(event()),
             Admission::Queued { sequence: 1 }
         );
-        poison(disk_free.shared.clone());
+        poison_queue(disk_free.shared.clone());
         disk_free.shared.fail(Error::Protocol("sender panic"));
         assert_eq!(
             disk_free.try_send(event()),
