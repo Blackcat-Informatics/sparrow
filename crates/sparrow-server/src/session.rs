@@ -145,9 +145,11 @@ impl Session {
             let spill = spill.clone();
             move || syslog_listener::check_spill_owners(&spill, &config.syslog)
         });
+        // Initial startup retains a pending interrupt for the existing serving teardown.
+        // A replacement already has bound listeners and can stop after this owned check.
         tokio::select! {
             result = &mut checked => result?.map_err(start_wait::bind_failure)?,
-            stop = interrupted(signal) => {
+            stop = interrupted(signal), if SERVING.load(std::sync::atomic::Ordering::Relaxed) => {
                 super::recovery::status("stopping after syslog spill inspection", &spill.display().to_string());
                 checked.await?.map_err(start_wait::bind_failure)?;
                 stop?;
