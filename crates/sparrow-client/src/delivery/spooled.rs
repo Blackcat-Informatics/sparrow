@@ -39,6 +39,7 @@ impl Completion {
 }
 
 struct Offer {
+    disk: u64,
     event: ProducerEvent,
     bytes: usize,
     token: Vec<u8>,
@@ -56,14 +57,19 @@ impl Delivery {
         if matches!(shared.config.mode, DeliveryMode::LosslessConfirmed(_)) {
             Admission::Refused { reason }
         } else {
-            shared.reject(reason.drop_reason(), None)
+            let drop = if reason == Refusal::SpoolFull {
+                DropReason::SpoolFull
+            } else {
+                reason.drop_reason()
+            };
+            shared.reject(drop, None)
         }
     }
 
     fn permit(
         &self,
-        bytes: usize,
-        token: usize,
+        offer: &Offer,
+        exact: bool,
     ) -> Result<(std::sync::MutexGuard<'_, State>, u64), Refusal> {
         let shared = &self.shared;
         let config = shared.config.mode.spool().ok_or(Refusal::Invalid)?;
@@ -74,18 +80,21 @@ impl Delivery {
         if state.closing || shared.aborted.load(Ordering::Acquire) {
             return Err(Refusal::Closed);
         }
-        let disk = reserve(bytes, token);
-        let used = state
-            .spool
-            .as_ref()
-            .ok_or(Refusal::SpoolFailed)?
-            .bytes
-            .saturating_add(state.reserved_disk);
-        if disk > config.max_bytes.saturating_sub(used) {
+        let used = state.spool.as_ref().ok_or(Refusal::SpoolFailed)?.bytes;
+        let free = config.max_bytes.saturating_sub(used);
+        if offer.disk > free {
             return Err(Refusal::SpoolFull);
         }
+        if offer.disk > free.saturating_sub(state.reserved_disk) {
+            return Err(if exact {
+                Refusal::Busy
+            } else {
+                Refusal::SpoolFull
+            });
+        }
         if state.count >= shared.config.max_queued_events
-            || bytes + token > shared.config.max_queued_bytes.saturating_sub(state.bytes)
+            || offer.bytes + offer.token.len()
+                > shared.config.max_queued_bytes.saturating_sub(state.bytes)
         {
             return Err(Refusal::Busy);
         }
@@ -105,8 +114,9 @@ impl Delivery {
         state.admitted += 1;
         state.bytes += input.bytes + input.token.len();
         state.count += 1;
-        state.reserved_disk += reserve(input.bytes, input.token.len());
+        state.reserved_disk += input.disk;
         state.queue.push_back(Queued {
+            disk: input.disk,
             event: input.event,
             bytes: input.bytes,
             at: Instant::now(),
@@ -122,18 +132,23 @@ impl Delivery {
         let Ok(bytes) = event.admission_bytes() else {
             return self.refuse(Refusal::Invalid);
         };
-        match self.permit(bytes, 0) {
+        let mut offer = Offer {
+            disk: reserve(bytes, 0),
+            event,
+            bytes,
+            token: Vec::new(),
+            ack: None,
+        };
+        let mut admission = self.permit(&offer, false);
+        if matches!(admission, Err(Refusal::SpoolFull))
+            && matches!(self.shared.config.mode, DeliveryMode::LossySpooled(_))
+        {
+            offer.disk = Log::frame_bytes(&offer.event, &[]);
+            admission = self.permit(&offer, true);
+        }
+        match admission {
             Ok((state, sequence)) => {
-                self.enqueue(
-                    state,
-                    sequence,
-                    Offer {
-                        event,
-                        bytes,
-                        token: Vec::new(),
-                        ack: None,
-                    },
-                );
+                self.enqueue(state, sequence, offer);
                 Admission::Queued { sequence }
             }
             Err(reason) => self.refuse(reason),
@@ -152,7 +167,35 @@ impl Delivery {
         event: ProducerEvent,
         token: &[u8],
     ) -> Result<SpoolReceipt, SendError> {
-        self.shared.bump(&self.shared.offered);
+        self.confirmed_offer(event, token, false).await
+    }
+
+    /// Wait for bounded intake room in lossy spooled mode. A synchronized event returns
+    /// its receipt. Only an actual full on-disk segment budget drops valid input and
+    /// returns `Ok(None)`. Setup, closed admission and storage failures remain errors.
+    pub async fn offer_spooled(
+        &self,
+        event: ProducerEvent,
+    ) -> Result<Option<SpoolReceipt>, SendError> {
+        match self.confirmed_offer(event, &[], true).await {
+            Ok(receipt) => Ok(Some(receipt)),
+            Err(SendError::Refused {
+                reason: Refusal::SpoolFull,
+                ..
+            }) => {
+                self.shared.reject(DropReason::SpoolFull, None);
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn confirmed_offer(
+        &self,
+        event: ProducerEvent,
+        token: &[u8],
+        backpressure: bool,
+    ) -> Result<SpoolReceipt, SendError> {
         let refused = |reason, event| {
             self.shared.bump(&self.shared.refusals[reason as usize]);
             Err(SendError::Refused {
@@ -160,18 +203,33 @@ impl Delivery {
                 event: Box::new(event),
             })
         };
+        // A disk confirmation API cannot offer an event on a disk-free handle.
+        if self.shared.config.disk_free() {
+            return refused(Refusal::Invalid, event);
+        }
+        self.shared.bump(&self.shared.offered);
         let Ok(bytes) = event.admission_bytes() else {
             return refused(Refusal::Invalid, event);
         };
         let Some(config) = self.shared.config.mode.spool() else {
             return refused(Refusal::Invalid, event);
         };
-        if token.len() > 256 {
+        if token.len() > 256
+            || backpressure && !matches!(self.shared.config.mode, DeliveryMode::LossySpooled(_))
+        {
+            return refused(Refusal::Invalid, event);
+        }
+        if bytes + token.len() > self.shared.config.max_queued_bytes {
             return refused(Refusal::Invalid, event);
         }
         let deadline = tokio::time::Instant::now() + config.max_wait;
         let (tx, rx) = oneshot::channel();
         let offer = Offer {
+            disk: if backpressure {
+                Log::frame_bytes(&event, token)
+            } else {
+                reserve(bytes, token.len())
+            },
             event,
             bytes,
             token: token.to_owned(),
@@ -181,7 +239,7 @@ impl Delivery {
             let room = self.shared.intake_room.notified();
             tokio::pin!(room);
             room.as_mut().enable();
-            let reason = match self.permit(bytes, token.len()) {
+            let reason = match self.permit(&offer, backpressure) {
                 Ok((state, seq)) => {
                     self.enqueue(state, seq, offer);
                     break seq;
@@ -189,6 +247,7 @@ impl Delivery {
                 Err(reason) => reason,
             };
             match reason {
+                Refusal::Busy if backpressure => room.await,
                 Refusal::Busy if tokio::time::Instant::now() < deadline => {
                     let _ = tokio::time::timeout_at(deadline, room).await;
                 }
@@ -284,6 +343,7 @@ impl Delivery {
             }
             state.closing = true;
         }
+        self.shared.intake_room.notify_waiters();
         self.shared.intake_work.notify_all();
         let synced = self.flush_local(timeout).await?;
         self.shared.aborted.store(true, Ordering::Release);
@@ -305,6 +365,9 @@ impl Delivery {
     /// Bind an unsealed prefix to an explicitly named store. An unresolved seal stays on
     /// its original store until an exact receipt establishes its outcome.
     pub async fn rebind(&self, store: &str) -> Result<(), Error> {
+        if self.shared.config.disk_free() {
+            return self.shared.rebind_memory(store);
+        }
         let spool = self
             .shared
             .spool
@@ -427,7 +490,7 @@ fn intake(shared: &Shared) -> Result<(), Error> {
             for item in &group {
                 state.count -= 1;
                 state.bytes -= item.bytes + item.token.len();
-                state.reserved_disk -= reserve(item.bytes, item.token.len());
+                state.reserved_disk -= item.disk;
             }
         }
         drop(log);

@@ -2340,7 +2340,7 @@ names = ['^(validate_cli_discovery|validate_producer_discovery)$']
 id = "producer-spool"
 summary = "Recover, seal, confirm and reclaim ordered producer segments under one persistent identity and bounded disk budget."
 home = "sparrow_client::spool::Log"
-entry_points = ["sparrow_client::delivery::spooled::Delivery::send_with_token", "sparrow_client::delivery::spooled::Delivery::flush_local", "sparrow_client::delivery::Delivery::try_send"]
+entry_points = ["sparrow_client::delivery::spooled::Delivery::send_with_token", "sparrow_client::delivery::spooled::Delivery::offer_spooled", "sparrow_client::delivery::spooled::Delivery::flush_local", "sparrow_client::delivery::Delivery::try_send"]
 spec = "docs/interfaces.md: Configured spool."
 vectors = ["crates/sparrow-client/src/spool.rs", "crates/sparrow-server/tests/rpc.rs"]
 bench = []
@@ -2350,6 +2350,21 @@ enforced = true
 constants = []
 fingerprints = []
 names = ['^(append_offline_event|replay_offline_segment)$']
+
+[[job]]
+id = "lossy-producer-fence"
+summary = "Release FIFO queue credit and capture the cumulative worker losses through a disk-free producer fence."
+home = "sparrow_client::delivery::lossy::State::release_credit"
+entry_points = ["sparrow_client::delivery::Shared::accepted", "sparrow_client::delivery::lossy::Shared::discard_batch", "sparrow_client::delivery::Shared::next"]
+spec = "docs/interfaces.md: Disk-free lossy delivery."
+vectors = ["crates/sparrow-client/src/delivery.rs", "crates/sparrow-server/tests/rpc.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(release_lossy_credit|settle_lossy_prefix)$']
 
 [[job]]
 id = "durable-producer-directory-creation"

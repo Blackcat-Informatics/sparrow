@@ -4745,6 +4745,7 @@ an exclusive lock and binds one persistent producer instance to its source.
 | --- | --- |
 | `try_send(event)` | `Admission::Queued` assigns a sequence and transfers the event to bounded RAM without file or socket I/O. |
 | `send(event).await` or `send_with_token(event, cursor).await` | A local disk sync covers the event and its optional application cursor of up to 256 bytes, even offline. |
+| `offer_spooled(event).await` in `lossy_spooled` mode | `Ok(Some(receipt))` confirms local disk sync. `Ok(None)` counts one drop when the encoded frame exceeds the remaining disk budget. |
 | `flush_local(timeout).await` | All admitted events through the captured sequence have reached synchronized local disk. |
 | `close_local(timeout).await` | Local flush completes and both workers stop. Release other producer handles before reopening its directory. |
 | `flush_async(timeout).await` or `shutdown_async(timeout).await` | Sparrow has durably acknowledged the captured prefix. Shutdown also closes admission and stops delivery. |
@@ -4768,7 +4769,12 @@ checkpoint and its directory before reclaiming segment files.
 File configuration selects `mode = "lossless"` by default. Fast offers report
 `Admission::Refused` on capacity or other admission failures. In
 `"lossy_spooled"` they report counted drops and successful admissions follow
-the same disk path. `"memory"` enables bounded RAM delivery and quarantine.
+the same disk path. Select that policy in Rust with
+`DeliveryConfig::lossy_spooled(endpoint, source, spool)`. For valid input
+and a healthy spool, `offer_spooled` waits for RAM and temporary disk
+reservations. A disk capacity drop increments `DropReason::SpoolFull`
+and consumes no sequence. Invalid input, shutdown and disk failures return
+typed errors. `"memory"` enables bounded RAM delivery and quarantine.
 `spool_max_bytes` defaults to 1 GiB of segment bytes and
 `spool_segment_bytes` to 16 MiB. Leave filesystem space for the checkpoint,
 lock and filesystem metadata. `spool_sync_interval_ms` defaults to 1,000 for
@@ -4795,6 +4801,47 @@ batch number. `retry_held()` wakes the sender after remediation.
 `rebind(store_id).await` can move an unsealed prefix. An unresolved seal
 requires its original store and exact receipt evidence.
 
+### Disk-free lossy delivery
+
+Use `DeliveryConfig::lossy(endpoint, source)` or TOML `mode = "lossy"`
+when the application requires immediate admission and can lose diagnostics.
+`try_send` assigns a checked sequence before validation or queue access.
+The configured count and byte quotas include detached and in-flight events.
+A background worker sorts each batch by sequence, holds uncertain requests
+across retries and counts permanent refusals before continuing.
+
+| Drop reason | When it occurs |
+| --- | --- |
+| `Full` | The next event exceeds the remaining RAM quota. |
+| `Contended` | Another thread holds the queue lock. |
+| `Invalid` | Event validation or capture fails. |
+| `Closed` | Shutdown or a terminal local failure closes admission. |
+| `Refused` | The daemon permanently refuses a batch, or a changed destination awaits rebinding. |
+| `Late` | A delayed offer arrives behind a sequence already dispatched. |
+| `CounterExhausted` | The producer cannot allocate another sequence. |
+
+`DeliveryStats.dropped_sequences` counts assigned sequences for all six
+sequenced reasons. A remote window can count an interior gap once it observes
+events on both sides. Leading and trailing loss, an expired window and a
+registry at capacity can leave loss unobserved. `continuity_unknown` preserves
+that uncertainty. Use local counters for the complete instance history. A
+flush covers the captured FIFO admissions and reports new losses once, even
+when concurrent producers finish admission in a different sequence order.
+
+`last_refusal` retains the daemon code and message. On store replacement the
+worker records the observed identifier in `store_mismatch`, counts all pending
+input as refused and refuses subsequent offers. Verify the destination and call
+`rebind(observed_store_id).await?` to resume. The original store may have
+accepted a request whose reply was lost. A replacement that fails a configured
+store or role expectation is refused during discovery with `INSTANCE_MISMATCH`.
+The worker retains the immutable batch and retries until an eligible daemon
+answers. Rebinding cannot override the configured expectation.
+
+`producer ENDPOINT SOURCE lossy COUNT RATE TAG` exercises this mode. Each
+observation carries a typed message with the tag and offer number. The example
+reports the instance, admissions, named losses and maximum caller latency on
+stderr and prints its final remote watermark and flush outcome on stdout.
+
 ### Memory delivery and shared event capture
 
 The separate `sparrow-client` crate keeps producers independent of the database
@@ -4806,7 +4853,8 @@ or semantic engine. The public surface includes:
 - Structured events with client instance/sequence identities, producer event
   time, level, target, message/fields, and current span/trace context. Span
   lifecycle/context becomes typed relationships with source evidence.
-- Bounded batching/retry queues and visible delivery/drop counters. The default
+- Bounded batching/retry queues and visible delivery/drop counters. With
+  `DeliveryConfig::new`, `for_endpoint`, `tcp` or TOML `mode = "memory"`, the
   logging path is nonblocking and drops new events when full; it never silently
   allocates an unlimited queue or stalls a production thread on network I/O. The queue
   holds at most 1024 events and 4 MiB by default (`max_queued_events`, `max_queued_bytes`); an event past either bound is refused as `Full` and

@@ -5086,9 +5086,14 @@ application tracing example below.
 
 ### Bounded producer delivery worker
 
-`sparrow_client::Delivery` owns one producer thread, a Tokio LocalSet and the
+`sparrow_client::Delivery` owns a sender thread, a Tokio LocalSet and the
 shared typed client. Producers call `try_send(ProducerEvent)` without waiting for
-socket I/O; admission waits only for the queue lock, whose holders do bounded
+socket I/O. `DeliveryConfig::lossy` stamps each offer before validation and
+returns immediately if the queue lock is occupied. It counts each sequenced
+loss, skips permanently refused batches and requires explicit rebinding when
+the store changes. See [disk-free lossy delivery](interfaces.md#disk-free-lossy-delivery).
+
+With `DeliveryConfig::new` or file mode `memory`, admission waits for the queue lock. Its holders do bounded
 in-memory work and never I/O, so a briefly held lock never drops an event. The
 worker assigns increasing sequences under queue serialization. Full, invalid,
 closed, failed and counter-exhausted admission each have visible drop counters.
@@ -5115,9 +5120,9 @@ these are configurable. Queue and immutable pending-batch ownership stay charged
 until a matching durable receipt. Retryable Unix-socket/transport/daemon errors
 preserve exactly the same request ID, instance, sequences, timestamps and values.
 RPC timeout means delivery unknown. The first discovered persistent store binds
-the worker; reconnecting to another store fails explicitly with pending input
-retained. Permanent failures remain inspectable through `stats` and
-`pending_batch`, with no manufactured acknowledgement. Source-time registration
+the worker. The selected mode determines how it handles a replacement store.
+Refusals, held requests and durable progress are inspectable through `stats`
+and `pending_batch`. Source-time registration
 pressure now uses the same retryable `STORAGE_PRESSURE` code as ingestion.
 
 `stats` exposes offered/admitted/durable counts, drops by reason, pending count/
