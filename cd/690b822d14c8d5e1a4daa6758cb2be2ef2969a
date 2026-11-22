@@ -1,0 +1,24 @@
+ghprsq source head backlink metadata
+
+parent_hashes: cd690b822d14c8d5e1a4daa6758cb2be2ef2969a
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 498
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/498
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 833aa4126ba3e80e172181d8bdf0edd4f25bb2ec
+GhpRsq-Head-Ref: paudley/449-fatal-i-o-error-on-a-wal-write-ends-the
+GhpRsq-Head-OID: cd690b822d14c8d5e1a4daa6758cb2be2ef2969a
+GhpRsq-Result-Tree: 63daf5c24d710cfd2a392f3957c19fabdd26cfd1
+GhpRsq-Result-Commit: d3a893690eeee675ea81404e2272c497b5f7ea4c
+GhpRsq-Parent-Hashes: cd690b822d14c8d5e1a4daa6758cb2be2ef2969a
+GhpRsq-Squash-Notes-SHA256: 29f6f17fcd1580221a69ba0bee675d986c1378e1940f563e2e6a587c6d5f9e7e
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Tree: 0e310a93772b7a175eda34683300db8d3a62d152
+GhpRsq-Stage-Commit: 0cf6fb6d831f132c61b2c064b666bcf1b8645d6c
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/0cf6fb6d831f132c61b2c064b666bcf1b8645d6c
+GhpRsq-Stage-Ref: refs/ghprsq/pr/498/stage
+GhpRsq-Stage-Files: 14
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/0cf6fb6d831f132c61b2c064b666bcf1b8645d6c
