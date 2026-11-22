@@ -4687,9 +4687,9 @@ caller cuts the input (see
 resend). The 32,768-record bound is checked while the layout is prepared, before
 any record is prepared.
 
-`sparrow-client` is the producer SDK. An application can depend on its version in
-the lab Cargo registry. The [SDK guide](../crates/sparrow-client/README.md) covers
-registry setup, console output, local spooling and bulk imports. The package
+`sparrow-client` is the producer SDK. Install it from crates.io with
+`cargo add sparrow-client@0.1.0`. The [SDK guide](../crates/sparrow-client/README.md)
+covers console output, local spooling and bulk imports. The package
 includes the Cap'n Proto schemas and builds with the host `capnp` compiler and
 Rust 1.98 on Linux, independently of Sparrow storage. The ingest socket carries
 `discover`, `ingest`, `import` (begin, append, seal,
@@ -4697,6 +4697,14 @@ layout, prepare, publish, get and cancel), `eventsIngest` and `flush`
 (`crates/sparrow-server/src/ingest_gate.rs`). A producer that writes its own client speaks
 the same schema and owns every rule the crate holds: resuming from the durable checkpoint,
 canceling on terminal failure and checking receipts.
+
+To consume the lab release, add the registry to the application's
+`.cargo/config.toml` and run `cargo add sparrow-client@0.1.0 --registry sparrow-lab`.
+
+```toml
+[registries.sparrow-lab]
+index = "sparse+http://lillith:7555/api/packages/fleet/cargo/"
+```
 
 The binaries are `sparrowd` for the daemon and `sparrow` for its client.
 Every client invocation takes an optional `--secret-file PATH` and then an
