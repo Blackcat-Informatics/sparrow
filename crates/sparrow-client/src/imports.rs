@@ -383,6 +383,10 @@ pub(crate) trait StagedInput {
     fn read_at(&self, buffer: &mut [u8], offset: u64) -> Result<(), Error>;
     /// Refuse an input that changed since its length was captured.
     fn unchanged(&self) -> Result<(), Error>;
+    /// Persist the native identity before publication when this input survives process loss.
+    fn before_publish(&self, _store: &str, _import: &str) -> Result<(), Error> {
+        Ok(())
+    }
     /// The payload identity already computed for these exact bytes, so `upload` need not
     /// read them again; `unchanged` still guards the input before begin.
     fn payload_hint(&self) -> Option<&str> {
@@ -592,17 +596,25 @@ pub(crate) async fn upload(
         }
     }
     staged.unchanged()?;
+    staged.before_publish(&store, &id)?;
+    let receipt = publish(client, &store, &id, &acceptance).await?;
+    staged.unchanged()?;
+    Ok(receipt)
+}
+
+/// Publish this existing native import. This operation cannot begin a replacement journal.
+pub(crate) async fn publish(
+    client: &wire::sparrow::Client,
+    store: &str,
+    id: &str,
+    acceptance: &crate::receipt::ExpectedArtifact<'_>,
+) -> Result<ArtifactReceipt, Error> {
     let mut request = client.import_publish_request();
-    import_reference(request.get().init_import(), &store, &id);
+    import_reference(request.get().init_import(), store, id);
     let response = request.send().promise.await?;
-    match response.get()?.get_result()?.which()? {
-        wire::result::Ok(value) => {
-            let receipt = acceptance.certify(ArtifactReceipt::decode(value?)?)?;
-            staged.unchanged()?;
-            Ok(receipt)
-        }
-        wire::result::Error(error) => Err(Error::domain(error?)),
-    }
+    crate::receipt::certify_result(response.get()?.get_result()?, |value| {
+        acceptance.certify(ArtifactReceipt::decode(value)?)
+    })
 }
 
 /// Canonical payload identity of the whole staged input, read positionally in `buffer`.
@@ -636,7 +648,7 @@ fn import_reference(mut out: wire::import_ref::Builder<'_>, store: &str, id: &st
 /// and for same-boot checks against a live descriptor, but it is never identity: it changes
 /// across a reboot on btrfs subvolumes, network, overlay and re-enumerated mounts, so an
 /// observation persisted before a restart must still equal the same file observed after it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CompletedFileIdentity {
     /// Filesystem device number, informational only; never compared.
     pub device: u64,
