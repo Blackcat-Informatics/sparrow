@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/449-fatal-i-o-error-on-a-wal-write-ends-the",
+  "branch": "paudley/449-fatal-i-o-error-on-a-wal-write-ends-the",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "aaed8a844bbfd07d670e840f0d397bbab88d9ca9",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/449-fatal-i-o-error-on-a-wal-write-ends-the/.stage/fatal-i-o-error-on-a-wal-write-ends-the/sync/20261122T091734-ba037f2249b74aed92f797eade854a8b",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "833aa4126ba3e80e172181d8bdf0edd4f25bb2ec",
+  "merge_bases": [
+    "aaed8a844bbfd07d670e840f0d397bbab88d9ca9"
+  ],
+  "commit": "833aa4126ba3e80e172181d8bdf0edd4f25bb2ec"
+}

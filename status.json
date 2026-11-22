@@ -1,0 +1,79 @@
+{
+  "issue": 449,
+  "pr_number": 498,
+  "branch": "paudley/449-fatal-i-o-error-on-a-wal-write-ends-the",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/449-fatal-i-o-error-on-a-wal-write-ends-the/.stage/fatal-i-o-error-on-a-wal-write-ends-the",
+  "observed_at": "2026-11-22T17:01:36.010199+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/449-fatal-i-o-error-on-a-wal-write-ends-the/.stage/fatal-i-o-error-on-a-wal-write-ends-the/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/449-fatal-i-o-error-on-a-wal-write-ends-the/.stage/fatal-i-o-error-on-a-wal-write-ends-the/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/449-fatal-i-o-error-on-a-wal-write-ends-the/.stage/fatal-i-o-error-on-a-wal-write-ends-the/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/449-fatal-i-o-error-on-a-wal-write-ends-the/.stage/fatal-i-o-error-on-a-wal-write-ends-the/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/449-fatal-i-o-error-on-a-wal-write-ends-the/.stage/fatal-i-o-error-on-a-wal-write-ends-the/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 498,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Reopen wedged RocksDB stores in process",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/498",
+    "baseRefName": "main",
+    "baseRefOid": "833aa4126ba3e80e172181d8bdf0edd4f25bb2ec",
+    "headRefName": "paudley/449-fatal-i-o-error-on-a-wal-write-ends-the",
+    "headRefOid": "cd690b822d14c8d5e1a4daa6758cb2be2ef2969a",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/500/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "cd690b822d14c8d5e1a4daa6758cb2be2ef2969a",
+    "branch": "paudley/449-fatal-i-o-error-on-a-wal-write-ends-the",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 498,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #498 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}
