@@ -461,7 +461,9 @@ root `intake_root/NAME`, the source directory, a glob and one finishing rule:
 Every rule also requires `settle_seconds` without modification. Small files are
 reflink copies, sharing extents on btrfs. Line-oriented files (`jsonl`, `log`)
 above `max_chunk_bytes` or `max_chunk_lines` are split on line boundaries into
-`NAME.partNNNNN.EXT` chunks. Other formats, such as single JSON documents, are
+`NAME.partNNNNN.EXT` chunks. An unterminated final line counts as a record.
+Set `max_chunk_lines` to an integer from 1 through 32,768.
+Other formats, such as single JSON documents, are
 shipped whole up to Sparrow's 7.93 GiB import bound; a larger file is reported
 as a failed file on every run and never queued. The removed `max_whole_bytes` key must be deleted
 from the shipper configuration; a configuration that still sets it is refused
@@ -471,8 +473,9 @@ directory beside the watch root and retires its claim; it is never published (se
 [Quarantining a permanently refused source](interfaces.md#quarantining-a-permanently-refused-source)).
 Every other failed publication retries without limit, backing off from five seconds to one
 attempt every 15 minutes after consecutive failures. Deadline expiries back off too, even when the
-resumed claim advances, so a chunk that needs many attempts finishes later; keep `max_chunk_lines` at or below
-32,768, the most records one publication holds, and below the server's `max_records`. And a consume publication has a 45-second deadline.
+resumed claim advances, so a chunk that needs many attempts finishes later. Keep
+`max_chunk_lines` below the server's `max_records`. A consume publication has a
+45-second deadline.
 Retries resume the durable upload and preparation, but each expiry spends the
 single consume worker. Ingest time grows faster than artifact size for deeply
 nested JSON: on 2026-10-27, under a host load average near 45, 17 KiB-per-line
@@ -536,6 +539,8 @@ exactly as when it was queued) with `b3sum` and asks the store
 `sparrow SOCKET payload STORE_ID blake3:HEX`. The file goes only when every part
 lists an artifact, which the store answers only while it holds all of that
 artifact's bytes ([Payload id index](interfaces.md#payload-id-index-store-format)).
+The shipper also accepts a matching whole-file artifact for files an earlier shipper
+sent whole because it excluded the unterminated last record from the count.
 A file that is still queued, waiting in a consume root, refused under storage
 pressure, quarantined, or held once and since retired lists nothing and stays.
 The ledger keeps its entry either way.
@@ -552,7 +557,8 @@ the run that finds every part of a file held, the shipper links the file to
 `.reaping-NAME` and unlinks NAME, which neither the shipper nor the spool scripts read; a script
 that opens NAME afterwards creates a new file under it. At its next run the
 shipper looks at each `.reaping-` file again and deletes it only if the store
-holds every part of its present content. A file that now holds a line the store
+holds the entire file and its identity is stable through the lookup.
+A file that now holds a line the store
 lacks goes back under NAME (under `NAME-late-NS` when NAME exists again) and
 ships like any finished file, so those lines appear twice at most. A file whose
 parts the store held and has since retired goes back too and stays in the spool.
