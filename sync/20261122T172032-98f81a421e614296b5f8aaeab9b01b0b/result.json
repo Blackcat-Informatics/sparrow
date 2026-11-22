@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/459-prepare-sparrow-for-public-github",
+  "branch": "paudley/459-prepare-sparrow-for-public-github",
+  "base_ref": "origin/main",
+  "head": "73ebdb9ed3a3be3e25df9f15da9a73b6ba438525",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/459-prepare-sparrow-for-public-github/.stage/prepare-sparrow-for-public-github/sync/20261122T172032-98f81a421e614296b5f8aaeab9b01b0b",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "d3a893690eeee675ea81404e2272c497b5f7ea4c",
+  "merge_bases": [
+    "73ebdb9ed3a3be3e25df9f15da9a73b6ba438525"
+  ],
+  "commit": "d3a893690eeee675ea81404e2272c497b5f7ea4c"
+}

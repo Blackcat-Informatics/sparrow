@@ -1,0 +1,79 @@
+{
+  "issue": null,
+  "pr_number": 501,
+  "branch": "paudley/459-prepare-sparrow-for-public-github",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/459-prepare-sparrow-for-public-github/.stage/release-459-merge",
+  "observed_at": "2026-11-22T20:24:06.937586+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/459-prepare-sparrow-for-public-github/.stage/release-459-merge/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/459-prepare-sparrow-for-public-github/.stage/release-459-merge/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/459-prepare-sparrow-for-public-github/.stage/release-459-merge/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/459-prepare-sparrow-for-public-github/.stage/release-459-merge/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/459-prepare-sparrow-for-public-github/.stage/release-459-merge/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 501,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Prepare Sparrow for public GitHub release",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/501",
+    "baseRefName": "main",
+    "baseRefOid": "d3a893690eeee675ea81404e2272c497b5f7ea4c",
+    "headRefName": "paudley/459-prepare-sparrow-for-public-github",
+    "headRefOid": "0e6f79eaaaeadca1d54e46413a3240819be16c25",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/503/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "0e6f79eaaaeadca1d54e46413a3240819be16c25",
+    "branch": "paudley/459-prepare-sparrow-for-public-github",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 501,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #501 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}
