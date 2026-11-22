@@ -1376,6 +1376,20 @@ impl Store {
     /// kept for the two-day retry window. More than [`MAX_LISTED_CLAIMS`] matches refuse,
     /// so the caller narrows the window rather than receiving a partial list.
     pub fn consumption_claims(&self, since: u64, until: u64) -> Result<Vec<ClaimListing>, Error> {
+        self.consumption_claims_matching(since, until, None)
+    }
+
+    /// An exact watch and raw path also includes claims completed in the window without
+    /// a pending attempt. Apply the scope before charging the result count.
+    pub fn consumption_claims_matching(
+        &self,
+        since: u64,
+        until: u64,
+        exact: Option<(&str, &[u8])>,
+    ) -> Result<Vec<ClaimListing>, Error> {
+        if let Some((watch, path)) = exact {
+            validate_consumption_path(watch, path)?;
+        }
         if since > until {
             return Err(Error::new(
                 "INVALID_ARGUMENT",
@@ -1422,7 +1436,14 @@ impl Store {
                 if journal.import_id.as_bytes() != id {
                     return Err(Error::new("STORAGE_FAILURE", "claim record key mismatch"));
                 }
-                if !listed_in(state, &journal.history, finished_at, &window) {
+                if exact.is_some_and(|(watch, path)| {
+                    journal.watch != watch || journal.relative_path != path
+                }) {
+                    continue;
+                }
+                let exact_completion =
+                    exact.is_some() && finished_at.is_some_and(|at| window.contains(&at));
+                if !exact_completion && !listed_in(state, &journal.history, finished_at, &window) {
                     continue;
                 }
                 if claims.len() >= MAX_LISTED_CLAIMS {

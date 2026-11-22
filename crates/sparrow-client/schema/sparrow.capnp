@@ -594,10 +594,17 @@ struct ClaimRow {
   finishedAt @9 :OptionalInstant;
 }
 # Window bounds are inclusive Unix milliseconds; an absent until means now.
-struct WatchClaimsQuery { storeId @0 :Text; since @1 :Instant; until @2 :OptionalInstant; }
+struct WatchClaimPath { watch @0 :Text; relativePath @1 :Data; }
+struct WatchClaimsQuery {
+  storeId @0 :Text; since @1 :Instant; until @2 :OptionalInstant;
+  # When present, include only this watch and raw path, including first-attempt completions.
+  exactPath @3 :WatchClaimPath;
+}
 struct WatchClaims {
   storeId @0 :Text; asOf @1 :Instant; since @2 :Instant; until @3 :Instant;
   claims @4 :List(ClaimRow);
+  # Echo the applied selector. Older daemons omit it even when given an exact path.
+  exactPath @5 :WatchClaimPath;
 }
 
 enum WatchMode { consume @0; tail @1; }
@@ -922,11 +929,13 @@ struct IngestIndexCounts {
   notApplicable @3 :UInt64; unavailable @4 :UInt64; pending @5 :UInt64;
 }
 enum IngestDeletion { notManaged @0; reserved @1; claimed @2; published @3; removed @4; retired @5; }
+enum IngestAcceptanceKind { artifact @0; orderedSet @1; }
 struct IngestAcceptance {
   artifactId @0 :Text; source @1 :Text; format @2 :Format;
   receivedAt @3 :Instant; expiresAt @4 :Instant; byteLength @5 :UInt64;
   payloadId @6 :Text; recordCount @7 :UInt64;
   durability @8 :Durability = durable; bufferedThrough @9 :OptionalDurabilityWatermark;
+  kind @10 :IngestAcceptanceKind;
 }
 struct IngestOwnership {
   watch @0 :Text; relativePath @1 :Data; source @2 :Text; format @3 :Format;

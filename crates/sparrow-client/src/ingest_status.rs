@@ -285,6 +285,22 @@ impl IngestStatus {
                 "source removal contradicts ownership or publication",
             ));
         }
+        let ordered_set = accepted
+            .map(|a| a.get_kind())
+            .transpose()?
+            .is_some_and(|kind| kind == wire::IngestAcceptanceKind::OrderedSet);
+        if ordered_set
+            && (staging.is_some()
+                || ownership.is_none()
+                || request
+                    .strip_prefix("consume:")
+                    .and_then(purrdf_hash::hex::decode_32_canonical)
+                    .is_none())
+        {
+            return Err(Error::Protocol(
+                "ordered acceptance requires an original consume claim without staging",
+            ));
+        }
         if let Some(o) = ownership {
             if o.get_relative_path()?.len() > 4096
                 || o.get_source()?.len() > 512
@@ -311,12 +327,18 @@ impl IngestStatus {
                     "source ownership phase contradicts original publication",
                 ));
             }
-            if let Some(a) = accepted
-                && (a.get_source()?.to_str()? != o.get_source()?.to_str()?
-                    || a.get_format()? != o.get_format()?
-                    || a.get_byte_length() != observed.length)
-            {
-                return Err(Error::Protocol("publication contradicts source generation"));
+            if let Some(a) = accepted {
+                let agrees = if ordered_set {
+                    a.get_format()? == wire::Format::Json
+                        && a.get_durability()? == wire::Durability::Durable
+                        && a.get_record_count() == 1
+                        && a.get_byte_length() > 0
+                } else {
+                    a.get_format()? == o.get_format()? && a.get_byte_length() == observed.length
+                };
+                if a.get_source()?.to_str()? != o.get_source()?.to_str()? || !agrees {
+                    return Err(Error::Protocol("publication contradicts source generation"));
+                }
             }
             if let Some(t) = tail {
                 let finish = match t.get_finish()?.which()? {

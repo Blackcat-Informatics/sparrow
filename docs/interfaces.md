@@ -1180,11 +1180,12 @@ with the original format and each part's range, stored format and artifact id in
 order. The manifest alone defines the set: a reader that needs the file reads the
 listed artifacts in order and concatenates their bytes.
 
-For a part-set claim, the journal's `published_artifact`, a handoff receipt's
-`artifact_id` and `watch claims` all name the manifest. Ingestion status by
-import, request or handoff reports the manifest as the accepted artifact with no
-staging. Every other reader of the claim's import identity (begin, get, admit,
-cancel, publish) refuses with `CONFLICT` naming the manifest. The manifest's
+For a part-set claim, the journal's `published_artifact` and a handoff receipt's
+`artifact_id` name the manifest. Use the import ID from `watch claims` to read
+it through ingestion status. Ingestion status by import, request or handoff
+reports the durable JSON manifest as the accepted artifact, with
+`accepted.kind = "ordered_set"` and no staging. The ordinary import operations
+(begin, get, admit, cancel and publish) refuse with `CONFLICT` naming the manifest. The manifest's
 receipt is kept while the claim's active or completed journal exists, not only
 for the retry window. A `consumeset:` request id is refused `INVALID_ARGUMENT` to
 an ingest-socket caller, and a manifest receipt that carries an intake is refused
@@ -1347,6 +1348,12 @@ Run `sparrow SOCKET parts verify SOURCE MANIFEST_ARTIFACT_ID` for a
 listing and reports its ordinal and ID with a status of available, missing,
 unavailable or mismatched. A partial set produces the report and a nonzero
 exit status. Retention can run between verification and readback.
+
+Append `--match-stdin` and give the command the original bytes on standard
+input to also compare each span against its durable artifact digest. The report
+includes `matches_input`. A changed, short or longer input fails, as does an
+unavailable manifest or member. The shipper uses this mode for ordered spool
+acknowledgments.
 
 ### Query-only daemon (schema 67)
 
@@ -4445,6 +4452,13 @@ retirement time. Absent times are null.
 ```sh
 sparrow SOCKET watch claims --since 2026-11-09T00:00:00Z
 ```
+
+Add `--watch WATCH --path-hex HEX` together to restrict the listing to one watch
+and relative path. Encode the raw Unix path bytes as lowercase hexadecimal. In
+this mode the window also includes successful first-attempt claims that
+completed within it. The CLI requires the daemon to echo the exact selector.
+Use a returned `claim_id` as the import ID for `ingest-get` to inspect the
+claim's original acceptance.
 
 ### Removed online backup
 

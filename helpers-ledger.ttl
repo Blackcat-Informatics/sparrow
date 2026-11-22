@@ -1,5 +1,5 @@
 VERSION "1.2"
-BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/a693bab4d2e04ff3b59c22268c56999b879648ffb5039274db8af8b1db7102ec>
+BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/a140d1f9b37b0f19d2ca41038cb6f1b96fb951ec41b3d801cd3798daf8c279bd>
 <> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#Ledger> .
 <> <https://blackcatinformatics.ca/raf/report/1#distinct> <#distinct/0> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/active-file-checkpoint-attachment> .
@@ -2176,10 +2176,11 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/a693bab4d2e04f
 <#job/ordered-part-set-verification> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
 <#job/ordered-part-set-verification> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
 <#job/ordered-part-set-verification> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_access::agent::parts::Verify::list_members" .
+<#job/ordered-part-set-verification> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_access::agent::parts::Verify::matches_input" .
 <#job/ordered-part-set-verification> <https://blackcatinformatics.ca/raf/report/1#homeSymbol> "sparrow_access::agent::parts::Verify::execute" .
 <#job/ordered-part-set-verification> <https://blackcatinformatics.ca/raf/report/1#jobId> "ordered-part-set-verification" .
 <#job/ordered-part-set-verification> <https://blackcatinformatics.ca/raf/report/1#specRef> "docs/interfaces.md: CLI ingestion and verification of ordered part sets." .
-<#job/ordered-part-set-verification> <https://blackcatinformatics.ca/raf/report/1#summary> "Read a bounded manifest, check each member against the catalog and release the catalog result." .
+<#job/ordered-part-set-verification> <https://blackcatinformatics.ca/raf/report/1#summary> "Read a bounded manifest, check each member against the catalog, and optionally match the input byte spans to their durable receipt digests." .
 <#job/ordered-part-set-verification> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/tests/rpc.rs" .
 <#job/oversized-raw-record-preparation> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
 <#job/oversized-raw-record-preparation> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .

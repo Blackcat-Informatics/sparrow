@@ -628,6 +628,7 @@ pub(super) fn discovery(discovery: &sparrow_client::Discovery) -> Value {
         .with("operation", "discover")
         .with("store_id", discovery.store_id.as_str())
         .with("schema_version", discovery.schema_version)
+        .with("max_import_bytes", discovery.max_import_bytes.to_string())
         .with(
             "producer_profiles",
             Value::array(discovery.producer_profiles.iter().map(String::as_str)),

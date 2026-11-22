@@ -48,6 +48,9 @@ pub(super) fn encode(
     }
     if let Some(artifact) = value.accepted {
         let mut acceptance = out.reborrow().init_accepted().init_value();
+        if value.ordered_set {
+            acceptance.set_kind(wire::IngestAcceptanceKind::OrderedSet);
+        }
         acceptance.set_artifact_id(&artifact.id);
         acceptance.set_source(&artifact.source);
         acceptance.set_format(stored_format(&artifact.format)?);

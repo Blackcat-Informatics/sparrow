@@ -2081,24 +2081,47 @@ impl wire::sparrow::Server for Rpc {
             wire::optional_instant::Value(at) => Some(at?.get_unix_millis()),
             wire::optional_instant::Absent(()) => None,
         };
+        let selector = query
+            .has_exact_path()
+            .then(|| query.get_exact_path())
+            .transpose()?;
+        let exact = if let Some(selector) = selector {
+            let watch = selector.get_watch()?.to_str()?;
+            let path = selector.get_relative_path()?;
+            if let Err(error) = sparrow_core::validate_consumption_path(watch, path) {
+                failure(results.get().init_result(), error);
+                return Ok(());
+            }
+            Some((watch.to_owned(), path.to_vec()))
+        } else {
+            None
+        };
         let result = match self.check_store(store) {
-            // The listing decodes up to 2048 journals: run it off the connection's event loop.
+            // Listing scans retained journals. Return at most 2048 matching rows.
             Ok(()) => {
                 self.lookup(move |store, as_of| {
                     let until = until.unwrap_or(as_of);
-                    Ok((as_of, until, store.consumption_claims(since, until)?))
+                    let scope = exact
+                        .as_ref()
+                        .map(|(watch, path)| (watch.as_str(), path.as_slice()));
+                    Ok((
+                        as_of,
+                        until,
+                        store.consumption_claims_matching(since, until, scope)?,
+                    ))
                 })
                 .await
             }
             Err(error) => Err(error),
         };
         match result {
-            Ok((as_of, until, claims)) => crate::watch_admin::encode_claims(
-                results.get().init_result().init_ok(),
-                store,
-                (as_of, since, until),
-                &claims,
-            ),
+            Ok((as_of, until, claims)) => {
+                let mut out = results.get().init_result().init_ok();
+                if let Some(selector) = selector {
+                    out.set_exact_path(selector)?;
+                }
+                crate::watch_admin::encode_claims(out, store, (as_of, since, until), &claims);
+            }
             Err(error) => failure(results.get().init_result(), error),
         }
         Ok(())
