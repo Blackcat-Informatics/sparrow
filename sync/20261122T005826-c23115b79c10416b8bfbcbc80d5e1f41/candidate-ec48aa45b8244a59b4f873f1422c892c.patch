@@ -1,0 +1,4231 @@
+diff --git README.md README.md
+index a69623d..97e3d8b 100644
+--- README.md
++++ README.md
+@@ -50,7 +50,7 @@ WAL flush controls, and helper-census tooling are implemented. Active tailing
+ with explicit completed-generation retirement, typed public TCP
+ ingestion, and syslog are implemented. Stored-view SELECT, ASK, CONSTRUCT,
+ DESCRIBE, measured EXPLAIN and native stored-text rank/span relations are
+-implemented. The wire schema is version 72. Producers negotiate the
++implemented. The wire schema is version 73. Producers negotiate the
+ `sparrow-producer/1` profile across compatible schema versions. The archive is implemented and not
+ yet running on the live daemon ([Archive status](docs/archive-format.md#archive-status)). See [Development runtime](docs/development-runtime.md) for
+ present commands, verified behavior and limits.
+@@ -70,6 +70,29 @@ with local display alone or send structured observations to Sparrow. The
+ [console example](crates/sparrow-client/examples/console.rs) shows a print-style
+ call, typed tracing fields and a `log` record in one span.
+ 
++For an application that sends logs to the local daemon, start a configured
++producer and attach the console once during startup. Printing an observation
++queues it in memory. A background worker appends it to a bounded private spool
++and replays the spool when the daemon returns.
++
++```rust
++use sparrow_client::{Console, Delivery, DeliveryConfig, sparrow_eprintln};
++use std::time::Duration;
++
++let delivery = Delivery::start_async(DeliveryConfig::configured_local("build.worker")).await?;
++let console = Console::install(Some(delivery.clone()))?;
++let targets = 12;
++sparrow_eprintln!("Compiled {targets} targets");
++console.flush().await?;
++delivery.close_local(Duration::from_secs(5)).await?;
++```
++
++Use `send_with_token(event, cursor).await?` when advancing an upstream cursor
++requires a local disk receipt. Use `shutdown_async(timeout).await?` when the
++caller requires a durable receipt from Sparrow. TCP endpoints, file-backed
++configuration, limits and recovery are covered in the
++[Rust client contract](docs/interfaces.md#7-rust-client-and-logging-integration).
++
+ Sparrow runs as a Rust service on one Linux server with local storage. The
+ initial workload is under 10 GiB of new, uncompressed data per day, including
+ large directories of JSONL and `.log` files. Sustained throughput, import bursts,
+diff --git crates/sparrow-client/build.rs crates/sparrow-client/build.rs
+index a8c51db..08a1a46 100644
+--- crates/sparrow-client/build.rs
++++ crates/sparrow-client/build.rs
+@@ -5,9 +5,11 @@
+ 
+ fn main() {
+     println!("cargo:rerun-if-changed=schema/sparrow.capnp");
++    println!("cargo:rerun-if-changed=schema/spool.capnp");
+     capnpc::CompilerCommand::new()
+         .src_prefix("schema")
+         .file("schema/sparrow.capnp")
++        .file("schema/spool.capnp")
+         .run()
+         .expect(
+             "Cap'n Proto schema compilation failed; install capnp and inspect schema/sparrow.capnp",
+diff --git crates/sparrow-client/examples/configured.rs crates/sparrow-client/examples/configured.rs
+index 5d94b29..ab9ab80 100644
+--- crates/sparrow-client/examples/configured.rs
++++ crates/sparrow-client/examples/configured.rs
+@@ -11,7 +11,7 @@ use tracing_subscriber::prelude::*;
+ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+     let settings = match std::env::args_os().nth(1) {
+         Some(file) => DeliveryConfig::from_file(file).await?,
+-        None => DeliveryConfig::local("example.worker"),
++        None => DeliveryConfig::configured_local("example.worker"),
+     };
+     let producer = Delivery::start_async(settings).await?;
+     let subscriber = tracing_subscriber::registry().with(TracingLayer::new(producer.clone()));
+diff --git crates/sparrow-client/examples/console.rs crates/sparrow-client/examples/console.rs
+index 89c0eb9..98e872e 100644
+--- crates/sparrow-client/examples/console.rs
++++ crates/sparrow-client/examples/console.rs
+@@ -9,7 +9,7 @@ use std::time::Duration;
+ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+     let delivery = match std::env::args().nth(1) {
+         Some(value) => {
+-            let config = DeliveryConfig::for_endpoint(Endpoint::parse(&value)?, "console-example");
++            let config = DeliveryConfig::configured(Endpoint::parse(&value)?, "console-example");
+             Some(Delivery::start_async(config).await?)
+         }
+         None => None,
+diff --git crates/sparrow-client/examples/producer.rs crates/sparrow-client/examples/producer.rs
+new file mode 100644
+index 0000000..52d58cc
+--- /dev/null
++++ crates/sparrow-client/examples/producer.rs
+@@ -0,0 +1,121 @@
++// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++//! Submit tagged events or drain an existing spool with COUNT=0.
++
++use purrdf_lex::json::{self, Object, Value};
++use sparrow_client::{
++    Delivery, DeliveryConfig, DeliveryStats, Endpoint, EventKind, EventLevel, ProducerEvent,
++    SendError, SpoolConfig,
++};
++use std::time::Duration;
++
++fn progress(stats: &DeliveryStats, flush: &str) -> String {
++    let mut refused = Object::new();
++    for (reason, count) in ["spool_full", "busy", "invalid", "closed", "spool_failed"]
++        .into_iter()
++        .zip(stats.refused_by_reason)
++    {
++        refused = refused.with(reason, count);
++    }
++    let mut object = Object::new()
++        .with("offered", stats.offered_events)
++        .with("durable_sequence", stats.last_durable_sequence)
++        .with("refused", refused)
++        .with("flush", flush);
++    if let Some(spool) = &stats.spool {
++        object = object
++            .with("spooled_sequence", spool.spooled_sequence)
++            .with("spool_bytes", spool.bytes);
++    }
++    let held = stats.held.as_ref().map_or(Value::Null, |error| {
++        let code = match error.as_ref() {
++            sparrow_client::Error::Domain { code, .. } => code.as_str(),
++            sparrow_client::Error::Unsupported(_) => "UNSUPPORTED",
++            _ => "DELIVERY_HELD",
++        };
++        Object::new()
++            .with("code", code)
++            .with("message", error.to_string())
++            .with(
++                "batch",
++                stats
++                    .spool
++                    .as_ref()
++                    .map(|s| s.next_batch)
++                    .map_or(Value::Null, Value::from),
++            )
++            .into()
++    });
++    json::write_compact(&object.with("held", held).into())
++}
++
++#[tokio::main(flavor = "current_thread")]
++async fn main() -> Result<(), Box<dyn std::error::Error>> {
++    let args: Vec<_> = std::env::args().skip(1).collect();
++    if !(args.len() == 7 || args.len() == 9 && args[7] == "--spool-max-bytes")
++        || args[2] != "lossless"
++    {
++        return Err("usage: producer ENDPOINT SOURCE lossless SPOOL_DIR COUNT RATE TAG [--spool-max-bytes N]".into());
++    }
++    let mut spool = SpoolConfig::new(std::path::absolute(&args[3])?);
++    if let Some(raw) = args.get(8) {
++        spool.max_bytes = raw.parse()?;
++    }
++    let count: u64 = args[4].parse()?;
++    let rate: u64 = args[5].parse()?;
++    if rate == 0 {
++        return Err("RATE must be positive".into());
++    }
++    let delivery = Delivery::start_async(DeliveryConfig::lossless(
++        Endpoint::parse(&args[0])?,
++        &args[1],
++        spool,
++    ))
++    .await?;
++    let start = tokio::time::Instant::now();
++    let mut report = start + Duration::from_secs(1);
++    for index in 0..count {
++        let event = ProducerEvent {
++            sequence: 0,
++            event_time: sparrow_client::unix_millis_now()?,
++            kind: EventKind::Log,
++            level: EventLevel::Info,
++            name: args[6].clone(),
++            target: "sparrow.example".to_owned(),
++            fields: vec![],
++            context: vec![],
++            span: None,
++            follows_from: None,
++        };
++        if let Err(SendError::Uncertain { sequence }) = delivery.send(event).await {
++            return Err(format!("recover local spool sequence {sequence}").into());
++        }
++        if tokio::time::Instant::now() >= report {
++            eprintln!("{}", progress(&delivery.stats()?, "pending"));
++            report = tokio::time::Instant::now() + Duration::from_secs(1);
++        }
++        let due = start + Duration::from_secs_f64((index + 1) as f64 / rate as f64);
++        if due > tokio::time::Instant::now() {
++            tokio::time::sleep_until(due).await;
++        }
++    }
++    delivery.flush_local(Duration::from_secs(10)).await?;
++    let flush = match delivery.shutdown_async(Duration::from_secs(10)).await {
++        Ok(_) => "ok",
++        Err(sparrow_client::FlushError::TimedOut(stats)) => {
++            if stats.held.is_some() {
++                "held"
++            } else {
++                "timed_out"
++            }
++        }
++        Err(error) => return Err(error.into()),
++    };
++    let stats = delivery.stats()?;
++    println!("{}", progress(&stats, flush));
++    if flush != "ok" || stats.refused_by_reason.iter().any(|&count| count > 0) {
++        return Err("producer run ended with refused input or an incomplete remote drain".into());
++    }
++    Ok(())
++}
+diff --git crates/sparrow-client/schema/sparrow.capnp crates/sparrow-client/schema/sparrow.capnp
+index c2b79c0..d17df69 100644
+--- crates/sparrow-client/schema/sparrow.capnp
++++ crates/sparrow-client/schema/sparrow.capnp
+@@ -493,6 +493,9 @@ struct Discovery {
+   # Additive (#371): the store's role; `unspecified` from an older daemon or a store with none.
+   instanceRole @16 :InstanceRole;
+   producerProfiles @17 :List(Text);
++  # Latest suggested last instant for first admission of a sealed event request.
++  # Zero when the server lacks conditional durable replay.
++  sealedEventDeadlineMs @18 :UInt64;
+ }
+ 
+ enum PressurePhase { ready @0; requested @1; awaitingReclamation @2; blocked @3; awaitingArchive @4; }
+@@ -1071,6 +1074,8 @@ interface Sparrow {
+   # Schema 71 additive (#323): the held artifacts of one payload digest, read-only. A daemon
+   # without this method answers the protocol's unimplemented error.
+   payloadLookup @56 (query :PayloadLookupQuery) -> (result :Result(PayloadLookupPage));
++  # After the deadline, only a previously accepted, exactly matching request can succeed.
++  sealedEventsIngest @57 (batch :EventBatch, storeId :Text, deadlineMs :UInt64) -> (result :Result(Artifact));
+ }
+ 
+ struct TcpChallenge { nonce @0 :Data; }
+diff --git crates/sparrow-client/schema/spool.capnp crates/sparrow-client/schema/spool.capnp
+new file mode 100644
+index 0000000..9987781
+--- /dev/null
++++ crates/sparrow-client/schema/spool.capnp
+@@ -0,0 +1,23 @@
++@0xa9bcc3513dfe918a;
++# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++using Sparrow = import "sparrow.capnp";
++
++# The checkpoint is replaced atomically. Its cursor points immediately after the
++# last certified event; its optional seal describes the exact subsequent request.
++struct Header {
++  format @0 :Text;
++  source @1 :Text;
++  instance @2 :Data;
++  store @3 :Text;
++  spanEpoch @4 :UInt32;
++  confirmed @5 :UInt64;
++  confirmedToken @6 :Data;
++  nextBatch @7 :UInt64;
++  cursor @8 :Position;
++  seal @9 :Seal;
++  artifact @10 :Text;
++}
++struct Position { segment @0 :UInt64; offset @1 :UInt64; }
++struct Seal { lastSequence @0 :UInt64; deadline @1 :UInt64; }
++struct Entry { event @0 :Sparrow.ProducerEvent; token @1 :Data; at @2 :UInt64; }
+diff --git crates/sparrow-client/src/console.rs crates/sparrow-client/src/console.rs
+index b6146b9..64f1bc9 100644
+--- crates/sparrow-client/src/console.rs
++++ crates/sparrow-client/src/console.rs
+@@ -211,7 +211,7 @@ impl Console {
+             }
+         }
+         if let Some(remote) = &self.delivery {
+-            remote.try_send(event);
++            remote.observe(event);
+         }
+     }
+ }
+diff --git crates/sparrow-client/src/console/stream.rs crates/sparrow-client/src/console/stream.rs
+index 9ea1923..4de2c55 100644
+--- crates/sparrow-client/src/console/stream.rs
++++ crates/sparrow-client/src/console/stream.rs
+@@ -211,7 +211,7 @@ impl Fragment {
+                     name: "message".into(),
+                     value: message,
+                 });
+-                delivery.try_send(event);
++                delivery.observe(event);
+             }
+             (Some(Err(())), _) => console.capture_failed(),
+             _ => {}
+diff --git crates/sparrow-client/src/delivery.rs crates/sparrow-client/src/delivery.rs
+index 31e716d..e6a370b 100644
+--- crates/sparrow-client/src/delivery.rs
++++ crates/sparrow-client/src/delivery.rs
+@@ -16,10 +16,13 @@ use std::{
+     },
+     time::{Duration, Instant},
+ };
++mod spooled;
+ 
+ /// Explicit producer resource and timing bounds.
+ #[derive(Debug, Clone)]
+ pub struct DeliveryConfig {
++    /// Admission and persistence semantics for this handle.
++    pub mode: crate::DeliveryMode,
+     /// Explicit Unix or public TCP daemon destination.
+     pub endpoint: crate::Endpoint,
+     /// Optional store identity or role required at discovery on every connection.
+@@ -79,6 +82,7 @@ impl DeliveryConfig {
+     /// One default resource/timing law for every supported transport.
+     pub fn for_endpoint(endpoint: crate::Endpoint, source: impl Into<String>) -> Self {
+         Self {
++            mode: crate::DeliveryMode::LossyAspirational,
+             endpoint,
+             expect: None,
+             source: source.into(),
+@@ -95,6 +99,36 @@ impl DeliveryConfig {
+         }
+     }
+ 
++    /// Configure durable offline delivery to an explicit endpoint and spool directory.
++    pub fn lossless(
++        endpoint: crate::Endpoint,
++        source: impl Into<String>,
++        spool: crate::SpoolConfig,
++    ) -> Self {
++        let mut config = Self::for_endpoint(endpoint, source);
++        config.mode = crate::DeliveryMode::LosslessConfirmed(spool);
++        config
++    }
++
++    /// Configure durable offline delivery under the application state directory.
++    /// One source owns one spool. Set an explicit directory for simultaneous instances.
++    pub fn configured(endpoint: crate::Endpoint, source: impl Into<String>) -> Self {
++        let source = source.into();
++        let id = purrdf_hash::hex::encode(purrdf_hash::blake3::hash(source.as_bytes()).as_bytes());
++        let path = crate::quarantine::default_dir()
++            .parent()
++            .map_or_else(PathBuf::new, |parent| parent.join("spool").join(id));
++        Self::lossless(endpoint, source, crate::SpoolConfig::new(path))
++    }
++
++    /// Default-spooled producer for the local ingest socket.
++    pub fn configured_local(source: impl Into<String>) -> Self {
++        Self::configured(
++            crate::Endpoint::Unix("/run/sparrow-ingest/ingest.sock".into()),
++            source,
++        )
++    }
++
+     /// Sub-second batching and retry intervals for tests that must not wait whole seconds.
+     /// Production configuration cannot reach this: the constructor exists only in this
+     /// crate's own tests and under the `test-timing` feature, which only the daemon's
+@@ -121,11 +155,14 @@ impl DeliveryConfig {
+         self
+     }
+     pub(crate) fn validate(&self) -> Result<(), Error> {
++        if let Some(spool) = self.mode.spool() {
++            spool.validate()?;
++        }
+         self.endpoint.validate()?;
+         if let Some(expect) = &self.expect {
+             expect.validate()?;
+         }
+-        if !self.quarantine_dir.is_absolute() {
++        if self.mode.spool().is_none() && !self.quarantine_dir.is_absolute() {
+             return Err(Error::InvalidArgument(
+                 "quarantine_dir must be an absolute directory: set DeliveryConfig::quarantine_dir, or provide an absolute XDG_STATE_HOME or HOME for the default",
+             ));
+@@ -201,6 +238,11 @@ pub enum DropReason {
+ /// section, so a briefly held lock never discards an event.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum Admission {
++    /// Local confirmation was refused and no durable acceptance is claimed.
++    Refused {
++        /// Machine-readable refusal reason.
++        reason: Refusal,
++    },
+     /// The event is retained under the queue quota, with this assigned sequence.
+     Queued {
+         /// Client sequence within this producer instance.
+@@ -215,6 +257,71 @@ pub enum Admission {
+     },
+ }
+ 
++/// Refusal of a disk-confirmed offer.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[repr(usize)]
++pub enum Refusal {
++    /// The bounded disk spool has no room for this entry.
++    SpoolFull,
++    /// The bounded memory intake remained occupied through the caller's wait.
++    Busy,
++    /// Invalid event, oversized cursor, or confirmed send on a memory-only handle.
++    Invalid,
++    /// Shutdown has closed this producer.
++    Closed,
++    /// Disk intake failed. The underlying failure is visible in delivery stats.
++    SpoolFailed,
++}
++
++impl Refusal {
++    fn drop_reason(self) -> DropReason {
++        match self {
++            Self::Busy | Self::SpoolFull => DropReason::Full,
++            Self::Invalid => DropReason::Invalid,
++            Self::Closed => DropReason::Closed,
++            Self::SpoolFailed => DropReason::Failed,
++        }
++    }
++}
++
++/// Locally synchronized acceptance of a producer event.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct SpoolReceipt {
++    /// Persistent instance owning the spool.
++    pub client_instance: [u8; 16],
++    /// Locally synchronized event sequence.
++    pub sequence: u64,
++}
++
++/// A refused offer retains its input. A failed post-admission write has an unknown outcome.
++#[derive(Debug)]
++pub enum SendError {
++    /// No sequence assigned. The application can retry the original input.
++    Refused {
++        /// Reason for the refusal.
++        reason: Refusal,
++        /// Original event with its fields intact.
++        event: Box<ProducerEvent>,
++    },
++    /// A sequence was assigned but disk acknowledgement was lost. Consult the recovered cursor.
++    Uncertain {
++        /// Assigned spool sequence.
++        sequence: u64,
++    },
++}
++
++impl std::fmt::Display for SendError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::Refused { reason, .. } => write!(f, "spool refused event: {reason:?}"),
++            Self::Uncertain { sequence } => {
++                write!(f, "spool append outcome unknown for sequence {sequence}")
++            }
++        }
++    }
++}
++impl std::error::Error for SendError {}
++
+ /// Durable accepted progress at an explicit flush/shutdown fence.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct DeliveryWatermark {
+@@ -284,6 +391,13 @@ impl std::error::Error for FlushError {
+ /// Queue and delivery diagnostics. These counters are not an RSS measurement.
+ #[derive(Debug, Clone)]
+ pub struct DeliveryStats {
++    /// Configured disk intake and recovery progress.
++    pub spool: Option<crate::SpoolStats>,
++    /// Confirmed-offer refusals indexed by [`Refusal`]. These never represent lost accepted events.
++    pub refused_by_reason: [u64; 5],
++    /// Failure currently holding the disk prefix pending. Its request number is in
++    /// [`SpoolStats::sealed_batch`](crate::SpoolStats::sealed_batch) after sealing.
++    pub held: Option<Arc<Error>>,
+     /// Offers observed by the producer handle, including refused input.
+     pub offered_events: u64,
+     /// Offers admitted into retained delivery state.
+@@ -294,7 +408,7 @@ pub struct DeliveryStats {
+     pub dropped_by_reason: [u64; 5],
+     /// Queued plus in-flight observations.
+     pub pending_events: usize,
+-    /// Conservative queued plus in-flight byte charge.
++    /// Conservative in-memory event charge. Disk occupancy is reported by `spool.bytes`.
+     pub pending_bytes: usize,
+     /// Monotonic age of the oldest retained observation, including in-flight retries.
+     pub oldest_pending_age: Option<Duration>,
+@@ -349,6 +463,8 @@ pub struct DeliveryStats {
+ }
+ 
+ struct Queued {
++    token: Vec<u8>,
++    ack: Option<tokio::sync::oneshot::Sender<()>>,
+     event: ProducerEvent,
+     bytes: usize,
+     at: Instant,
+@@ -359,6 +475,11 @@ struct Pending {
+     at: Instant,
+ }
+ struct State {
++    released_workers: u8,
++    held: Option<Arc<Error>>,
++    force_local: u64,
++    spool: Option<crate::SpoolStats>,
++    reserved_disk: u64,
+     queue: VecDeque<Queued>,
+     pending: Option<Pending>,
+     bytes: usize,
+@@ -392,15 +513,22 @@ struct State {
+     held_unsaved_events: u64,
+ }
+ struct Shared {
++    spool: Option<Arc<Mutex<crate::spool::Log>>>,
++    intake_work: Condvar,
++    intake_room: Arc<tokio::sync::Notify>,
++    refusals: [AtomicU64; 5],
++    span_limit: u64,
+     config: DeliveryConfig,
+     instance: [u8; 16],
+-    state: Mutex<State>,
+-    changed: Condvar,
+-    async_changed: tokio::sync::Notify,
++    state: Arc<Mutex<State>>,
++    changed: Arc<Condvar>,
++    async_changed: Arc<tokio::sync::Notify>,
+     wake: tokio::sync::Notify,
+     /// Signalled by every flush or shutdown so a waiting retry delay ends at once. Kept apart
+     /// from `wake`, which each admitted event signals and would otherwise cut the backoff short.
+     retry_wake: tokio::sync::Notify,
++    /// Explicit operator retry for a permanently held spool prefix.
++    operator_retry: tokio::sync::Notify,
+     /// Flush and shutdown calls currently waiting. A `retry_wake` signal ends a retry delay only
+     /// while this is nonzero, so a signal left by a barrier that already returned cannot shorten
+     /// the first delay of a later outage.
+@@ -430,9 +558,12 @@ impl Clone for Delivery {
+ impl Drop for Delivery {
+     fn drop(&mut self) {
+         if self.shared.owners.fetch_sub(1, Ordering::SeqCst) == 1 {
++            let state = self.shared.state.lock();
+             self.shared.aborted.store(true, Ordering::SeqCst);
++            drop(state);
+             self.shared.abort_wake.notify_one();
+             self.shared.wake.notify_one();
++            self.shared.intake_work.notify_all();
+         }
+     }
+ }
+@@ -458,17 +589,33 @@ impl Delivery {
+         let runtime = tokio::runtime::Builder::new_current_thread()
+             .enable_all()
+             .build()?;
+-        let shared = Shared::new(config, instance);
++        let spool = config
++            .mode
++            .spool()
++            .map(|settings| crate::spool::Log::open(settings, &config.source, instance))
++            .transpose()?;
++        let shared = Shared::with_spool(config, instance, spool);
+         let worker = shared.clone();
++        let completed = spooled::Completion::new(&shared);
+         std::thread::Builder::new()
+             .name("sparrow-delivery".into())
+             .spawn(move || {
+                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+-                    runtime.block_on(tokio::task::LocalSet::new().run_until(run(&worker)))
++                    runtime.block_on(tokio::task::LocalSet::new().run_until(async {
++                        if worker.spool.is_some() {
++                            spooled::deliver(&worker).await
++                        } else {
++                            run(&worker).await
++                        }
++                    }))
+                 }));
+                 match result {
+                     Ok(Ok(())) => {}
++                    Ok(Err(error)) if worker.spool.is_some() => worker.fail(error),
+                     Ok(Err(error)) => worker.settle_failure(&runtime, error),
++                    Err(_) if worker.spool.is_some() => {
++                        worker.fail(Error::Protocol("spool sender panicked"))
++                    }
+                     Err(_) => worker.settle_failure(
+                         &runtime,
+                         Error::Protocol(
+@@ -478,13 +625,28 @@ impl Delivery {
+                 }
+                 drop(runtime);
+                 worker.finished();
++                drop(worker);
++                if let Some(completed) = completed {
++                    completed.release();
++                }
+             })?;
++        if shared.spool.is_some()
++            && let Err(error) = spooled::start_intake(&shared)
++        {
++            shared.aborted.store(true, Ordering::Release);
++            shared.abort_wake.notify_one();
++            shared.wake.notify_one();
++            return Err(error);
++        }
+         Ok(Self { shared })
+     }
+ 
+     /// Offer a bounded event, assigning its sequence without waiting for I/O.
+     pub fn try_send(&self, mut event: ProducerEvent) -> Admission {
+         let shared = &self.shared;
++        if shared.spool.is_some() {
++            return self.spool_offer(event);
++        }
+         if !shared.bump(&shared.offered) {
+             return shared.reject(DropReason::CounterExhausted, None);
+         }
+@@ -521,6 +683,8 @@ impl Delivery {
+         state.admitted += 1;
+         state.admitted_sequence = sequence;
+         state.queue.push_back(Queued {
++            token: Vec::new(),
++            ack: None,
+             event,
+             bytes,
+             at: Instant::now(),
+@@ -530,9 +694,20 @@ impl Delivery {
+         Admission::Queued { sequence }
+     }
+ 
++    /// A capture adapter has no caller to reclaim a refused event. Report that loss at its fence.
++    pub(crate) fn observe(&self, event: ProducerEvent) {
++        if let Admission::Refused { reason } = self.try_send(event) {
++            self.shared.reject(reason.drop_reason(), None);
++        }
++    }
++
+     /// Account for an observation refused before an event could be constructed.
+     /// Capture adapters use this same drop accounting and durable fence law.
+     pub(crate) fn capture_failed(&self) {
++        if self.shared.spool.is_some() {
++            self.shared
++                .bump(&self.shared.refusals[Refusal::Invalid as usize]);
++        }
+         if self.shared.bump(&self.shared.offered) {
+             self.shared.reject(DropReason::Invalid, None);
+         } else {
+@@ -547,7 +722,9 @@ impl Delivery {
+         self.shared
+             .spans
+             .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+-                value.checked_add(1)
++                value
++                    .checked_add(1)
++                    .filter(|id| *id <= self.shared.span_limit)
+             })
+             .map(|value| value + 1)
+             .map_err(|_| {
+@@ -676,7 +853,14 @@ impl Fence<'_> {
+             return Some(Err(FlushError::Delivery(error.clone())));
+         }
+         if state.durable_sequence.max(state.quarantined_sequence) < self.target
+-            || (self.closing && !self.shared.stopped.load(Ordering::SeqCst))
++            || state
++                .spool
++                .as_ref()
++                .is_some_and(|spool| spool.cleanup_pending)
++                && self.target >= state.durable_sequence
++            || self.closing
++                && (!self.shared.stopped.load(Ordering::SeqCst)
++                    || state.spool.is_some() && !spooled::Completion::both_released(state))
+         {
+             return expired.then(|| Err(FlushError::TimedOut(Box::new(self.shared.stats(state)))));
+         }
+@@ -724,6 +908,7 @@ impl Shared {
+         state.closing |= closing;
+         state.force_through = state.force_through.max(fence.target);
+         drop(state);
++        self.intake_work.notify_all();
+         self.wake.notify_one();
+         self.retry_wake.notify_one();
+         Ok(fence)
+@@ -735,20 +920,47 @@ impl Shared {
+             self.async_changed.notify_one();
+         }
+     }
++    #[cfg(test)]
+     fn new(config: DeliveryConfig, instance: [u8; 16]) -> Arc<Self> {
++        Self::with_spool(config, instance, None)
++    }
++    fn with_spool(
++        config: DeliveryConfig,
++        mut instance: [u8; 16],
++        spool: Option<crate::spool::Log>,
++    ) -> Arc<Self> {
++        let (mut sequence, mut confirmed, mut span, mut span_limit) = (0, 0, 0, u64::MAX);
++        let stats = spool.as_ref().map(|log| {
++            instance = log.head.instance;
++            sequence = log.stats.spooled_sequence;
++            confirmed = log.head.confirmed;
++            span = u64::from(log.head.epoch - 1) << 32;
++            span_limit = span + u64::from(u32::MAX);
++            log.stats.clone()
++        });
+         Arc::new(Self {
++            spool: spool.map(|log| Arc::new(Mutex::new(log))),
++            intake_work: Condvar::new(),
++            intake_room: Arc::default(),
++            refusals: std::array::from_fn(|_| AtomicU64::new(0)),
++            span_limit,
+             config,
+             instance,
+-            state: Mutex::new(State {
++            state: Arc::new(Mutex::new(State {
++                released_workers: 0,
++                held: None,
++                force_local: 0,
++                spool: stats,
++                reserved_disk: 0,
+                 queue: VecDeque::new(),
+                 pending: None,
+                 bytes: 0,
+                 count: 0,
+-                sequence: 0,
+-                admitted_sequence: 0,
+-                admitted: 0,
+-                durable_sequence: 0,
+-                durable: 0,
++                sequence,
++                admitted_sequence: sequence,
++                admitted: sequence,
++                durable_sequence: confirmed,
++                durable: confirmed,
+                 batch_number: 0,
+                 retries: 0,
+                 floor_refusals: 0,
+@@ -767,16 +979,17 @@ impl Shared {
+                 reported_drops: 0,
+                 reported_quarantined: 0,
+                 held_unsaved_events: 0,
+-            }),
+-            changed: Condvar::new(),
+-            async_changed: tokio::sync::Notify::new(),
++            })),
++            changed: Arc::default(),
++            async_changed: Arc::default(),
+             wake: tokio::sync::Notify::new(),
+             retry_wake: tokio::sync::Notify::new(),
++            operator_retry: tokio::sync::Notify::new(),
+             barrier_active: AtomicBool::new(false),
+             abort_wake: tokio::sync::Notify::new(),
+             owners: AtomicUsize::new(1),
+             offered: AtomicU64::new(0),
+-            spans: AtomicU64::new(0),
++            spans: AtomicU64::new(span),
+             drops: std::array::from_fn(|_| AtomicU64::new(0)),
+             exhausted: AtomicBool::new(false),
+             aborted: AtomicBool::new(false),
+@@ -789,6 +1002,7 @@ impl Shared {
+         self.stopped.store(true, Ordering::SeqCst);
+         drop(guard);
+         self.notify_barrier();
++        self.intake_room.notify_waiters();
+     }
+     fn bump(&self, counter: &AtomicU64) -> bool {
+         let ok = counter
+@@ -820,13 +1034,25 @@ impl Shared {
+             .or_else(|| state.queue.front().map(|queued| queued.at))
+             .map(|at| at.elapsed());
+         DeliveryStats {
++            spool: state.spool.clone(),
++            refused_by_reason: std::array::from_fn(|i| self.refusals[i].load(Ordering::Relaxed)),
++            held: state.held.clone(),
+             dropped_by_reason: std::array::from_fn(|index| {
+                 self.drops[index].load(Ordering::SeqCst)
+             }),
+             offered_events: self.offered.load(Ordering::SeqCst),
+             admitted_events: state.admitted,
+             durable_events: state.durable,
+-            pending_events: state.count,
++            pending_events: if state.spool.is_some() {
++                usize::try_from(
++                    state
++                        .admitted_sequence
++                        .saturating_sub(state.durable_sequence),
++                )
++                .unwrap_or(usize::MAX)
++            } else {
++                state.count
++            },
+             pending_bytes: state.bytes,
+             oldest_pending_age,
+             flush_lag: oldest_pending_age.map_or(Duration::ZERO, |age| {
+@@ -858,6 +1084,8 @@ impl Shared {
+             state.failure = Some(Arc::new(error));
+         }
+         self.notify_barrier();
++        self.intake_work.notify_all();
++        self.intake_room.notify_waiters();
+     }
+     fn next(&self, advertised: Option<crate::events::BatchLimits>) -> Result<Action, Error> {
+         let mut state = self
+@@ -1213,7 +1441,7 @@ impl Shared {
+         self.notify_barrier();
+         Ok(())
+     }
+-    fn retry(&self, error: Error) -> Result<(), Error> {
++    fn retry(&self, error: Error, manual: bool) -> Result<(), Error> {
+         let mut state = self
+             .state
+             .lock()
+@@ -1225,7 +1453,9 @@ impl Shared {
+         if error.is_free_space_floor() {
+             state.floor_refusals = state.floor_refusals.saturating_add(1);
+         }
+-        state.transient = Some(Arc::new(error));
++        let error = Arc::new(error);
++        state.held = manual.then(|| error.clone());
++        state.transient = Some(error);
+         drop(state);
+         self.notify_barrier();
+         Ok(())
+@@ -1348,9 +1578,7 @@ async fn run(shared: &Shared) -> Result<(), Error> {
+                         Err(error @ Error::InvalidArgument(_)) => {
+                             may_have_sent = previous_attempt;
+                             return Err(if previous_attempt {
+-                                Error::Unsupported(
+-                                    "current producer ceilings cannot admit the immutable batch with an unknown delivery outcome",
+-                                )
++                                Error::Unsupported(IMMUTABLE_BATCH_LIMIT)
+                             } else {
+                                 error
+                             });
+@@ -1419,7 +1647,7 @@ async fn run(shared: &Shared) -> Result<(), Error> {
+                         } else {
+                             backoff.take()
+                         };
+-                        shared.retry(error)?;
++                        shared.retry(error, false)?;
+                         if wait_out_retry_delay(
+                             &shared.abort_wake,
+                             &shared.retry_wake,
+@@ -1438,6 +1666,8 @@ async fn run(shared: &Shared) -> Result<(), Error> {
+ }
+ 
+ const STORE_MISMATCH: &str = "STORE_MISMATCH";
++pub(crate) const IMMUTABLE_BATCH_LIMIT: &str =
++    "current producer ceilings cannot admit the immutable batch with an unknown delivery outcome";
+ 
+ /// What the worker does with one failed attempt. It never ends delivery: a failure is either
+ /// about this batch, which is set aside durably so later batches proceed, or about the
+@@ -1961,6 +2191,8 @@ mod tests {
+         {
+             let mut state = shared.state.lock().unwrap();
+             state.queue.push_back(Queued {
++                token: Vec::new(),
++                ack: None,
+                 event: ProducerEvent {
+                     sequence: 1,
+                     ..event()
+@@ -2171,6 +2403,8 @@ mod tests {
+             .unwrap_or_else(std::sync::PoisonError::into_inner)
+             .queue
+             .push_back(Queued {
++                token: Vec::new(),
++                ack: None,
+                 event: ProducerEvent {
+                     sequence: 2,
+                     ..event()
+diff --git crates/sparrow-client/src/delivery/spooled.rs crates/sparrow-client/src/delivery/spooled.rs
+new file mode 100644
+index 0000000..9ad7acf
+--- /dev/null
++++ crates/sparrow-client/src/delivery/spooled.rs
+@@ -0,0 +1,599 @@
++// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++//! Independent disk intake and network replay. The admission mutex never owns file I/O.
++
++use super::*;
++use crate::{DeliveryMode, Durability, spool::Log};
++use tokio::sync::oneshot;
++
++/// The two workers signal through the fence's predicate and wait channels only
++/// after releasing their reference to the journal. These fields own no disk handles.
++pub(super) struct Completion {
++    state: Arc<Mutex<State>>,
++    changed: Arc<Condvar>,
++    async_changed: Arc<tokio::sync::Notify>,
++    room: Arc<tokio::sync::Notify>,
++}
++
++impl Completion {
++    pub(super) fn new(shared: &Shared) -> Option<Self> {
++        shared.spool.as_ref().map(|_| Self {
++            state: shared.state.clone(),
++            changed: shared.changed.clone(),
++            async_changed: shared.async_changed.clone(),
++            room: shared.intake_room.clone(),
++        })
++    }
++    pub(super) fn release(self) {
++        if let Ok(mut state) = self.state.lock() {
++            state.released_workers += 1;
++        }
++        self.changed.notify_all();
++        self.async_changed.notify_one();
++        self.room.notify_waiters();
++    }
++    pub(super) fn both_released(state: &State) -> bool {
++        state.released_workers == 2
++    }
++}
++
++struct Offer {
++    event: ProducerEvent,
++    bytes: usize,
++    token: Vec<u8>,
++    ack: Option<oneshot::Sender<()>>,
++}
++
++fn reserve(bytes: usize, token: usize) -> u64 {
++    (bytes + token + 128) as u64
++}
++
++impl Delivery {
++    pub(super) fn refuse(&self, reason: Refusal) -> Admission {
++        let shared = &self.shared;
++        shared.bump(&shared.refusals[reason as usize]);
++        if matches!(shared.config.mode, DeliveryMode::LosslessConfirmed(_)) {
++            Admission::Refused { reason }
++        } else {
++            shared.reject(reason.drop_reason(), None)
++        }
++    }
++
++    fn permit(
++        &self,
++        bytes: usize,
++        token: usize,
++    ) -> Result<(std::sync::MutexGuard<'_, State>, u64), Refusal> {
++        let shared = &self.shared;
++        let config = shared.config.mode.spool().ok_or(Refusal::Invalid)?;
++        let state = shared.state.lock().map_err(|_| Refusal::SpoolFailed)?;
++        if state.failure.is_some() || shared.exhausted.load(Ordering::Acquire) {
++            return Err(Refusal::SpoolFailed);
++        }
++        if state.closing || shared.aborted.load(Ordering::Acquire) {
++            return Err(Refusal::Closed);
++        }
++        let disk = reserve(bytes, token);
++        let used = state
++            .spool
++            .as_ref()
++            .ok_or(Refusal::SpoolFailed)?
++            .bytes
++            .saturating_add(state.reserved_disk);
++        if disk > config.max_bytes.saturating_sub(used) {
++            return Err(Refusal::SpoolFull);
++        }
++        if state.count >= shared.config.max_queued_events
++            || bytes + token > shared.config.max_queued_bytes.saturating_sub(state.bytes)
++        {
++            return Err(Refusal::Busy);
++        }
++        let sequence = state.sequence.checked_add(1).ok_or(Refusal::SpoolFailed)?;
++        Ok((state, sequence))
++    }
++
++    fn enqueue(
++        &self,
++        mut state: std::sync::MutexGuard<'_, State>,
++        sequence: u64,
++        mut input: Offer,
++    ) {
++        input.event.sequence = sequence;
++        state.sequence = sequence;
++        state.admitted_sequence = sequence;
++        state.admitted += 1;
++        state.bytes += input.bytes + input.token.len();
++        state.count += 1;
++        state.reserved_disk += reserve(input.bytes, input.token.len());
++        state.queue.push_back(Queued {
++            event: input.event,
++            bytes: input.bytes,
++            at: Instant::now(),
++            token: input.token,
++            ack: input.ack,
++        });
++        drop(state);
++        self.shared.intake_work.notify_one();
++    }
++
++    pub(super) fn spool_offer(&self, event: ProducerEvent) -> Admission {
++        self.shared.bump(&self.shared.offered);
++        let Ok(bytes) = event.admission_bytes() else {
++            return self.refuse(Refusal::Invalid);
++        };
++        match self.permit(bytes, 0) {
++            Ok((state, sequence)) => {
++                self.enqueue(
++                    state,
++                    sequence,
++                    Offer {
++                        event,
++                        bytes,
++                        token: Vec::new(),
++                        ack: None,
++                    },
++                );
++                Admission::Queued { sequence }
++            }
++            Err(reason) => self.refuse(reason),
++        }
++    }
++
++    /// Append and synchronize an event on the local spool, independently of remote delivery.
++    pub async fn send(&self, event: ProducerEvent) -> Result<SpoolReceipt, SendError> {
++        self.send_with_token(event, &[]).await
++    }
++
++    /// Confirm local disk ownership of the event and its opaque application cursor together.
++    /// Cancellation after memory admission leaves the accepted operation running.
++    pub async fn send_with_token(
++        &self,
++        event: ProducerEvent,
++        token: &[u8],
++    ) -> Result<SpoolReceipt, SendError> {
++        self.shared.bump(&self.shared.offered);
++        let refused = |reason, event| {
++            self.shared.bump(&self.shared.refusals[reason as usize]);
++            Err(SendError::Refused {
++                reason,
++                event: Box::new(event),
++            })
++        };
++        let Ok(bytes) = event.admission_bytes() else {
++            return refused(Refusal::Invalid, event);
++        };
++        let Some(config) = self.shared.config.mode.spool() else {
++            return refused(Refusal::Invalid, event);
++        };
++        if token.len() > 256 {
++            return refused(Refusal::Invalid, event);
++        }
++        let deadline = tokio::time::Instant::now() + config.max_wait;
++        let (tx, rx) = oneshot::channel();
++        let offer = Offer {
++            event,
++            bytes,
++            token: token.to_owned(),
++            ack: Some(tx),
++        };
++        let sequence = loop {
++            let room = self.shared.intake_room.notified();
++            tokio::pin!(room);
++            room.as_mut().enable();
++            let reason = match self.permit(bytes, token.len()) {
++                Ok((state, seq)) => {
++                    self.enqueue(state, seq, offer);
++                    break seq;
++                }
++                Err(reason) => reason,
++            };
++            match reason {
++                Refusal::Busy if tokio::time::Instant::now() < deadline => {
++                    let _ = tokio::time::timeout_at(deadline, room).await;
++                }
++                reason => return refused(reason, offer.event),
++            }
++        };
++        match rx.await {
++            Ok(()) => Ok(SpoolReceipt {
++                client_instance: self.shared.instance,
++                sequence,
++            }),
++            Err(_) => Err(SendError::Uncertain { sequence }),
++        }
++    }
++
++    /// Cursor on the latest local spool checkpoint, retained after segment cleanup.
++    pub fn accepted_token(&self) -> Result<Vec<u8>, FlushError> {
++        Ok(self
++            .shared
++            .barrier_state()?
++            .spool
++            .as_ref()
++            .ok_or(FlushError::Unavailable("delivery has no spool"))?
++            .accepted_token
++            .clone())
++    }
++
++    /// Cursor on the latest certified remote receipt, retained across process restarts.
++    pub fn confirmed_token(&self) -> Result<Vec<u8>, FlushError> {
++        Ok(self
++            .shared
++            .barrier_state()?
++            .spool
++            .as_ref()
++            .ok_or(FlushError::Unavailable("delivery has no spool"))?
++            .confirmed_token
++            .clone())
++    }
++
++    /// Wait for fast offers through the captured sequence to reach local disk, even offline.
++    pub async fn flush_local(&self, timeout: Duration) -> Result<u64, FlushError> {
++        let target = {
++            let mut state = self.shared.barrier_state()?;
++            let target = state.admitted_sequence;
++            state.force_local = state.force_local.max(target);
++            target
++        };
++        self.shared.intake_work.notify_one();
++        let deadline = tokio::time::Instant::now()
++            .checked_add(timeout)
++            .ok_or(DEADLINE_RANGE)?;
++        loop {
++            let ready = self.shared.intake_room.notified();
++            tokio::pin!(ready);
++            ready.as_mut().enable();
++            {
++                let state = self.shared.barrier_state()?;
++                if let Some(error) = &state.failure {
++                    return Err(FlushError::Delivery(error.clone()));
++                }
++                let synced = state
++                    .spool
++                    .as_ref()
++                    .ok_or(FlushError::Unavailable("delivery has no spool"))?
++                    .synced_sequence;
++                if synced >= target {
++                    return Ok(synced);
++                }
++                if tokio::time::Instant::now() >= deadline {
++                    return Err(FlushError::TimedOut(Box::new(self.shared.stats(&state))));
++                }
++            }
++            let _ = tokio::time::timeout_at(deadline, ready).await;
++        }
++    }
++
++    /// Ask the network worker to retry a held prefix immediately.
++    pub fn retry_held(&self) {
++        self.shared.operator_retry.notify_waiters();
++        self.shared.retry_wake.notify_one();
++    }
++
++    /// Close admission, synchronize every fast offer and stop both workers without
++    /// waiting for the server. Reopen the directory after releasing all other handles.
++    pub async fn close_local(self, timeout: Duration) -> Result<u64, FlushError> {
++        let deadline = tokio::time::Instant::now()
++            .checked_add(timeout)
++            .ok_or(DEADLINE_RANGE)?;
++        {
++            let mut state = self.shared.barrier_state()?;
++            if state.spool.is_none() {
++                return Err(FlushError::Unavailable("delivery has no spool"));
++            }
++            state.closing = true;
++        }
++        self.shared.intake_work.notify_all();
++        let synced = self.flush_local(timeout).await?;
++        self.shared.aborted.store(true, Ordering::Release);
++        self.shared.abort_wake.notify_one();
++        self.shared.wake.notify_one();
++        loop {
++            let released = self.shared.intake_room.notified();
++            tokio::pin!(released);
++            released.as_mut().enable();
++            if Completion::both_released(&*self.shared.barrier_state()?) {
++                return Ok(synced);
++            }
++            if tokio::time::timeout_at(deadline, released).await.is_err() {
++                return Err(FlushError::TimedOut(Box::new(self.stats()?)));
++            }
++        }
++    }
++
++    /// Bind an unsealed prefix to an explicitly named store. An unresolved seal stays on
++    /// its original store until an exact receipt establishes its outcome.
++    pub async fn rebind(&self, store: &str) -> Result<(), Error> {
++        let spool = self
++            .shared
++            .spool
++            .clone()
++            .ok_or(Error::InvalidArgument("delivery has no spool"))?;
++        let store = store.to_owned();
++        tokio::task::spawn_blocking(move || {
++            spool
++                .lock()
++                .map_err(|_| Error::Protocol("spool lock poisoned"))?
++                .rebind(&store)
++        })
++        .await
++        .map_err(std::io::Error::other)??;
++        self.retry_held();
++        Ok(())
++    }
++}
++
++pub(super) fn start_intake(shared: &Arc<Shared>) -> Result<(), Error> {
++    let worker = shared.clone();
++    let completed =
++        Completion::new(shared).ok_or(Error::Protocol("spool intake requires a disk journal"))?;
++    std::thread::Builder::new()
++        .name("sparrow-spool".into())
++        .spawn(move || {
++            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| intake(&worker)));
++            if let Some(error) = match result {
++                Ok(Ok(())) => None,
++                Ok(Err(error)) => Some(error),
++                Err(_) => Some(Error::Protocol("spool intake panicked")),
++            } {
++                worker.fail(error);
++                if let Ok(mut state) = worker.state.lock() {
++                    for queued in &mut state.queue {
++                        queued.ack.take();
++                    }
++                }
++            }
++            worker.intake_room.notify_waiters();
++            worker.wake.notify_one();
++            drop(worker);
++            completed.release();
++        })?;
++    Ok(())
++}
++
++fn disk(shared: &Shared) -> Result<std::sync::MutexGuard<'_, Log>, Error> {
++    shared
++        .spool
++        .as_ref()
++        .ok_or(Error::Protocol("configured spool is missing"))?
++        .lock()
++        .map_err(|_| Error::Protocol("spool lock poisoned"))
++}
++
++fn state(shared: &Shared) -> Result<std::sync::MutexGuard<'_, State>, Error> {
++    shared
++        .state
++        .lock()
++        .map_err(|_| Error::Protocol("producer queue state poisoned"))
++}
++
++fn intake(shared: &Shared) -> Result<(), Error> {
++    let interval = shared
++        .config
++        .mode
++        .spool()
++        .ok_or(Error::Protocol("disk intake requires spool limits"))?
++        .sync_interval;
++    let mut synced_at = Instant::now();
++    loop {
++        let (group, force): (Vec<_>, bool) = {
++            let mut state = state(shared)?;
++            loop {
++                let stats = state
++                    .spool
++                    .as_ref()
++                    .ok_or(Error::Protocol("missing spool progress"))?;
++                let dirty = stats.synced_sequence < stats.spooled_sequence;
++                let done = state.closing
++                    || state.failure.is_some()
++                    || shared.aborted.load(Ordering::Acquire);
++                let force = done
++                    || state.force_local > stats.synced_sequence
++                    || synced_at.elapsed() >= interval;
++                if !state.queue.is_empty() || dirty && force {
++                    let count = state.queue.len().min(shared.config.batch_events);
++                    break (state.queue.drain(..count).collect(), force);
++                }
++                if done {
++                    return Ok(());
++                }
++                state = if dirty {
++                    shared
++                        .intake_work
++                        .wait_timeout(state, interval.saturating_sub(synced_at.elapsed()))
++                        .map_err(|_| Error::Protocol("spool sync wait poisoned"))?
++                        .0
++                } else {
++                    shared
++                        .intake_work
++                        .wait(state)
++                        .map_err(|_| Error::Protocol("spool intake wait poisoned"))?
++                };
++            }
++        };
++        let mut log = disk(shared)?;
++        let at = crate::unix_millis_now()?;
++        for item in &group {
++            log.append(&item.event, &item.token, at)?;
++        }
++        if force || group.iter().any(|item| item.ack.is_some()) {
++            log.sync()?;
++            synced_at = Instant::now();
++        }
++        {
++            let mut state = state(shared)?;
++            state.spool = Some(log.stats.clone());
++            for item in &group {
++                state.count -= 1;
++                state.bytes -= item.bytes + item.token.len();
++                state.reserved_disk -= reserve(item.bytes, item.token.len());
++            }
++        }
++        drop(log);
++        for item in group {
++            if let Some(ack) = item.ack {
++                let _ = ack.send(());
++            }
++        }
++        shared.intake_room.notify_waiters();
++        shared.wake.notify_one();
++    }
++}
++
++pub(super) async fn deliver(shared: &Shared) -> Result<(), Error> {
++    let mut connection: Option<Client> = None;
++    let mut certified: Option<(crate::spool::Prepared, ArtifactReceipt)> = None;
++    let mut discovered_at = Instant::now();
++    let mut ready_since = None;
++    let mut backoff = Backoff::new(&shared.config);
++    loop {
++        if shared.aborted.load(Ordering::Acquire) {
++            return Ok(());
++        }
++        let (wait, delay, cleanup) = {
++            let state = state(shared)?;
++            let spool = state
++                .spool
++                .as_ref()
++                .ok_or(Error::Protocol("missing spool progress"))?;
++            if state.failure.is_some()
++                || state.closing
++                    && state.durable_sequence >= state.admitted_sequence
++                    && !spool.cleanup_pending
++            {
++                return Ok(());
++            }
++            let pending = spool
++                .spooled_sequence
++                .saturating_sub(state.durable_sequence);
++            let delay = if pending > 0
++                && pending < shared.config.batch_events as u64
++                && spool.bytes < shared.config.batch_bytes as u64
++                && !state.closing
++                && state.force_through <= state.durable_sequence
++                && spool.sealed_batch.is_none()
++            {
++                let at = ready_since.get_or_insert_with(Instant::now);
++                shared.config.flush_interval.saturating_sub(at.elapsed())
++            } else {
++                Duration::ZERO
++            };
++            (pending == 0, delay, spool.cleanup_pending)
++        };
++        if wait && !cleanup {
++            ready_since = None;
++            tokio::select! { _=shared.wake.notified()=>{}, _=shared.abort_wake.notified()=>return Ok(()) };
++            continue;
++        }
++        if !delay.is_zero() && !cleanup {
++            tokio::select! { _=shared.wake.notified()=>{}, _=tokio::time::sleep(delay)=>{}, _=shared.abort_wake.notified()=>return Ok(()) }
++            continue;
++        }
++        let attempt = async {
++            if cleanup {
++                let mut log = disk(shared)?;
++                log.finish_confirmation()?;
++                let mut state = state(shared)?;
++                state.spool = Some(log.stats.clone());
++                state.transient = None;
++                return Ok(());
++            }
++            // Once the server certified this batch, only the disk checkpoint remains.
++            // Keep that evidence across ENOSPC or sync failures, including after the
++            // server's retry window closes or its socket becomes unavailable.
++            if let Some((prepared, receipt)) = &certified {
++                let mut log = disk(shared)?;
++                log.confirm(prepared, &receipt.id)?;
++                let mut state = state(shared)?;
++                state.spool = Some(log.stats.clone());
++                state.durable_sequence = log.head.confirmed;
++                state.durable = log.head.confirmed;
++                state.receipt = certified.take().map(|(_, receipt)| receipt);
++                state.pending = None;
++                state.transient = None;
++                state.held = None;
++                return Ok(());
++            }
++            // Discovery samples the server clock. Renew a long-idle connection before
++            // preparing new seals. A recovered seal always keeps its original deadline.
++            if connection.is_none() || discovered_at.elapsed() >= Duration::from_secs(60) {
++                drop(connection.take());
++                connection = Some(
++                    Client::open(
++                        &shared.config.endpoint,
++                        shared.config.expect.as_ref(),
++                        crate::receipt::Contract::Producer,
++                    )
++                    .await?,
++                );
++                discovered_at = Instant::now();
++            }
++            let client = connection
++                .as_ref()
++                .ok_or(Error::Protocol("spool connection missing"))?;
++            let info = client.discovery();
++            let limits = info
++                .event_limits()
++                .bounded(shared.config.batch_events, shared.config.batch_bytes);
++            let prepared = {
++                let mut log = disk(shared)?;
++                let prepared = log
++                    .prepare(&info.store_id, info.sealed_event_deadline_ms, limits)?
++                    .ok_or(Error::Protocol("spool pending range vanished"))?;
++                let mut state = state(shared)?;
++                state.spool = Some(log.stats.clone());
++                state.pending = Some(Pending {
++                    batch: prepared.batch.clone(),
++                    bytes: 0,
++                    at: Instant::now(),
++                });
++                prepared
++            };
++            shared.intake_room.notify_waiters();
++            let receipt = client
++                .submit_events(
++                    &prepared.batch,
++                    Durability::Durable,
++                    Some(prepared.deadline),
++                )
++                .await?;
++            certified = Some((prepared, receipt));
++            Ok::<_, Error>(())
++        };
++        let result = tokio::select! { _=shared.abort_wake.notified()=>return Ok(()), result=tokio::time::timeout(shared.config.rpc_timeout,attempt)=> result.unwrap_or_else(|_| Err(Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut,"sealed event RPC timed out")))) };
++        match result {
++            Ok(()) => {
++                ready_since = None;
++                backoff.reset();
++                shared.notify_barrier();
++                shared.intake_room.notify_waiters();
++            }
++            Err(error) => {
++                let manual = connection.is_some()
++                    && !cleanup
++                    && certified.is_none()
++                    && (disposition(&error) == Disposition::SetAside
++                        || matches!(&error,Error::Domain{code,..} if code == STORE_MISMATCH));
++                connection = None;
++                if manual {
++                    // Register before publishing the reason so an immediate operator reply
++                    // cannot be missed. Ordinary flushes and further appends cannot resume it.
++                    let retry = shared.operator_retry.notified();
++                    tokio::pin!(retry);
++                    retry.as_mut().enable();
++                    shared.retry(error, true)?;
++                    tokio::select! { _=retry=>{}, _=shared.abort_wake.notified()=>return Ok(()) }
++                    continue;
++                }
++                let delay = if matches!(error, Error::Unsupported(crate::PRODUCER_PROFILE)) {
++                    Duration::from_secs(30)
++                } else {
++                    backoff.take()
++                };
++                shared.retry(error, false)?;
++                tokio::select! { _=tokio::time::sleep(delay)=>{}, _=shared.retry_wake.notified()=>{}, _=shared.abort_wake.notified()=>return Ok(()) }
++            }
++        }
++    }
++}
+diff --git crates/sparrow-client/src/events.rs crates/sparrow-client/src/events.rs
+index f6b78a5..811cbef 100644
+--- crates/sparrow-client/src/events.rs
++++ crates/sparrow-client/src/events.rs
+@@ -224,30 +224,7 @@ impl EventBatch {
+         out.set_client_instance(&self.client_instance);
+         let mut events = out.init_events(self.events.len() as u32);
+         for (index, event) in self.events.iter().enumerate() {
+-            let mut out = events.reborrow().get(index as u32);
+-            out.set_sequence(event.sequence);
+-            out.reborrow()
+-                .init_event_time()
+-                .set_unix_millis(event.event_time);
+-            out.set_kind(event.kind);
+-            out.set_level(event.level);
+-            out.set_name(&event.name);
+-            out.set_target(&event.target);
+-            encode_fields(
+-                &event.fields,
+-                out.reborrow().init_fields(event.fields.len() as u32),
+-            );
+-            optional_span(out.reborrow().init_span(), event.span);
+-            optional_span(out.reborrow().init_follows_from(), event.follows_from);
+-            let mut context = out.init_context(event.context.len() as u32);
+-            for (index, span) in event.context.iter().enumerate() {
+-                let mut out = context.reborrow().get(index as u32);
+-                out.set_id(span.id);
+-                optional_span(out.reborrow().init_parent(), span.parent);
+-                out.set_name(&span.name);
+-                out.set_target(&span.target);
+-                encode_fields(&span.fields, out.init_fields(span.fields.len() as u32));
+-            }
++            event.encode(events.reborrow().get(index as u32));
+         }
+         Ok(())
+     }
+@@ -266,36 +243,9 @@ impl EventBatch {
+         check_count(list.len() as usize)?;
+         let mut events = Vec::with_capacity(list.len() as usize);
+         for value in list.iter() {
+-            let mut budget = Budget::new(batch.left.min(MAX_EVENT_BYTES));
+-            budget.charge(1024)?;
+-            let name = budget.read_text(value.get_name()?)?;
+-            let target = budget.read_text(value.get_target()?)?;
+-            let fields = decode_fields(value.get_fields()?, &mut budget)?;
+-            let spans = value.get_context()?;
+-            budget.context(spans.len() as usize)?;
+-            let mut context = Vec::with_capacity(spans.len() as usize);
+-            for span in spans.iter() {
+-                context.push(EventSpan {
+-                    id: span.get_id(),
+-                    parent: read_span(span.get_parent()?)?,
+-                    name: budget.read_text(span.get_name()?)?,
+-                    target: budget.read_text(span.get_target()?)?,
+-                    fields: decode_fields(span.get_fields()?, &mut budget)?,
+-                });
+-            }
+-            batch.charge(budget.used())?;
+-            events.push(ProducerEvent {
+-                sequence: value.get_sequence(),
+-                event_time: value.get_event_time()?.get_unix_millis(),
+-                kind: value.get_kind()?,
+-                level: value.get_level()?,
+-                name,
+-                target,
+-                fields,
+-                context,
+-                span: read_span(value.get_span()?)?,
+-                follows_from: read_span(value.get_follows_from()?)?,
+-            });
++            let (event, charge) = ProducerEvent::decode(value, batch.left)?;
++            batch.charge(charge)?;
++            events.push(event);
+         }
+         let result = Self {
+             request_id,
+@@ -309,6 +259,69 @@ impl EventBatch {
+ }
+ 
+ impl ProducerEvent {
++    pub(crate) fn encode(&self, mut out: wire::producer_event::Builder<'_>) {
++        out.set_sequence(self.sequence);
++        out.reborrow()
++            .init_event_time()
++            .set_unix_millis(self.event_time);
++        out.set_kind(self.kind);
++        out.set_level(self.level);
++        out.set_name(&self.name);
++        out.set_target(&self.target);
++        encode_fields(
++            &self.fields,
++            out.reborrow().init_fields(self.fields.len() as u32),
++        );
++        optional_span(out.reborrow().init_span(), self.span);
++        optional_span(out.reborrow().init_follows_from(), self.follows_from);
++        let mut context = out.init_context(self.context.len() as u32);
++        for (index, span) in self.context.iter().enumerate() {
++            let mut out = context.reborrow().get(index as u32);
++            out.set_id(span.id);
++            optional_span(out.reborrow().init_parent(), span.parent);
++            out.set_name(&span.name);
++            out.set_target(&span.target);
++            encode_fields(&span.fields, out.init_fields(span.fields.len() as u32));
++        }
++    }
++
++    pub(crate) fn decode(
++        value: wire::producer_event::Reader<'_>,
++        limit: usize,
++    ) -> Result<(Self, usize), Error> {
++        let mut budget = Budget::new(limit.min(MAX_EVENT_BYTES));
++        budget.charge(1024)?;
++        let name = budget.read_text(value.get_name()?)?;
++        let target = budget.read_text(value.get_target()?)?;
++        let fields = decode_fields(value.get_fields()?, &mut budget)?;
++        let spans = value.get_context()?;
++        budget.context(spans.len() as usize)?;
++        let mut context = Vec::with_capacity(spans.len() as usize);
++        for span in spans.iter() {
++            context.push(EventSpan {
++                id: span.get_id(),
++                parent: read_span(span.get_parent()?)?,
++                name: budget.read_text(span.get_name()?)?,
++                target: budget.read_text(span.get_target()?)?,
++                fields: decode_fields(span.get_fields()?, &mut budget)?,
++            });
++        }
++        Ok((
++            Self {
++                sequence: value.get_sequence(),
++                event_time: value.get_event_time()?.get_unix_millis(),
++                kind: value.get_kind()?,
++                level: value.get_level()?,
++                name,
++                target,
++                fields,
++                context,
++                span: read_span(value.get_span()?)?,
++                follows_from: read_span(value.get_follows_from()?)?,
++            },
++            budget.used(),
++        ))
++    }
+     /// Conservative source expansion and owned allocation charge, independent of sequence assignment.
+     /// Unused container/string capacity is admitted too, so a tiny value cannot retain an oversized allocation.
+     pub fn admission_bytes(&self) -> Result<usize, Error> {
+diff --git crates/sparrow-client/src/lib.rs crates/sparrow-client/src/lib.rs
+index 4149787..23a98ad 100644
+--- crates/sparrow-client/src/lib.rs
++++ crates/sparrow-client/src/lib.rs
+@@ -39,6 +39,13 @@ pub mod sparrow_capnp {
+     include!(concat!(env!("OUT_DIR"), "/sparrow_capnp.rs"));
+ }
+ 
++/// Generated on-disk spool format. Applications use `Delivery` and its checked cursors.
++#[doc(hidden)]
++#[allow(missing_docs, clippy::extra_unused_type_parameters)]
++pub mod spool_capnp {
++    include!(concat!(env!("OUT_DIR"), "/spool_capnp.rs"));
++}
++
+ mod transport;
+ pub use transport::{Connection, Endpoint, connect, connect_tcp};
+ mod tcp_secret;
+@@ -90,11 +97,14 @@ pub use producer_config::ConfigError;
+ mod logging;
+ mod quarantine;
+ mod replay;
++mod spool;
+ pub use console::{Console, ConsoleStats, ConsoleStream, ConsoleWriter};
+ pub use delivery::{
+     Admission, Delivery, DeliveryConfig, DeliveryStats, DeliveryWatermark, DropReason, FlushError,
++    Refusal, SendError, SpoolReceipt,
+ };
+ pub use logging::TracingLayer;
++pub use spool::{DeliveryMode, SpoolConfig, SpoolStats};
+ 
+ #[doc(hidden)]
+ pub use tracing as __tracing;
+@@ -113,7 +123,7 @@ pub use replay::{ReplayReceipt, replay_quarantine};
+ pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
+ 
+ /// Exact schema version used by query and administrative clients.
+-pub const SCHEMA_VERSION: u32 = 72;
++pub const SCHEMA_VERSION: u32 = 73;
+ /// Ingestion and durability profile advertised across compatible schema versions.
+ pub const PRODUCER_PROFILE: &str = "sparrow-producer/1";
+ /// Fixed upload unit admitted by the schema's private staging contract.
+@@ -209,9 +219,28 @@ impl Client {
+         &self,
+         batch: &EventBatch,
+         durability: Durability,
++    ) -> Result<ArtifactReceipt, Error> {
++        self.submit_events(batch, durability, None).await
++    }
++
++    async fn submit_events(
++        &self,
++        batch: &EventBatch,
++        durability: Durability,
++        seal: Option<u64>,
+     ) -> Result<ArtifactReceipt, Error> {
+         self.discovery.require(receipt::Contract::Producer)?;
+-        let bytes = batch.source_bytes_with_limits(self.discovery.event_limits())?;
++        let bytes = batch
++            .source_bytes_with_limits(self.discovery.event_limits())
++            .map_err(|error| {
++                if seal.is_some() && matches!(error, Error::InvalidArgument(_)) {
++                    // Newly sealed input already passed admission. A recovered seal must wait
++                    // for compatible advertised ceilings without changing its identity or range.
++                    Error::Unsupported(delivery::IMMUTABLE_BATCH_LIMIT)
++                } else {
++                    error
++                }
++            })?;
+         let expected = receipt::ExpectedArtifact::bytes(
+             &self.discovery,
+             &batch.source,
+@@ -220,6 +249,16 @@ impl Client {
+             durability,
+             Some(batch.events.len()),
+         );
++        if let Some(deadline) = seal {
++            let mut request = self.capability().sealed_events_ingest_request();
++            request.get().set_store_id(&self.discovery.store_id);
++            request.get().set_deadline_ms(deadline);
++            batch.encode(request.get().init_batch())?;
++            let response = request.send().promise.await?;
++            return receipt::certify_result(response.get()?.get_result()?, |value| {
++                expected.certify(ArtifactReceipt::decode(value)?)
++            });
++        }
+         let mut request = self.capability().events_ingest_request();
+         request.get().set_durability(durability);
+         batch.encode(request.get().init_batch())?;
+diff --git crates/sparrow-client/src/logging.rs crates/sparrow-client/src/logging.rs
+index 2c1d5eb..5742d34 100644
+--- crates/sparrow-client/src/logging.rs
++++ crates/sparrow-client/src/logging.rs
+@@ -89,7 +89,7 @@ impl TracingLayer {
+             Ok(event) => match &self.output {
+                 Output::Console(console) => console.emit(event),
+                 Output::Remote(delivery) => {
+-                    delivery.try_send(event);
++                    delivery.observe(event);
+                 }
+             },
+             Err(()) => self.capture_failed(),
+diff --git crates/sparrow-client/src/parts.rs crates/sparrow-client/src/parts.rs
+index 60c8b60..c82ac22 100644
+--- crates/sparrow-client/src/parts.rs
++++ crates/sparrow-client/src/parts.rs
+@@ -1239,6 +1239,7 @@ mod tests {
+             store_id: "store:1".into(),
+             schema_version: crate::SCHEMA_VERSION,
+             producer_profiles: vec![crate::PRODUCER_PROFILE.into()],
++            sealed_event_deadline_ms: 0,
+             producer_limits: crate::ProducerLimits::default(),
+             max_inline_artifact_bytes: 1,
+             max_records_per_artifact: 1,
+diff --git crates/sparrow-client/src/producer_config.rs crates/sparrow-client/src/producer_config.rs
+index be8f1f2..4a6c110 100644
+--- crates/sparrow-client/src/producer_config.rs
++++ crates/sparrow-client/src/producer_config.rs
+@@ -35,6 +35,12 @@ impl StdError for ConfigError {
+ #[derive(serde::Deserialize)]
+ #[serde(deny_unknown_fields)]
+ struct FileConfig {
++    mode: Option<FileMode>,
++    spool_dir: Option<PathBuf>,
++    spool_max_bytes: Option<u64>,
++    spool_segment_bytes: Option<u64>,
++    spool_sync_interval_ms: Option<u64>,
++    spool_max_wait_ms: Option<u64>,
+     source: String,
+     endpoint: Option<String>,
+     secret_file: Option<PathBuf>,
+@@ -51,6 +57,14 @@ struct FileConfig {
+     retry_max_interval_ms: Option<u64>,
+ }
+ 
++#[derive(serde::Deserialize)]
++#[serde(rename_all = "snake_case")]
++enum FileMode {
++    Memory,
++    LossySpooled,
++    Lossless,
++}
++
+ impl DeliveryConfig {
+     /// Load an explicit TOML file and its optional TCP secret on Tokio's blocking pool.
+     /// Relative paths are resolved beside the TOML file. Supplying only a source selects
+@@ -83,7 +97,7 @@ impl FileConfig {
+         let dir = absolute
+             .parent()
+             .ok_or("configuration path requires a parent directory")?;
+-        let mut config = DeliveryConfig::local(file.source);
++        let mut config = DeliveryConfig::configured_local(file.source);
+         if let Some(value) = file.endpoint {
+             config.endpoint = match Endpoint::parse(&value)? {
+                 Endpoint::Unix(socket) => Endpoint::Unix(dir.join(socket)),
+@@ -106,6 +120,29 @@ impl FileConfig {
+             (Some(role), None) => Some(Expect::new(role)),
+             (None, store) => store.map(Expect::store),
+         };
++        let crate::DeliveryMode::LosslessConfirmed(mut spool) = config.mode else {
++            return Err("configured producer lacks its default spool".into());
++        };
++        if let Some(path) = file.spool_dir {
++            spool.dir = dir.join(path);
++        }
++        if let Some(n) = file.spool_max_bytes {
++            spool.max_bytes = n;
++        }
++        if let Some(n) = file.spool_segment_bytes {
++            spool.segment_bytes = n;
++        }
++        if let Some(n) = file.spool_sync_interval_ms {
++            spool.sync_interval = Duration::from_millis(n);
++        }
++        if let Some(n) = file.spool_max_wait_ms {
++            spool.max_wait = Duration::from_millis(n);
++        }
++        config.mode = match file.mode.unwrap_or(FileMode::Lossless) {
++            FileMode::Memory => crate::DeliveryMode::LossyAspirational,
++            FileMode::LossySpooled => crate::DeliveryMode::LossySpooled(spool),
++            FileMode::Lossless => crate::DeliveryMode::LosslessConfirmed(spool),
++        };
+         if let Some(path) = file.quarantine_dir {
+             config.quarantine_dir = dir.join(path);
+         }
+diff --git crates/sparrow-client/src/receipt.rs crates/sparrow-client/src/receipt.rs
+index f1f9749..127162f 100644
+--- crates/sparrow-client/src/receipt.rs
++++ crates/sparrow-client/src/receipt.rs
+@@ -49,6 +49,8 @@ pub struct Discovery {
+     pub schema_version: u32,
+     /// Named ingestion contracts the daemon advertises.
+     pub producer_profiles: Vec<String>,
++    /// Server-clock deadline for sealing a new durable request. Zero means unavailable.
++    pub sealed_event_deadline_ms: u64,
+     /// Server limits for tracking producer evidence. These describe the server's windows.
+     pub producer_limits: ProducerLimits,
+     /// Largest artifact carried in one inline ingest message. Larger artifacts
+@@ -142,6 +144,7 @@ impl Discovery {
+             store_id: value.get_store_id()?.to_str()?.to_owned(),
+             schema_version: value.get_schema_version(),
+             producer_profiles,
++            sealed_event_deadline_ms: value.get_sealed_event_deadline_ms(),
+             producer_limits: ProducerLimits {
+                 max_streams: limits.get_max_streams(),
+                 max_gap_intervals: limits.get_max_gap_intervals(),
+diff --git crates/sparrow-client/src/spool.rs crates/sparrow-client/src/spool.rs
+new file mode 100644
+index 0000000..3ca12f6
+--- /dev/null
++++ crates/sparrow-client/src/spool.rs
+@@ -0,0 +1,1007 @@
++// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++//! Bounded private producer log. One append worker and one sender share its short disk transactions.
++
++use crate::{Error, EventBatch, ProducerEvent, spool_capnp as wire};
++use std::{
++    collections::BTreeMap,
++    fs::{self, File, OpenOptions},
++    io::{BufReader, Read, Seek, SeekFrom, Write},
++    os::unix::fs::{OpenOptionsExt, PermissionsExt},
++    path::{Path, PathBuf},
++    time::Duration,
++};
++
++/// Limits for one private, exclusively owned spool directory.
++#[derive(Clone, Debug)]
++pub struct SpoolConfig {
++    /// Absolute private directory outside daemon consume roots.
++    pub dir: PathBuf,
++    /// Maximum total event segment bytes.
++    pub max_bytes: u64,
++    /// Target segment size. Capped at the total disk budget.
++    pub segment_bytes: u64,
++    /// Longest interval between synchronization of ordinary fast admissions.
++    pub sync_interval: Duration,
++    /// Longest wait for a confirmed caller to obtain intake capacity.
++    pub max_wait: Duration,
++}
++
++impl SpoolConfig {
++    /// A 1 GiB spool using 16 MiB segments.
++    #[must_use]
++    pub fn new(dir: impl Into<PathBuf>) -> Self {
++        Self {
++            dir: dir.into(),
++            max_bytes: 1 << 30,
++            segment_bytes: 16 << 20,
++            sync_interval: Duration::from_secs(1),
++            max_wait: Duration::from_millis(20),
++        }
++    }
++
++    pub(crate) fn validate(&self) -> Result<(), Error> {
++        if !self.dir.is_absolute()
++            || !(1 << 20..=1 << 40).contains(&self.max_bytes)
++            || self.segment_bytes < 64 << 10
++            || self.sync_interval.is_zero()
++            || self.sync_interval > Duration::from_secs(60)
++            || self.max_wait > Duration::from_secs(1)
++        {
++            return Err(Error::InvalidArgument(
++                "spool requires an absolute path, 1 MiB..1 TiB budget, at least 64 KiB segments, a positive sync interval <=60 s and max wait <=1 s",
++            ));
++        }
++        Ok(())
++    }
++}
++
++/// Memory-only delivery or delivery through a private, bounded disk spool.
++#[derive(Clone, Debug)]
++pub enum DeliveryMode {
++    /// Memory queue with exact refusal counters and permanent-input quarantine.
++    LossyAspirational,
++    /// Fast memory admission followed by asynchronous disk intake.
++    LossySpooled(SpoolConfig),
++    /// Supports both fast memory offers and explicit confirmed disk acceptance.
++    LosslessConfirmed(SpoolConfig),
++}
++
++impl DeliveryMode {
++    pub(crate) fn spool(&self) -> Option<&SpoolConfig> {
++        match self {
++            Self::LossyAspirational => None,
++            Self::LossySpooled(config) | Self::LosslessConfirmed(config) => Some(config),
++        }
++    }
++}
++
++/// Observable local-disk progress, independent of the network worker's state.
++#[derive(Clone, Debug, Default)]
++pub struct SpoolStats {
++    /// Number of the oldest request awaiting certification, including unsealed input.
++    pub next_batch: u64,
++    /// The remote confirmation is durable. Local segment reclamation is still due.
++    pub cleanup_pending: bool,
++    /// Wall clock of the oldest locally accepted event still awaiting a remote receipt.
++    pub oldest_spooled_at_ms: Option<u64>,
++    /// Number of the current immutable sealed request, if any.
++    pub sealed_batch: Option<u64>,
++    /// Highest locally appended sequence.
++    pub spooled_sequence: u64,
++    /// Highest sequence synchronized to the local filesystem.
++    pub synced_sequence: u64,
++    /// Total bytes occupied by segment files.
++    pub bytes: u64,
++    /// Number of retained segments.
++    pub segments: usize,
++    /// Incomplete final entries truncated on this startup.
++    pub torn_tail: u64,
++    /// Exact sealed requests recovered on startup.
++    pub replayed_batches: u64,
++    /// Latest accepted cursor, including after cleanup and restart.
++    pub accepted_token: Vec<u8>,
++    /// Cursor of the most recent remotely confirmed event.
++    pub confirmed_token: Vec<u8>,
++}
++
++const FRAME_MAX: usize = 128 << 10;
++const PREFIX: usize = 44;
++const FORMAT: &str = "sparrow-spool/1";
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
++struct Position {
++    segment: u64,
++    offset: u64,
++}
++
++#[derive(Clone, Debug)]
++pub(crate) struct Seal {
++    pub(crate) last: u64,
++    pub(crate) deadline: u64,
++}
++
++#[derive(Clone)]
++pub(crate) struct Header {
++    pub(crate) source: String,
++    pub(crate) instance: [u8; 16],
++    pub(crate) store: String,
++    pub(crate) epoch: u32,
++    pub(crate) confirmed: u64,
++    token: Vec<u8>,
++    batch: u64,
++    cursor: Position,
++    pub(crate) seal: Option<Seal>,
++    artifact: String,
++}
++
++struct Entry {
++    event: ProducerEvent,
++    token: Vec<u8>,
++    at: u64,
++}
++
++pub(crate) struct Prepared {
++    pub(crate) batch: std::sync::Arc<EventBatch>,
++    pub(crate) deadline: u64,
++    end: Position,
++    token: Vec<u8>,
++}
++
++pub(crate) struct Log {
++    config: SpoolConfig,
++    directory: File,
++    _lock: File,
++    pub(crate) head: Header,
++    sizes: BTreeMap<u64, u64>,
++    active: Option<(u64, File)>,
++    appended_token: Vec<u8>,
++    pub(crate) stats: SpoolStats,
++}
++
++fn options() -> OpenOptions {
++    let mut result = OpenOptions::new();
++    result
++        .mode(0o600)
++        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
++    result
++}
++
++fn segment(dir: &Path, index: u64) -> PathBuf {
++    dir.join(format!("seg-{index:020}"))
++}
++
++fn message_bytes(message: &capnp::message::Builder<capnp::message::HeapAllocator>) -> Vec<u8> {
++    capnp::serialize::write_message_to_words(message)
++}
++
++fn decode<T: capnp::traits::Owned, R>(
++    bytes: &[u8],
++    f: impl for<'a> FnOnce(T::Reader<'a>) -> Result<R, Error>,
++) -> Result<R, Error> {
++    let mut input = bytes;
++    let message = capnp::serialize::read_message(
++        &mut input,
++        capnp::message::ReaderOptions {
++            traversal_limit_in_words: Some(FRAME_MAX),
++            nesting_limit: 32,
++        },
++    )?;
++    if !input.is_empty() {
++        return Err(Error::Protocol("trailing bytes in spool message"));
++    }
++    f(message.get_root::<T::Reader<'_>>()?)
++}
++
++impl Header {
++    fn encode(&self) -> Vec<u8> {
++        let mut message = capnp::message::Builder::new_default();
++        let mut out = message.init_root::<wire::header::Builder<'_>>();
++        out.set_format(FORMAT);
++        out.set_source(&self.source);
++        out.set_instance(&self.instance);
++        out.set_store(&self.store);
++        out.set_span_epoch(self.epoch);
++        out.set_confirmed(self.confirmed);
++        out.set_confirmed_token(&self.token);
++        out.set_next_batch(self.batch);
++        out.set_artifact(&self.artifact);
++        let mut cursor = out.reborrow().init_cursor();
++        cursor.set_segment(self.cursor.segment);
++        cursor.set_offset(self.cursor.offset);
++        if let Some(seal) = &self.seal {
++            let mut out = out.init_seal();
++            out.set_last_sequence(seal.last);
++            out.set_deadline(seal.deadline);
++        }
++        message_bytes(&message)
++    }
++
++    fn read(file: File) -> Result<Self, Error> {
++        let mut bytes = Vec::new();
++        file.take(8193).read_to_end(&mut bytes)?;
++        if bytes.len() > 8192 {
++            return Err(Error::Protocol("oversized spool header"));
++        }
++        let (checksum, body) = bytes
++            .split_at_checked(32)
++            .ok_or(Error::Protocol("truncated spool checkpoint"))?;
++        if purrdf_hash::blake3::hash(body).as_bytes() != checksum {
++            return Err(Error::Protocol("corrupt spool checkpoint checksum"));
++        }
++        decode::<wire::header::Owned, _>(body, |value| {
++            if value.get_format()?.to_str()? != FORMAT {
++                return Err(Error::Unsupported("unrecognized spool format"));
++            }
++            let cursor = value.get_cursor()?;
++            let seal = value.get_seal()?;
++            let store = value.get_store()?.to_str()?.to_owned();
++            let confirmed = value.get_confirmed();
++            let batch = value.get_next_batch();
++            let token = value.get_confirmed_token()?.to_vec();
++            if batch == 0
++                || token.len() > 256
++                || value.has_seal()
++                    && (seal.get_last_sequence() <= confirmed
++                        || seal.get_deadline() == 0
++                        || store.is_empty())
++            {
++                return Err(Error::Protocol("inconsistent spool checkpoint or seal"));
++            }
++            Ok(Self {
++                source: value.get_source()?.to_str()?.to_owned(),
++                instance: value
++                    .get_instance()?
++                    .try_into()
++                    .map_err(|_| Error::Protocol("invalid spool instance"))?,
++                store,
++                epoch: value.get_span_epoch(),
++                confirmed,
++                token,
++                batch,
++                artifact: value.get_artifact()?.to_str()?.to_owned(),
++                cursor: Position {
++                    segment: cursor.get_segment(),
++                    offset: cursor.get_offset(),
++                },
++                seal: value.has_seal().then(|| Seal {
++                    last: seal.get_last_sequence(),
++                    deadline: seal.get_deadline(),
++                }),
++            })
++        })
++    }
++}
++
++enum Frame {
++    End,
++    Torn,
++    Entry(Entry, u64),
++}
++
++fn read_frame(reader: &mut impl Read) -> Result<Frame, Error> {
++    let mut prefix = [0; PREFIX];
++    if reader.read(&mut prefix[..1])? == 0 {
++        return Ok(Frame::End);
++    }
++    if let Err(err) = reader.read_exact(&mut prefix[1..]) {
++        return if err.kind() == std::io::ErrorKind::UnexpectedEof {
++            Ok(Frame::Torn)
++        } else {
++            Err(err.into())
++        };
++    }
++    let size = u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
++    if &prefix[4..8] != b"SP01"
++        || prefix[8..12] != (!(size as u32)).to_le_bytes()
++        || !(8..=FRAME_MAX).contains(&size)
++    {
++        return Err(Error::Protocol("corrupt spool frame prefix"));
++    }
++    let mut body = vec![0; size];
++    if let Err(err) = reader.read_exact(&mut body) {
++        return if err.kind() == std::io::ErrorKind::UnexpectedEof {
++            Ok(Frame::Torn)
++        } else {
++            Err(err.into())
++        };
++    }
++    if purrdf_hash::blake3::hash(&body).as_bytes() != &prefix[12..] {
++        return Err(Error::Protocol("corrupt spool frame checksum"));
++    }
++    let entry = decode::<wire::entry::Owned, _>(&body, |value| {
++        let token = value.get_token()?;
++        if token.len() > 256 {
++            return Err(Error::Protocol("oversized spool cursor token"));
++        }
++        let (event, _) = ProducerEvent::decode(value.get_event()?, crate::MAX_EVENT_BYTES)?;
++        event.admission_bytes()?;
++        Ok(Entry {
++            event,
++            token: token.to_vec(),
++            at: value.get_at(),
++        })
++    })?;
++    Ok(Frame::Entry(entry, (size + PREFIX) as u64))
++}
++
++impl Log {
++    pub(crate) fn open(
++        config: &SpoolConfig,
++        source: &str,
++        instance: [u8; 16],
++    ) -> Result<Self, Error> {
++        config.validate()?;
++        crate::quarantine::create_dir(&config.dir)?;
++        let directory = options().read(true).open(&config.dir)?;
++        let metadata = directory.metadata()?;
++        if !metadata.is_dir() || metadata.permissions().mode() & 0o777 != 0o700 {
++            return Err(Error::InvalidArgument(
++                "spool directory must be private (mode 0700) and cannot be a symlink",
++            ));
++        }
++        let lock = options()
++            .read(true)
++            .write(true)
++            .create(true)
++            .truncate(false)
++            .open(config.dir.join("LOCK"))?;
++        lock.try_lock().map_err(|error| {
++            Error::Io(match error {
++                std::fs::TryLockError::WouldBlock => std::io::Error::new(
++                    std::io::ErrorKind::WouldBlock,
++                    format!("spool already open: {}", config.dir.display()),
++                ),
++                std::fs::TryLockError::Error(error) => error,
++            })
++        })?;
++        let mut sizes = BTreeMap::new();
++        for entry in fs::read_dir(&config.dir)? {
++            let entry = entry?;
++            let name = entry.file_name();
++            let name = name
++                .to_str()
++                .ok_or(Error::Protocol("invalid spool file name"))?;
++            if matches!(name, "HEADER" | "LOCK" | "HEADER.new") {
++                continue;
++            }
++            let index = name
++                .strip_prefix("seg-")
++                .filter(|s| s.len() == 20 && s.bytes().all(|b| b.is_ascii_digit()))
++                .and_then(|s| s.parse::<u64>().ok())
++                .ok_or(Error::Protocol(
++                    "unexpected file in private spool directory",
++                ))?;
++            if !entry.file_type()?.is_file() {
++                return Err(Error::Protocol("spool segment is not a regular file"));
++            }
++            sizes.insert(index, entry.metadata()?.len());
++        }
++        let mut head = match options().read(true).open(config.dir.join("HEADER")) {
++            Ok(file) => Header::read(file)?,
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound && sizes.is_empty() => {
++                Header {
++                    source: source.to_owned(),
++                    instance,
++                    store: String::new(),
++                    epoch: 0,
++                    confirmed: 0,
++                    token: vec![],
++                    batch: 1,
++                    cursor: Position::default(),
++                    seal: None,
++                    artifact: String::new(),
++                }
++            }
++            Err(error) => return Err(error.into()),
++        };
++        if head.source != source {
++            return Err(Error::InvalidArgument(
++                "spool belongs to a different source",
++            ));
++        }
++        head.epoch = head
++            .epoch
++            .checked_add(1)
++            .ok_or(Error::Protocol("spool span epoch exhausted"))?;
++        let stats = SpoolStats {
++            next_batch: head.batch,
++            spooled_sequence: head.confirmed,
++            synced_sequence: head.confirmed,
++            sealed_batch: head.seal.as_ref().map(|_| head.batch),
++            replayed_batches: u64::from(head.seal.is_some()),
++            accepted_token: head.token.clone(),
++            confirmed_token: head.token.clone(),
++            ..SpoolStats::default()
++        };
++        let mut log = Self {
++            config: config.clone(),
++            directory,
++            _lock: lock,
++            appended_token: head.token.clone(),
++            head,
++            sizes,
++            active: None,
++            stats,
++        };
++        log.recover()?;
++        log.checkpoint(&log.head)?;
++        log.cleanup()?;
++        Ok(log)
++    }
++
++    fn checkpoint(&self, head: &Header) -> Result<(), Error> {
++        let path = self.config.dir.join("HEADER.new");
++        let mut file = options()
++            .write(true)
++            .create(true)
++            .truncate(true)
++            .open(&path)?;
++        let body = head.encode();
++        file.write_all(purrdf_hash::blake3::hash(&body).as_bytes())?;
++        file.write_all(&body)?;
++        file.sync_all()?;
++        fs::rename(path, self.config.dir.join("HEADER"))?;
++        self.directory.sync_all()?;
++        Ok(())
++    }
++
++    fn recover(&mut self) -> Result<(), Error> {
++        let end_segment = self.sizes.last_key_value().map(|(index, _)| *index);
++        let mut expected_segment = self.head.cursor.segment;
++        let mut saw_cursor = self.head.cursor.offset == 0;
++        for (&index, size) in &mut self.sizes {
++            if index >= self.head.cursor.segment {
++                if index != expected_segment {
++                    return Err(Error::Protocol("gap in producer spool segments"));
++                }
++                expected_segment = index
++                    .checked_add(1)
++                    .ok_or(Error::Protocol("spool segment index exhausted"))?;
++            }
++            let file = options()
++                .read(true)
++                .write(true)
++                .open(segment(&self.config.dir, index))?;
++            let mut reader = BufReader::new(&file);
++            let mut offset = 0;
++            loop {
++                let pos = Position {
++                    segment: index,
++                    offset,
++                };
++                if pos == self.head.cursor {
++                    saw_cursor = true;
++                }
++                match read_frame(&mut reader)? {
++                    Frame::End => break,
++                    Frame::Torn if Some(index) == end_segment && pos >= self.head.cursor => {
++                        file.set_len(offset)?;
++                        file.sync_all()?;
++                        self.stats.torn_tail += 1;
++                        *size = offset;
++                        break;
++                    }
++                    Frame::Torn => {
++                        return Err(Error::Protocol("incomplete interior producer spool frame"));
++                    }
++                    Frame::Entry(entry, length) => {
++                        if pos >= self.head.cursor {
++                            if self.stats.spooled_sequence.checked_add(1)
++                                != Some(entry.event.sequence)
++                            {
++                                return Err(Error::Protocol(
++                                    "nonconsecutive spooled event sequence",
++                                ));
++                            }
++                            self.stats.spooled_sequence = entry.event.sequence;
++                            self.stats.oldest_spooled_at_ms.get_or_insert(entry.at);
++                            self.appended_token = entry.token;
++                        } else if entry.event.sequence > self.head.confirmed {
++                            return Err(Error::Protocol(
++                                "spool checkpoint skips an unconfirmed event",
++                            ));
++                        }
++                        offset += length;
++                    }
++                }
++            }
++            self.stats.bytes = self
++                .stats
++                .bytes
++                .checked_add(*size)
++                .ok_or(Error::Protocol("spool length overflow"))?;
++            if Some(index) == end_segment && index >= self.head.cursor.segment {
++                drop(file);
++                self.active = Some((
++                    index,
++                    options()
++                        .append(true)
++                        .open(segment(&self.config.dir, index))?,
++                ));
++            }
++        }
++        if !saw_cursor
++            || self
++                .head
++                .seal
++                .as_ref()
++                .is_some_and(|seal| seal.last > self.stats.spooled_sequence)
++        {
++            return Err(Error::Protocol(
++                "spool checkpoint points past recoverable data",
++            ));
++        }
++        self.stats.segments = self.sizes.len();
++        self.sync()
++    }
++
++    fn cleanup(&mut self) -> Result<(), Error> {
++        while let Some((&index, &size)) = self.sizes.first_key_value() {
++            if index >= self.head.cursor.segment {
++                break;
++            }
++            if self
++                .active
++                .as_ref()
++                .is_some_and(|(active, _)| *active == index)
++            {
++                self.active = None;
++            }
++            fs::remove_file(segment(&self.config.dir, index))?;
++            self.sizes.remove(&index);
++            self.stats.bytes -= size;
++        }
++        self.stats.segments = self.sizes.len();
++        self.directory.sync_all()?;
++        Ok(())
++    }
++
++    pub(crate) fn sync(&mut self) -> Result<(), Error> {
++        if let Some((_, file)) = &self.active {
++            file.sync_data()?;
++        }
++        self.stats.synced_sequence = self.stats.spooled_sequence;
++        self.stats.accepted_token.clone_from(&self.appended_token);
++        Ok(())
++    }
++
++    pub(crate) fn append(
++        &mut self,
++        event: &ProducerEvent,
++        token: &[u8],
++        at: u64,
++    ) -> Result<(), Error> {
++        if self.stats.spooled_sequence.checked_add(1) != Some(event.sequence) || token.len() > 256 {
++            return Err(Error::Protocol("invalid local spool append order or token"));
++        }
++        let mut msg = capnp::message::Builder::new_default();
++        let mut out = msg.init_root::<wire::entry::Builder<'_>>();
++        out.set_at(at);
++        out.set_token(token);
++        event.encode(out.init_event());
++        let body = message_bytes(&msg);
++        let size = (PREFIX + body.len()) as u64;
++        if body.len() > FRAME_MAX || size > self.config.max_bytes.saturating_sub(self.stats.bytes) {
++            return Err(Error::Protocol(
++                "admitted spool frame exceeds its reserved disk budget",
++            ));
++        }
++        let mut frame = Vec::with_capacity(size as usize);
++        frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
++        frame.extend_from_slice(b"SP01");
++        frame.extend_from_slice(&(!(body.len() as u32)).to_le_bytes());
++        frame.extend_from_slice(purrdf_hash::blake3::hash(&body).as_bytes());
++        frame.extend_from_slice(&body);
++        let rotate = match self.sizes.last_key_value() {
++            Some((_, len)) => {
++                *len > 0
++                    && len.saturating_add(size)
++                        > self.config.segment_bytes.min(self.config.max_bytes)
++            }
++            None => true,
++        };
++        if self.active.is_none() || rotate {
++            self.sync()?;
++            let index = match self.sizes.last_key_value() {
++                Some((&i, _)) => i
++                    .checked_add(1)
++                    .ok_or(Error::Protocol("spool segment index exhausted"))?,
++                None => self.head.cursor.segment,
++            };
++            let file = options()
++                .append(true)
++                .create_new(true)
++                .open(segment(&self.config.dir, index))?;
++            self.directory.sync_all()?;
++            self.sizes.insert(index, 0);
++            self.active = Some((index, file));
++        }
++        let (index, file) = self
++            .active
++            .as_mut()
++            .ok_or(Error::Protocol("no active spool segment"))?;
++        file.write_all(&frame)?;
++        *self
++            .sizes
++            .get_mut(index)
++            .ok_or(Error::Protocol("missing active segment length"))? += size;
++        self.stats.bytes += size;
++        self.stats.segments = self.sizes.len();
++        self.stats.spooled_sequence = event.sequence;
++        self.stats.oldest_spooled_at_ms.get_or_insert(at);
++        self.appended_token.clear();
++        self.appended_token.extend_from_slice(token);
++        Ok(())
++    }
++
++    pub(crate) fn rebind(&mut self, store: &str) -> Result<(), Error> {
++        if self.head.seal.is_some() {
++            return Err(Error::InvalidArgument(
++                "cannot rebind a sealed batch of uncertain delivery to a different store",
++            ));
++        }
++        if !crate::receipt::valid_store_id(store) {
++            return Err(Error::InvalidArgument("invalid persistent store id"));
++        }
++        let mut next = self.head.clone();
++        next.store = store.to_owned();
++        self.checkpoint(&next)?;
++        self.head = next;
++        Ok(())
++    }
++
++    pub(crate) fn prepare(
++        &mut self,
++        store: &str,
++        deadline: u64,
++        limits: crate::events::BatchLimits,
++    ) -> Result<Option<Prepared>, Error> {
++        if !self.head.store.is_empty() && self.head.store != store {
++            return Err(Error::Domain {
++                code: "STORE_MISMATCH".into(),
++                message: format!(
++                    "spool is bound to {}, connected to {store}",
++                    self.head.store
++                ),
++                retryable: false,
++                class: crate::FailureClass::Local,
++            });
++        }
++        if self.stats.spooled_sequence == self.head.confirmed {
++            return Ok(None);
++        }
++        if deadline == 0 {
++            return Err(Error::Unsupported(
++                "configured spool requires conditional sealed event ingestion",
++            ));
++        }
++        let request_id = format!(
++            "events:{}:{:020}",
++            purrdf_hash::hex::encode(&self.head.instance),
++            self.head.batch
++        );
++        let mut batch = EventBatch {
++            request_id,
++            source: self.head.source.clone(),
++            client_instance: self.head.instance,
++            events: Vec::new(),
++        };
++        let mut charge = 1024 + 6 * (batch.request_id.len() + batch.source.len());
++        let mut end = self.head.cursor;
++        let mut token = Vec::new();
++        let sealed = self.head.seal.as_ref();
++        'segments: for (&index, &size) in self.sizes.range(self.head.cursor.segment..) {
++            let mut file = options()
++                .read(true)
++                .open(segment(&self.config.dir, index))?;
++            let offset = if index == self.head.cursor.segment {
++                self.head.cursor.offset
++            } else {
++                0
++            };
++            file.seek(SeekFrom::Start(offset))?;
++            let mut reader = BufReader::new(file);
++            let mut offset = offset;
++            while offset < size {
++                let Frame::Entry(entry, len) = read_frame(&mut reader)? else {
++                    return Err(Error::Protocol("spool entry lost before delivery"));
++                };
++                let bytes = entry.event.admission_bytes()?;
++                if sealed.is_none()
++                    && !batch.events.is_empty()
++                    && (batch.events.len() >= limits.events
++                        || charge + bytes > limits.payload_bytes.min(limits.bytes))
++                {
++                    break 'segments;
++                }
++                let sequence = entry.event.sequence;
++                batch.events.push(entry.event);
++                if batch.events.len() > crate::MAX_EVENT_BATCH_EVENTS {
++                    return Err(Error::Protocol(
++                        "sealed spool request exceeds native count ceiling",
++                    ));
++                }
++                token = entry.token;
++                charge += bytes;
++                offset += len;
++                end = Position {
++                    segment: index,
++                    offset,
++                };
++                if sealed.is_some_and(|seal| seal.last == sequence) {
++                    break 'segments;
++                }
++            }
++        }
++        let last = batch
++            .events
++            .last()
++            .ok_or(Error::Protocol("spool checkpoint has no next event"))?
++            .sequence;
++        if sealed.is_some_and(|seal| seal.last != last) {
++            return Err(Error::Protocol("sealed spool range is incomplete"));
++        }
++        let seal = match sealed {
++            Some(seal) => seal.clone(),
++            None => {
++                // Validate before sealing: unsendable input remains on disk with a visible hold.
++                batch.source_bytes_with_limits(limits)?;
++                self.sync()?;
++                let mut next = self.head.clone();
++                next.store = store.to_owned();
++                let seal = Seal { last, deadline };
++                next.seal = Some(seal.clone());
++                self.checkpoint(&next)?;
++                self.head = next;
++                self.stats.sealed_batch = Some(self.head.batch);
++                seal
++            }
++        };
++        Ok(Some(Prepared {
++            batch: std::sync::Arc::new(batch),
++            deadline: seal.deadline,
++            end,
++            token,
++        }))
++    }
++
++    pub(crate) fn confirm(&mut self, prepared: &Prepared, artifact: &str) -> Result<(), Error> {
++        let seal = self
++            .head
++            .seal
++            .as_ref()
++            .ok_or(Error::Protocol("missing spool confirmation seal"))?;
++        let mut next = self.head.clone();
++        next.confirmed = seal.last;
++        next.token = prepared.token.clone();
++        next.artifact = artifact.to_owned();
++        next.batch = next
++            .batch
++            .checked_add(1)
++            .ok_or(Error::Protocol("spool batch id exhausted"))?;
++        next.cursor = prepared.end;
++        if self.sizes.get(&next.cursor.segment) == Some(&next.cursor.offset) {
++            next.cursor = Position {
++                segment: next
++                    .cursor
++                    .segment
++                    .checked_add(1)
++                    .ok_or(Error::Protocol("spool cursor exhausted"))?,
++                offset: 0,
++            };
++        }
++        next.seal = None;
++        // A failed directory sync can leave the new HEADER visible after rename.
++        // Never append behind either recoverable cursor, even when checkpoint returns an error.
++        if self
++            .active
++            .as_ref()
++            .is_some_and(|(index, _)| *index < next.cursor.segment)
++        {
++            self.active = None;
++        }
++        self.checkpoint(&next)?;
++        self.head = next;
++        self.stats.confirmed_token = prepared.token.clone();
++        self.stats.next_batch = self.head.batch;
++        self.stats.sealed_batch = None;
++        self.stats.cleanup_pending = true;
++        Ok(())
++    }
++
++    pub(crate) fn finish_confirmation(&mut self) -> Result<(), Error> {
++        self.cleanup()?;
++        self.stats.oldest_spooled_at_ms = if self.stats.spooled_sequence == self.head.confirmed {
++            None
++        } else {
++            let mut file = options()
++                .read(true)
++                .open(segment(&self.config.dir, self.head.cursor.segment))?;
++            file.seek(SeekFrom::Start(self.head.cursor.offset))?;
++            let Frame::Entry(entry, _) = read_frame(&mut BufReader::new(file))? else {
++                return Err(Error::Protocol(
++                    "confirmed spool cursor lost the next event",
++                ));
++            };
++            Some(entry.at)
++        };
++        self.stats.cleanup_pending = false;
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::{
++        Delivery, DeliveryConfig, Endpoint, EventField, EventKind, EventLevel, FieldValue, Refusal,
++        SendError,
++    };
++
++    /// A cleanup failure after a durable confirmation cannot replay the accepted batch
++    /// or delete an event appended while reclamation is being retried.
++    #[test]
++    fn failed_confirmation_cleanup_preserves_the_next_append_across_restart() {
++        let dir = tempfile::tempdir().unwrap();
++        let config = SpoolConfig::new(dir.path().join("private"));
++        let store = "store:00000000000000000000000000000001";
++        let limits = crate::events::BatchLimits::NATIVE;
++        let mut log = Log::open(&config, "app", [1; 16]).unwrap();
++        let mut event = ProducerEvent {
++            sequence: 1,
++            event_time: 1,
++            kind: EventKind::Log,
++            level: EventLevel::Info,
++            name: "accepted".into(),
++            target: "app".into(),
++            fields: vec![],
++            context: vec![],
++            span: None,
++            follows_from: None,
++        };
++        log.append(&event, b"first", 1).unwrap();
++        let prepared = log.prepare(store, 20, limits).unwrap().unwrap();
++        drop(log);
++        let mut log = Log::open(&config, "app", [3; 16]).unwrap();
++        let replacement = "store:00000000000000000000000000000002";
++        assert!(
++            matches!(log.prepare(replacement, 30, limits), Err(Error::Domain {code,..}) if code == "STORE_MISMATCH")
++        );
++        assert!(log.rebind(replacement).is_err());
++        let replay = log.prepare(store, 30, limits).unwrap().unwrap();
++        assert_eq!(replay.deadline, prepared.deadline);
++        assert_eq!(replay.batch, prepared.batch);
++        let checkpoint = config.dir.join("HEADER.new");
++        fs::create_dir(&checkpoint).unwrap();
++        assert!(log.confirm(&prepared, "artifact:first").is_err());
++        event.sequence = 2;
++        log.append(&event, b"second", 2).unwrap();
++        let second = event.clone();
++        fs::remove_dir(checkpoint).unwrap();
++        log.confirm(&prepared, "artifact:first").unwrap();
++        let retired = segment(&config.dir, 0);
++        let saved = dir.path().join("saved");
++        fs::rename(&retired, &saved).unwrap();
++        fs::create_dir(&retired).unwrap();
++        assert!(log.finish_confirmation().is_err());
++        assert!(log.stats.cleanup_pending);
++        event.sequence = 3;
++        log.append(&event, b"third", 3).unwrap();
++        fs::remove_dir(&retired).unwrap();
++        fs::rename(&saved, &retired).unwrap();
++        log.finish_confirmation().unwrap();
++        assert!(!retired.exists());
++        assert_eq!(log.stats.oldest_spooled_at_ms, Some(2));
++        drop(log);
++        let mut log = Log::open(&config, "app", [2; 16]).unwrap();
++        assert_eq!(log.stats.confirmed_token, b"first");
++        assert_eq!(log.stats.accepted_token, b"third");
++        let next = log.prepare(store, 30, limits).unwrap().unwrap();
++        assert_eq!(next.batch.events.as_slice(), [second, event]);
++        assert_ne!(next.batch.request_id, prepared.batch.request_id);
++    }
++
++    /// Full disk refuses further confirmed input without consuming its cursor. A crash tear
++    /// is repairable only at the tail. A checksum failure inside a complete frame is fatal.
++    #[tokio::test]
++    async fn bounded_offline_spool_distinguishes_capacity_torn_tail_and_corrupt_data() {
++        let dir = tempfile::tempdir().unwrap();
++        let mut spool = SpoolConfig::new(dir.path().join("private"));
++        spool.max_bytes = 1 << 20;
++        spool.segment_bytes = 256 << 10;
++        let config = DeliveryConfig::lossless(
++            Endpoint::Unix(dir.path().join("absent.sock")),
++            "bounded",
++            spool.clone(),
++        );
++        let delivery = Delivery::start_async(config.clone()).await.unwrap();
++        assert!(
++            matches!(Delivery::start_async(config.clone()).await, Err(Error::Io(e)) if e.kind()==std::io::ErrorKind::WouldBlock)
++        );
++        let mut count = 0u64;
++        loop {
++            let event = ProducerEvent {
++                sequence: 0,
++                event_time: 1,
++                kind: EventKind::Log,
++                level: EventLevel::Info,
++                name: "offline".into(),
++                target: "sdk".into(),
++                fields: vec![EventField {
++                    name: "message".into(),
++                    value: FieldValue::Text("x".repeat(5000)),
++                }],
++                context: vec![],
++                span: None,
++                follows_from: None,
++            };
++            match delivery
++                .send_with_token(event, &(count + 1).to_le_bytes())
++                .await
++            {
++                Ok(receipt) => {
++                    count += 1;
++                    assert_eq!(count, receipt.sequence);
++                }
++                Err(SendError::Refused {
++                    reason: Refusal::SpoolFull,
++                    event,
++                }) => {
++                    assert_eq!(event.name, "offline");
++                    assert_eq!(
++                        delivery.stats().unwrap().dropped_by_reason
++                            [crate::DropReason::Full as usize],
++                        0
++                    );
++                    // A tracing or console callback has no upstream owner to reclaim the refusal.
++                    let mut event = *event;
++                    event.name.push_str(" captured");
++                    delivery.observe(event);
++                    break;
++                }
++                other => panic!("unexpected offline admission {other:?}"),
++            }
++        }
++        assert!(count > 1 && delivery.stats().unwrap().spool.unwrap().bytes <= spool.max_bytes);
++        assert_eq!(
++            delivery.stats().unwrap().refused_by_reason[Refusal::SpoolFull as usize],
++            2
++        );
++        assert_eq!(
++            delivery.stats().unwrap().dropped_by_reason[crate::DropReason::Full as usize],
++            1
++        );
++        assert_eq!(
++            delivery.close_local(Duration::from_secs(5)).await.unwrap(),
++            count
++        );
++        let mut segments: Vec<_> = fs::read_dir(&spool.dir)
++            .unwrap()
++            .map(|entry| entry.unwrap().path())
++            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("seg-"))
++            .collect();
++        segments.sort();
++        let tail = segments.last().unwrap();
++        let old = tail.metadata().unwrap().len();
++        options()
++            .append(true)
++            .open(tail)
++            .unwrap()
++            .write_all(&[8, 0])
++            .unwrap();
++        let recovered = Delivery::start_async(config.clone()).await.unwrap();
++        assert_eq!(recovered.stats().unwrap().spool.unwrap().torn_tail, 1);
++        assert_eq!(recovered.accepted_token().unwrap(), count.to_le_bytes());
++        assert_eq!(tail.metadata().unwrap().len(), old);
++        recovered.close_local(Duration::from_secs(5)).await.unwrap();
++        let mut file = options().write(true).open(&segments[0]).unwrap();
++        file.seek(SeekFrom::Start(12)).unwrap();
++        file.write_all(&[0; 32]).unwrap();
++        assert!(matches!(
++            Delivery::start_async(config).await,
++            Err(Error::Protocol("corrupt spool frame checksum"))
++        ));
++    }
++}
+diff --git crates/sparrow-core/src/storage.rs crates/sparrow-core/src/storage.rs
+index f8d7f09..5c2d76b 100644
+--- crates/sparrow-core/src/storage.rs
++++ crates/sparrow-core/src/storage.rs
+@@ -706,6 +706,8 @@ struct Writer {
+     pressure: writer_queue::Observed<pressure::State>,
+     eviction: std::cell::RefCell<eviction::Cursor>,
+     expiry: std::cell::RefCell<expiry::Cursor>,
++    /// Greatest expiry among event receipts physically deleted since sealed replay was enabled.
++    retry_gc_clock: std::cell::Cell<Option<u64>>,
+     recompression: writer_queue::Observed<recompression::State>,
+     /// Dev-only: how long each migration page holds the writer before it commits.
+     #[cfg(feature = "test-support")]
+@@ -1810,6 +1812,7 @@ impl Store {
+         // Schema 69's backfills and a stale source-context cache's rebuild run online, one
+         // page per maintenance admission.
+         migration::fence(&db)?;
++        let retry_gc = writer_format::retry_watermark(&db)?;
+         timer.lap("migration_fence");
+         let archive = archive::open(&db, config.archive.as_ref())?;
+         if db.get(producer_stream::KEY)?.is_none() {
+@@ -1879,6 +1882,7 @@ impl Store {
+                 writer_recoveries: std::sync::atomic::AtomicU64::new(0),
+             }),
+             inner: Arc::new(Mutex::new(Writer {
++                retry_gc_clock: std::cell::Cell::new(retry_gc),
+                 db,
+                 id,
+                 config,
+@@ -2110,6 +2114,31 @@ impl Store {
+         intake: Option<intake::Intake>,
+         now: u64,
+         mode: durability::Durability,
++    ) -> Result<Artifact, Error> {
++        self.ingest_events_before(request_id, source, bytes, producer, intake, now, mode, None)
++    }
++
++    /// Server-clock upper bound on first submission, strictly inside receipt retention.
++    #[must_use]
++    pub fn sealed_event_deadline(now: u64) -> u64 {
++        now.saturating_add(RETRY_WINDOW / 2)
++    }
++
++    /// Accept an exact retry, or publish for the first time only within the sealed deadline.
++    #[expect(
++        clippy::too_many_arguments,
++        reason = "event provenance, WAL boundary and immutable retry deadline"
++    )]
++    pub fn ingest_events_before(
++        &self,
++        request_id: &str,
++        source: &str,
++        bytes: &[u8],
++        producer: &producer_stream::ProducerBatch,
++        intake: Option<intake::Intake>,
++        now: u64,
++        mode: durability::Durability,
++        deadline: Option<u64>,
+     ) -> Result<Artifact, Error> {
+         producer.validate()?;
+         self.ingest_input(
+@@ -2117,7 +2146,7 @@ impl Store {
+             source,
+             "jsonl",
+             bytes,
+-            ingest::Origin::Event(producer),
++            ingest::Origin::Event(producer, deadline),
+             intake,
+             now,
+             mode,
+@@ -2210,6 +2239,20 @@ impl Store {
+         )? {
+             return writer.receipt(receipt, mode);
+         }
++        if let ingest::Origin::Event(_, Some(deadline)) = origin {
++            if now.max(writer.retry_gc_clock.get().unwrap_or(0)) >= deadline
++                || deadline > Self::sealed_event_deadline(now)
++            {
++                return Err(Error::new(
++                    "UNCERTAIN_DELIVERY",
++                    "no exact retained event receipt at the sealed submission deadline",
++                ));
++            }
++            if writer.retry_gc_clock.get().is_none() {
++                writer_format::activate_sealed(&writer.db)?;
++                writer.retry_gc_clock.set(Some(0));
++            }
++        }
+         if writer.db.get(import::import_id(request_id))?.is_some() {
+             return Err(Error::new(
+                 "CONFLICT",
+@@ -3543,7 +3586,7 @@ mod atomic_bound_tests {
+             sequences: vec![1],
+         };
+         check_atomic_batch(Origin::Producer(&batch), ATOMIC_BATCH_BYTES).unwrap();
+-        let producer = check_atomic_batch(Origin::Event(&batch), ATOMIC_BATCH_BYTES + 1);
++        let producer = check_atomic_batch(Origin::Event(&batch, None), ATOMIC_BATCH_BYTES + 1);
+         assert_eq!(producer.unwrap_err().code, "INVALID_ARGUMENT");
+         let other = check_atomic_batch(Origin::Ordinary, ATOMIC_BATCH_BYTES + 1);
+         assert_eq!(other.unwrap_err().code, "RESOURCE_LIMIT");
+diff --git crates/sparrow-core/src/storage/expiry.rs crates/sparrow-core/src/storage/expiry.rs
+index fd9040e..2db007b 100644
+--- crates/sparrow-core/src/storage/expiry.rs
++++ crates/sparrow-core/src/storage/expiry.rs
+@@ -265,6 +265,7 @@ struct Walked {
+ 
+ /// One bounded pass: the shared budgets, batch and per-pass parent state of both walks.
+ struct Pass<'a> {
++    retry_gc: Option<u64>,
+     writer: &'a Writer,
+     now: u64,
+     limits: EvictionLimits,
+@@ -686,6 +687,11 @@ impl Pass<'_> {
+                 };
+             self.report.visited += 1;
+             if !managed && expires_at <= self.now {
++                if key.starts_with(b"request:ingest:")
++                    && let Some(watermark) = &mut self.retry_gc
++                {
++                    *watermark = (*watermark).max(expires_at);
++                }
+                 staged(&mut self.retirement, writer)?.batch.delete(&key);
+                 self.report.deleted += 1;
+             }
+@@ -744,6 +750,7 @@ impl Writer {
+             local.rewind();
+         }
+         let mut pass = Pass {
++            retry_gc: self.retry_gc_clock.get(),
+             writer: self,
+             now,
+             limits,
+@@ -788,6 +795,7 @@ impl Writer {
+             }
+         }
+         let Pass {
++            retry_gc,
+             retirement,
+             mut report,
+             held,
+@@ -795,10 +803,15 @@ impl Writer {
+             reads,
+             ..
+         } = pass;
+-        let batch = match retirement {
++        let mut batch = match retirement {
+             Some(retirement) => retirement.finish()?,
+             None => rocksdb::WriteBatch::default(),
+         };
++        if retry_gc != self.retry_gc_clock.get()
++            && let Some(watermark) = retry_gc
++        {
++            batch.put(super::writer_format::RETRY_GC, watermark.to_be_bytes());
++        }
+         // The shared writer appends the bounded format and feature fence.
+         if batch.size_in_bytes().saturating_add(256) > limits.max_batch_bytes {
+             return Err(Error::new(
+@@ -808,6 +821,7 @@ impl Writer {
+         }
+         if !batch.is_empty() {
+             self.commit(batch)?;
++            self.retry_gc_clock.set(retry_gc);
+         }
+         report.frontier = frontier.unwrap_or_default();
+         report.continuation = frontier.is_some_and(|stopped| stopped != ExpiryFrontier::ArchiveLag);
+diff --git crates/sparrow-core/src/storage/ingest.rs crates/sparrow-core/src/storage/ingest.rs
+index 1093252..8bffe54 100644
+--- crates/sparrow-core/src/storage/ingest.rs
++++ crates/sparrow-core/src/storage/ingest.rs
+@@ -14,7 +14,7 @@ pub(super) enum Origin<'a> {
+     Producer(&'a super::producer_stream::ProducerBatch),
+     /// A producer batch from the daemon's event route: like `Producer`, and the source's
+     /// `/event_time` mapping is bound on first use, or counted lost when the registry is full.
+-    Event(&'a super::producer_stream::ProducerBatch),
++    Event(&'a super::producer_stream::ProducerBatch, Option<u64>),
+     Receiver(&'a super::receiver_stream::SyslogReceiver),
+     Tail(super::tail::Append<'a>),
+ }
+@@ -28,12 +28,12 @@ impl<'a> Origin<'a> {
+     }
+     pub(super) fn producer(self) -> Option<&'a super::producer_stream::ProducerBatch> {
+         match self {
+-            Self::Producer(value) | Self::Event(value) => Some(value),
++            Self::Producer(value) | Self::Event(value, _) => Some(value),
+             _ => None,
+         }
+     }
+     pub(super) fn maps_event_time(self) -> bool {
+-        matches!(self, Self::Event(_))
++        matches!(self, Self::Event(..))
+     }
+     pub(super) fn tail(self) -> Option<super::tail::Append<'a>> {
+         match self {
+diff --git crates/sparrow-core/src/storage/producer_stream.rs crates/sparrow-core/src/storage/producer_stream.rs
+index 97da755..377f0cf 100644
+--- crates/sparrow-core/src/storage/producer_stream.rs
++++ crates/sparrow-core/src/storage/producer_stream.rs
+@@ -387,6 +387,88 @@ mod tests {
+     use super::*;
+     use crate::Config;
+ 
++    /// A sealed producer can submit the missing prefix after reopening the store. Once
++    /// GC retires its exact receipt, a backward clock can never admit it as new again.
++    #[test]
++    fn sealed_event_watermark_survives_restart_gc_and_clock_rollback() {
++        let dir = tempfile::tempdir().unwrap();
++        let config = sparrow_test_support::storage_config!(Config);
++        let now = 10_000;
++        let deadline = Store::sealed_event_deadline(now);
++        let producer = ProducerBatch {
++            instance: [42; 16],
++            sequences: vec![1],
++        };
++        let submit = |store: &Store, id, t, deadline, batch: &ProducerBatch| {
++            store.ingest_events_before(
++                id,
++                "source",
++                b"{}\n",
++                batch,
++                None,
++                t,
++                crate::Durability::Durable,
++                Some(deadline),
++            )
++        };
++        let store = Store::open(dir.path(), config.clone()).unwrap();
++        drop(store);
++        let store = Store::open(dir.path(), config.clone()).unwrap();
++        let original =
++            |store: &Store, t| submit(store, "events:sealed:test", t, deadline, &producer);
++        let first = original(&store, now).unwrap();
++        drop(store);
++        let store = Store::open(dir.path(), config.clone()).unwrap();
++        assert_eq!(original(&store, now + 1).unwrap().id, first.id);
++        let later = now + super::super::RETRY_WINDOW + 10;
++        assert_eq!(
++            original(&store, later).unwrap_err().code,
++            "UNCERTAIN_DELIVERY"
++        );
++        store.expire(later).unwrap();
++        assert!(
++            store
++                .lock()
++                .unwrap()
++                .db
++                .get("request:ingest:events:sealed:test")
++                .unwrap()
++                .is_none()
++        );
++        drop(store);
++        let store = Store::open(dir.path(), config.clone()).unwrap();
++        assert_eq!(
++            original(&store, now + 1).unwrap_err().code,
++            "UNCERTAIN_DELIVERY"
++        );
++        assert_eq!(store.artifacts(now + 1).unwrap().len(), 1);
++        let next = ProducerBatch {
++            instance: producer.instance,
++            sequences: vec![2],
++        };
++        submit(
++            &store,
++            "events:sealed:next",
++            later,
++            Store::sealed_event_deadline(later),
++            &next,
++        )
++        .unwrap();
++        assert_eq!(store.artifacts(later).unwrap().len(), 2);
++        // An upgraded writer cannot make a fresh assumption about missing GC evidence.
++        store
++            .lock()
++            .unwrap()
++            .db
++            .delete(super::super::writer_format::RETRY_GC)
++            .unwrap();
++        drop(store);
++        assert_eq!(
++            Store::open(dir.path(), config).err().unwrap().code,
++            "STORAGE_FAILURE"
++        );
++    }
++
+     /// INVARIANT (#215): a registry at its byte bound never refuses a batch. An existing
+     /// window first sheds its own oldest gap intervals; with none left, the batch is taken
+     /// without a window update (`None`, counted by the caller). The old code answered
+diff --git crates/sparrow-core/src/storage/writer_format.rs crates/sparrow-core/src/storage/writer_format.rs
+index fd9ef07..d30195c 100644
+--- crates/sparrow-core/src/storage/writer_format.rs
++++ crates/sparrow-core/src/storage/writer_format.rs
+@@ -537,10 +537,127 @@ fn position(families: &[[&'static [u8]; 11]; 5], format: &[u8]) -> Option<(usize
+         })
+ }
+ 
++// Sealed producer replay requires every writer that retires an event receipt to
++// advance the durable GC watermark. Preserve the five payload-index families.
++const SEALED: [[&[u8]; 11]; 5] = [
++    [
++        b"sparrow.store/407",
++        b"sparrow.store/408",
++        b"sparrow.store/409",
++        b"sparrow.store/410",
++        b"sparrow.store/411",
++        b"sparrow.store/412",
++        b"sparrow.store/413",
++        b"sparrow.store/414",
++        b"sparrow.store/415",
++        b"sparrow.store/416",
++        b"sparrow.store/417",
++    ],
++    [
++        b"sparrow.store/418",
++        b"sparrow.store/419",
++        b"sparrow.store/420",
++        b"sparrow.store/421",
++        b"sparrow.store/422",
++        b"sparrow.store/423",
++        b"sparrow.store/424",
++        b"sparrow.store/425",
++        b"sparrow.store/426",
++        b"sparrow.store/427",
++        b"sparrow.store/428",
++    ],
++    [
++        b"sparrow.store/429",
++        b"sparrow.store/430",
++        b"sparrow.store/431",
++        b"sparrow.store/432",
++        b"sparrow.store/433",
++        b"sparrow.store/434",
++        b"sparrow.store/435",
++        b"sparrow.store/436",
++        b"sparrow.store/437",
++        b"sparrow.store/438",
++        b"sparrow.store/439",
++    ],
++    [
++        b"sparrow.store/440",
++        b"sparrow.store/441",
++        b"sparrow.store/442",
++        b"sparrow.store/443",
++        b"sparrow.store/444",
++        b"sparrow.store/445",
++        b"sparrow.store/446",
++        b"sparrow.store/447",
++        b"sparrow.store/448",
++        b"sparrow.store/449",
++        b"sparrow.store/450",
++    ],
++    [
++        b"sparrow.store/451",
++        b"sparrow.store/452",
++        b"sparrow.store/453",
++        b"sparrow.store/454",
++        b"sparrow.store/455",
++        b"sparrow.store/456",
++        b"sparrow.store/457",
++        b"sparrow.store/458",
++        b"sparrow.store/459",
++        b"sparrow.store/460",
++        b"sparrow.store/461",
++    ],
++];
++pub(super) const RETRY_GC: &str = "producer:sealed-receipt-gc";
++
++fn sealed(format: &[u8]) -> Option<&'static [u8]> {
++    position(&SEALED, format).map(|(family, i)| SEALED[family][i])
++}
++
++fn enable_sealed(format: &[u8]) -> Result<&'static [u8], Error> {
++    position(&PAYLOAD_INDEX, format)
++        .or_else(|| position(&SEALED, format))
++        .map(|(family, i)| SEALED[family][i])
++        .ok_or_else(|| {
++            Error::new(
++                "STORAGE_FAILURE",
++                "sealed events require a payload-index authority family",
++            )
++        })
++}
++
++pub(super) fn retry_watermark(db: &DB) -> Result<Option<u64>, Error> {
++    let format = db
++        .get("store_format")?
++        .ok_or_else(|| Error::new("STORAGE_FAILURE", "missing store format"))?;
++    match (sealed(&format), db.get(RETRY_GC)?) {
++        (None, None) => Ok(None),
++        (Some(_), Some(bytes)) if bytes.len() == 8 => Ok(Some(u64::from_be_bytes(
++            bytes
++                .as_slice()
++                .try_into()
++                .map_err(|_| Error::new("STORAGE_FAILURE", "invalid sealed receipt watermark"))?,
++        ))),
++        _ => Err(Error::new(
++            "STORAGE_FAILURE",
++            "sealed receipt watermark contradicts writer format",
++        )),
++    }
++}
++
++pub(super) fn activate_sealed(db: &DB) -> Result<(), Error> {
++    let format = db
++        .get("store_format")?
++        .ok_or_else(|| Error::new("STORAGE_FAILURE", "missing store format"))?;
++    let mut batch = WriteBatch::default();
++    batch.put("store_format", enable_sealed(&format)?);
++    batch.put(RETRY_GC, 0u64.to_be_bytes());
++    super::catalog_upgrade::commit(db, batch)
++}
++
+ /// The pre-fallback identity a store-counter, source-summary, owner-graph or fallback-fenced
+ /// format lifts;
+ /// other formats are unchanged.
+ fn lower(format: &[u8]) -> &[u8] {
++    let format = position(&SEALED, format).map_or(format, |(family, i)| PAYLOAD_INDEX[family][i]);
+     let format = position(&PAYLOAD_INDEX, format)
+         .map_or(format, |(family, index)| STORE_COUNTERS[family][index]);
+     let format = position(&STORE_COUNTERS, format)
+@@ -575,7 +692,9 @@ fn relift<'a>(current: &[u8], next: &'a [u8]) -> Result<&'a [u8], Error> {
+     } else {
+         next
+     };
+-    if has_payload_index(current) {
++    if sealed(current).is_some() {
++        enable_sealed(enable_payload_index(next)?)
++    } else if has_payload_index(current) {
+         enable_payload_index(next)
+     } else {
+         Ok(next)
+@@ -609,6 +728,7 @@ pub(super) fn lower_store_counters(format: &[u8]) -> &[u8] {
+ /// The store counter identity a payload index family lifts; other formats are unchanged.
+ #[cfg(feature = "test-support")]
+ pub(super) fn lower_payload_index(format: &[u8]) -> &[u8] {
++    let format = position(&SEALED, format).map_or(format, |(family, i)| PAYLOAD_INDEX[family][i]);
+     position(&PAYLOAD_INDEX, format).map_or(format, |(family, index)| STORE_COUNTERS[family][index])
+ }
+ 
+@@ -621,11 +741,14 @@ pub(super) fn has_store_counters(format: &[u8]) -> bool {
+ }
+ 
+ pub(super) fn has_payload_index(format: &[u8]) -> bool {
+-    position(&PAYLOAD_INDEX, format).is_some()
++    position(&PAYLOAD_INDEX, format).is_some() || sealed(format).is_some()
+ }
+ 
+ /// Fence a current store counter family for the payload id index (#323); idempotent.
+ pub(super) fn enable_payload_index(format: &[u8]) -> Result<&'static [u8], Error> {
++    if let Some(identity) = sealed(format) {
++        return Ok(identity);
++    }
+     position(&PAYLOAD_INDEX, format)
+         .or_else(|| position(&STORE_COUNTERS, format))
+         .map(|(family, index)| PAYLOAD_INDEX[family][index])
+@@ -639,6 +762,9 @@ pub(super) fn enable_payload_index(format: &[u8]) -> Result<&'static [u8], Error
+ 
+ /// Fence a current source summary family for the store counters; idempotent.
+ pub(super) fn enable_store_counters(format: &[u8]) -> Result<&'static [u8], Error> {
++    if let Some(identity) = sealed(format) {
++        return Ok(identity);
++    }
+     if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {
+         return Ok(PAYLOAD_INDEX[family][index]);
+     }
+@@ -656,6 +782,9 @@ pub(super) fn enable_store_counters(format: &[u8]) -> Result<&'static [u8], Erro
+ /// Fence a current owner graph family for the per-source counters and artifact index;
+ /// idempotent.
+ pub(super) fn enable_source_summary(format: &[u8]) -> Result<&'static [u8], Error> {
++    if let Some(identity) = sealed(format) {
++        return Ok(identity);
++    }
+     if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {
+         return Ok(PAYLOAD_INDEX[family][index]);
+     }
+@@ -675,6 +804,9 @@ pub(super) fn enable_source_summary(format: &[u8]) -> Result<&'static [u8], Erro
+ 
+ /// Fence a current event fallback family for the owner-to-graph index; idempotent.
+ pub(super) fn enable_owner_graphs(format: &[u8]) -> Result<&'static [u8], Error> {
++    if let Some(identity) = sealed(format) {
++        return Ok(identity);
++    }
+     if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {
+         return Ok(PAYLOAD_INDEX[family][index]);
+     }
+@@ -697,6 +829,9 @@ pub(super) fn enable_owner_graphs(format: &[u8]) -> Result<&'static [u8], Error>
+ 
+ /// Fence a current tracing-or-later family for receipt-time fallback RDF; idempotent.
+ pub(super) fn enable_event_fallback(format: &[u8]) -> Result<&'static [u8], Error> {
++    if let Some(identity) = sealed(format) {
++        return Ok(identity);
++    }
+     if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {
+         return Ok(PAYLOAD_INDEX[family][index]);
+     }
+@@ -738,6 +873,7 @@ fn families() -> impl Iterator<Item = &'static &'static [u8]> {
+         .chain(SOURCE_SUMMARY.iter().flatten())
+         .chain(STORE_COUNTERS.iter().flatten())
+         .chain(PAYLOAD_INDEX.iter().flatten())
++        .chain(SEALED.iter().flatten())
+ }
+ 
+ fn base_index(format: &[u8], purpose: &str) -> Result<usize, Error> {
+@@ -887,6 +1023,7 @@ pub(super) fn read(db: &DB) -> Result<Option<Vec<u8>>, Error> {
+             .chain(SOURCE_SUMMARY.iter().flatten())
+             .chain(STORE_COUNTERS.iter().flatten())
+             .chain(PAYLOAD_INDEX.iter().flatten())
++            .chain(SEALED.iter().flatten())
+             .position(|identity| *identity == raw)
+             .map_or(raw.clone(), |index| BASE[index % BASE.len()].to_vec())
+     }))
+@@ -990,6 +1127,11 @@ mod tests {
+             PAYLOAD_INDEX_ARCHIVE,
+             PAYLOAD_INDEX_INTAKE,
+             PAYLOAD_INDEX_INTAKE_ARCHIVE,
++            SEALED[0],
++            SEALED[1],
++            SEALED[2],
++            SEALED[3],
++            SEALED[4],
+         ] {
+             for (base, format) in BASE.into_iter().zip(family) {
+                 db.put("store_format", format).unwrap();
+diff --git crates/sparrow-core/tests/storage.rs crates/sparrow-core/tests/storage.rs
+index 87c6ee1..39a387c 100644
+--- crates/sparrow-core/tests/storage.rs
++++ crates/sparrow-core/tests/storage.rs
+@@ -10,6 +10,8 @@ use sparrow_test_support::{catalog_db, remove_artifact_rdf_upgrade, remove_tail_
+ 
+ const DAY: u64 = 86_400_000;
+ const HOUR: u64 = 60 * 60 * 1000;
++/// A syntactically valid future identity outside all allocated writer families.
++const UNKNOWN_WRITER_FORMAT: &[u8] = b"sparrow.store/4294967295";
+ 
+ /// Hang deadline for the two load-sensitive event-driven tests. The slowest measured
+ /// run was 44.41 s (sigkill test under load 33-43, .stage/flaky-tests/s1.log), so five
+@@ -21873,7 +21875,7 @@ fn archive_fence_refuses_unconfigured_open_and_older_writers() {
+     // The log time law is removed so the format identity alone decides the refusal.
+     let db = catalog_db(dir.path()).unwrap();
+     db.put("archive:through", through).unwrap();
+-    db.put("store_format", b"sparrow.store/407").unwrap();
++    db.put("store_format", UNKNOWN_WRITER_FORMAT).unwrap();
+     db.delete("log-time-profile-law").unwrap();
+     drop(db);
+     assert_eq!(
+@@ -24643,7 +24645,7 @@ fn source_index_migration_seeds_exact_counters_and_fences_older_writers() {
+     // these families refuses this store.
+     let db = catalog_db(dir.path()).unwrap();
+     db.put("source-summary-upgrade", checkpoint).unwrap();
+-    db.put("store_format", b"sparrow.store/407").unwrap();
++    db.put("store_format", UNKNOWN_WRITER_FORMAT).unwrap();
+     drop(db);
+     assert_eq!(
+         Store::open(dir.path(), large_config()).err().unwrap().code,
+diff --git crates/sparrow-server/src/ingest_gate.rs crates/sparrow-server/src/ingest_gate.rs
+index 81c3690..394bd16 100644
+--- crates/sparrow-server/src/ingest_gate.rs
++++ crates/sparrow-server/src/ingest_gate.rs
+@@ -135,6 +135,7 @@ decide! {
+         import_publish: ImportPublishParams, ImportPublishResults;
+         import_cancel: ImportCancelParams, ImportCancelResults;
+         events_ingest: EventsIngestParams, EventsIngestResults;
++        sealed_events_ingest: SealedEventsIngestParams, SealedEventsIngestResults;
+         flush: FlushParams, FlushResults;
+         discover: DiscoverParams, DiscoverResults;
+     }
+diff --git crates/sparrow-server/src/query_only.rs crates/sparrow-server/src/query_only.rs
+index bdd817c..fe20788 100644
+--- crates/sparrow-server/src/query_only.rs
++++ crates/sparrow-server/src/query_only.rs
+@@ -116,6 +116,7 @@ classify! {
+     writes {
+         ingest: IngestParams, IngestResults;
+         events_ingest: EventsIngestParams, EventsIngestResults;
++        sealed_events_ingest: SealedEventsIngestParams, SealedEventsIngestResults;
+         import_begin: ImportBeginParams, ImportBeginResults;
+         import_append: ImportAppendParams, ImportAppendResults;
+         import_seal: ImportSealParams, ImportSealResults;
+diff --git crates/sparrow-server/src/rpc.rs crates/sparrow-server/src/rpc.rs
+index 324ca48..e135ea2 100644
+--- crates/sparrow-server/src/rpc.rs
++++ crates/sparrow-server/src/rpc.rs
+@@ -185,6 +185,70 @@ enum Next {
+ }
+ 
+ impl Rpc {
++    async fn accept_events(
++        &self,
++        batch: wire::event_batch::Reader<'_>,
++        mode: sparrow_core::Durability,
++        guard: Option<(String, u64)>,
++        out: wire::result::Builder<'_, wire::artifact::Owned>,
++    ) -> capnp::Result<()> {
++        let input = match sparrow_client::EventBatch::decode(batch) {
++            Ok(input) => input,
++            Err(error) => {
++                failure(out, invalid(error));
++                return Ok(());
++            }
++        };
++        // Batch validation bounds normalization by MAX_EVENT_BATCH_EVENTS and
++        // MAX_EVENT_BATCH_BYTES, well inside the store's inline ingest bound.
++        let bytes = match input.source_bytes().map_err(invalid) {
++            Ok(bytes) => bytes,
++            Err(error) => {
++                failure(out, error);
++                return Ok(());
++            }
++        };
++        let intake = self.intake;
++        match self
++            .work(move |store, now| {
++                // The store binds the source's /event_time mapping; a full source registry
++                // stores the batch with unknown time and counts it (#227).
++                if let Some((id, _)) = &guard
++                    && store.store_id()? != *id
++                {
++                    return Err(sparrow_core::Error::new(
++                        "STORE_MISMATCH",
++                        "sealed request belongs to another store",
++                    ));
++                }
++                store.ingest_events_before(
++                    &input.request_id,
++                    &input.source,
++                    &bytes,
++                    &sparrow_core::ProducerBatch {
++                        instance: input.client_instance,
++                        sequences: input.events.iter().map(|event| event.sequence).collect(),
++                    },
++                    intake,
++                    now,
++                    mode,
++                    guard.map(|(_, deadline)| deadline),
++                )
++            })
++            .await
++        {
++            Ok(value) => artifact(
++                out.init_ok(),
++                value,
++                &self
++                    .store
++                    .store_id()
++                    .map_err(|error| capnp::Error::failed(error.to_string()))?,
++            )?,
++            Err(error) => failure(out, error),
++        }
++        Ok(())
++    }
+     /// Construct the one typed adapter with explicit admission limits.
+     pub fn new(store: Store, requests: Arc<Semaphore>, max_pin_members: usize) -> Self {
+         Self {
+@@ -2149,53 +2213,35 @@ impl wire::sparrow::Server for Rpc {
+         mut results: wire::sparrow::EventsIngestResults,
+     ) -> capnp::Result<()> {
+         let mode = durability_mode(params.get()?.get_durability()?);
+-        let input = match sparrow_client::EventBatch::decode(params.get()?.get_batch()?) {
+-            Ok(input) => input,
+-            Err(error) => {
+-                failure(results.get().init_result(), invalid(error));
+-                return Ok(());
+-            }
+-        };
+-        // Batch validation bounds normalization by MAX_EVENT_BATCH_EVENTS and
+-        // MAX_EVENT_BATCH_BYTES, well inside the store's inline ingest bound.
+-        let bytes = match input.source_bytes().map_err(invalid) {
+-            Ok(bytes) => bytes,
+-            Err(error) => {
+-                failure(results.get().init_result(), error);
+-                return Ok(());
+-            }
+-        };
+-        let intake = self.intake;
+-        match self
+-            .work(move |store, now| {
+-                // The store binds the source's /event_time mapping; a full source registry
+-                // stores the batch with unknown time and counts it (#227).
+-                store.ingest_events_with_intake(
+-                    &input.request_id,
+-                    &input.source,
+-                    &bytes,
+-                    &sparrow_core::ProducerBatch {
+-                        instance: input.client_instance,
+-                        sequences: input.events.iter().map(|event| event.sequence).collect(),
+-                    },
+-                    intake,
+-                    now,
+-                    mode,
+-                )
+-            })
+-            .await
+-        {
+-            Ok(value) => artifact(
+-                results.get().init_result().init_ok(),
+-                value,
+-                &self
+-                    .store
+-                    .store_id()
+-                    .map_err(|error| capnp::Error::failed(error.to_string()))?,
+-            )?,
+-            Err(error) => failure(results.get().init_result(), error),
++        self.accept_events(
++            params.get()?.get_batch()?,
++            mode,
++            None,
++            results.get().init_result(),
++        )
++        .await
++    }
++    async fn sealed_events_ingest(
++        self: Rc<Self>,
++        params: wire::sparrow::SealedEventsIngestParams,
++        mut results: wire::sparrow::SealedEventsIngestResults,
++    ) -> capnp::Result<()> {
++        let input = params.get()?;
++        let store = input.get_store_id()?.to_str()?;
++        if store.len() > 128 {
++            failure(
++                results.get().init_result(),
++                invalid("sealed store id exceeds its limit"),
++            );
++            return Ok(());
+         }
+-        Ok(())
++        self.accept_events(
++            input.get_batch()?,
++            sparrow_core::Durability::Durable,
++            Some((store.to_owned(), input.get_deadline_ms())),
++            results.get().init_result(),
++        )
++        .await
+     }
+     async fn import_begin(
+         self: Rc<Self>,
+@@ -3155,13 +3201,20 @@ impl wire::sparrow::Server for Rpc {
+     ) -> capnp::Result<()> {
+         let paused = self.pause.paused();
+         let discovered = self
+-            .work(|store, _| Ok((store.properties()?, store.durability_status()?)))
++            .work(|store, now| {
++                Ok((
++                    store.properties()?,
++                    store.durability_status()?,
++                    sparrow_core::Store::sealed_event_deadline(now),
++                ))
++            })
+             .await;
+         self.pause.read_finished(paused, &discovered);
+         match discovered {
+             Err(error) => failure(results.get().init_result(), error),
+-            Ok((value, durability)) => {
++            Ok((value, durability, deadline)) => {
+                 let mut out = results.get().init_result().init_ok();
++                out.set_sealed_event_deadline_ms(deadline);
+                 out.set_store_id(field::<String>(&value, "store_id")?);
+                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                 out.reborrow()
+diff --git crates/sparrow-server/tests/rpc.rs crates/sparrow-server/tests/rpc.rs
+index 573cec5..4e3e3af 100644
+--- crates/sparrow-server/tests/rpc.rs
++++ crates/sparrow-server/tests/rpc.rs
+@@ -3771,7 +3771,17 @@ async fn bounded_discovery_and_status_do_not_read_corrupt_evidence_and_keys_refu
+             let discovery = sparrow_client::Discovery::fetch(client.capability())
+                 .await
+                 .unwrap();
+-            assert_eq!(discovery, client.discovery().clone());
++            // Each discovery samples its own server-clock deadline. The negotiated
++            // capabilities and identities are stable across both reads.
++            let cached = client.discovery();
++            assert!(cached.sealed_event_deadline_ms > 0 && discovery.sealed_event_deadline_ms > 0);
++            assert_eq!(
++                discovery,
++                sparrow_client::Discovery {
++                    sealed_event_deadline_ms: discovery.sealed_event_deadline_ms,
++                    ..cached.clone()
++                }
++            );
+             assert_eq!(
+                 Some(discovery.store_id.as_str()),
+                 properties["store_id"].as_str()
+@@ -7742,6 +7752,93 @@ impl Drop for Daemon {
+     }
+ }
+ 
++/// Both spool modes preserve acknowledged offline input, cursor and span identity across
++/// SIGKILL. A new producer drains the exact prefix to a real daemon and reclaims its disk.
++#[tokio::test(flavor = "current_thread")]
++async fn configured_spools_recover_after_producer_sigkill_and_drain_once() {
++    use sparrow_client::{
++        Admission, Delivery, DeliveryConfig, DeliveryMode, Endpoint, SpoolConfig,
++    };
++    const CHILD: &str = "SPARROW_TEST_OFFLINE_SPOOL";
++    if let Some(path) = std::env::var_os(CHILD) {
++        let path = std::path::PathBuf::from(path);
++        let name = std::env::var("SPARROW_TEST_SPOOL_MODE").unwrap();
++        let spool = SpoolConfig::new(path.join(&name));
++        let mut config = DeliveryConfig::lossless(
++            Endpoint::Unix(path.join("unavailable.sock")),
++            &name,
++            spool.clone(),
++        );
++        if name == "lossy" {
++            config.mode = DeliveryMode::LossySpooled(spool);
++        }
++        let delivery = Delivery::start_async(config).await.unwrap();
++        assert_eq!(delivery.next_span_id().unwrap(), 1);
++        for index in 1..=12u64 {
++            let event = delivery_event("crash recovery");
++            if index % 2 == 0 {
++                assert_eq!(
++                    delivery
++                        .send_with_token(event, &index.to_le_bytes())
++                        .await
++                        .unwrap()
++                        .sequence,
++                    index
++                );
++            } else {
++                assert_eq!(
++                    delivery.try_send(event),
++                    Admission::Queued { sequence: index }
++                );
++            }
++        }
++        delivery.flush_local(Duration::from_secs(5)).await.unwrap();
++        sparrow_test_support::crash::checkpoint("spooled");
++        return;
++    }
++    let dir = tempfile::tempdir().unwrap();
++    let store = dir.path().join("store");
++    let socket = store.join("rpc.sock");
++    let cfg = write_server_config(dir.path(), &store, &socket);
++    let _daemon = start(&cfg, &socket).await;
++    for mode in ["lossless", "lossy"] {
++        let marker = dir.path().join(format!("{mode}-ready"));
++        let mut child = Command::new(std::env::current_exe().unwrap());
++        child
++            .args([
++                "--exact",
++                "configured_spools_recover_after_producer_sigkill_and_drain_once",
++                "--nocapture",
++            ])
++            .env(CHILD, dir.path())
++            .env("SPARROW_TEST_SPOOL_MODE", mode)
++            .env("SPARROW_TEST_CRASH_POINT", "spooled")
++            .env("SPARROW_TEST_CRASH_READY", &marker);
++        sparrow_test_support::crash::kill_at_checkpoint(&mut child, &marker, "spooled").unwrap();
++        let settings = SpoolConfig::new(dir.path().join(mode));
++        let mut config =
++            DeliveryConfig::lossless(Endpoint::Unix(socket.clone()), mode, settings.clone());
++        if mode == "lossy" {
++            config.mode = DeliveryMode::LossySpooled(settings);
++        }
++        let delivery = Delivery::start_async(config).await.unwrap();
++        assert!(delivery.next_span_id().unwrap() > u64::from(u32::MAX));
++        assert_eq!(delivery.accepted_token().unwrap(), 12u64.to_le_bytes());
++        let fence = delivery
++            .shutdown_async(Duration::from_secs(10))
++            .await
++            .unwrap();
++        assert_eq!(fence.durable_events, 12);
++        assert_eq!(delivery.confirmed_token().unwrap(), 12u64.to_le_bytes());
++        let disk = delivery.stats().unwrap().spool.unwrap();
++        assert_eq!((disk.bytes, disk.segments), (0, 0));
++    }
++    assert_eq!(
++        cli(&socket, &["status"])["live_records"].as_str(),
++        Some("24")
++    );
++}
++
+ fn delivery_event(text: &str) -> sparrow_client::ProducerEvent {
+     sparrow_client::ProducerEvent {
+         sequence: 0,
+@@ -7822,10 +7919,54 @@ struct EventRelayState {
+     mutate_file: std::cell::RefCell<Option<std::path::PathBuf>>,
+     mutate_published_file: std::cell::RefCell<Option<std::path::PathBuf>>,
+     first_accepted: tokio::sync::Notify,
++    obstruct_checkpoint: std::cell::RefCell<Option<std::path::PathBuf>>,
+     discovered: tokio::sync::Notify,
+ }
+ struct EventRelay(std::rc::Rc<EventRelayState>);
+ impl EventRelayState {
++    fn refuse_event(
++        &self,
++        batch: wire::event_batch::Reader<'_>,
++        out: wire::result::Builder<'_, wire::artifact::Owned>,
++    ) -> capnp::Result<bool> {
++        let input = sparrow_client::EventBatch::decode(batch)
++            .map_err(|error| capnp::Error::failed(error.to_string()))?;
++        assert!(
++            self.calls.borrow().len() < 8,
++            "retry fixture exceeded its request bound"
++        );
++        self.calls.borrow_mut().push(input);
++        if let Some((code, retryable)) = self.refusals.borrow_mut().pop_front() {
++            let mut failure = out.init_error();
++            failure.set_code(code);
++            failure.set_message("injected refusal");
++            failure.set_retryable(retryable);
++            return Ok(true);
++        }
++        Ok(false)
++    }
++
++    async fn accepted_event(
++        &self,
++        result: wire::result::Reader<'_, wire::artifact::Owned>,
++    ) -> capnp::Result<()> {
++        if let wire::result::Ok(value) = result.which()? {
++            let receipt = sparrow_client::ArtifactReceipt::decode(value?)
++                .map_err(|error| capnp::Error::failed(error.to_string()))?;
++            if self.drop_first.replace(false) {
++                *self.accepted.borrow_mut() = Some(receipt);
++                self.first_accepted.notify_one();
++                // The real daemon committed. Only the reply is lost.
++                std::future::pending::<()>().await;
++            }
++            if let Some(path) = self.obstruct_checkpoint.borrow_mut().take() {
++                std::fs::create_dir(path)?;
++                self.first_accepted.notify_one();
++            }
++        }
++        Ok(())
++    }
++
+     fn corrupt(&self, mut artifact: wire::artifact::Builder<'_>, enabled: bool) {
+         if enabled {
+             artifact.set_payload_id(format!("blake3:{}", purrdf_hash::hex::encode(&[0; 32])));
+@@ -7915,36 +8056,15 @@ impl wire::sparrow::Server for EventRelay {
+         params: wire::sparrow::EventsIngestParams,
+         mut results: wire::sparrow::EventsIngestResults,
+     ) -> capnp::Result<()> {
+-        let input = sparrow_client::EventBatch::decode(params.get()?.get_batch()?)
+-            .map_err(|error| capnp::Error::failed(error.to_string()))?;
+-        assert!(
+-            self.0.calls.borrow().len() < 8,
+-            "retry fixture exceeded its request bound"
+-        );
+-        self.0.calls.borrow_mut().push(input.clone());
+-        if let Some((code, retryable)) = self.0.refusals.borrow_mut().pop_front() {
+-            let mut failure = results.get().init_result().init_error();
+-            failure.set_code(code);
+-            failure.set_message("injected refusal");
+-            failure.set_retryable(retryable);
++        let input = params.get()?.get_batch()?;
++        if self.0.refuse_event(input, results.get().init_result())? {
+             return Ok(());
+         }
+         let backend = self.0.backend.borrow().clone();
+         let mut request = backend.events_ingest_request();
+-        input
+-            .encode(request.get().init_batch())
+-            .map_err(|error| capnp::Error::failed(error.to_string()))?;
++        request.get().set_batch(input)?;
+         let response = request.send().promise.await?;
+-        if let wire::result::Ok(value) = response.get()?.get_result()?.which()? {
+-            let receipt = sparrow_client::ArtifactReceipt::decode(value?)
+-                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+-            if self.0.drop_first.replace(false) {
+-                *self.0.accepted.borrow_mut() = Some(receipt);
+-                self.0.first_accepted.notify_one();
+-                // The real daemon committed. Withhold its reply until the worker's finite deadline closes this connection.
+-                tokio::time::sleep(Duration::from_secs(60)).await;
+-            }
+-        }
++        self.0.accepted_event(response.get()?.get_result()?).await?;
+         results.get().set_result(response.get()?.get_result()?)?;
+         if let wire::result::Ok(value) = results.get().get_result()?.which()? {
+             self.0.corrupt(value?, self.0.corrupt_receipt.get());
+@@ -7952,6 +8072,28 @@ impl wire::sparrow::Server for EventRelay {
+         Ok(())
+     }
+ 
++    async fn sealed_events_ingest(
++        self: std::rc::Rc<Self>,
++        params: wire::sparrow::SealedEventsIngestParams,
++        mut results: wire::sparrow::SealedEventsIngestResults,
++    ) -> capnp::Result<()> {
++        let input = params.get()?;
++        if self
++            .0
++            .refuse_event(input.get_batch()?, results.get().init_result())?
++        {
++            return Ok(());
++        }
++        let mut request = self.0.backend.borrow().sealed_events_ingest_request();
++        request.get().set_batch(input.get_batch()?)?;
++        request.get().set_store_id(input.get_store_id()?);
++        request.get().set_deadline_ms(input.get_deadline_ms());
++        let response = request.send().promise.await?;
++        self.0.accepted_event(response.get()?.get_result()?).await?;
++        results.get().set_result(response.get()?.get_result()?)?;
++        Ok(())
++    }
++
+     async fn import_append(
+         self: std::rc::Rc<Self>,
+         params: wire::sparrow::ImportAppendParams,
+@@ -8666,6 +8808,7 @@ fn relay(
+         mutate_file: std::cell::RefCell::new(None),
+         mutate_published_file: std::cell::RefCell::new(None),
+         first_accepted: tokio::sync::Notify::new(),
++        obstruct_checkpoint: std::cell::RefCell::new(None),
+         discovered: tokio::sync::Notify::new(),
+     });
+     let capability: wire::sparrow::Client = capnp_rpc::new_client(EventRelay(state.clone()));
+@@ -8682,6 +8825,134 @@ fn relay(
+     (state, task)
+ }
+ 
++/// A durable reply lost before a daemon restart keeps its sealed identity. A permanent
++/// refusal then suspends retries through appends and flushes until explicit operator retry.
++#[tokio::test(flavor = "current_thread")]
++async fn sealed_spool_holds_across_fences_and_retries_the_original_receipt_after_restart() {
++    use sparrow_client::{Delivery, DeliveryConfig, Endpoint, Error, FlushError, SpoolConfig};
++    let test = async {
++        let dir = tempfile::tempdir().unwrap();
++        let store = dir.path().join("store");
++        let socket = store.join("rpc.sock");
++        let server = write_server_config(dir.path(), &store, &socket);
++        let daemon = start(&server, &socket).await;
++        let proxy_socket = dir.path().join("relay.sock");
++        let backend = connect(&socket).await.unwrap();
++        let (state, proxy) = relay(&proxy_socket, backend.client.clone());
++        let config = DeliveryConfig::lossless(
++            Endpoint::Unix(proxy_socket),
++            "sealed-restart",
++            SpoolConfig::new(dir.path().join("private")),
++        )
++        .with_test_timing(
++            Duration::from_millis(20),
++            Duration::from_millis(30),
++            Duration::from_millis(30),
++        );
++        let deadline = Duration::from_secs(10);
++        let delivery = Delivery::start_async(config.clone()).await.unwrap();
++        delivery
++            .send_with_token(delivery_event("lost reply"), b"one")
++            .await
++            .unwrap();
++        tokio::time::timeout(deadline, state.first_accepted.notified())
++            .await
++            .unwrap();
++        delivery.close_local(deadline).await.unwrap();
++        drop(backend);
++        drop(daemon);
++        let _daemon = start(&server, &socket).await;
++        let restarted = connect(&socket).await.unwrap();
++        *state.backend.borrow_mut() = restarted.client.clone();
++        state.refusals.borrow_mut().push_back(("CONFLICT", false));
++        state.profile.set(Some((true, 256)));
++        state.artifact_limits.set(Some((256, 1)));
++        let delivery = Delivery::start_async(config.clone()).await.unwrap();
++        let short = Duration::from_millis(350);
++        assert!(matches!(
++            delivery.flush_async(short).await,
++            Err(FlushError::TimedOut(_))
++        ));
++        let stats = delivery.stats().unwrap();
++        assert!(stats.held.is_none());
++        assert!(
++            matches!(stats.last_transient_failure.as_deref(), Some(Error::Unsupported(message)) if message.contains("immutable batch"))
++        );
++        assert_eq!(state.calls.borrow().len(), 1);
++        state.artifact_limits.set(None);
++        assert!(matches!(
++            delivery.flush_async(short).await,
++            Err(FlushError::TimedOut(_))
++        ));
++        assert!(
++            matches!(delivery.stats().unwrap().held.as_deref(),Some(Error::Domain{code,..}) if code=="CONFLICT")
++        );
++        delivery
++            .send_with_token(delivery_event("held intake"), b"two")
++            .await
++            .unwrap();
++        assert!(matches!(
++            delivery.flush_async(short).await,
++            Err(FlushError::TimedOut(_))
++        ));
++        assert_eq!(state.calls.borrow().len(), 2);
++        let checkpoint = dir.path().join("private/HEADER.new");
++        *state.obstruct_checkpoint.borrow_mut() = Some(checkpoint.clone());
++        delivery.retry_held();
++        tokio::time::timeout(deadline, state.first_accepted.notified())
++            .await
++            .unwrap();
++        state.refuse_discovery.set(true);
++        assert!(matches!(
++            delivery.flush_async(short).await,
++            Err(FlushError::TimedOut(_))
++        ));
++        assert!(matches!(
++            delivery.stats().unwrap().last_transient_failure.as_deref(),
++            Some(Error::Io(_))
++        ));
++        std::fs::remove_dir(checkpoint).unwrap();
++        // Only the second batch still needs the daemon. The first checkpoints offline
++        // using its already certified receipt, even when a new discovery is refused.
++        assert!(matches!(
++            delivery.flush_async(short).await,
++            Err(FlushError::TimedOut(_))
++        ));
++        assert_eq!(delivery.confirmed_token().unwrap(), b"one");
++        assert_eq!(state.calls.borrow().len(), 3);
++        state.refuse_discovery.set(false);
++        assert_eq!(
++            delivery
++                .shutdown_async(deadline)
++                .await
++                .unwrap()
++                .durable_events,
++            2
++        );
++        assert_eq!(delivery.confirmed_token().unwrap(), b"two");
++        assert_eq!(delivery.stats().unwrap().spool.unwrap().bytes, 0);
++        drop(delivery);
++        let empty = Delivery::start(config.clone()).unwrap();
++        assert_eq!(empty.shutdown(deadline).unwrap().durable_events, 2);
++        drop(empty);
++        Delivery::start(config)
++            .unwrap()
++            .close_local(deadline)
++            .await
++            .unwrap();
++        let calls = state.calls.borrow();
++        assert_eq!(calls.len(), 4);
++        assert_eq!(calls[0], calls[1]);
++        assert_eq!(calls[0], calls[2]);
++        assert_eq!(
++            cli(&socket, &["status"])["live_records"].as_str(),
++            Some("2")
++        );
++        proxy.abort();
++    };
++    tokio::task::LocalSet::new().run_until(test).await;
++}
++
+ /// A newer daemon can acquire the producer profile while a worker is running. Limits apply
+ /// before first dispatch and a lost durable reply keeps its exact request across lower limits.
+ #[tokio::test(flavor = "current_thread")]
+diff --git docs/architecture.md docs/architecture.md
+index d8af68a..b775314 100644
+--- docs/architecture.md
++++ docs/architecture.md
+@@ -413,6 +413,18 @@ flush are available. It is an intended buffering interval, not a guarantee that
+ failing disk will complete synchronization on schedule. Expose flush lag and stop
+ admitting buffered writes when the durability queue cannot remain bounded.
+ 
++Configured SDKs acknowledge local disk acceptance independently of remote
++publication. When a producer first uses conditional sealed ingestion, the
++store atomically lifts its raw writer identity from the corresponding
++`sparrow.store/352` through `406` family to `407` through `461` and initializes
++`producer:sealed-receipt-gc`. The eight-byte watermark is the greatest
++expiration time of any subsequently retired inline ingestion receipt.
++Retirement advances it in the same durable write as deletion. A missing
++receipt permits first publication only for a seal whose deadline exceeds the
++watermark and falls within the server's current admission interval. A server
++clock rollback after retirement therefore cannot republish the batch.
++Receipt comparison and first publication share the ordinary writer lock.
++
+ A failed write or WAL sync latches durability uncertain: the store refuses writes
+ and fences with a retryable refusal naming the latch and certifies nothing it accepted
+ after the last successful sync. Reads are served; an artifact read reports its pending
+diff --git docs/deployment.md docs/deployment.md
+index edd427b..27729cc 100644
+--- docs/deployment.md
++++ docs/deployment.md
+@@ -77,6 +77,21 @@ seed only a missing catalog; typed watch administration controls later
+ changes. Never add production sample directories as destructive watches merely
+ because they were sample inputs.
+ 
++Configure producer spools on local storage outside every consume root.
++Each writer requires its own private directory (mode `0700`). Size
++`spool_max_bytes` for the expected offline interval and retain free space for
++metadata and checkpoint replacement. Resume with the same source and spool
++directory. The SDK drains and removes confirmed segments automatically.
++For an explicit drain, run the `sparrow-client` example
++`producer ENDPOINT SOURCE lossless SPOOL_DIR 0 1 drain` after the previous
++writer releases the directory. Inspect its final JSON progress and exit code.
++
++The first conditional sealed request eligible for new publication enables the receipt-retirement
++watermark and its raw writer format. Use a daemon that supports store writer
++families 407 through 461 when reopening an upgraded store. To roll back to an
++older binary, restore a compatible pre-upgrade store snapshot. See
++[publication and durability](architecture.md#61-publication-and-durability).
++
+ `instance_role` (`"production"` or `"scratch"`, optional) fixes the role of a
+ store when the daemon creates it, and `discover` and `status` report it as
+ `instanceRole` (`unspecified` for a store with no role). At startup a configured
+diff --git docs/interfaces.md docs/interfaces.md
+index a973176..46305a3 100644
+--- docs/interfaces.md
++++ docs/interfaces.md
+@@ -3106,12 +3106,21 @@ count. The canonical JSONL must fit `maxInlineArtifactBytes`. The worker
+ groups events using a conservative byte estimate and checks the actual
+ encoded length before sending a singleton.
+ 
++Schema 73 adds `sealedEventsIngest` on each producer endpoint. Its
++`storeId` and `deadlineMs` bind first publication to a particular store and
++server-clock deadline. Discovery supplies `sealedEventDeadlineMs` for new
++batches. Zero means the daemon lacks this operation. A previously accepted
++request with a live matching receipt returns the same durable artifact.
++Absent that receipt, the daemon permits first publication only before the
++deadline, inside half its retry window, and above its persisted receipt-GC
++watermark. An expired or ambiguous request returns `UNCERTAIN_DELIVERY`.
++
+ Keep the request identity across transport failures, timeouts, overload and
+ retryable daemon refusals such as `STORAGE_PRESSURE`, `SHUTTING_DOWN` and a
+ busy `RESOURCE_LIMIT`. Retry an unknown outcome with the same data. If the
+ new ceiling cannot admit a possibly committed batch, delivery holds it
+-until a compatible daemon returns. A permanent input refusal or store
+-replacement ends retries for that batch after quarantine, as described in
++until a compatible daemon returns. The memory worker quarantines permanent
++input refusals. Spooled delivery holds the original batch, as described in
+ section 7.
+ 
+ Extend the profile with trailing Cap'n Proto fields or new operations.
+@@ -4749,11 +4758,12 @@ The delivery worker retains its pending event on a daemon that lacks
+ `sparrow-producer/1`. It exposes the missing profile as
+ `last_transient_failure` and retries discovery every 30 seconds.
+ An explicit flush or shutdown can wake the retry early. Admission stays
+-bounded while the daemon upgrades. The worker prepares a singleton before
++bounded while the daemon upgrades. The memory worker prepares a singleton before
+ its first successful discovery and batches subsequent events within the
+ advertised ceilings.
+ 
+-`DeliveryConfig::local(source)` selects `/run/sparrow-ingest/ingest.sock`.
++`DeliveryConfig::configured_local(source)` selects `/run/sparrow-ingest/ingest.sock`
++and a bounded private disk spool.
+ Supply a Unix path or TCP endpoint in Rust, or load a producer TOML file with
+ `DeliveryConfig::from_file(path).await?`. A file requires `source`; omitting
+ `endpoint` selects the local ingest socket. Relative paths resolve beside the
+@@ -4765,6 +4775,8 @@ source = "example.worker"
+ endpoint = "tcp://192.0.2.10:518"
+ expected_role = "production"
+ secret_file = "tcp.secret"
++mode = "lossless"
++spool_dir = "spool"
+ ```
+ 
+ `expected_role` accepts `production` or `scratch`. `expected_store` takes the
+@@ -4779,6 +4791,72 @@ and uses the same private-file rules as the CLI. Other optional keys are
+ `batch_bytes`, `flush_interval_ms`, `rpc_timeout_ms`, `retry_interval_ms`,
+ and `retry_max_interval_ms`. All bounds and defaults come from `DeliveryConfig`.
+ 
++### Configured spool
++
++Use `DeliveryConfig::configured(endpoint, source)` for Unix or TCP, or
++`DeliveryConfig::lossless(endpoint, source, SpoolConfig::new(directory))` to
++select the spool directory. The default lives under
++`$XDG_STATE_HOME/sparrow-client/spool/<source-digest>`, with
++`$HOME/.local/state` as the default state directory. Concurrent processes
++sharing a source require separate spool directories. Each directory holds
++an exclusive lock and binds one persistent producer instance to its source.
++
++| Call | What success establishes |
++| --- | --- |
++| `try_send(event)` | `Admission::Queued` assigns a sequence and transfers the event to bounded RAM without file or socket I/O. |
++| `send(event).await` or `send_with_token(event, cursor).await` | A local disk sync covers the event and its optional application cursor of up to 256 bytes, even offline. |
++| `flush_local(timeout).await` | All admitted events through the captured sequence have reached synchronized local disk. |
++| `close_local(timeout).await` | Local flush completes and both workers stop. Release other producer handles before reopening its directory. |
++| `flush_async(timeout).await` or `shutdown_async(timeout).await` | Sparrow has durably acknowledged the captured prefix. Shutdown also closes admission and stops delivery. |
++
++Read `accepted_token()` for the synchronized local cursor and
++`confirmed_token()` for the remotely acknowledged cursor. Both survive restart
++and segment cleanup. A fast offer can be lost on process death before the disk
++worker appends it. A host failure can lose unsynchronized writes. The confirmed
++send returns the original event in `SendError::Refused` if admission fails.
++`SendError::Uncertain` names the assigned sequence if a disk acknowledgement
++was lost. Recover the cursor before resuming that input. Cancelling an
++already queued send leaves its append running.
++
++The private `sparrow-spool/1` layout uses `LOCK` for exclusive ownership,
++`HEADER` for the checksummed Cap'n Proto checkpoint and
++`seg-<20-digit-index>` files for checksummed, length-framed Cap'n Proto events.
++The checkpoint records the producer identity, span epoch, confirmed cursor,
++artifact identity and any in-flight seal. Writers synchronize the replacement
++checkpoint and its directory before reclaiming segment files.
++
++File configuration selects `mode = "lossless"` by default. Fast offers report
++`Admission::Refused` on capacity or other admission failures. In
++`"lossy_spooled"` they report counted drops and successful admissions follow
++the same disk path. `"memory"` enables bounded RAM delivery and quarantine.
++`spool_max_bytes` defaults to 1 GiB of segment bytes and
++`spool_segment_bytes` to 16 MiB. Leave filesystem space for the checkpoint,
++lock and filesystem metadata. `spool_sync_interval_ms` defaults to 1,000 for
++ordinary offers. `spool_max_wait_ms` defaults to 20 for obtaining memory
++intake capacity on a confirmed send. Disk sync time is additional. A full
++spool refuses new confirmed sends immediately.
++
++The sender groups entries within the configured and discovered ceilings and
++syncs the exact batch identity, range, store and deadline before its first
++transmission. Reconnect and process restart preserve them. Receipt
++certification and a synchronized local checkpoint precede segment removal.
++After a certified reply, the sender retains the receipt in memory and retries
++a failed local checkpoint even if the daemon goes offline.
++An incomplete final append is truncated on recovery. Interior corruption
++stops startup. A missing compatible daemon, a replaced store, a permanent
++input refusal or an uncertain receipt retains the prefix on disk.
++Connection and discovery failures retry on backoff and appear in
++`last_transient_failure`. A permanent refusal or store replacement stops
++transmission until an explicit retry or rebind. `stats().held` identifies
++the cause and `spool.next_batch` identifies the request. Local intake
++continues while space remains. Inspect the spool statistics for byte
++and segment counts, progress, pending cleanup, oldest event time and sealed
++batch number. `retry_held()` wakes the sender after remediation.
++`rebind(store_id).await` can move an unsealed prefix. An unresolved seal
++requires its original store and exact receipt evidence.
++
++### Memory delivery and shared event capture
++
+ The separate `sparrow-client` crate keeps producers independent of the database
+ or semantic engine. The public surface includes:
+ 
+@@ -4855,11 +4933,11 @@ or semantic engine. The public surface includes:
+   error. Durable flush cannot certify events already dropped before enqueue.
+ 
+ Use stable client request/batch identities across retries. Reconnection preserves
+-pending event identity; application restart is a new client instance. Preserve
++pending event identity. A memory producer starts a new instance on restart.
++The spool recovers its instance and reserves a fresh span identity range. Preserve
+ Rust event field types through the shared wire contract without substituting
+ formatted JSON strings for already structured fields. A bridge from the `log`
+-facade can compose through tracing. A persistent client spool is a later
+-extension; the initial layer does not promise survival of producer-process loss.
++facade can compose through tracing.
+ The layer follows the public [tracing subscriber layer contract](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/layer/index.html).
+ 
+ `DeliveryConfig::tcp(SocketAddr, source)` selects public Cap'n Proto for the
+diff --git helpers-ledger.toml helpers-ledger.toml
+index f8dab5a..7dd39a3 100644
+--- helpers-ledger.toml
++++ helpers-ledger.toml
+@@ -2350,6 +2350,51 @@ constants = []
+ fingerprints = []
+ names = ['^(validate_cli_discovery|validate_producer_discovery)$']
+ 
++[[job]]
++id = "producer-spool"
++summary = "Recover, seal, confirm and reclaim ordered producer segments under one persistent identity and bounded disk budget."
++home = "sparrow_client::spool::Log"
++entry_points = ["sparrow_client::delivery::spooled::Delivery::send_with_token", "sparrow_client::delivery::spooled::Delivery::flush_local", "sparrow_client::delivery::Delivery::try_send"]
++spec = "docs/interfaces.md: Configured spool."
++vectors = ["crates/sparrow-client/src/spool.rs", "crates/sparrow-server/tests/rpc.rs"]
++bench = []
++enforced = true
++
++[job.forbidden]
++constants = []
++fingerprints = []
++names = ['^(append_offline_event|replay_offline_segment)$']
++
++[[job]]
++id = "durable-producer-directory-creation"
++summary = "Create private producer directories and synchronize newly created directory entries through their first existing parent."
++home = "sparrow_client::quarantine::create_dir"
++entry_points = ["sparrow_client::quarantine::save", "sparrow_client::spool::Log::open"]
++spec = "docs/interfaces.md: Configured spool."
++vectors = ["crates/sparrow-client/src/quarantine.rs", "crates/sparrow-client/src/spool.rs"]
++bench = []
++enforced = true
++
++[job.forbidden]
++constants = []
++fingerprints = []
++names = ['^(create_spool_dirs|create_quarantine_dirs)$']
++
++[[job]]
++id = "sealed-producer-publication"
++summary = "Compare the exact retained receipt and fence a missing receipt against the server deadline and persistent retirement watermark before first publication."
++home = "sparrow_core::storage::Store::ingest_events_before"
++entry_points = ["sparrow_core::storage::Writer::accepted_ingest", "sparrow_core::storage::Store::sealed_event_deadline"]
++spec = "docs/architecture.md: publication and durability."
++vectors = ["crates/sparrow-core/src/storage/producer_stream.rs", "crates/sparrow-server/tests/rpc.rs"]
++bench = []
++enforced = true
++
++[job.forbidden]
++constants = []
++fingerprints = []
++names = ['^(lookup_sealed_retry|publish_offline_events)$']
++
+ [[job]]
+ id = "completed-file-upload"
+ summary = "Hash and stream the opened stable regular file through shared typed durable staging and publication."
+@@ -2488,8 +2533,8 @@ names = ['^(charge_event_decode_budget|charge_event_encode_budget)$']
+ [[job]]
+ id = "typed-event-wire-encoding"
+ summary = "Marshal the producer's ordered native Rust values and context through one shared generated contract."
+-home = "sparrow_client::events::EventBatch::encode"
+-entry_points = []
++home = "sparrow_client::events::ProducerEvent::encode"
++entry_points = ["sparrow_client::events::EventBatch::encode", "sparrow_client::spool::Log::append"]
+ spec = "crates/sparrow-client/schema/sparrow.capnp: typed EventBatch and field union."
+ vectors = ["crates/sparrow-server/tests/rpc.rs"]
+ bench = []
+@@ -2503,8 +2548,8 @@ names = ['^(encode_logger_event_batch|encode_direct_event_batch)$']
+ [[job]]
+ id = "typed-event-wire-decoding"
+ summary = "Decode typed fields, exact float bits, wide integers and span relationships with admission before allocations."
+-home = "sparrow_client::events::EventBatch::decode"
+-entry_points = []
++home = "sparrow_client::events::ProducerEvent::decode"
++entry_points = ["sparrow_client::events::EventBatch::decode", "sparrow_client::spool::read_frame"]
+ spec = "crates/sparrow-client/schema/sparrow.capnp: typed EventBatch and field union."
+ vectors = ["crates/sparrow-server/tests/rpc.rs"]
+ bench = []

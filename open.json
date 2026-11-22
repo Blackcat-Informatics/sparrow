@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 462,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/462-import-files-and-live-byte-streams",
+  "branch": "paudley/462-import-files-and-live-byte-streams",
+  "slug": "import-files-and-live-byte-streams",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/462-import-files-and-live-byte-streams/.stage/import-files-and-live-byte-streams",
+  "stage_tracked": true,
+  "base": "refs/remotes/origin/main",
+  "base_oid": "fe330e574401fd7bbf86eba8fe825d160d2bcafd",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/462-import-files-and-live-byte-streams",
+    "branch:paudley/462-import-files-and-live-byte-streams",
+    "ignored:4 files (4 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow/.worktrees/7-add-the-lossless-confirmed-producer caches into /home/paudley/Active/sparrow/.worktrees/462-import-files-and-live-byte-streams plus 0 dependency units from 0 other checkouts in 3.5s; 316 unchanged files keep their built mtimes; 18 other files take the seed time and rebuild; 4 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/462-import-files-and-live-byte-streams/.stage/import-files-and-live-byte-streams",
+    "issue:/home/paudley/Active/sparrow/.worktrees/462-import-files-and-live-byte-streams/.stage/import-files-and-live-byte-streams/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-21T17:51:30-0600",
+  "seed_error": ""
+}
