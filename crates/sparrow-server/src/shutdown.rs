@@ -13,6 +13,7 @@ pub(super) struct Workers {
     pub consumer: Option<sparrow_server::watches::ConsumeWorker>,
     pub syslog: Option<sparrow_server::syslog_listener::SyslogWorker>,
     pub maintenance: Option<super::maintenance::Worker>,
+    pub archive: Option<sparrow_server::archive::Worker>,
 }
 
 /// Reserve the complete native admission budget, waiting for every owned worker.
@@ -46,6 +47,9 @@ pub(super) async fn finish(
         .err()
         .is_some_and(|error| sparrow_server::start_wait::is_permanent(error.as_ref()));
     record_failure(&mut errors, "daemon", initial);
+    if let Some(worker) = workers.archive {
+        record_failure(&mut errors, "archive shutdown", worker.shutdown().await);
+    }
     if let Some(worker) = workers.consumer {
         record_failure(&mut errors, "consume shutdown", worker.shutdown().await);
     }

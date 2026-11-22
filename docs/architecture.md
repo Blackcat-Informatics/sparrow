@@ -300,9 +300,10 @@ Pressure then reports `AwaitingArchive` and keeps refusing data writes, because
 safety comes before admission. Archiving starts early, at 75% of an entry's
 retention or of the data budget, so the gate is rarely reached in normal
 operation. Pins only delay deletion. Archiving ignores them, and an archived
-pinned record survives until its pin ends. A dedicated archive thread performs
-every NAS operation, one at a time, so a hung NAS degrades archiving without
-blocking queries, ingest or maintenance. A pass that panics does not end the thread:
+pinned record survives until its pin ends. One process-owned archive thread
+performs NAS work using prepared segment bytes. The store worker can abandon
+a blocked result and release the store independently of the mount. The
+filesystem slot stays occupied until its job returns. A pass that panics does not end the thread:
 the worker journals it, reports it in status and starts the next pass from the
 store's durable watermark. A store format fence keeps older
 binaries away from an archiving store, and a clock-regression guard refuses

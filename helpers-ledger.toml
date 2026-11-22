@@ -4811,6 +4811,20 @@ fingerprints = []
 names = ['^(mark_archived|set_archive_watermark|archive_for_tests)$']
 
 [[job]]
+id = "archive-filesystem-handoff"
+summary = "Reserve the process archive filesystem slot before preparing a segment. The filesystem job owns the segment bytes and returns verification to the originating store worker. Only that worker commits, and joining it lets another store session open while the filesystem job still holds the slot."
+home = "sparrow_server::archive::Coordinator::archive"
+entry_points = ["sparrow_server::archive::Filesystem::start", "sparrow_server::archive::Filesystem::reserve", "sparrow_server::archive::FilesystemJob::run", "sparrow_server::archive::Coordinator::write_and_wait", "sparrow_server::archive::Worker::start", "sparrow_server::archive::Worker::shutdown"]
+spec = "docs/archive-format.md: write protocol and archive filesystem slot."
+vectors = ["crates/sparrow-server/src/archive.rs"]
+bench = []
+enforced = true
+[job.forbidden]
+constants = []
+fingerprints = []
+names = []
+
+[[job]]
 id = "archive-clock-regression-guard"
 summary = "Every publication batch is refused when its earliest eviction position is at or behind the archive watermark or the in-flight segment's end."
 home = "sparrow_core::storage::archive::ArchiveState::admit_publication"

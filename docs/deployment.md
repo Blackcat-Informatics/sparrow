@@ -2307,7 +2307,7 @@ is retired once it is due and archived.
 
 Check the mount first. The worker refuses a directory that is on the root filesystem's device or
 on a local filesystem of the root's type, and never creates `dir`
-(`crates/sparrow-server/src/archive.rs`, `require_own_mount` and `archive_segment`). The share is
+(`crates/sparrow-server/src/archive.rs`, `require_own_mount` and `write_and_verify`). The share is
 `/net/synology/archives` (nfs4, source `192.168.1.1:/volume1/archives`, mounted `hard`: `findmnt -no OPTIONS -T "$SHARE"` shows it, so a lost server hangs a call and the stall path applies rather than an error); the directory `dir` names
 lies inside it, so the share's mount point is never `dir` itself. Each command chain below ends in
 an exit status and stops at its first failure, and a lookup that errors stops the chain: no result
@@ -2467,7 +2467,7 @@ share refuses: the daemon serves, the worker retries each pass, and nothing is d
 pass's length and its demand on the NAS: [to be measured].
 
 If the mount goes away while the daemon runs, the code shows this (`crates/sparrow-server/src/archive.rs`).
-The worker checks the mount once per segment, at its start: `archive_segment` tests that `dir` is a
+The filesystem worker checks the mount once per segment, at its start. It tests that `dir` is a
 directory (`is_dir` reports any error, `ESTALE` and `EIO` included, as false) and then
 reads its device and filesystem type (`require_mounted`). A directory that is gone fails
 as `ARCHIVE_IO` ("not a directory; is it mounted?"); a directory left on the root disk fails as
@@ -2477,14 +2477,15 @@ repeated inside the segment. Every failure leaves the watermark where it was
 (`archive_commit` runs only after the read-back), the pass ends, `status` reports
 `archive_worker.phase` `holding` with the code, the segment file and the reason, the daemon
 journals `sparrowd: archive pass failed; the watermark did not move: ...`, and the
-worker tries again after `check_secs`. A call that hangs instead of failing blocks the worker's
-thread inside the system call: the watchdog journals `sparrowd: archive stalled step=...` every
-`stall_warn_secs`, and a step that ran `io_timeout_secs` marks the pass as overrun, which is checked only after the
-write and the read-back succeed (`archive_segment`). A slow call that returns an error fails the pass as `ARCHIVE_IO`, and a later
-failing step fails with its own code (for example `ARCHIVE_IO`, `ARCHIVE_VERIFY`, `ARCHIVE_NOT_ON_MOUNT` or
-`ARCHIVE_ROOT`: after a slow step that succeeds, the mount and root checks that follow can fail too; these are
-examples, not a complete list); `ARCHIVE_OVERRAN` is the result only
-when every step succeeded. The segment is not committed in any of these cases. The daemon keeps serving in each case. A segment file
+worker tries again after `check_secs`. When a call hangs, the store worker journals
+`sparrowd: archive stalled step=...` at `stall_warn_secs` intervals while waiting.
+A step that reaches `io_timeout_secs` reports `ARCHIVE_OVERRAN` with its step
+and path, even while the call is still blocked. Shutdown also abandons the
+outstanding result and releases the store. The filesystem thread holds its
+single slot until the job returns. A pass that finds the slot occupied reports
+the outstanding segment and starts no filesystem writes. Once the job returns,
+the next pass verifies any files it left. The daemon keeps serving while it
+reports an archive hold. A segment file
 that a failed pass left in `<store_id>/` is kept and read back on the next pass, never overwritten
 (`write_segment`); one that differs from what the worker prepared fails as
 `ARCHIVE_VERIFY` and the operator moves it aside.

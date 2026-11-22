@@ -184,6 +184,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Keep the subscription alive through startup and awaited maintenance work.
     // Recreating ctrl_c() inside select drops its listener when another branch wins.
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let archive_filesystem = config
+        .archive
+        .as_ref()
+        .filter(|_| !config.query_only)
+        .map(|_| sparrow_server::archive::Filesystem::start())
+        .transpose()?;
     // Refuse an unavailable public port before opening/migrating the store or Unix endpoint.
     // A departing owner of the address is waited for, not exited on (start_wait).
     let tcp_listener = match config.rpc_tcp_address {
@@ -434,8 +440,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
             });
             // Segments go to `<dir>/<store_id>/`; the worker never writes anywhere else in `dir`.
-            let archive = match config.archive.as_ref().filter(|_| !config.query_only) {
-                Some(archive) => Some(sparrow_server::archive::Worker::start(
+            let archive = match config.archive.as_ref().zip(archive_filesystem.as_ref()) {
+                Some((archive, filesystem)) => Some(sparrow_server::archive::Worker::start(
+                    filesystem,
                     store.clone(),
                     archive.dir.clone(),
                     std::time::Duration::from_secs(archive.check_secs),
@@ -482,15 +489,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .await
             }
             .await;
-            // Dropping the handle stops the archive thread; it is not joined, so a hung mount
-            // cannot hold the shutdown.
-            drop(archive);
             shutdown::finish(
                 serving,
                 shutdown::Workers {
                     consumer: consumer.take(),
                     syslog: syslog.take(),
                     maintenance: maintenance.take(),
+                    archive,
                 },
                 &store,
                 &endpoints,
