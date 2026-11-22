@@ -17,6 +17,7 @@ const MAX_SECRET_BYTES: u64 = 4096;
 #[derive(Clone)]
 pub struct TcpSecret {
     key: SecretArray<u8, CHAP_BYTES>,
+    source: Option<std::sync::Arc<std::path::PathBuf>>,
 }
 
 impl TcpSecret {
@@ -57,7 +58,14 @@ impl TcpSecret {
         }
         let key = SecretArray::new(blake3::derive_key(CONTEXT, &material));
         purrdf_hash::wipe_secret(&mut material);
-        Ok(Self { key })
+        Ok(Self { key, source: None })
+    }
+
+    pub(crate) fn from_source(path: &Path) -> Result<Self, crate::Error> {
+        let path = std::path::absolute(path)?;
+        let mut secret = Self::read(&path)?;
+        secret.source = Some(std::sync::Arc::new(path));
+        Ok(secret)
     }
 
     /// The response a holder of this secret gives to one store-bound challenge.
@@ -83,6 +91,15 @@ pub(crate) async fn authenticate(
     secret: &TcpSecret,
 ) -> Result<crate::sparrow_capnp::sparrow::Client, crate::Error> {
     use crate::sparrow_capnp::result;
+    let current;
+    let secret = if let Some(path) = secret.source.clone() {
+        current = tokio::task::spawn_blocking(move || TcpSecret::read(&path))
+            .await
+            .map_err(std::io::Error::other)??;
+        &current
+    } else {
+        secret
+    };
     let challenge = client.auth_challenge_request().send().promise.await?;
     let nonce: [u8; CHAP_BYTES] = match challenge.get()?.get_result()?.which()? {
         result::Ok(value) => value?
@@ -108,10 +125,11 @@ impl std::fmt::Debug for TcpSecret {
     }
 }
 
-/// Secrets compare by derived key so endpoints remain comparable without exposing bytes.
+/// Compare both credential source and derived key without exposing the key bytes.
 impl PartialEq for TcpSecret {
     fn eq(&self, other: &Self) -> bool {
-        purrdf_ed25519::constant_time_eq(self.key.as_slice(), other.key.as_slice())
+        self.source == other.source
+            && purrdf_ed25519::constant_time_eq(self.key.as_slice(), other.key.as_slice())
     }
 }
 impl Eq for TcpSecret {}

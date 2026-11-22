@@ -4969,26 +4969,40 @@ or semantic engine. The public surface includes:
     held: whether the old store holds the pending batch is unknown, and the batch must not
     reach another store unrecorded, so it goes to a quarantine file with the refusal. The
     worker then adopts the store now behind the socket and later batches are delivered there;
-    nothing stays in memory only and no restart is needed. Replaying the file into the
-    original store stores a batch that the original store may already hold a second time.
+    nothing stays in memory only and no restart is needed. On replay, the original store must supply an exact
+    retained receipt for the uncertain batch. A missing receipt keeps the file intact.
   - Local failure. Only a local invariant failure (a poisoned lock, an exhausted counter, a
     worker panic) ends the worker: `terminal_failure` is set, later events are refused as
     `Failed`, and the pending batch and queued events are written to quarantine files. While
     such a write fails, `held_unsaved_events` counts the events held only in memory and the
     worker retries the write on the backoff until it succeeds; they are never counted
     delivered.
-  - Replay. `sparrow_client::replay_quarantine(client, path)` and the CLI command
-    `sparrow $ENDPOINT quarantine-replay FILE` resend the batch in a quarantine file under
-    a replay identity derived from the file's request identity and producer instance: the
-    store refuses batches that lie behind positions it already accepted from the original
-    instance, so a live producer's later batches must not block replay. Retrying one replay
-    repeats the identity and is answered idempotently. A file larger than one batch (the
-    queued events saved at a local failure) is sent as several batches within the batch
-    limits, in order, each with its own stable identity. The file is removed only after the
-    store acknowledges every batch durably. A daemon refusal returns the error and keeps the file, recording the refusal in
-    its header (`replay_attempts`, `last_replay_code`, `last_replay_reason`); a transport
-    failure changes nothing. A file that does not parse back into exactly the stored event
-    lines is refused.
+  - Replay. Run `sparrow ENDPOINT quarantine-replay FILE` or call
+    `sparrow_client::replay_quarantine(client, path)`. One replay holds the quarantine
+    directory lock through completion. An interrupted writer may leave its temporary hard
+    link beside the published file. Replay verifies the matching names and inode, syncs
+    the directory and removes that temporary link. The client verifies that decoding the event lines
+    reproduces their exact bytes. Version 2 files distinguish never-submitted input,
+    definitive input refusals and an original submission with an unknown outcome. A file
+    retains the original store identifier when known. A lost original reply can be
+    recovered only from a matching receipt on the same store. A zero-deadline request
+    obtains that receipt without authorizing publication.
+  - Previously unsent or definitively refused events use derived identities so the
+    producer can continue logging while an operator recovers an older sequence. Before
+    sending the first part, the client records the destination and stable partition.
+    Each part appends a synchronized attempt with a fresh server deadline, then a
+    synchronized certified receipt. A torn final checkpoint leaves the previous
+    complete checkpoint authoritative. An invalid interior checkpoint stops replay.
+    After a refusal the client folds progress into the header for inspection. A retry
+    verifies the saved prefix and retains the deadline of any uncertain attempt.
+    A definitive refusal of a part's first attempt allows a fresh deadline after the
+    cause clears. Expired uncertain attempts keep their input. A refusal is recorded in `last_replay_code`, `last_replay_reason` and
+    `replay_attempts`. Removal follows certification of every part.
+  - Version 1 files lack an original destination and submission history. Select the
+    intended store and the original intake account. The client checks for the original
+    receipt and for the stable historical derived receipts. Missing or expired
+    evidence leaves the file intact. A payload match alone cannot establish occurrence
+    identity, producer position or caller provenance.
   - Barriers. `flush` and `shutdown` report the drops and quarantines first seen since the
     previous barrier that returned a watermark or `Dropped`, so a fence that reported them is
     clean for later input without a restart. `DeliveryStats` keeps the running totals
@@ -5011,7 +5025,13 @@ The layer follows the public [tracing subscriber layer contract](https://docs.rs
 `DeliveryConfig::tcp(SocketAddr, source)` selects public Cap'n Proto for the
 same bounded logging worker; `DeliveryConfig::new(path, source)` selects Unix.
 The explicit `endpoint: Endpoint` field selects Unix, anonymous TCP or
-CHAP-authenticated TCP; there is no second socket fallback. Logging producers
+CHAP-authenticated TCP. Producers using `secret_file` or `Endpoint::with_secret_file`
+reread their private credential
+on every connection. Replace the file atomically with the current server secret.
+Authentication or permission refusals hold the pending request while the worker
+reconnects on backoff. A directly constructed
+`Endpoint::AuthenticatedTcp(address, TcpSecret::read(path)?)` uses the supplied
+snapshot for its lifetime. Logging producers
 only ingest, so anonymous TCP suffices. Direct clients and workers share discovery, retries,
 store identity checks and native field preservation. Both examples use the
 shared `Endpoint::parse` spelling, `tcp://IP:PORT` or a Unix path. The tracing

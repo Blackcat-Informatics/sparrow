@@ -511,11 +511,13 @@ struct Queued {
     at: Instant,
 }
 struct Pending {
+    original: crate::quarantine::Original,
     batch: Arc<EventBatch>,
     bytes: usize,
     at: Instant,
 }
 struct State {
+    published_quarantine: std::collections::BTreeMap<String, crate::quarantine::Published>,
     lossy: lossy::Progress,
     released_workers: u8,
     held: Option<Arc<Error>>,
@@ -1076,6 +1078,7 @@ impl Shared {
             config,
             instance,
             state: Arc::new(Mutex::new(State {
+                published_quarantine: Default::default(),
                 lossy: lossy::Progress::default(),
                 released_workers: 0,
                 held: None,
@@ -1378,6 +1381,7 @@ impl Shared {
             return Ok(Action::Continue);
         }
         state.pending = Some(Pending {
+            original: Default::default(),
             batch: batch.clone(),
             bytes: bytes - late_bytes,
             at,
@@ -1385,6 +1389,23 @@ impl Shared {
         drop(state);
         batch.validate()?;
         Ok(Action::Send(batch))
+    }
+    fn note_original(
+        &self,
+        original: crate::quarantine::Original,
+    ) -> Result<crate::quarantine::Original, Error> {
+        if !self.config.disk_free() {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| Error::Protocol("producer queue state poisoned"))?;
+            let pending = state
+                .pending
+                .as_mut()
+                .ok_or(Error::Protocol("missing request before submission"))?;
+            return Ok(std::mem::replace(&mut pending.original, original));
+        }
+        Ok(crate::quarantine::Original::Unsent)
     }
     fn bind_store(&self, store: &str) -> Result<(), Error> {
         let mut state = self
@@ -1465,18 +1486,46 @@ impl Shared {
             Error::Domain { code, message, .. } => (code.as_str(), message.clone()),
             other => ("CLIENT_REFUSED", other.to_string()),
         };
-        let saved = crate::quarantine::save(&self.config.quarantine_dir, batch, code, &reason);
+        let (original, store, published) = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let original = state
+                .pending
+                .as_ref()
+                .filter(|p| p.batch.request_id == batch.request_id)
+                .map_or(crate::quarantine::Original::Unsent, |p| p.original);
+            (
+                original,
+                state.store.clone(),
+                state.published_quarantine.get(&batch.request_id).cloned(),
+            )
+        };
+        let saved = if let Some(published) = published {
+            published.finish()
+        } else {
+            crate::quarantine::save(
+                &self.config.quarantine_dir,
+                batch,
+                code,
+                &reason,
+                original,
+                store.as_deref(),
+            )
+        };
         let context = format!(
             "{code}: {reason}; quarantine write to {} failed",
             self.config.quarantine_dir.display()
         );
-        self.record(saved, &context)
+        self.record(&batch.request_id, saved, &context)
     }
     /// Count a save's outcome. A poisoned lock still holds consistent counters (every writer
     /// updates them in one step) and the file is already written, so it is recovered rather
     /// than reported as an unsaved batch.
     fn record(
         &self,
+        request: &str,
         saved: Result<(PathBuf, bool), crate::quarantine::SaveFailure>,
         context: &str,
     ) -> Result<PathBuf, Error> {
@@ -1486,6 +1535,7 @@ impl Shared {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match saved {
             Ok((path, created)) => {
+                state.published_quarantine.remove(request);
                 if created {
                     state.quarantine_files = state.quarantine_files.saturating_add(1);
                 }
@@ -1493,6 +1543,11 @@ impl Shared {
                 Ok(path)
             }
             Err(failure) => {
+                if let Some(published) = failure.published {
+                    state
+                        .published_quarantine
+                        .insert(request.to_owned(), published);
+                }
                 if let Some(path) = failure.created {
                     state.quarantine_files = state.quarantine_files.saturating_add(1);
                     state.quarantine_file = Some(path);
@@ -1517,7 +1572,11 @@ impl Shared {
     /// means every held byte is in a file; `Err` names the batches that are not (they stay
     /// held in memory and each failed write is counted). Saving again is safe: a batch
     /// already in a file is reused, not written twice.
-    fn save_held(&self, error: &Error) -> Result<(), Error> {
+    fn save_held(
+        &self,
+        error: &Error,
+        saved: &mut std::collections::BTreeSet<String>,
+    ) -> Result<(), Error> {
         // A panicked worker may have poisoned the state; the held bytes are still readable.
         let (pending, queued, source) = {
             let state = self
@@ -1551,9 +1610,14 @@ impl Shared {
         let mut unsaved = Vec::new();
         let mut unsaved_events = 0_u64;
         for batch in &batches {
+            if saved.contains(&batch.request_id) {
+                continue;
+            }
             if let Err(write) = self.save(batch, error) {
                 unsaved.push(format!("{} ({write})", batch.request_id));
                 unsaved_events = unsaved_events.saturating_add(batch.events.len() as u64);
+            } else {
+                saved.insert(batch.request_id.clone());
             }
         }
         self.state
@@ -1575,9 +1639,14 @@ impl Shared {
     /// `held_unsaved_events` counts them and the write is retried on the backoff until it
     /// succeeds or the last producer handle is dropped. Nothing held is ever counted delivered.
     fn settle_failure(&self, runtime: &tokio::runtime::Runtime, error: Error) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closing = true;
+        let mut saved = std::collections::BTreeSet::new();
         let mut backoff = Backoff::new(&self.config);
         loop {
-            match self.save_held(&error) {
+            match self.save_held(&error, &mut saved) {
                 Ok(()) => {
                     self.fail(error);
                     return;
@@ -1745,6 +1814,7 @@ enum Action {
 async fn run(shared: &Shared) -> Result<(), Error> {
     let mut connection: Option<Client> = None;
     let mut may_have_sent = false;
+    let mut preserve = None;
     let mut backoff = Backoff::new(&shared.config);
     loop {
         let advertised = connection
@@ -1761,7 +1831,11 @@ async fn run(shared: &Shared) -> Result<(), Error> {
             },
             Action::Send(batch) => {
                 let mut replacement = None;
+                let recovering_file = preserve.is_some();
                 let attempt = async {
+                    if let Some(error) = preserve.take() {
+                        return Err(error);
+                    }
                     if connection.is_none() {
                         let client = Client::open(
                             &shared.config.endpoint,
@@ -1783,15 +1857,29 @@ async fn run(shared: &Shared) -> Result<(), Error> {
                     // Once the RPC can have left the process, even a timeout must keep the
                     // immutable identity. Client-side size validation runs before dispatch.
                     let previous_attempt = may_have_sent;
+                    let already_uncertain = matches!(
+                        shared.note_original(crate::quarantine::Original::Submitted)?,
+                        crate::quarantine::Original::Submitted
+                    );
                     may_have_sent = true;
                     let receipt = match client.events(&batch).await {
                         Err(error @ Error::InvalidArgument(_)) => {
                             may_have_sent = previous_attempt;
+                            if !already_uncertain {
+                                shared.note_original(crate::quarantine::Original::Refused)?;
+                            }
                             return Err(if previous_attempt {
                                 Error::Unsupported(IMMUTABLE_BATCH_LIMIT)
                             } else {
                                 error
                             });
+                        }
+                        Err(error)
+                            if !already_uncertain
+                                && crate::quarantine::Original::definitively_refused(&error) =>
+                        {
+                            shared.note_original(crate::quarantine::Original::Refused)?;
+                            return Err(error);
                         }
                         result => result?,
                     };
@@ -1823,18 +1911,19 @@ async fn run(shared: &Shared) -> Result<(), Error> {
                         // identity check with its own replacement policy.
                         let mismatch =
                             matches!(&error, Error::Domain { code, .. } if code == STORE_MISMATCH);
-                        let action = if connection.is_some()
+                        let action = if recovering_file {
+                            Disposition::SetAside
+                        } else if connection.is_some()
                             && !(shared.config.disk_free() && mismatch && replacement.is_none())
                         {
                             disposition(&error)
                         } else {
                             Disposition::Hold
                         };
-                        // A daemon answer, even a refusal, proves the connection works; only
-                        // a transport, I/O or protocol failure, or a store that is not the
-                        // bound one, means the connection may be wrong. A needless reconnect on
-                        // every busy retry also feeds the daemon's connection ceiling.
-                        if !matches!(&error, Error::Domain { code, .. } if code != STORE_MISMATCH) {
+                        // A replacement store or authorization refusal needs a new session.
+                        // Keep a busy connection to avoid consuming its admission budget.
+                        if !matches!(&error, Error::Domain { code, .. } if !matches!(code.as_str(), STORE_MISMATCH | "UNAUTHENTICATED" | "PERMISSION_DENIED"))
+                        {
                             connection = None;
                         }
                         // A refusal about this batch must reach a quarantine file before the
@@ -1859,7 +1948,20 @@ async fn run(shared: &Shared) -> Result<(), Error> {
                                     backoff.reset();
                                     continue;
                                 }
-                                Err(write) => write,
+                                Err(write) => {
+                                    if shared
+                                        .state
+                                        .lock()
+                                        .map_err(|_| {
+                                            Error::Protocol("producer queue state poisoned")
+                                        })?
+                                        .published_quarantine
+                                        .contains_key(&batch.request_id)
+                                    {
+                                        preserve = Some(error);
+                                    }
+                                    write
+                                }
                             },
                             Disposition::Hold => error,
                         };
@@ -2531,9 +2633,10 @@ mod tests {
                 delivery.try_send(event()),
                 Admission::Queued { sequence: 1 }
             ));
-            let saved = delivery
-                .shared
-                .save_held(&Error::Protocol("terminal for the test"));
+            let saved = delivery.shared.save_held(
+                &Error::Protocol("terminal for the test"),
+                &mut Default::default(),
+            );
             (delivery, saved)
         };
         let good = dir.path().join("good");
@@ -2843,7 +2946,10 @@ mod tests {
                 at: Instant::now(),
             });
         shared
-            .save_held(&Error::Protocol("terminal for the test"))
+            .save_held(
+                &Error::Protocol("terminal for the test"),
+                &mut Default::default(),
+            )
             .expect("a saved queue is not reported unsaved");
         let state = shared
             .state
@@ -2894,9 +3000,16 @@ mod tests {
         let quarantine = blocker.join("q");
         let shared = shared(&quarantine);
         let batch = batch_of("events:blocked:1", 1);
-        let io = crate::quarantine::save(&quarantine, &batch, "c", "r")
-            .unwrap_err()
-            .error;
+        let io = crate::quarantine::save(
+            &quarantine,
+            &batch,
+            "c",
+            "r",
+            crate::quarantine::Original::Unsent,
+            None,
+        )
+        .unwrap_err()
+        .error;
         let refusal = Error::Domain {
             code: "CONFLICT".into(),
             message: "sequences overlap".into(),
@@ -2980,16 +3093,31 @@ mod tests {
         let failure = crate::quarantine::SaveFailure {
             error: std::io::Error::other("scratch removal refused"),
             created: Some(linked.clone()),
+            published: Some(crate::quarantine::Published {
+                path: linked.clone(),
+                scratch: None,
+            }),
         };
-        assert!(shared.record(Err(failure), "context").is_err());
+        let batch = batch_of("recovered", 1);
+        assert!(
+            shared
+                .record(&batch.request_id, Err(failure), "context")
+                .is_err()
+        );
         assert_eq!(
             shared
-                .record(Ok((linked.clone(), false)), "context")
+                .save(&batch, &Error::Protocol("prior refusal"))
                 .unwrap(),
             linked
         );
         let state = shared.state.lock().unwrap();
         assert_eq!((state.quarantine_files, state.quarantine_failures), (1, 1));
         assert_eq!(state.quarantine_file.as_deref(), Some(linked.as_path()));
+        assert!(state.published_quarantine.is_empty());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "repair must not republish a quarantine that an operator replayed"
+        );
     }
 }

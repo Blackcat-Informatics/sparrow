@@ -27,6 +27,7 @@ purrdf-lex = "=4"
 purrdf-ed25519 = "=4"
 purrdf-core = "=4"
 getrandom = "0.3"
+tempfile = "3"
 rustix = { version = "1.1.5", features = ["fs"] }
 tracing = "0.1.44"
 log = { version = "0.4", features = ["std", "kv"] }

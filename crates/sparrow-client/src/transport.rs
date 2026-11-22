@@ -58,7 +58,7 @@ impl Endpoint {
         Ok((endpoint, rest))
     }
 
-    /// Authenticate this TCP destination using a private shared-secret file.
+    /// Authenticate this TCP destination by reading the private file on every connection.
     pub fn with_secret_file(self, path: &Path) -> Result<Self, crate::Error> {
         let Self::Tcp(address) = self else {
             return Err(crate::Error::InvalidArgument(
@@ -67,7 +67,7 @@ impl Endpoint {
         };
         Ok(Self::AuthenticatedTcp(
             address,
-            crate::TcpSecret::read(path)?,
+            crate::TcpSecret::from_source(path)?,
         ))
     }
 
