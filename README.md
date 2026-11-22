@@ -91,7 +91,12 @@ delivery.close_local(Duration::from_secs(5)).await?;
 
 Use `send_with_token(event, cursor).await?` when advancing an upstream cursor
 requires a local disk receipt. Use `shutdown_async(timeout).await?` when the
-caller requires a durable receipt from Sparrow. TCP endpoints, file-backed
+caller requires a durable receipt from Sparrow. For latency-sensitive diagnostics,
+`DeliveryConfig::lossy(endpoint, source)` counts each dropped observation and
+returns immediately on queue contention. It performs no disk writes. A producer
+that tolerates RAM backpressure can select `DeliveryConfig::lossy_spooled` and
+await `offer_spooled(event)` to buffer offline until its disk budget fills.
+TCP endpoints, file-backed
 configuration, limits and recovery are covered in the
 [Rust client contract](docs/interfaces.md#7-rust-client-and-logging-integration).
 

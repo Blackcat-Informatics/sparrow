@@ -611,10 +611,8 @@ mod tests {
             let stats = delivery.stats().unwrap();
             assert!(stats.floor_refusals >= 1, "{stats:?}");
             assert!(stats.retries >= stats.floor_refusals);
-            assert_eq!(
-                (stats.quarantined_events, stats.dropped_by_reason),
-                (0, [0; 5])
-            );
+            assert_eq!(stats.quarantined_events, 0);
+            assert!(stats.dropped_by_reason.iter().all(|&count| count == 0));
             assert!(stats.terminal_failure.is_none());
             fixture.stop.take().unwrap().send(()).unwrap();
             fixture.served.await.unwrap().unwrap();
