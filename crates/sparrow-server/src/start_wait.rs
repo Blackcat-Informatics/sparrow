@@ -199,6 +199,11 @@ fn status(text: &str) -> String {
     format!("STATUS={}", text.replace(['\n', '\r'], " "))
 }
 
+/// Publish a process phase without changing its readiness state.
+pub fn notify_status(text: &str) {
+    notify(&status(text));
+}
+
 fn send_notification(path: &OsStr, state: &str) -> io::Result<()> {
     let address = match path.as_bytes().strip_prefix(b"@") {
         Some(name) => SocketAddr::from_abstract_name(name)?,
@@ -220,8 +225,10 @@ pub fn notify_serving() {
 /// soon to look again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hold {
-    key: &'static str,
-    interval: Duration,
+    /// The condition reported while waiting.
+    pub key: &'static str,
+    /// How soon another attempt can be useful.
+    pub interval: Duration,
 }
 
 /// How a wait ended.

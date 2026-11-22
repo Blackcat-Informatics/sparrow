@@ -420,6 +420,19 @@ join. Endpoint cleanup preserves replacement names under the ownership rules
 above. Failed startup returns a failure after cleanup, allowing a corrected
 configuration to reopen the same store.
 
+For a durability-triggered session replacement, the TCP, private Unix and
+ingest listeners stay bound. A peer connecting during the replacement receives
+a retryable transport disconnect. An active query cancelled during retirement
+receives retryable `SHUTTING_DOWN` or a transport disconnect. The old session
+lets joined intake finish with its admitted capabilities and drains both storage
+budgets. It then drops the old connection tasks and waits for detached native
+owners before closing. Socket names may be restored under the reopened store's
+ownership. The daemon reports draining, native close, replay or the standing
+reopen refusal in the journal and service status. The listeners reject peers
+while the replacement loads watch state and checks syslog spill ownership. A
+stop waits for the owned close, open or intake setup to finish before terminal
+cleanup.
+
 ### Daemon maintenance scheduling
 
 One joined worker owns retention, pressure and periodic buffered synchronization.
@@ -5302,13 +5315,14 @@ measured. It proves once space has been adequate for 15 s, and spaces further pr
 every memtable to a synchronized table file and then synchronizes the WAL. If the writer is
 poisoned, maintenance reloads its catalog state before the proof and clears poison after the
 proof succeeds. The worker logs each failed proof and its backoff. A latch that
-still stands 120 s after space became adequate ends the daemon with an ordinary failure status
-so the store is reopened; an I/O error other than no space (EIO) is expected to end it that way
-until #449 lands. Status counts latches,
-in-place recoveries and writer-lock recoveries (`latches`, `recoveries`,
-`writerRecoveries`). Opening synchronizes
-recovered data before starting a fresh session. These fences certify storage
-durability, not retention extension, producer drops or power-loss qualification.
+still stands 120 s after space became adequate requests a new store session.
+While the original media is unavailable, the daemon retries the existing-store
+open with a bounded backoff. It synchronizes replayed data before starting the
+new session and logs every pending buffered occurrence that is absent after
+replay. A request through an old watermark receives `STALE_WATERMARK` after
+reconnecting. Status counts session-local latches, in-place recoveries and
+writer-lock recoveries (`latches`, `recoveries`, `writerRecoveries`). Fences
+certify storage durability within that session.
 
 ## 8. Errors and compatibility
 

@@ -615,21 +615,38 @@ impl ServerConfig {
 
     /// Open the one storage owner with native analyzer artifacts and private permissions.
     pub fn open_store(&self) -> Result<Store, Box<dyn std::error::Error>> {
-        let store = Store::open(
-            &self.data_dir,
-            Config {
-                buffered_flush_interval_ms: self.buffered_flush_interval_ms,
-                disk_budget: self.disk_budget,
-                maintenance_reserve: self.maintenance_reserve,
-                min_free_bytes: self.min_free_bytes,
-                max_records: self.max_records,
-                max_pin_members: self.max_pin_members,
-                text_analyzer: sparrow_core::resolve_text_analyzer(&self.text_lexicon_dir)?,
-                archive: self.archive.as_ref().map(ArchiveConfig::policy),
-                retire_without_archive: false,
-                instance_role: self.instance_role,
-            },
-        )?;
+        self.open_database(None)
+            .map_err(|error| error as Box<dyn std::error::Error>)
+    }
+
+    /// Reopen the original store with the same configuration and authorization checks.
+    pub fn reopen_store(
+        &self,
+        expected_id: &str,
+    ) -> Result<Store, Box<dyn std::error::Error + Send + Sync>> {
+        self.open_database(Some(expected_id))
+    }
+
+    fn open_database(
+        &self,
+        expected_id: Option<&str>,
+    ) -> Result<Store, Box<dyn std::error::Error + Send + Sync>> {
+        let config = Config {
+            buffered_flush_interval_ms: self.buffered_flush_interval_ms,
+            disk_budget: self.disk_budget,
+            maintenance_reserve: self.maintenance_reserve,
+            min_free_bytes: self.min_free_bytes,
+            max_records: self.max_records,
+            max_pin_members: self.max_pin_members,
+            text_analyzer: sparrow_core::resolve_text_analyzer(&self.text_lexicon_dir)?,
+            archive: self.archive.as_ref().map(ArchiveConfig::policy),
+            retire_without_archive: false,
+            instance_role: self.instance_role,
+        };
+        let store = match expected_id {
+            Some(id) => Store::reopen(&self.data_dir, config, id)?,
+            None => Store::open(&self.data_dir, config)?,
+        };
         // The daemon's group may traverse to the socket it binds here (mode 0660); it can
         // neither list nor read the store, whose files the unit's umask keeps owner-only.
         std::fs::set_permissions(&self.data_dir, std::fs::Permissions::from_mode(0o710))?;

@@ -6,9 +6,10 @@
 //! is ignored in the gate. Run it with `tools/enospc-check.sh LOG core A` or `... core B`: the
 //! script mounts a 160 MiB tmpfs in a user and mount namespace (`unshare -rm`, no root) and
 //! names it in `SPARROW_ENOSPC_DIR`. Arm `A` repeats the proof of durability every second after
-//! space returns; arm `B` leaves the store alone and proves once at the end.
+//! space returns. Arm `B` leaves the store alone and proves once at the end.
+//! Arm `A0-reopen` reproduces the wedge and replaces the stopped handle.
 
-use sparrow_core::{Config, Durability, Store};
+use sparrow_core::{Config, Durability, DurabilityWatermark, Store};
 use std::{io::Write, path::Path, time::Duration};
 
 /// How long the wait after space returns lasts: twenty-four of RocksDB's 5 s polls.
@@ -33,7 +34,8 @@ fn resumed(data: &Path) -> bool {
 /// with a retryable refusal and leaves reads served; once space returns RocksDB resumes the
 /// handle by itself when the store is left alone, the proof of durability then succeeds and
 /// the latch clears in the running store. Arm `A` is the control that repeats the proof through
-/// the wait; its result is reported, not asserted.
+/// the wait and reports its result. Arm `A0-reopen` requires a native wedge and verifies
+/// that closing and opening the original store restores reads and retries.
 #[test]
 #[ignore = "runs under tools/enospc-check.sh on a 160 MiB tmpfs and needs about four minutes"]
 fn a_full_disk_latch_clears_once_space_returns() {
@@ -47,6 +49,12 @@ fn a_full_disk_latch_clears_once_space_returns() {
     let before = store
         .ingest("before", "source", "log", b"kept\n", 1)
         .unwrap();
+    let before_status = store.durability_status().unwrap();
+    let before_fence = DurabilityWatermark {
+        store_id: store.store_id().unwrap(),
+        session_id: before_status.session_id,
+        sequence: before_status.durable_through,
+    };
 
     // Fill the filesystem, leaving 16 KiB so the floor admits a write and the WAL append is
     // what runs out of space. The WAL file was preallocated before the fill, so appends fit in
@@ -129,8 +137,8 @@ fn a_full_disk_latch_clears_once_space_returns() {
             store.reestablish_durability()
         );
     }
-    // Arm `A0` is arm `A` starting at the moment space returns and repeating every 0.5 s.
-    let eager = arm == "A0";
+    // Arm `A0` starts at the moment space returns and repeats every 0.5 s.
+    let eager = arm.starts_with("A0");
     let step = Duration::from_millis(if eager { 500 } else { 1000 });
     while began.elapsed() < WAIT && cleared_after.is_none() {
         if !eager {
@@ -161,7 +169,33 @@ fn a_full_disk_latch_clears_once_space_returns() {
         }
     }
     eprintln!("RESULT arm={arm} resumed_after={resumed_after:?} cleared_after={cleared_after:?}");
-    if arm == "B" {
+    if arm == "A0-reopen" {
+        assert!(
+            resumed_after.is_none() && cleared_after.is_none(),
+            "the native wedge did not reproduce"
+        );
+        assert!(store.durability_status().unwrap().failure.is_some());
+        assert!(store.close_for_reopen().is_empty());
+        let reopened = Store::reopen(&data, config(), &before_fence.store_id).unwrap();
+        let status = reopened.durability_status().unwrap();
+        assert_ne!(status.session_id, before_fence.session_id);
+        assert!(status.failure.is_none());
+        assert_eq!(
+            reopened.flush_through(&before_fence).unwrap_err().code,
+            "STALE_WATERMARK"
+        );
+        assert_eq!(reopened.bytes(&before.id, 0, 5, 4).unwrap(), b"kept\n");
+        let retried = reopened
+            .ingest("refused", "source", "log", b"refused\n", 3)
+            .unwrap();
+        assert!(retried.buffered.is_none());
+        eprintln!(
+            "RESULT pid={} store={} new_session={}",
+            std::process::id(),
+            before_fence.store_id,
+            status.session_id
+        );
+    } else if arm == "B" {
         assert!(cleared_after.is_some(), "the latch did not clear");
         let after = store
             .ingest("after", "source", "log", b"after\n", 4)

@@ -93,6 +93,7 @@ pub fn now() -> Result<u64, Error> {
 /// Shared storage owner exposed through the generated RPC capability.
 #[derive(Clone)]
 pub struct Rpc {
+    session: sparrow_core::QueryCancellation,
     connection: sparrow_core::QueryCancellation,
     syslog: crate::syslog_listener::SyslogRegistry,
     store: Store,
@@ -251,8 +252,10 @@ impl Rpc {
     }
     /// Construct the one typed adapter with explicit admission limits.
     pub fn new(store: Store, requests: Arc<Semaphore>, max_pin_members: usize) -> Self {
+        let session = sparrow_core::QueryCancellation::default();
         Self {
-            connection: Default::default(),
+            connection: session.clone(),
+            session,
             syslog: crate::syslog_listener::SyslogRegistry::default(),
             pause: crate::floor_pause::FloorPause::new(store.space_floor()),
             archive: crate::archive::ArchiveStatus::new(),
@@ -330,9 +333,14 @@ impl Rpc {
 
     pub(crate) fn for_connection(&self) -> (Self, CancelQuery) {
         let mut rpc = self.clone();
-        rpc.connection = sparrow_core::QueryCancellation::default();
+        rpc.connection = self.connection.child();
         let guard = CancelQuery(rpc.connection.clone());
         (rpc, guard)
+    }
+
+    /// Cancel active query captures as this store session retires.
+    pub fn cancel_queries(&self) {
+        self.session.cancel();
     }
 
     /// Attach the daemon's one bounded configured-watch snapshot owner.
@@ -548,13 +556,21 @@ impl Rpc {
     ) -> Result<T, Error> {
         let cancellation = self.connection.child();
         let _caller = CancelQuery(cancellation.clone());
-        self.lookup(move |store, now| {
-            cancellation.checkpoint()?;
-            let reply = operation(store, now, cancellation.clone())?;
-            cancellation.checkpoint()?;
-            Ok(reply)
-        })
-        .await
+        let result = self
+            .lookup(move |store, now| {
+                cancellation.checkpoint()?;
+                let reply = operation(store, now, cancellation.clone())?;
+                cancellation.checkpoint()?;
+                Ok(reply)
+            })
+            .await;
+        if self.session.checkpoint().is_err() {
+            return Err(Error::new(
+                "SHUTTING_DOWN",
+                "store session is reopening; retry on a new connection",
+            ));
+        }
+        result
     }
 
     async fn query_work<B: Send + 'static>(

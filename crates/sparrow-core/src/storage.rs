@@ -600,9 +600,7 @@ struct Unlocked {
     import_reclaim_waker: Mutex<Option<RetentionWaker>>,
     /// The writer's pressure-request wake, shared so the owner can install it (#247).
     pressure_request_waker: Arc<Mutex<Option<RetentionWaker>>>,
-    /// The one compaction a stalled pressure wait may force, held here only for the
-    /// test-support handles that arm and release it; the writer owns it in production.
-    #[cfg(feature = "test-support")]
+    /// The one compaction a stalled pressure wait may force. Closing waits for its native handle.
     forced: Arc<forced_compaction::Forced>,
     /// Gap evidence lost to a full stream registry, counted per stream (#215).
     stream_evidence: stream_evidence::Ledger,
@@ -1693,20 +1691,78 @@ impl Store {
 
     /// Open a single-writer RocksDB store with an explicit disk budget.
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self, Error> {
+        Self::open_store(path.as_ref(), config, None)
+    }
+
+    /// Reopen the expected persistent store after the previous session has closed.
+    /// Both the database and its column families must already exist.
+    ///
+    /// # Errors
+    /// `NOT_FOUND` means the path holds no RocksDB database. `STORE_MISMATCH` means its
+    /// persisted identity differs. A matching store must pass the ordinary open checks.
+    pub fn reopen(
+        path: impl AsRef<Path>,
+        config: Config,
+        expected_store_id: &str,
+    ) -> Result<Self, Error> {
+        Self::open_store(path.as_ref(), config, Some(expected_store_id))
+    }
+
+    fn open_store(
+        path: &Path,
+        config: Config,
+        expected_store_id: Option<&str>,
+    ) -> Result<Self, Error> {
         let mut timer = OpenTimer::start();
         config.validate()?;
-        let space = space::SpaceFloor::new(path.as_ref(), config.min_free_bytes);
+        // The Rust binding creates the directory before the native open even when both
+        // native creation options are off. A missing store should not create that directory.
+        if let Some(expected) = expected_store_id
+            && !path.join("CURRENT").try_exists().map_err(|error| {
+                Error::new(
+                    "STORAGE_FAILURE",
+                    format!("cannot inspect the database at {}: {error}", path.display()),
+                )
+            })?
+        {
+            return Err(Error::new(
+                "NOT_FOUND",
+                format!("store {expected} is unavailable at {}", path.display()),
+            ));
+        }
+        let space = space::SpaceFloor::new(path, config.min_free_bytes);
         let open_files = open_files::OpenFiles::from_process()?;
         let db = DB::open_cf_descriptors(
-            &table_options::database(open_files.max_open_files)?,
+            &table_options::database(open_files.max_open_files, expected_store_id.is_none())?,
             path,
             table_options::descriptors(),
         )?;
         timer.lap("rocksdb");
+        let format = writer_format::read(&db)?;
+        let persisted_id =
+            if expected_store_id.is_some() || format.as_deref().is_some_and(is_known_format) {
+                db.get("store_id")?
+            } else {
+                None
+            };
+        if let Some(expected) = expected_store_id
+            && persisted_id.as_deref() != Some(expected.as_bytes())
+        {
+            let found = persisted_id
+                .as_deref()
+                .map_or_else(|| "no store identity".into(), String::from_utf8_lossy);
+            return Err(Error::new(
+                "STORE_MISMATCH",
+                format!(
+                    "expected store {expected} at {}, found {found}",
+                    path.display()
+                ),
+            ));
+        }
         source_time::validate_log_fence(&db)?;
         let fingerprint = hex::encode(&config.text_analyzer.fingerprint());
         let rdf_fingerprint = rdf_index::profile_identity()?;
-        let id = match writer_format::read(&db)? {
+        let id = match format {
             Some(format) if is_known_format(&format) => {
                 if recordless::requires_watch_registry(&format)
                     != db.get("watch_registry")?.is_some()
@@ -1716,8 +1772,7 @@ impl Store {
                         "store format and durable watch registry disagree; restore the original catalog and its writer fence",
                     ));
                 }
-                let id = db
-                    .get("store_id")?
+                let id = persisted_id
                     .ok_or_else(|| Error::new("STORAGE_FAILURE", "store identity missing"))?;
                 String::from_utf8(id).map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?
             }
@@ -1728,6 +1783,12 @@ impl Store {
                 ));
             }
             None => {
+                if expected_store_id.is_some() {
+                    return Err(Error::new(
+                        "STORAGE_FAILURE",
+                        "restore the original catalog to recover the missing store writer format",
+                    ));
+                }
                 if db.iterator(IteratorMode::Start).next().is_some() {
                     return Err(Error::new("STORAGE_FAILURE", "nonempty unversioned store"));
                 }
@@ -1864,7 +1925,6 @@ impl Store {
                 import_slot_waker: Mutex::new(None),
                 import_reclaim_waker: Mutex::new(None),
                 pressure_request_waker: Arc::clone(&pressure_request_waker),
-                #[cfg(feature = "test-support")]
                 forced: Arc::clone(&forced),
                 stream_evidence: stream_evidence::Ledger::default(),
                 source_time_evidence: stream_evidence::Ledger::default(),
@@ -1927,6 +1987,31 @@ impl Store {
         timer.lap("registries");
         store.open_phases = timer.phases.into();
         Ok(store)
+    }
+
+    /// Close a drained session and return the buffered occurrence identities to check after
+    /// replay. Call after dropping all external store clones and ending admitted work.
+    /// Blocks until detached listing builds and forced compaction release their native handles.
+    #[must_use]
+    pub fn close_for_reopen(self) -> Vec<String> {
+        catalog_lease::lock_whole(&self.unlocked.source_builds).cancel_and_wait();
+        catalog_lease::lock_whole(&self.unlocked.artifact_builds).cancel_and_wait();
+        self.unlocked.forced.wait_finished();
+        self.pending_durability_occurrences()
+    }
+
+    /// Return the bounded identities awaiting a durability proof in this session.
+    /// Use after draining admitted work when reporting an unverified terminal stop.
+    #[must_use]
+    pub fn pending_durability_occurrences(&self) -> Vec<String> {
+        // Closing a stopped session observes pending writes without recovering a poisoned
+        // writer or attempting another durability proof.
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .durability
+            .borrow()
+            .pending_occurrences()
     }
 
     /// Wall time of each phase of the open that produced this store, in order. A stale

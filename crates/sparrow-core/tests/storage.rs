@@ -24088,6 +24088,58 @@ fn a_poisoned_writer_waits_for_the_explicit_durability_proof() {
         .unwrap();
 }
 
+/// INVARIANT (#449): recovery stays pinned to the original database, preserving confirmed
+/// bytes and reporting buffered occurrence identities even with a latched, poisoned writer.
+#[test]
+fn reopening_recovers_only_the_original_store_and_reports_pending_occurrences() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("original");
+    let foreign = dir.path().join("foreign");
+    let store = Store::open(&original, config()).unwrap();
+    let identity = store.store_id().unwrap();
+    let bytes = b"confirmed\r\nexact \xff\n";
+    let confirmed = store
+        .ingest("confirmed", "source", "log", bytes, 1)
+        .unwrap();
+    let buffered = store
+        .ingest_with_durability(
+            "buffered",
+            "source",
+            "log",
+            b"uncertain\n",
+            2,
+            sparrow_core::Durability::Buffered,
+        )
+        .unwrap();
+    store.latch_durability_for_tests("WAL sync failed").unwrap();
+    store.poison_writer_for_tests();
+    assert_eq!(store.close_for_reopen(), [buffered.id]);
+
+    let missing = dir.path().join("missing");
+    assert!(matches!(
+        Store::reopen(&missing, config(), &identity),
+        Err(error) if error.code == "NOT_FOUND"
+    ));
+    assert!(!missing.exists());
+    drop(Store::open(&foreign, config()).unwrap());
+    assert!(matches!(
+        Store::reopen(&foreign, config(), &identity),
+        Err(error) if error.code == "STORE_MISMATCH"
+    ));
+    let reopened = Store::reopen(&original, config(), &identity).unwrap();
+    assert_eq!(
+        reopened.bytes(&confirmed.id, 0, bytes.len(), 3).unwrap(),
+        bytes
+    );
+    assert_eq!(
+        reopened
+            .flush_through(&buffered.buffered.unwrap())
+            .unwrap_err()
+            .code,
+        "STALE_WATERMARK"
+    );
+}
+
 /// INVARIANT (#447): an artifact read is served while durability is latched uncertain,
 /// reporting the artifact's still-pending fence, because a read certifies nothing. Writes and
 /// fences stay refused.

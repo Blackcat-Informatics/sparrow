@@ -41,9 +41,15 @@ const MIGRATION_PROGRESS_PAGES: u64 = 64;
 
 pub(super) struct Worker {
     stop: watch::Sender<bool>,
-    task: Option<tokio::task::JoinHandle<Result<(), String>>>,
+    task: Option<tokio::task::JoinHandle<Result<End, String>>>,
     /// Closes when the task ends, by return, panic or cancellation.
     ended: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[derive(Debug)]
+pub(super) enum End {
+    Stopped,
+    Reopen(String),
 }
 
 impl Worker {
@@ -89,7 +95,7 @@ impl Worker {
         let _ = (&mut self.ended).await;
     }
 
-    pub(super) async fn shutdown(mut self) -> Result<(), String> {
+    pub(super) async fn shutdown(mut self) -> Result<End, String> {
         self.stop.send_replace(true);
         self.task
             .take()
@@ -203,10 +209,9 @@ async fn deferred_page(
     deferral: &mut Option<tokio::task::JoinHandle<std::time::Duration>>,
 ) -> Result<(), String> {
     if let Some(handle) = deferral.as_mut() {
-        handle
-            .await
-            .map_err(|error| format!("migration page deferral join failed: {error}"))?;
+        let result = handle.await;
         *deferral = None;
+        result.map_err(|error| format!("migration page deferral join failed: {error}"))?;
     }
     Ok(())
 }
@@ -366,7 +371,7 @@ fn observe_floor(
     Ok(paused)
 }
 
-/// When the worker proves a standing durability latch, and when it gives up and exits.
+/// When the worker proves a standing durability latch, and when it requests a new session.
 ///
 /// A proof writes every memtable to a table file, which competes with the background work
 /// RocksDB runs to resume a handle a full disk stopped; repeated proofs through that window
@@ -382,8 +387,8 @@ pub(super) struct Pace {
     pub(super) first: Duration,
     /// The longest wait between proofs.
     pub(super) longest: Duration,
-    /// How long the latch may stand with free space adequate before the daemon exits so the
-    /// store is reopened. A resume takes one to two polls once space is back, so 120 s (twenty
+    /// How long the latch may stand with free space adequate before the store is reopened.
+    /// A resume takes one to two polls once space is back, so 120 s (twenty
     /// four polls, with the proofs at 15 s, 45 s and 105 s) leaves a working resume ample time,
     /// and a handle that does not resume by then never will.
     pub(super) bound: Duration,
@@ -413,8 +418,8 @@ enum Step {
     Wait,
     /// Prove every accepted write durable now.
     Prove,
-    /// End the daemon so its supervisor reopens the store.
-    Exit,
+    /// Ask the daemon to replace the stopped store session.
+    Reopen,
 }
 
 /// The schedule of proofs of one standing latch.
@@ -467,7 +472,7 @@ impl Proofs {
         }
         let elapsed = now.saturating_duration_since(*self.adequate_since.get_or_insert(now));
         if elapsed >= pace.bound {
-            return Step::Exit;
+            return Step::Reopen;
         }
         if elapsed < pace.grace {
             return Step::Wait;
@@ -761,11 +766,26 @@ mod skips {
 
 async fn run(
     store: &Store,
+    stopped: watch::Receiver<bool>,
+    flush_interval: Duration,
+    held: sparrow_server::pressure_wake::PressureWake,
+    pace: Pace,
+) -> Result<End, String> {
+    let mut deferral = None;
+    let outcome = run_duties(store, stopped, flush_interval, held, pace, &mut deferral).await;
+    // The deferral carries a Store clone even when no next migration page is due.
+    let joined = deferred_page(&mut deferral).await;
+    outcome.and_then(|end| joined.map(|()| end))
+}
+
+async fn run_duties(
+    store: &Store,
     mut stopped: watch::Receiver<bool>,
     flush_interval: Duration,
     held: sparrow_server::pressure_wake::PressureWake,
     pace: Pace,
-) -> Result<(), String> {
+    deferral: &mut Option<tokio::task::JoinHandle<std::time::Duration>>,
+) -> Result<End, String> {
     // A pin release or commit and an archive commit change what expiry may retire; the store
     // notifies this wake without blocking, and a pending wake survives a busy duty.
     // The same events, and the end of a forced compaction, change what a pressure pass can
@@ -850,7 +870,6 @@ async fn run(
     // delays only the page. If that task finished while another duty ran, writers may have
     // arrived since, so the page waits again inline, as the first page after a retry does.
     let mut migrating = false;
-    let mut deferral: Option<tokio::task::JoinHandle<std::time::Duration>> = None;
     let mut stale = false;
     // How long a duty that keeps panicking waits; the other duties run on their own clocks.
     let mut pressure_panics = PanicBackoff::default();
@@ -863,7 +882,7 @@ async fn run(
     loop {
         let job = tokio::select! {
             biased;
-            _ = stopped.changed() => return Ok(()),
+            _ = stopped.changed() => return Ok(End::Stopped),
             job = async {
                 // Keep duties fair even when a flush interval is shorter than
                 // native work. Only stop admission has strict priority.
@@ -896,7 +915,7 @@ async fn run(
                         skips::migrate_started(true);
                         Ok(Job::Migrate { defer: true })
                     }
-                    deferred = deferred_page(&mut deferral), if migrating => {
+                    deferred = deferred_page(deferral), if migrating => {
                         deferred.map(|()| Job::Migrate { defer: stale })
                     }
                 }
@@ -912,7 +931,6 @@ async fn run(
         if paused && !runs_below_floor(job) {
             continuation = false;
             migrating = false;
-            deferral = None;
             #[cfg(test)]
             skips::note(job);
             continue;
@@ -951,7 +969,6 @@ async fn run(
                 );
                 continuation = false;
                 migrating = false;
-                deferral = None;
                 continue;
             }
         };
@@ -991,13 +1008,13 @@ async fn run(
             }
             match proofs.step(&pace, tokio::time::Instant::now(), space_low) {
                 Step::Wait => {}
-                Step::Exit => {
-                    return Err(format!(
-                        "store durability uncertain and not re-established within {:?} of adequate free space ({}); RocksDB clears this only by reopening, so exiting for the supervisor to reopen it: {}",
+                Step::Reopen => {
+                    return Ok(End::Reopen(format!(
+                        "store durability remains uncertain after {:?} of adequate free space ({}): {}",
                         pace.bound,
                         named.name(),
                         proof_failure.as_deref().unwrap_or(&latch)
-                    ));
+                    )));
                 }
                 Step::Prove => {
                     let owner = store.clone();
@@ -1093,8 +1110,9 @@ async fn run(
             Ok(Outcome::Migrated(page, began)) => {
                 migrating = page.is_some();
                 if migrating {
+                    deferred_page(deferral).await?;
                     let owner = store.clone();
-                    deferral = Some(tokio::task::spawn_blocking(move || {
+                    *deferral = Some(tokio::task::spawn_blocking(move || {
                         owner.defer_migration_page()
                     }));
                     stale = false;
@@ -1439,7 +1457,7 @@ mod tests {
         proofs.failed(at(4105));
         // The bound counts from when space became adequate.
         assert_eq!(proofs.step(&pace, at(4119), Some(false)), Step::Wait);
-        assert_eq!(proofs.step(&pace, at(4120), Some(false)), Step::Exit);
+        assert_eq!(proofs.step(&pace, at(4120), Some(false)), Step::Reopen);
         // Low space or a failed measurement restarts the entire wait.
         for (interrupted, restart_at) in [(Some(true), 4200), (None, 4300)] {
             assert_eq!(
@@ -2047,25 +2065,37 @@ mod tests {
         let path =
             sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
         let store = open_retiring(&sparrow_server::ServerConfig::read(&path).unwrap()).unwrap();
-        let mut worker = Worker::start(store, Duration::from_millis(1), Default::default());
-        let (mut consumer, mut syslog) = (None, None);
+        let mut workers = crate::shutdown::Workers {
+            maintenance: Some(Worker::start(
+                store,
+                Duration::from_millis(1),
+                Default::default(),
+            )),
+            ..Default::default()
+        };
         // A running worker: a second passes without a failure.
         assert!(
             tokio::time::timeout(
                 Duration::from_secs(1),
-                crate::worker_health(&mut consumer, &mut syslog, Some(&mut worker)),
+                crate::session::worker_health(&mut workers),
             )
             .await
             .is_err()
         );
         // End the loop without consuming the worker, as any unexpected end would.
-        worker.stop.send_replace(true);
-        let failure = tokio::time::timeout(
+        workers
+            .maintenance
+            .as_ref()
+            .unwrap()
+            .stop
+            .send_replace(true);
+        let ended = tokio::time::timeout(
             Duration::from_secs(10),
-            crate::worker_health(&mut consumer, &mut syslog, Some(&mut worker)),
+            crate::session::worker_health(&mut workers),
         )
         .await
         .unwrap();
+        let failure = ended.join(&mut workers).await.unwrap_err();
         assert_eq!(
             failure.to_string(),
             "maintenance worker terminated unexpectedly"

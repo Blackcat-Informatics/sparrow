@@ -436,19 +436,31 @@ table file and syncing the WAL. A scheduled proof reloads a poisoned writer's ca
 first and clears poison only after the proof succeeds. The maintenance
 worker leaves a latched store alone while free space is below RocksDB's recovery buffer
 (32 MiB, or the maintenance reserve or floor if larger), proves once after space has been
-adequate for 15 s, spaces further proofs 30 s then 60 s apart, and exits with an ordinary
-failure status when the latch has stood 120 s with space adequate, so the supervisor reopens
-the store. In the full-disk test on a tmpfs (`tools/enospc-check.sh`, ignored in the gate) the latch
+adequate for 15 s, and spaces further proofs 30 s then 60 s apart. If the latch
+still stands after 120 s of adequate space, maintenance requests a replacement
+store session. In the full-disk test on a tmpfs (`tools/enospc-check.sh`, ignored in the gate) the latch
 cleared in place after space returned in 5 clean runs. Repeated proofs from the instant space
 returned never let RocksDB resume in 3 runs, while one proof at that instant resumed; the
 threshold is not isolated, and the worker's 15 s grace avoids that window by schedule only.
-A recovery that does not resume ends the daemon (exit 1, restart, the start waits for space)
-until #449 lands, which is required before the switch image. An I/O error other than no space
-(EIO and similar) is not known to clear and ends the daemon the same way. A forced
-compaction has no latch check. An explicit RocksDB `Resume()` and a real filesystem near
-full are untested. Reopening in place is not used, because buffered writes held only in the stopped
-handle's memtables can be lost by it while the daemon's workers keep state derived from
-them; a restart resets both together.
+
+The process keeps its RPC listeners and the archive filesystem worker while
+replacing the session. It disconnects new peers so their requests can retry,
+cancels active queries, and keeps admitted streams available while intake settles.
+The operation and diagnostic budgets drain before the old capabilities and read
+leases expire. A tracked blocking task waits for detached native owners and closes
+the RocksDB handle. Reopening requires the original persisted store identity
+and replays its WAL before admitting work through a fresh session. If the original
+storage is missing, occupied by another owner, or unreadable, the daemon reports
+the condition and retries with bounded backoff. The archive worker finishes a
+pending filesystem job in its process-owned slot, while only the live session
+can prepare and commit an archive range.
+
+A write held only in the stopped handle's memtables can be lost. The retiring
+session hands off the bounded set of buffered occurrence identities, and the
+daemon checks each one after replay and logs any absence by ID. If the process
+stops before it can reconcile them, it journals the unverified identities.
+Fresh workers read their state from the reopened store. A sequence fence
+remains bound to its original session.
 
 Keep the write-ahead log enabled. Pin success and source deletion require a
 durable boundary covering their complete dependency set. For a large import,

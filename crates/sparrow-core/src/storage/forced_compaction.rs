@@ -182,9 +182,8 @@ impl Forced {
                 });
                 outcome.elapsed_ms =
                     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                // Release the database before publishing the end: whoever sees `Finished` (a
-                // test waiting for native quiet, then closing the store and reopening its
-                // directory) must find no handle of this thread left holding the RocksDB lock.
+                // Release the database before publishing the end so a session waiting to
+                // close finds no handle of this thread left holding the RocksDB lock.
                 drop(db);
                 *owner.slot() = Slot::Finished(outcome);
                 owner.changed.notify_all();
@@ -196,6 +195,7 @@ impl Forced {
             .map(|_| true)
             .map_err(|error| {
                 *self.slot() = Slot::Idle;
+                self.changed.notify_all();
                 Error::new(
                     "STORAGE_FAILURE",
                     format!("cannot start the forced compaction thread: {error}"),
@@ -254,8 +254,7 @@ impl Forced {
             .fetch_add(count, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Block until no compaction is running, for tests that must observe its end.
-    #[cfg(any(test, feature = "test-support"))]
+    /// Block until no forced compaction owns a database handle.
     pub(super) fn wait_finished(&self) {
         let mut slot = self.slot();
         while *slot == Slot::Running {

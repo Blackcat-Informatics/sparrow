@@ -3,7 +3,23 @@
 
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Waker},
+};
 use tokio_util::compat::TokioAsyncReadCompatExt;
+
+/// Cap'n Proto starts clearing its answer pipelines and capability exports on the
+/// first poll of its disconnector. The remaining socket flush can wait on the peer.
+/// Start teardown before dropping the driver, even when its task is cancelled.
+struct DisconnectOnDrop<F: Future + Unpin>(F);
+
+impl<F: Future + Unpin> Drop for DisconnectOnDrop<F> {
+    fn drop(&mut self) {
+        let _ = Pin::new(&mut self.0).poll(&mut Context::from_waker(Waker::noop()));
+    }
+}
 
 /// Serve one owned byte stream through the shared generated capability.
 /// Run within a Tokio LocalSet. The caller owns connection admission and its lease.
@@ -24,7 +40,9 @@ where
             nesting_limit: 64,
         },
     );
-    RpcSystem::new(Box::new(network), Some(client.client)).await
+    let mut system = RpcSystem::new(Box::new(network), Some(client.client));
+    let _disconnect = DisconnectOnDrop(system.get_disconnector());
+    (&mut system).await
 }
 
 /// Who reached the daemon, which selects the bootstrap capability.

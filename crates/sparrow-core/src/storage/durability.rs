@@ -160,6 +160,10 @@ impl State {
         self.pending.clear();
         self.bytes = 0;
     }
+
+    pub(super) fn pending_occurrences(&self) -> Vec<String> {
+        self.pending.keys().cloned().collect()
+    }
 }
 
 impl Writer {
