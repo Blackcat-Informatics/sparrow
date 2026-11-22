@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+
+# Development store and owned synthetic intake only. No live producer directories.
+# Consume entries seed a missing catalog; use typed watch administration afterward.
+socket_path = "/srv/sparrow-dev/development-v5/rpc.sock"
+rpc_tcp_address = "0.0.0.0:518"
+rpc_tcp_secret_file = "/srv/sparrow-dev/tcp.secret"
+data_dir = "/srv/sparrow-dev/development-v5"
+disk_budget = 536870912
+maintenance_reserve = 67108864
+max_records = 100000
+max_pin_members = 10000
+max_concurrent_requests = 4
+max_rpc_connections = 16
+buffered_flush_interval_ms = 2000
+text_lexicon_dir = "/path/to/purrdf/crates/text/lexicons/artifacts"
+
+[[consume]]
+id = "development-completed"
+root = "/srv/sparrow-dev/development-completed"
+producer_contract = "finished_files"
+source = "development-consume"
+format = "jsonl"
+quiet_ms = 30000
+max_directories = 16
+max_candidates = 64

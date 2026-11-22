@@ -1,0 +1,3802 @@
+// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+
+//! Explicit bounded syslog intake, independent of the private typed query transport.
+
+mod udp_hold;
+
+use crate::pressure_wake::{PressureWake, Waiter};
+use crate::syslog_spill::Spill;
+use serde::Deserialize;
+use std::{
+    collections::BTreeMap,
+    io,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, BufReader},
+    net::{TcpListener, UdpSocket},
+    sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc, watch},
+    task::JoinSet,
+};
+
+/// Explicit TCP packet boundary law; the listener never guesses between frames.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SyslogFraming {
+    /// RFC 6587 decimal octet count followed by one space and exact payload bytes.
+    OctetCounting,
+    /// One LF trailer; any preceding CR remains a packet byte.
+    Lf,
+    /// An exact CRLF trailer.
+    CrLf,
+}
+
+/// Intake transport; UDP has no delivery acknowledgement.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SyslogTransport {
+    /// Configured RFC 6587 framing and bounded simultaneous connections.
+    Tcp,
+    /// One message per datagram, kept whole; refusals are counted and there is no delivery
+    /// acknowledgement.
+    Udp,
+}
+
+/// One explicit local ingestion authority, never a query or model-backend transport.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyslogListener {
+    /// Bounded configuration identity.
+    pub id: String,
+    /// Explicit loopback binding; port zero is useful for isolated qualification.
+    pub address: SocketAddr,
+    /// Exact intake source label.
+    pub source: String,
+    /// Explicit TCP or UDP admission.
+    pub transport: SyslogTransport,
+    /// Required for TCP and absent for UDP.
+    pub framing: Option<SyslogFraming>,
+    /// Required, 480..65536. TCP line framing keeps this many bytes of a line and counts the
+    /// cut; UDP ignores it, since a datagram always fits the store's ceiling.
+    pub max_message_bytes: usize,
+    /// Required per-listener TCP connection ceiling, 1..16; UDP requires one.
+    pub max_connections: usize,
+    /// Required complete-frame read deadline, 1..60000 milliseconds.
+    pub read_timeout_ms: u32,
+    /// UDP only, optional: the bytes the reader may queue for the publisher, 1 MiB to 512 MiB,
+    /// 64 MiB when absent. The sum over all listeners is at most 512 MiB. A queued datagram
+    /// costs its length plus [`ENTRY_OVERHEAD`].
+    #[serde(default)]
+    pub hold_bytes: Option<usize>,
+}
+
+/// Bytes the reader may queue by default.
+pub const DEFAULT_HOLD_BYTES: usize = 64 << 20;
+/// Least `hold_bytes` of one listener.
+pub const MIN_HOLD_BYTES: usize = 1 << 20;
+/// Greatest sum of the `hold_bytes` of all UDP listeners: a quarter of the unit's `MemoryHigh`.
+/// It is also the greatest for one listener.
+pub const MAX_TOTAL_HOLD_BYTES: usize = 512 << 20;
+/// Greatest `hold_bytes` of one listener: the whole total.
+pub const MAX_HOLD_BYTES: usize = MAX_TOTAL_HOLD_BYTES;
+/// Budget a queued datagram costs beyond its length, so a flood of tiny datagrams is bounded in
+/// count as well as in bytes.
+pub const ENTRY_OVERHEAD: usize = 128;
+
+impl SyslogListener {
+    /// The queue bound of a UDP listener: the configured value or the default.
+    pub(crate) fn hold_bytes(&self) -> usize {
+        self.hold_bytes.unwrap_or(DEFAULT_HOLD_BYTES)
+    }
+}
+
+pub(crate) fn validate(listeners: &[SyslogListener]) -> io::Result<()> {
+    let mut ids = std::collections::BTreeSet::new();
+    let mut addresses = std::collections::BTreeSet::new();
+    if listeners.len() > 4 {
+        return Err(io::Error::other("syslog admits at most four listeners"));
+    }
+    for listener in listeners {
+        if listener.id.is_empty()
+            || listener.id.len() > 64
+            || !ids.insert(&listener.id)
+            || listener.source.is_empty()
+            || listener.source.len() > 512
+            || !listener.address.ip().is_loopback()
+            || (listener.address.port() != 0
+                && !addresses
+                    .insert((listener.address, listener.transport == SyslogTransport::Tcp)))
+            || !(480..=sparrow_core::SYSLOG_MESSAGE_BYTES).contains(&listener.max_message_bytes)
+            || !(1..=16).contains(&listener.max_connections)
+            || !(1..=60000).contains(&listener.read_timeout_ms)
+            || (listener.transport == SyslogTransport::Tcp) != listener.framing.is_some()
+            || (listener.transport == SyslogTransport::Udp && listener.max_connections != 1)
+        {
+            return Err(io::Error::other(
+                "syslog requires unique identities, explicit loopback bindings, source 1..512 bytes, max_message_bytes 480..65536, max_connections 1..16, read_timeout_ms 1..60000, TCP framing, and UDP max_connections=1 with no framing",
+            ));
+        }
+        if let Some(bytes) = listener.hold_bytes
+            && (listener.transport != SyslogTransport::Udp
+                || !(MIN_HOLD_BYTES..=MAX_HOLD_BYTES).contains(&bytes))
+        {
+            return Err(io::Error::other(
+                "syslog hold_bytes is for UDP listeners only and must be 1048576..536870912",
+            ));
+        }
+    }
+    let total = listeners
+        .iter()
+        .filter(|listener| listener.transport == SyslogTransport::Udp)
+        .map(SyslogListener::hold_bytes)
+        .try_fold(0_usize, usize::checked_add);
+    if total.is_none_or(|total| total > MAX_TOTAL_HOLD_BYTES) {
+        return Err(io::Error::other(
+            "the hold_bytes of all UDP syslog listeners sum to more than 536870912 bytes",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Default)]
+struct Counts {
+    accepted: u64,
+    interpretation_failures: u64,
+    refused: u64,
+    truncated: u64,
+    framing_failures: u64,
+    timed_out: u64,
+    /// Frames held at least once for the store's `STORAGE_PRESSURE` (#243).
+    holds_storage_pressure: u64,
+    /// Frames held at least once for an operation permit (#243).
+    holds_no_permit: u64,
+    /// Frames held at least once for a store failure that is not pressure (#445).
+    holds_store_failure: u64,
+    /// Errors the listener survived (a failed accept, a failed connection) or was bound again
+    /// after (#445).
+    listener_errors: u64,
+    /// Longest finished hold, in milliseconds.
+    longest_hold_ms: u64,
+    /// Times the UDP reader stopped because the queue was full (#255).
+    reader_full_waits: u64,
+    /// Longest finished full-queue wait, in milliseconds.
+    reader_full_longest_ms: u64,
+    /// Datagrams published with the commit instant because their read instant was behind the
+    /// archive watermark.
+    restamped: u64,
+    /// Datagrams stored just past the archive watermark because the commit instant was behind
+    /// it too (the clock stepped back).
+    restamped_past_watermark: u64,
+    /// Datagrams read and not stored when the listener stopped: the queue's remainder under
+    /// pressure, or what a failed publisher could not publish. Payload bytes alongside.
+    lost_at_shutdown: u64,
+    lost_at_shutdown_bytes: u64,
+}
+
+/// Why a frame already read is kept instead of published.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HoldReason {
+    StoragePressure,
+    NoPermit,
+    /// The store failed the write for a cause that is not pressure (a latched or uncertain
+    /// store, a clock behind the archive watermark). The frame is kept and offered again on
+    /// [`STORE_FAILURE_RETRY`] until the store takes it.
+    StoreFailure,
+}
+impl HoldReason {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::StoragePressure => "storage_pressure",
+            Self::NoPermit => "no_permit",
+            Self::StoreFailure => "store_failure",
+        }
+    }
+}
+
+/// Least time between two journal lines announcing a hold, as for the pressure duty.
+const HOLD_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Holds that overlap are one episode for the journal.
+#[derive(Clone)]
+struct Episode {
+    frames: u64,
+    longest: Duration,
+    /// Whether the entering line was journaled; only then is the leaving line.
+    announced: bool,
+}
+#[derive(Clone)]
+pub(crate) struct Status {
+    receiver: sparrow_core::SyslogReceiver,
+    pub definition: SyslogListener,
+    pub address: SocketAddr,
+    pub active_connections: usize,
+    counts: Counts,
+    pub failure: Option<String>,
+    /// Start of every hold in progress, one frame per connection: at most `max_connections`.
+    holding: BTreeMap<u64, tokio::time::Instant>,
+    next_hold: u64,
+    episode: Option<Episode>,
+    announced_at: Option<tokio::time::Instant>,
+    /// Receive buffer and kernel drop counter; present for a UDP listener started by the worker.
+    kernel: Option<crate::udp_kernel::Kernel>,
+    /// Datagrams in the UDP queue, the one at the head of the publisher included until it is
+    /// stored or counted, and the budget they use (length plus [`ENTRY_OVERHEAD`] each).
+    queued_datagrams: usize,
+    queued_bytes: u64,
+    /// When the reader stopped on a full queue, while it waits.
+    waiting_since: Option<tokio::time::Instant>,
+    full: Option<udp_hold::FullEpisode>,
+    full_announced_at: Option<tokio::time::Instant>,
+    /// Set when an episode begins, so the next time the queue drains the kernel count is read
+    /// again; cleared by that read. Without it every drain to empty would read the file.
+    sample_due: bool,
+    /// The payload bytes of the datagram the reader holds while it waits for room.
+    in_hand: Option<usize>,
+    /// When the last past-the-watermark stamp was journaled.
+    fenced_announced_at: Option<tokio::time::Instant>,
+}
+#[derive(Clone)]
+struct Metrics(Arc<Mutex<Status>>);
+impl Metrics {
+    fn update(&self, update: impl FnOnce(&mut Status) -> io::Result<()>) -> io::Result<()> {
+        let mut status = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("syslog status poisoned"))?;
+        update(&mut status)
+    }
+    fn snapshot(&self) -> io::Result<Status> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("syslog status poisoned"))?
+            .clone())
+    }
+    /// Read the kernel drop counter now. Called only at events: a status request and the reader
+    /// leaving a wait.
+    ///
+    /// The file read happens on a copy of the kernel evidence, outside the status mutex, so a
+    /// slow read never holds up the counters the intake paths update. A read is one small file
+    /// whose size follows the UDP sockets of the network namespace, taken once per event. It
+    /// stays a plain read on the calling thread because every caller is a synchronous status
+    /// path or the reader itself, which has just left a wait.
+    fn sample_kernel(&self) -> io::Result<()> {
+        let Some(kernel) = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("syslog status poisoned"))?
+            .kernel
+            .clone()
+            .filter(|kernel| !kernel.finished)
+        else {
+            return Ok(());
+        };
+        let counter = kernel.read();
+        self.update(|status| {
+            if let Some(kernel) = status.kernel.as_mut() {
+                kernel.record(counter);
+            }
+            Ok(())
+        })
+    }
+    /// Take the last sample while the socket is open, freeze the count and journal it.
+    fn finish_kernel(&self) -> io::Result<()> {
+        let mut line = None;
+        self.update(|status| {
+            if let Some(kernel) = status.kernel.as_mut() {
+                kernel.finish();
+                line = Some(match &kernel.counter {
+                    crate::udp_kernel::Counter::Available(drops) => format!(
+                        "sparrowd: syslog listener {}: stopped; the kernel dropped {drops} datagram(s) for this socket (final count)",
+                        status.definition.id
+                    ),
+                    crate::udp_kernel::Counter::Unavailable(reason) => format!(
+                        "sparrowd: syslog listener {}: stopped; the kernel drop count is unavailable: {reason}",
+                        status.definition.id
+                    ),
+                });
+            }
+            Ok(())
+        })?;
+        if let Some(line) = line {
+            journal(&line);
+        }
+        Ok(())
+    }
+}
+impl Status {
+    fn new(
+        receiver: sparrow_core::SyslogReceiver,
+        definition: SyslogListener,
+        address: SocketAddr,
+    ) -> Self {
+        Self {
+            receiver,
+            definition,
+            address,
+            active_connections: 0,
+            counts: Counts::default(),
+            failure: None,
+            holding: BTreeMap::new(),
+            next_hold: 0,
+            episode: None,
+            announced_at: None,
+            kernel: None,
+            queued_datagrams: 0,
+            queued_bytes: 0,
+            waiting_since: None,
+            full: None,
+            full_announced_at: None,
+            sample_due: false,
+            in_hand: None,
+            fenced_announced_at: None,
+        }
+    }
+
+    /// What one held unit is called in the journal, and what holding it does to its sender.
+    fn hold_words(&self) -> (&'static str, &'static str) {
+        match self.definition.transport {
+            SyslogTransport::Tcp => (
+                "frame(s)",
+                "each sender's TCP window closes until it clears",
+            ),
+            SyslogTransport::Udp => (
+                "datagram(s)",
+                "the reader keeps queueing arrivals until the queue is full",
+            ),
+        }
+    }
+
+    /// The kernel drop count at the last sample, when it could be read.
+    fn kernel_drops(&self) -> Option<u64> {
+        match &self.kernel.as_ref()?.counter {
+            crate::udp_kernel::Counter::Available(drops) => Some(*drops),
+            crate::udp_kernel::Counter::Unavailable(_) => None,
+        }
+    }
+
+    /// Register or continue one frame's hold at `now`; returns the journal line to print, if
+    /// any. Holds that overlap are one episode. The entering line is limited to one per
+    /// [`HOLD_REPORT_INTERVAL`], but an episode the limit suppressed is announced by its next
+    /// call once the interval has passed, so no long hold is left unannounced. A pressure hold
+    /// calls on every offer; a permit wait calls on every observer tick.
+    fn hold(
+        &mut self,
+        id: &mut Option<u64>,
+        seen: &mut [bool; 3],
+        reason: HoldReason,
+        now: tokio::time::Instant,
+    ) -> io::Result<Option<String>> {
+        if id.is_none() {
+            self.next_hold += 1;
+            self.sample_due = true;
+            *id = Some(self.next_hold);
+            self.holding.insert(self.next_hold, now);
+            self.episode
+                .get_or_insert(Episode {
+                    frames: 0,
+                    longest: Duration::ZERO,
+                    announced: false,
+                })
+                .frames += 1;
+        }
+        let slot = match reason {
+            HoldReason::StoragePressure => 0,
+            HoldReason::NoPermit => 1,
+            HoldReason::StoreFailure => 2,
+        };
+        if !seen[slot] {
+            seen[slot] = true;
+            increment(match reason {
+                HoldReason::StoragePressure => &mut self.counts.holds_storage_pressure,
+                HoldReason::NoPermit => &mut self.counts.holds_no_permit,
+                HoldReason::StoreFailure => &mut self.counts.holds_store_failure,
+            })?;
+        }
+        let quiet = self
+            .announced_at
+            .is_none_or(|at| now.duration_since(at) >= HOLD_REPORT_INTERVAL);
+        let held = self.holding.len();
+        let (unit, effect) = self.hold_words();
+        let Some(episode) = self
+            .episode
+            .as_mut()
+            .filter(|episode| !episode.announced && quiet)
+        else {
+            return Ok(None);
+        };
+        episode.announced = true;
+        self.announced_at = Some(now);
+        Ok(Some(format!(
+            "sparrowd: syslog listener {}: holding {held} {unit} under {}; {effect}",
+            self.definition.id,
+            reason.name()
+        )))
+    }
+
+    /// End one frame's hold at `now`; returns the journal line when the episode it belonged
+    /// to was announced and this was its last hold. An episode the limit never announced
+    /// ended within the report interval and shows in the counters only.
+    fn release(&mut self, id: u64, now: tokio::time::Instant) -> Option<String> {
+        let since = self.holding.remove(&id)?;
+        let waited = now.duration_since(since);
+        self.counts.longest_hold_ms = self
+            .counts
+            .longest_hold_ms
+            .max(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX));
+        if let Some(episode) = self.episode.as_mut() {
+            episode.longest = episode.longest.max(waited);
+        }
+        if !self.holding.is_empty() {
+            return None;
+        }
+        let (unit, _) = self.hold_words();
+        let episode = self.episode.take().filter(|episode| episode.announced)?;
+        Some(format!(
+            "sparrowd: syslog listener {}: hold ended; {} {unit} held, longest wait {} ms",
+            self.definition.id,
+            episode.frames,
+            episode.longest.as_millis()
+        ))
+    }
+
+    /// The longest hold, finished or still running.
+    fn longest_hold(&self) -> Duration {
+        let running = self.holding.values().map(|since| since.elapsed()).max();
+        running
+            .unwrap_or_default()
+            .max(Duration::from_millis(self.counts.longest_hold_ms))
+    }
+}
+
+/// One frame's hold on its connection. The gauge falls when it is left or dropped, so a
+/// failed or cancelled connection cannot leave it raised.
+struct Hold<'a> {
+    metrics: &'a Metrics,
+    id: Option<u64>,
+    seen: [bool; 3],
+}
+impl<'a> Hold<'a> {
+    fn new(metrics: &'a Metrics) -> Self {
+        Self {
+            metrics,
+            id: None,
+            seen: [false; 3],
+        }
+    }
+
+    /// Begin the hold if it has not begun, and count `reason` once for this frame. Called on
+    /// every refused attempt, so a long hold is announced once the report interval allows.
+    fn enter(&mut self, reason: HoldReason) -> io::Result<()> {
+        let mut line = None;
+        self.metrics.update(|status| {
+            line = status.hold(
+                &mut self.id,
+                &mut self.seen,
+                reason,
+                tokio::time::Instant::now(),
+            )?;
+            Ok(())
+        })?;
+        if let Some(line) = line {
+            journal(&line);
+        }
+        Ok(())
+    }
+
+    /// End the hold, if any, recording how long it lasted.
+    fn leave(&mut self) -> io::Result<()> {
+        let Some(id) = self.id.take() else {
+            return Ok(());
+        };
+        let mut line = None;
+        self.metrics.update(|status| {
+            line = status.release(id, tokio::time::Instant::now());
+            Ok(())
+        })?;
+        if let Some(line) = line {
+            journal(&line);
+        }
+        Ok(())
+    }
+}
+impl Drop for Hold<'_> {
+    fn drop(&mut self) {
+        // A poisoned status has nothing left to correct.
+        let _ = self.leave();
+    }
+}
+
+/// Print one journal line. Under test the line is also kept per thread, so a test can read
+/// what an operator would have seen.
+fn journal(line: &str) {
+    #[cfg(test)]
+    printed::note(line);
+    eprintln!("{line}");
+}
+
+#[cfg(test)]
+mod printed {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LINES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn note(line: &str) {
+        LINES.with(|lines| lines.borrow_mut().push(line.to_owned()));
+    }
+
+    /// Every line printed on this thread so far (each test runs on its own thread).
+    pub(super) fn lines() -> Vec<String> {
+        LINES.with(|lines| lines.borrow().clone())
+    }
+}
+
+fn increment(counter: &mut u64) -> io::Result<()> {
+    *counter = counter
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("syslog intake counter overflow"))?;
+    Ok(())
+}
+
+/// Shared finite runtime status registry, including listeners with no retained packets.
+#[derive(Clone, Default)]
+pub struct SyslogRegistry(Arc<Mutex<Vec<Metrics>>>);
+impl SyslogRegistry {
+    /// Every listener's status, reading each UDP kernel counter now: this is a status request.
+    pub(crate) fn snapshot(&self) -> io::Result<Vec<Status>> {
+        // The registry mutex is released before any /proc read.
+        self.listeners()?
+            .iter()
+            .map(|metrics| {
+                metrics.sample_kernel()?;
+                metrics.snapshot()
+            })
+            .collect()
+    }
+    fn listeners(&self) -> io::Result<Vec<Metrics>> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("syslog registry poisoned"))?
+            .clone())
+    }
+    pub(crate) fn sources(&self) -> io::Result<Vec<sparrow_core::SourceSyslogBinding>> {
+        // Ids only: no kernel counter is read.
+        Ok(self
+            .listeners()?
+            .iter()
+            .map(Metrics::snapshot)
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|status| sparrow_core::SourceSyslogBinding {
+                source: status.definition.source,
+                listener_id: status.definition.id,
+            })
+            .collect())
+    }
+}
+
+enum Socket {
+    Tcp(TcpListener),
+    Udp(UdpSocket),
+}
+
+/// Bind the socket DEFINITION describes, enlarging a UDP receive buffer and starting its kernel
+/// drop counter. Used at start and each time a failed listener is bound again.
+async fn bind_socket(
+    definition: &SyslogListener,
+) -> io::Result<(Socket, SocketAddr, Option<crate::udp_kernel::Kernel>)> {
+    let mut kernel = None;
+    let (socket, address) = match definition.transport {
+        SyslogTransport::Tcp => {
+            let socket = TcpListener::bind(definition.address).await?;
+            let address = socket.local_addr()?;
+            (Socket::Tcp(socket), address)
+        }
+        SyslogTransport::Udp => {
+            let socket = UdpSocket::bind(definition.address).await?;
+            let address = socket.local_addr()?;
+            let buffer = crate::udp_kernel::request_buffer(
+                &socket,
+                crate::udp_kernel::REQUESTED_RCVBUF_BYTES,
+            )
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("syslog listener {}: {error}", definition.id),
+                )
+            })?;
+            let rmem_max = crate::udp_kernel::rmem_max()
+                .map_or_else(|| "unreadable".to_owned(), |limit| limit.to_string());
+            // A refused enlarge does not stop the daemon taking syslog: it keeps the
+            // default buffer and says so, here and in status.
+            journal(&match &buffer.enlarge_error {
+                None => format!(
+                    "sparrowd: syslog listener {}: receive buffer requested {} bytes, kernel granted {} bytes (net.core.rmem_max {rmem_max})",
+                    definition.id, buffer.requested, buffer.granted,
+                ),
+                Some(error) => format!(
+                    "sparrowd: syslog listener {}: receive buffer enlarge failed: {error}; keeping the default buffer of {} bytes (requested {} bytes, net.core.rmem_max {rmem_max})",
+                    definition.id, buffer.granted, buffer.requested,
+                ),
+            });
+            kernel = Some(
+                crate::udp_kernel::Kernel::new(&socket, address, buffer).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("syslog listener {}: {error}", definition.id),
+                    )
+                })?,
+            );
+            (Socket::Udp(socket), address)
+        }
+    };
+    Ok((socket, address, kernel))
+}
+
+/// Owned listener group; shutdown joins admitted writes before the daemon's final WAL fence.
+pub struct SyslogWorker {
+    stop: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<io::Result<()>>,
+    /// Closes when the task ends, by return, panic or cancellation.
+    ended: tokio::sync::oneshot::Receiver<()>,
+}
+impl SyslogWorker {
+    /// Bind every configured socket before starting bounded ingestion tasks.
+    pub async fn start(
+        store: sparrow_core::Store,
+        definitions: &[SyslogListener],
+        operations: Arc<Semaphore>,
+        registry: SyslogRegistry,
+        wake: PressureWake,
+        spill_dir: &std::path::Path,
+    ) -> io::Result<Self> {
+        validate(definitions)?;
+        let mut sockets = Vec::new();
+        let mut metrics = Vec::new();
+        for definition in definitions {
+            let (socket, address, kernel) = bind_socket(definition).await?;
+            let mut status = Status::new(
+                sparrow_core::SyslogReceiver::new(
+                    &definition.id,
+                    match (definition.transport, definition.framing) {
+                        (SyslogTransport::Udp, _) => "udp",
+                        (SyslogTransport::Tcp, Some(SyslogFraming::OctetCounting)) => {
+                            "tcp_octet_counting"
+                        }
+                        (SyslogTransport::Tcp, Some(SyslogFraming::Lf)) => "tcp_lf",
+                        (SyslogTransport::Tcp, Some(SyslogFraming::CrLf)) => "tcp_cr_lf",
+                        _ => return Err(io::Error::other("TCP receiver framing missing")),
+                    },
+                )
+                .map_err(io::Error::other)?,
+                definition.clone(),
+                address,
+            );
+            status.kernel = kernel;
+            let metric = Metrics(Arc::new(Mutex::new(status)));
+            let spill = Arc::new(Spill::new(spill_dir, &definition.id));
+            sockets.push((socket, metric.clone(), spill));
+            metrics.push(metric);
+        }
+        *registry
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("syslog registry poisoned"))? = metrics;
+        let (stop, receiver) = watch::channel(false);
+        let shutdown = stop.clone();
+        let (alive, ended) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _alive = alive;
+            let mut listeners = JoinSet::new();
+            for (socket, metrics, spill) in sockets {
+                listeners.spawn(supervise(
+                    socket,
+                    metrics,
+                    store.clone(),
+                    operations.clone(),
+                    receiver.clone(),
+                    PressureHold::new(wake.clone(), spill),
+                ));
+            }
+            finish_tasks(Ok(()), &mut listeners, &shutdown).await
+        });
+        Ok(Self { stop, task, ended })
+    }
+    /// Whether the worker has terminated.
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+    /// Resolve when the worker terminates, for the daemon health gate. Await it at most once.
+    pub async fn ended(&mut self) {
+        // The task never sends: its sender closes as it ends, the only outcome.
+        let _ = (&mut self.ended).await;
+    }
+    /// Stop admission and wait for every in-flight atomic publication.
+    pub async fn shutdown(self) -> io::Result<()> {
+        self.stop.send_replace(true);
+        self.task.await.map_err(io::Error::other)?
+    }
+}
+
+/// Stop the entire intake group on failure, but join every admitted child first.
+async fn finish_tasks(
+    initial: io::Result<()>,
+    tasks: &mut JoinSet<io::Result<()>>,
+    stop: &watch::Sender<bool>,
+) -> io::Result<()> {
+    let mut failures = Vec::new();
+    if let Err(error) = initial {
+        stop.send_replace(true);
+        failures.push(error.to_string());
+    }
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result.map_err(io::Error::other).and_then(|value| value) {
+            stop.send_replace(true);
+            failures.push(error.to_string());
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(failures.join("; ")))
+    }
+}
+
+/// What one attempt to store a packet came to.
+#[derive(Debug, PartialEq, Eq)]
+enum Published {
+    /// Durably stored and counted accepted.
+    Stored,
+    /// Refused and counted; the caller does not retry it.
+    Refused,
+    /// The store answered `STORAGE_PRESSURE` and the caller asked to keep the packet: nothing
+    /// was counted, and the same bytes may be offered again.
+    Pressured,
+    /// The store failed the write for a cause that is not pressure and not this packet's own:
+    /// the text names it. Nothing was counted; the caller keeps the packet and offers it again.
+    Failed(String),
+}
+
+/// Where a packet came from, and so what instant stamps it.
+#[derive(Clone, Copy)]
+enum Intake {
+    /// A TCP frame: stamped when it is committed.
+    Tcp,
+    /// A UDP datagram: stamped with the instant the reader took it off the socket.
+    Udp { read_at: u64 },
+}
+impl Intake {
+    const fn stamp(self) -> Option<u64> {
+        match self {
+            Self::Tcp => None,
+            Self::Udp { read_at } => Some(read_at),
+        }
+    }
+}
+
+/// Which instant a stored packet carries.
+#[derive(Clone, Copy)]
+enum Stamped {
+    /// The instant it was read, or for a TCP frame the commit instant.
+    Read,
+    /// The commit instant, because the archive watermark refused the read instant.
+    Commit,
+    /// The instant just past the archive watermark, because it refused the commit instant too.
+    PastWatermark {
+        read_at: u64,
+        commit: u64,
+        stamp: u64,
+    },
+}
+
+/// A packet in hand and where it came from.
+struct Packet {
+    bytes: Arc<[u8]>,
+    intake: Intake,
+}
+
+/// Publish the frames an earlier stop spilled, in order, before this listener accepts a
+/// connection. A frame the store refuses for pressure is held as a live frame is, until the
+/// store takes it or the listener stops. Returns `true` once the file is empty, and `false` when
+/// a stop ended the drain: every frame the store has not taken is then rewritten to the file.
+/// A frame the store refuses otherwise fails the listener and keeps its file.
+async fn publish_spilled(
+    store: &sparrow_core::Store,
+    spill: &Spill,
+    metrics: &Metrics,
+    operations: &Arc<Semaphore>,
+    stop: &mut watch::Receiver<bool>,
+    wake: &mut Waiter,
+) -> io::Result<bool> {
+    let spilled = spill.read()?;
+    let definition = metrics.snapshot()?.definition;
+    if spilled.torn_bytes != 0 {
+        journal(&format!(
+            "sparrowd: syslog listener {}: spill {} ends in {} bytes of a record cut off by a crash; that frame was never synced and is dropped",
+            definition.id,
+            spill.path().display(),
+            spilled.torn_bytes,
+        ));
+    }
+    let frames = spilled.frames;
+    let mut next = 0;
+    let mut outcome = Ok(true);
+    while let Some(frame) = frames.get(next) {
+        let packet = Packet {
+            bytes: frame.bytes.clone(),
+            intake: Intake::Tcp,
+        };
+        match publish_held(
+            store,
+            &frame.source,
+            packet,
+            metrics,
+            operations,
+            stop,
+            wake,
+        )
+        .await
+        {
+            Ok(Published::Stored) => next += 1,
+            // `publish_held` returns `Failed` never: a stop turns it into `Pressured`.
+            Ok(Published::Pressured | Published::Failed(_)) => {
+                outcome = Ok(false);
+                break;
+            }
+            Ok(Published::Refused) => {
+                outcome = Err(io::Error::other(format!(
+                    "syslog spill {}: frame {} of {} was refused by the store; the file keeps it and the listener does not accept connections",
+                    spill.path().display(),
+                    next + 1,
+                    frames.len(),
+                )));
+                break;
+            }
+            Err(error) => {
+                outcome = Err(error);
+                break;
+            }
+        }
+    }
+    spill.replace(&frames[next..])?;
+    outcome
+}
+
+/// What ends a held frame's wait and what keeps it past a stop: the daemon's pressure wake and the
+/// listener's spill file. A listener hands both to each connection together.
+struct PressureHold {
+    wake: PressureWake,
+    spill: Arc<Spill>,
+}
+
+impl PressureHold {
+    fn new(wake: PressureWake, spill: Arc<Spill>) -> Self {
+        Self { wake, spill }
+    }
+}
+
+/// Refuse to start while a configured TCP listener has no writable spill directory, or while the
+/// directory holds a file that no configured TCP listener owns: its frames would never be
+/// published, so the scan runs for every configuration, including one without a TCP listener.
+/// Only a TCP listener requires the directory to exist and be writable.
+pub fn check_spill_owners(dir: &std::path::Path, listeners: &[SyslogListener]) -> io::Result<()> {
+    if listeners
+        .iter()
+        .any(|listener| listener.transport == SyslogTransport::Tcp)
+    {
+        prepare_spill_directory(dir)?;
+    }
+    let owned: std::collections::BTreeSet<std::ffi::OsString> = listeners
+        .iter()
+        .filter(|listener| listener.transport == SyslogTransport::Tcp)
+        .flat_map(|listener| {
+            let spill = Spill::new(dir, &listener.id);
+            [spill.path().to_owned(), spill.partial_path()]
+        })
+        .filter_map(|path| path.file_name().map(std::ffi::OsStr::to_owned))
+        .collect();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // A path that is missing or runs through a file holds no spill file.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("syslog spill directory {}: {error}", dir.display()),
+            ));
+        }
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !owned.contains(&entry.file_name()) {
+            return Err(io::Error::other(format!(
+                "syslog spill {} is not owned by any configured TCP syslog listener, so its frames would never be published; restore the listener or move the file aside by hand",
+                entry.path().display(),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Create the spill directory if it is missing and prove the daemon can write in it, so a stop
+/// under pressure never finds out that the spill cannot be kept. The failure names the directory
+/// and the host steps that make it writable.
+fn prepare_spill_directory(dir: &std::path::Path) -> io::Result<()> {
+    let refuse = |action: &str, error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "syslog spill directory {}: cannot {action}: {error}; a TCP syslog listener needs a directory the daemon can write (docs/deployment.md, \"Syslog TCP listener install steps\")",
+                dir.display()
+            ),
+        )
+    };
+    std::fs::create_dir_all(dir).map_err(|error| refuse("create it", error))?;
+    let probe = dir.join(".write-probe");
+    std::fs::File::create(&probe).map_err(|error| refuse("write in it", error))?;
+    std::fs::remove_file(&probe).map_err(|error| refuse("remove its write probe", error))
+}
+
+/// Offer one packet to the store. A `STORAGE_PRESSURE` answer always leaves the packet with the
+/// caller, which holds it, spills it or counts it, so no packet is discarded here for pressure.
+/// A packet with a `stamp` that the store refuses as behind the archive watermark is offered
+/// once more with the commit instant and counted restamped: a log is never refused for its stamp.
+async fn publish(
+    store: sparrow_core::Store,
+    source: String,
+    bytes: Arc<[u8]>,
+    metrics: &Metrics,
+    stamp: Option<u64>,
+) -> io::Result<Published> {
+    enum Attempt {
+        Stored { failed: bool, stamped: Stamped },
+        Refused { durable: bool },
+        Pressured,
+        Failed(String),
+    }
+    let receiver = metrics.snapshot()?.receiver;
+    let result = tokio::task::spawn_blocking(move || {
+        let commit = crate::now()?;
+        let mut now = stamp.unwrap_or(commit);
+        let mut stamped = Stamped::Read;
+        let artifact = match loop {
+            match store.ingest_received_syslog(&source, &receiver, &bytes, now) {
+                // Only a stamped packet is restamped; the commit instant of a TCP frame
+                // behind the watermark is a clock regression and stays an error.
+                Err(error) if error.code == sparrow_core::ARCHIVE_WATERMARK => {
+                    let Some(read_at) = stamp else {
+                        break Err(error);
+                    };
+                    let next = if matches!(stamped, Stamped::Read) {
+                        stamped = Stamped::Commit;
+                        crate::now()?
+                    } else {
+                        // The clock is behind the watermark too: a log is never refused for
+                        // its stamp, so take the instant just past the fence. It always
+                        // advances, so a moving watermark cannot loop this forever.
+                        let fence = store
+                            .archive_state()?
+                            .and_then(|state| state.fence_millis())
+                            .and_then(|fence| fence.checked_add(1))
+                            .filter(|next| *next > now);
+                        let Some(next) = fence else {
+                            break Err(error);
+                        };
+                        stamped = Stamped::PastWatermark {
+                            read_at,
+                            commit,
+                            stamp: next,
+                        };
+                        next
+                    };
+                    now = next;
+                }
+                result => break result,
+            }
+        } {
+            Ok(artifact) => artifact,
+            Err(error) if error.code == "STORAGE_PRESSURE" => {
+                return Ok(Attempt::Pressured);
+            }
+            // A full receiver-window registry no longer refuses (#215): the packet is stored
+            // without a window and the store counts the lost evidence.
+            Err(error) if error.code == "RESOURCE_LIMIT" => {
+                return record_discard(
+                    &store,
+                    &source,
+                    &receiver,
+                    sparrow_core::ReceiverDiscard::Refused,
+                    now,
+                )
+                .map(|durable| Attempt::Refused { durable });
+            }
+            Err(error) if store_wide(error.code) => return Ok(Attempt::Failed(error.to_string())),
+            Err(error) => return Err(error),
+        };
+        let record = store.record(artifact.record_ids.first().ok_or_else(|| {
+            sparrow_core::Error::new(
+                "STORAGE_FAILURE",
+                "syslog publication has no packet occurrence",
+            )
+        })?)?;
+        let snapshot = record.syslog.ok_or_else(|| {
+            sparrow_core::Error::new(
+                "STORAGE_FAILURE",
+                "syslog publication has no protocol snapshot",
+            )
+        })?;
+        Ok::<_, sparrow_core::Error>(Attempt::Stored {
+            failed: snapshot.diagnostic.is_some(),
+            stamped,
+        })
+    })
+    .await
+    .map_err(io::Error::other)?;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) if store_wide(error.code) => return Ok(Published::Failed(error.to_string())),
+        Err(error) => return Err(io::Error::other(error)),
+    };
+    match result {
+        Attempt::Stored { failed, stamped } => {
+            let mut line = None;
+            metrics.update(|status| {
+                increment(&mut status.counts.accepted)?;
+                match stamped {
+                    Stamped::Read => {}
+                    Stamped::Commit => increment(&mut status.counts.restamped)?,
+                    Stamped::PastWatermark {
+                        read_at,
+                        commit,
+                        stamp,
+                    } => {
+                        increment(&mut status.counts.restamped_past_watermark)?;
+                        line = status.past_watermark_line(
+                            read_at,
+                            commit,
+                            stamp,
+                            tokio::time::Instant::now(),
+                        );
+                    }
+                }
+                if failed {
+                    increment(&mut status.counts.interpretation_failures)?;
+                }
+                if status
+                    .failure
+                    .as_deref()
+                    .is_some_and(|text| text.starts_with(STORE_FAILURE_STATUS))
+                {
+                    status.failure = None;
+                }
+                Ok(())
+            })?;
+            if let Some(line) = line {
+                journal(&line);
+            }
+            Ok(Published::Stored)
+        }
+        Attempt::Refused { durable } => {
+            metrics.update(|status| {
+                increment(&mut status.counts.refused)?;
+                status.failure = Some(if durable {
+                    "packet refused by storage admission".into()
+                } else {
+                    NOT_DURABLE.into()
+                });
+                Ok(())
+            })?;
+            Ok(Published::Refused)
+        }
+        Attempt::Pressured => Ok(Published::Pressured),
+        Attempt::Failed(text) => Ok(Published::Failed(text)),
+    }
+}
+
+/// Whether a store error code names a state of the whole store, not of one packet: a latched
+/// or uncertain store (`STORAGE_FAILURE`), a clock behind the archive watermark, a store that
+/// is stopping. The state clears when its cause does, so the packet is kept and offered
+/// again instead of ending the listener or being discarded.
+fn store_wide(code: &str) -> bool {
+    matches!(
+        code,
+        "STORAGE_FAILURE" | sparrow_core::ARCHIVE_WATERMARK | "SHUTTING_DOWN"
+    )
+}
+
+/// How long a frame refused for a store failure waits before it is offered again when no
+/// pressure wake arrives. A latched store clears only when the daemon reopens it or an operator
+/// acts, so a fast cadence gains nothing; a minute would leave senders stalled long after the
+/// cause is gone. Five seconds is one attempt (one blocking store call and, at most, one
+/// journal line per change of text) a few times a minute per held frame.
+const STORE_FAILURE_RETRY: Duration = Duration::from_secs(5);
+
+/// Store one frame read from a TCP connection, holding it while the store refuses it for
+/// pressure or no operation permit is free (#243). The caller reads no further frame until this
+/// returns, so the sender's window closes and the sender holds. A frame held for pressure
+/// blocks on `wake`, the stop and nothing else, and its same bytes are offered again at each
+/// wake; it owns no timer. The daemon sends the wake at every ending it can see, and the
+/// maintenance worker's one observation wakes every held frame at its one-second cadence
+/// for the endings it cannot (see `crate::pressure_wake`). A stop ends the hold: the frame gets
+/// one last attempt and, if refused for pressure, is returned as `Pressured` for the caller to
+/// spill (TCP) or count (UDP) instead of being held. A frame waiting for a permit blocks on the
+/// permit and, so the journal can announce its wait once the report interval has passed, on the
+/// same observer tick; it never retries on a clock.
+///
+/// A UDP datagram is stamped with its read instant. A stop leaves it the same way, so the
+/// caller counts the rest of its queue as lost.
+async fn publish_held(
+    store: &sparrow_core::Store,
+    source: &str,
+    packet: Packet,
+    metrics: &Metrics,
+    operations: &Arc<Semaphore>,
+    stop: &mut watch::Receiver<bool>,
+    wake: &mut Waiter,
+) -> io::Result<Published> {
+    let Packet { bytes, intake } = packet;
+    let mut hold = Hold::new(metrics);
+    // Counted while the frame is held for pressure, so the observer tick wakes it.
+    let mut pressured = None;
+    loop {
+        let permit = match operations.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                hold.enter(HoldReason::NoPermit)?;
+                // A stop does not interrupt this wait: the frame must still be published, and
+                // that takes a permit from the operation budget shutdown waits on anyway.
+                // The wait blocks on the permit and, to announce a long wait the report
+                // interval suppressed at entry, on the observer tick (counted as held so the
+                // tick sends it). The one acquire future is kept across ticks: dropping it
+                // would give up the frame's place in the fair queue.
+                let _held = wake.hold();
+                wake.mark_seen();
+                let acquire = operations.clone().acquire_owned();
+                tokio::pin!(acquire);
+                loop {
+                    tokio::select! {
+                        permit = &mut acquire => break permit.map_err(io::Error::other)?,
+                        () = wake.woken() => hold.enter(HoldReason::NoPermit)?,
+                    }
+                }
+            }
+            Err(error @ TryAcquireError::Closed) => return Err(io::Error::other(error)),
+        };
+        // A wake that lands during the attempt must still end the wait after it.
+        wake.mark_seen();
+        let stopping = *stop.borrow();
+        let published = publish(
+            store.clone(),
+            source.to_owned(),
+            bytes.clone(),
+            metrics,
+            intake.stamp(),
+        )
+        .await?;
+        drop(permit);
+        let reason = match &published {
+            Published::Pressured => HoldReason::StoragePressure,
+            Published::Failed(_) => HoldReason::StoreFailure,
+            _ => {
+                hold.leave()?;
+                return Ok(published);
+            }
+        };
+        if stopping {
+            // A stop ends the hold: the caller spills or counts the packet.
+            hold.leave()?;
+            return Ok(Published::Pressured);
+        }
+        pressured.get_or_insert_with(|| wake.hold());
+        hold.enter(reason)?;
+        if let Published::Failed(text) = &published {
+            note_store_failure(metrics, text)?;
+        }
+        tokio::select! {
+            changed = stop.changed() => { changed.map_err(io::Error::other)?; },
+            () = wake.woken() => {},
+            () = tokio::time::sleep(STORE_FAILURE_RETRY), if reason == HoldReason::StoreFailure => {},
+        }
+    }
+}
+
+/// Start of the status failure text while a store failure holds a packet.
+const STORE_FAILURE_STATUS: &str = "store failure holds intake: ";
+
+/// Count and journal an error the listener survives or restarts on, and show it in status.
+fn note_listener_error(metrics: &Metrics, what: &str, error: &dyn std::fmt::Display) {
+    let mut id = String::new();
+    let _ = metrics.update(|status| {
+        id.clone_from(&status.definition.id);
+        increment(&mut status.counts.listener_errors)?;
+        status.failure = Some(format!("{what}: {error}"));
+        Ok(())
+    });
+    journal(&format!("sparrowd: syslog listener {id}: {what}: {error}"));
+}
+
+/// Wait out the `failures`th consecutive failure of one listener operation, or a stop. The wait
+/// doubles from 10 ms to a 1 s ceiling. A descriptor shortage (EMFILE) or a rebind race clears
+/// within about a connection's life, so the ceiling bounds the retry rate to one a second,
+/// which also bounds the journal and the CPU a persistent fault costs; the floor keeps a
+/// transient fault from costing a second.
+async fn listener_backoff(failures: u32, stop: &mut watch::Receiver<bool>) {
+    let wait = Duration::from_millis(10)
+        .saturating_mul(1 << failures.saturating_sub(1).min(7))
+        .min(Duration::from_secs(1));
+    tokio::select! {
+        _ = stop.changed() => {}
+        () = tokio::time::sleep(wait) => {}
+    }
+}
+
+/// Show the store failure that holds a packet in the listener's status, and journal it once per
+/// change of its text.
+fn note_store_failure(metrics: &Metrics, text: &str) -> io::Result<()> {
+    let mut changed = false;
+    metrics.update(|status| {
+        let current = format!("{STORE_FAILURE_STATUS}{text}");
+        changed = status.failure.as_deref() != Some(current.as_str());
+        status.failure = Some(current);
+        Ok(())
+    })?;
+    if changed {
+        let id = metrics.snapshot()?.definition.id;
+        journal(&format!(
+            "sparrowd: syslog listener {id}: the store failed a write ({text}); the packet is held and offered again every {} s until it is taken",
+            STORE_FAILURE_RETRY.as_secs()
+        ));
+    }
+    Ok(())
+}
+
+const NOT_DURABLE: &str = "storage pressure refused the discard count; discards are counted in memory only until writes resume";
+
+/// Count a discard durably, or report `false` when storage pressure (including the
+/// free-space floor) refuses the count. Intake keeps running and the in-memory
+/// counters still advance.
+fn record_discard(
+    store: &sparrow_core::Store,
+    source: &str,
+    receiver: &sparrow_core::SyslogReceiver,
+    reason: sparrow_core::ReceiverDiscard,
+    now: u64,
+) -> Result<bool, sparrow_core::Error> {
+    match store.discard_syslog(source, receiver, reason, now) {
+        Ok(_) => Ok(true),
+        Err(error) if error.code == "STORAGE_PRESSURE" => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// One bounded waiter per admitted listener/connection; shutdown joins the control write.
+async fn discard(
+    store: &sparrow_core::Store,
+    metrics: &Metrics,
+    operations: &Arc<Semaphore>,
+    reason: sparrow_core::ReceiverDiscard,
+) -> io::Result<()> {
+    let permit = operations
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(io::Error::other)?;
+    let status = metrics.snapshot()?;
+    let store = store.clone();
+    let durable = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        record_discard(
+            &store,
+            &status.definition.source,
+            &status.receiver,
+            reason,
+            crate::now()?,
+        )
+    })
+    .await
+    .map_err(io::Error::other)?
+    .map_err(io::Error::other)?;
+    metrics.update(|status| {
+        if !durable {
+            status.failure = Some(NOT_DURABLE.into());
+        }
+        increment(match reason {
+            sparrow_core::ReceiverDiscard::Refused => &mut status.counts.refused,
+            sparrow_core::ReceiverDiscard::Truncated => &mut status.counts.truncated,
+            sparrow_core::ReceiverDiscard::FramingFailure => &mut status.counts.framing_failures,
+            sparrow_core::ReceiverDiscard::TimedOut => &mut status.counts.timed_out,
+        })
+    })
+}
+
+async fn listen(
+    socket: Socket,
+    metrics: Metrics,
+    store: sparrow_core::Store,
+    operations: Arc<Semaphore>,
+    mut stop: watch::Receiver<bool>,
+    shutdown: watch::Sender<bool>,
+    hold: PressureHold,
+) -> io::Result<()> {
+    let PressureHold { wake, spill } = hold;
+    let definition = metrics.snapshot()?.definition;
+    match socket {
+        Socket::Tcp(listener) => {
+            let mut waiter = wake.subscribe();
+            if !publish_spilled(
+                &store,
+                &spill,
+                &metrics,
+                &operations,
+                &mut stop,
+                &mut waiter,
+            )
+            .await?
+            {
+                return Ok(());
+            }
+            let connections = Arc::new(Semaphore::new(definition.max_connections));
+            let roster = Arc::new(Roster::default());
+            let mut tasks = JoinSet::new();
+            // The free-space floor does not stop accepting (#257): a frame the store refuses under
+            // it is held unread past (#243), whatever the accept state, so the sender's window
+            // closes and it holds, and the connection ceiling below bounds the connections.
+            // At the ceiling one arrival is held while the longest-idle connection is closed
+            // at a frame boundary for it; it is never refused.
+            let mut pending: Option<tokio::net::TcpStream> = None;
+            let mut evicting = false;
+            let mut accept_failures = 0_u32;
+            let serving = async {
+            loop {
+                if *stop.borrow() { break; }
+                tokio::select! {
+                    changed = stop.changed() => { changed.map_err(io::Error::other)?; if *stop.borrow() { break; } },
+                    result = tasks.join_next(), if !tasks.is_empty() => {
+                        // One connection's failure ends that connection, not the listener.
+                        if let Some(result) = result
+                            && let Err(error) = result.map_err(io::Error::other)?
+                        {
+                            note_listener_error(&metrics, "a connection failed", &error);
+                        }
+                    },
+                    accepted = listener.accept(), if pending.is_none() => {
+                        match accepted {
+                            Ok((stream, _)) => {
+                                pending = Some(stream);
+                                evicting = false;
+                                if std::mem::take(&mut accept_failures) != 0 {
+                                    let _ = metrics.update(|status| {
+                                        if status.failure.as_deref().is_some_and(|text| text.starts_with("accept failed")) {
+                                            status.failure = None;
+                                        }
+                                        Ok(())
+                                    });
+                                }
+                            }
+                            Err(error) => {
+                                accept_failures = accept_failures.saturating_add(1);
+                                note_listener_error(&metrics, "accept failed", &error);
+                                listener_backoff(accept_failures, &mut stop).await;
+                            }
+                        }
+                    }
+                    _ = roster.idled.notified(), if pending.is_some() && !evicting && connections.available_permits() == 0 => {}
+                    permit = connections.clone().acquire_owned(), if pending.is_some() => {
+                        let permit = permit.map_err(io::Error::other)?;
+                        let Some(stream) = pending.take() else { continue; };
+                        let lease = roster.enroll()?;
+                        metrics.update(|status| { status.active_connections += 1; Ok(()) })?;
+                        let metrics = metrics.clone(); let store = store.clone(); let operations = operations.clone(); let stop = stop.clone(); let wake = wake.clone(); let spill = spill.clone();
+                        tasks.spawn(async move {
+                            let _permit = permit;
+                            let result = receive_tcp(BufReader::with_capacity(4096, stream), &metrics, store, operations, stop, lease, PressureHold::new(wake, spill)).await;
+                            metrics.update(|status| { status.active_connections = status.active_connections.checked_sub(1).ok_or_else(|| io::Error::other("syslog connection counter underflow"))?; Ok(()) })?;
+                            result
+                        });
+                    }
+                }
+                if pending.is_some() && !evicting && connections.available_permits() == 0 {
+                    evicting = roster.evict_longest_idle()?;
+                }
+            }
+            Ok(())
+            }.await;
+            drop(listener);
+            finish_tasks(serving, &mut tasks, &shutdown).await
+        }
+        Socket::Udp(socket) => {
+            udp_hold::listen_udp(
+                socket,
+                metrics,
+                store,
+                operations,
+                stop,
+                wake,
+                udp_hold::wall_clock(),
+            )
+            .await
+        }
+    }
+}
+
+/// A listener that ran this long before failing was healthy, so its failure count starts over.
+/// One minute is longer than any backoff the listener waits (`listener_backoff` is at most a
+/// second) and than a bind race lasts, and short enough that a fault recurring every few
+/// minutes is not punished with a stale count.
+const HEALTHY_RUN: Duration = Duration::from_secs(60);
+
+/// Run one listener for the life of the daemon. An error that ends it (a failed bind, a failed
+/// receive, an unexpected store error, a failed connection setup) does not end the daemon or
+/// its sibling listeners: it is counted, journaled and shown in status, and the listener is
+/// bound again after a backoff, until a stop. Only a stop ends it, with the error the stopping
+/// listener reported, if any.
+async fn supervise(
+    first: Socket,
+    metrics: Metrics,
+    store: sparrow_core::Store,
+    operations: Arc<Semaphore>,
+    mut stop: watch::Receiver<bool>,
+    hold: PressureHold,
+) -> io::Result<()> {
+    let mut socket = Some(first);
+    let mut failures = 0_u32;
+    loop {
+        let bound = match socket.take() {
+            Some(bound) => bound,
+            None => {
+                let definition = metrics.snapshot()?.definition;
+                match bind_socket(&definition).await {
+                    Ok((bound, address, kernel)) => {
+                        metrics.update(|status| {
+                            status.address = address;
+                            status.kernel = kernel;
+                            Ok(())
+                        })?;
+                        journal(&format!(
+                            "sparrowd: syslog listener {}: bound again on {address}",
+                            definition.id
+                        ));
+                        bound
+                    }
+                    Err(error) => {
+                        failures = failures.saturating_add(1);
+                        note_listener_error(&metrics, "bind failed", &error);
+                        listener_backoff(failures, &mut stop).await;
+                        if *stop.borrow() {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+        // This incarnation's own stop: its failure stops its own connections and no sibling.
+        let (local, local_stop) = watch::channel(false);
+        let began = tokio::time::Instant::now();
+        let listening = listen(
+            bound,
+            metrics.clone(),
+            store.clone(),
+            operations.clone(),
+            local_stop,
+            local.clone(),
+            PressureHold::new(hold.wake.clone(), hold.spill.clone()),
+        );
+        tokio::pin!(listening);
+        let mut forwarded = false;
+        let result = loop {
+            tokio::select! {
+                result = &mut listening => break result,
+                changed = stop.changed(), if !forwarded => {
+                    changed.map_err(io::Error::other)?;
+                    if *stop.borrow() {
+                        forwarded = true;
+                        local.send_replace(true);
+                    }
+                }
+            }
+        };
+        if *stop.borrow() {
+            return result;
+        }
+        match result {
+            // A listener returns without an error only for a stop.
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if began.elapsed() >= HEALTHY_RUN {
+                    failures = 0;
+                }
+                failures = failures.saturating_add(1);
+                note_listener_error(&metrics, "listener ended and is bound again", &error);
+                listener_backoff(failures, &mut stop).await;
+                if *stop.borrow() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// How the listener tells which connections are idle at a frame boundary, so a new arrival at
+/// the connection ceiling can reclaim the one idle longest instead of being refused.
+#[derive(Default)]
+struct Roster {
+    slots: Mutex<(u64, std::collections::BTreeMap<u64, Slot>)>,
+    /// Signalled whenever a connection reaches a frame boundary.
+    idled: tokio::sync::Notify,
+}
+struct Slot {
+    idle_since: Option<std::time::Instant>,
+    kick: Option<tokio::sync::oneshot::Sender<()>>,
+}
+impl Roster {
+    fn enroll(self: &Arc<Self>) -> io::Result<Lease> {
+        let (kick, kicked) = tokio::sync::oneshot::channel();
+        let mut slots = self
+            .slots
+            .lock()
+            .map_err(|_| io::Error::other("syslog roster poisoned"))?;
+        slots.0 += 1;
+        let id = slots.0;
+        slots.1.insert(
+            id,
+            Slot {
+                idle_since: None,
+                kick: Some(kick),
+            },
+        );
+        Ok(Lease {
+            roster: self.clone(),
+            id,
+            kicked,
+        })
+    }
+    /// Ask the connection idle longest to close; `false` when none is idle at a boundary.
+    fn evict_longest_idle(&self) -> io::Result<bool> {
+        let mut slots = self
+            .slots
+            .lock()
+            .map_err(|_| io::Error::other("syslog roster poisoned"))?;
+        let victim = slots
+            .1
+            .iter()
+            .filter(|(_, slot)| slot.kick.is_some())
+            .filter_map(|(id, slot)| slot.idle_since.map(|since| (since, *id)))
+            .min()
+            .map(|(_, id)| id);
+        let Some(kick) = victim.and_then(|id| slots.1.get_mut(&id)?.kick.take()) else {
+            return Ok(false);
+        };
+        // A closed receiver means the connection is already ending, which frees its slot.
+        let _ = kick.send(());
+        Ok(true)
+    }
+}
+
+/// One connection's place in the roster; dropping it leaves the roster.
+struct Lease {
+    roster: Arc<Roster>,
+    id: u64,
+    kicked: tokio::sync::oneshot::Receiver<()>,
+}
+impl Lease {
+    fn set_idle(&self, idle: bool) -> io::Result<()> {
+        let mut slots = self
+            .roster
+            .slots
+            .lock()
+            .map_err(|_| io::Error::other("syslog roster poisoned"))?;
+        if let Some(slot) = slots.1.get_mut(&self.id) {
+            slot.idle_since = idle.then(std::time::Instant::now);
+        }
+        drop(slots);
+        if idle {
+            self.roster.idled.notify_one();
+        }
+        Ok(())
+    }
+    /// Whether the listener asked this connection to close at its next frame boundary.
+    fn kicked(&mut self) -> bool {
+        self.kicked.try_recv().is_ok()
+    }
+}
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if let Ok(mut slots) = self.roster.slots.lock() {
+            slots.1.remove(&self.id);
+        }
+    }
+}
+
+/// Bytes of the frame being read. They live outside the read future so a deadline that
+/// cancels it still leaves every byte read so far to be kept. At most the store ceiling is
+/// held per connection; the rest of an oversize frame is counted and dropped as it arrives.
+#[derive(Default)]
+struct Partial {
+    bytes: Vec<u8>,
+    /// Octet-count header length, excluded from a complete frame but kept in a broken one.
+    body_start: usize,
+    /// Bytes beyond what is kept were read and dropped.
+    dropped: bool,
+}
+
+/// How the read of one frame ended; a deadline is the caller's.
+enum End {
+    Complete,
+    /// Bad octet-count start, a frame cut by end of stream, or a read error.
+    Malformed(String),
+    /// The frame deadline expired inside the frame (decided by the caller).
+    Stalled,
+    /// The daemon began stopping inside the frame (decided by the caller).
+    Stopped,
+}
+
+enum Fault {
+    Framing(String),
+    TimedOut,
+}
+
+/// The packet to publish and what was lost reading it.
+struct Frame {
+    bytes: Vec<u8>,
+    truncated: bool,
+    fault: Option<Fault>,
+}
+
+impl Partial {
+    fn into_frame(mut self, end: End) -> Frame {
+        let fault = match end {
+            End::Complete => {
+                self.bytes.drain(..self.body_start);
+                None
+            }
+            End::Malformed(reason) => Some(Fault::Framing(reason)),
+            End::Stalled => Some(Fault::TimedOut),
+            End::Stopped => Some(Fault::Framing("daemon stopping inside a frame".into())),
+        };
+        // A broken frame keeps its header too, so it can pass the store's ceiling: keep what
+        // fits and count the cut.
+        if self.bytes.len() > sparrow_core::SYSLOG_MESSAGE_BYTES {
+            self.bytes.truncate(sparrow_core::SYSLOG_MESSAGE_BYTES);
+            self.dropped = true;
+        }
+        Frame {
+            bytes: self.bytes,
+            truncated: self.dropped,
+            fault,
+        }
+    }
+}
+
+async fn receive_tcp<R: AsyncRead + Unpin>(
+    mut stream: R,
+    metrics: &Metrics,
+    store: sparrow_core::Store,
+    operations: Arc<Semaphore>,
+    mut stop: watch::Receiver<bool>,
+    mut lease: Lease,
+    hold: PressureHold,
+) -> io::Result<()> {
+    let PressureHold { wake, spill } = hold;
+    let mut wake = wake.subscribe();
+    let definition = &metrics.snapshot()?.definition;
+    let framing = definition
+        .framing
+        .ok_or_else(|| io::Error::other("TCP syslog framing missing"))?;
+    let deadline = Duration::from_millis(u64::from(definition.read_timeout_ms));
+    loop {
+        if *stop.borrow() || lease.kicked() {
+            return Ok(());
+        }
+        // At a frame boundary a quiet sender is idle, not faulty: no deadline runs here.
+        lease.set_idle(true)?;
+        let first = tokio::select! {
+            biased;
+            first = read_first(&mut stream) => first,
+            _ = &mut lease.kicked => return Ok(()),
+            changed = stop.changed() => { changed.map_err(io::Error::other)?; continue; },
+        };
+        lease.set_idle(false)?;
+        let first = match first {
+            Ok(Some(first)) => first,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                discard(
+                    &store,
+                    metrics,
+                    &operations,
+                    sparrow_core::ReceiverDiscard::FramingFailure,
+                )
+                .await?;
+                metrics.update(|status| {
+                    status.failure = Some(error.to_string());
+                    Ok(())
+                })?;
+                return Ok(());
+            }
+        };
+        let mut partial = Partial::default();
+        let end = tokio::select! {
+            changed = stop.changed() => { changed.map_err(io::Error::other)?; None },
+            end = tokio::time::timeout(deadline, read_frame(&mut stream, framing, definition.max_message_bytes, first, &mut partial)) => Some(end),
+        };
+        // A stop, a stall or a read error ends the stream: continuity past it is unknown. The
+        // bytes read so far are still published, so shutdown loses none it holds.
+        let (end, closing) = match end {
+            Some(Ok(Ok(end))) => (end, false),
+            Some(Ok(Err(error))) => (End::Malformed(error.to_string()), true),
+            Some(Err(_)) => (End::Stalled, true),
+            None => (End::Stopped, true),
+        };
+        let frame = partial.into_frame(end);
+        // The frame is held here, unread past, until the store takes it. The listener has taken it
+        // off the wire, so the sender cannot resend it: a stop that still finds the store under
+        // pressure spills it beside the store, and a spill that cannot be written fails the stop.
+        let bytes: Arc<[u8]> = Arc::from(frame.bytes);
+        let published = publish_held(
+            &store,
+            &definition.source,
+            Packet {
+                bytes: bytes.clone(),
+                intake: Intake::Tcp,
+            },
+            metrics,
+            &operations,
+            &mut stop,
+            &mut wake,
+        )
+        .await?;
+        if published == Published::Pressured {
+            spill.append(&definition.source, &bytes)?;
+            journal(&format!(
+                "sparrowd: syslog listener {}: stop spilled a held TCP frame of {} bytes to {}; it is published at the next start",
+                definition.id,
+                bytes.len(),
+                spill.path().display(),
+            ));
+        }
+        let accepted = published == Published::Stored;
+        if frame.truncated {
+            discard(
+                &store,
+                metrics,
+                &operations,
+                sparrow_core::ReceiverDiscard::Truncated,
+            )
+            .await?;
+        }
+        let closing = match frame.fault {
+            None => closing,
+            Some(fault) => {
+                let (reason, message) = match fault {
+                    Fault::Framing(message) => {
+                        (sparrow_core::ReceiverDiscard::FramingFailure, message)
+                    }
+                    Fault::TimedOut => (
+                        sparrow_core::ReceiverDiscard::TimedOut,
+                        "TCP frame deadline expired; continuity unknown".into(),
+                    ),
+                };
+                discard(&store, metrics, &operations, reason).await?;
+                metrics.update(|status| {
+                    status.failure = Some(message);
+                    Ok(())
+                })?;
+                closing
+            }
+        };
+        if !accepted || closing {
+            return Ok(());
+        }
+    }
+}
+
+async fn read_first<R: AsyncRead + Unpin>(stream: &mut R) -> io::Result<Option<u8>> {
+    let mut byte = [0_u8];
+    Ok((stream.read(&mut byte).await? == 1).then_some(byte[0]))
+}
+
+/// Read the rest of one frame whose first byte is `first`, keeping every byte that fits and
+/// dropping the remainder of an oversize frame as it arrives, in constant memory.
+///
+/// Octet counting reads exactly the announced length (at most 99999): the whole frame is kept up
+/// to the store's syslog ceiling and only the bytes above it are dropped. A line frame keeps
+/// its first `maximum` bytes. A bad octet-count start keeps the line it begins, so the next
+/// frame starts after the newline. Cancel safe: every byte is in `partial` before the next
+/// await.
+async fn read_frame<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    framing: SyslogFraming,
+    maximum: usize,
+    first: u8,
+    partial: &mut Partial,
+) -> io::Result<End> {
+    if framing != SyslogFraming::OctetCounting {
+        return read_line(
+            stream,
+            partial,
+            maximum,
+            framing == SyslogFraming::CrLf,
+            first,
+        )
+        .await;
+    }
+    partial.bytes.push(first);
+    if !(b'1'..=b'9').contains(&first) {
+        return bad_start(
+            stream,
+            partial,
+            maximum,
+            "octet count requires a nonzero first digit",
+        )
+        .await;
+    }
+    let mut size = usize::from(first - b'0');
+    let mut digits = 1;
+    loop {
+        let mut byte = [0_u8];
+        if stream.read(&mut byte).await? == 0 {
+            return Ok(End::Malformed("frame cut inside the octet count".into()));
+        }
+        partial.bytes.push(byte[0]);
+        if byte[0] == b' ' {
+            break;
+        }
+        if !byte[0].is_ascii_digit() || digits == 5 {
+            return bad_start(stream, partial, maximum, "invalid bounded octet count").await;
+        }
+        size = size * 10 + usize::from(byte[0] - b'0');
+        digits += 1;
+    }
+    let header = partial.bytes.len();
+    partial.body_start = header;
+    let keep = size.min(sparrow_core::SYSLOG_MESSAGE_BYTES);
+    let mut chunk = [0_u8; 4096];
+    while partial.bytes.len() - header < keep {
+        let want = (keep - (partial.bytes.len() - header)).min(chunk.len());
+        let read = stream.read(&mut chunk[..want]).await?;
+        if read == 0 {
+            return Ok(End::Malformed("frame cut by end of stream".into()));
+        }
+        partial.bytes.extend_from_slice(&chunk[..read]);
+    }
+    let mut rest = size - keep;
+    partial.dropped = rest > 0;
+    while rest > 0 {
+        let want = rest.min(chunk.len());
+        let read = stream.read(&mut chunk[..want]).await?;
+        if read == 0 {
+            return Ok(End::Malformed("frame cut by end of stream".into()));
+        }
+        rest -= read;
+    }
+    Ok(End::Complete)
+}
+
+/// A bad octet-count start: keep the bytes read and the rest of the line, then resume at the
+/// next frame after its newline.
+async fn bad_start<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    partial: &mut Partial,
+    maximum: usize,
+    reason: &str,
+) -> io::Result<End> {
+    // The offending byte is already in `partial`; the line reader takes it back.
+    let Some(bad) = partial.bytes.pop() else {
+        return Ok(End::Malformed(reason.into()));
+    };
+    read_line(stream, partial, maximum, false, bad).await?;
+    Ok(End::Malformed(reason.into()))
+}
+
+/// Read to the line terminator (LF, or CRLF when `crlf`), keeping the first `maximum` content
+/// bytes. The terminator is not part of the packet; with LF framing a preceding CR is.
+async fn read_line<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    partial: &mut Partial,
+    maximum: usize,
+    crlf: bool,
+    mut byte: u8,
+) -> io::Result<End> {
+    // CRLF holds one more byte so an exactly full line's trailing CR can be told from content.
+    let cap = maximum + usize::from(crlf);
+    let mut last = 0_u8;
+    loop {
+        if byte == b'\n' && (!crlf || last == b'\r') {
+            if crlf && !partial.dropped {
+                partial.bytes.pop();
+            }
+            partial.bytes.truncate(maximum);
+            return Ok(End::Complete);
+        }
+        if partial.bytes.len() < cap {
+            partial.bytes.push(byte);
+        } else {
+            partial.dropped = true;
+        }
+        last = byte;
+        let mut next = [0_u8];
+        if stream.read(&mut next).await? == 0 {
+            return Ok(End::Malformed("frame cut by end of stream".into()));
+        }
+        byte = next[0];
+    }
+}
+
+impl Status {
+    pub(crate) fn encode(
+        &self,
+        mut out: crate::sparrow_capnp::syslog_listener_status::Builder<'_>,
+    ) {
+        out.set_id(&self.definition.id);
+        out.set_source(&self.definition.source);
+        out.set_address(self.address.to_string());
+        out.set_transport(match self.definition.transport {
+            SyslogTransport::Tcp => crate::sparrow_capnp::SyslogTransport::Tcp,
+            SyslogTransport::Udp => crate::sparrow_capnp::SyslogTransport::Udp,
+        });
+        match self.definition.framing {
+            None => out.reborrow().init_framing().set_absent(()),
+            Some(value) => out.reborrow().init_framing().set_value(match value {
+                SyslogFraming::OctetCounting => crate::sparrow_capnp::SyslogFraming::OctetCounting,
+                SyslogFraming::Lf => crate::sparrow_capnp::SyslogFraming::Lf,
+                SyslogFraming::CrLf => crate::sparrow_capnp::SyslogFraming::CrLf,
+            }),
+        }
+        out.set_max_message_bytes(self.definition.max_message_bytes as u32);
+        out.set_max_connections(self.definition.max_connections as u32);
+        out.set_read_timeout_ms(self.definition.read_timeout_ms);
+        out.set_active_connections(self.active_connections as u32);
+        out.set_held_frames(self.holding.len() as u32);
+        out.set_holds_storage_pressure(self.counts.holds_storage_pressure);
+        out.set_holds_no_permit(self.counts.holds_no_permit);
+        out.set_holds_store_failure(self.counts.holds_store_failure);
+        out.set_listener_errors(self.counts.listener_errors);
+        out.set_longest_hold_ms(u64::try_from(self.longest_hold().as_millis()).unwrap_or(u64::MAX));
+        self.encode_queue(out.reborrow());
+        out.set_accepted_messages(self.counts.accepted);
+        out.set_interpretation_failures(self.counts.interpretation_failures);
+        out.set_refused_messages(self.counts.refused);
+        out.set_truncated_datagrams(self.counts.truncated);
+        out.set_framing_failures(self.counts.framing_failures);
+        // Arrivals at the ceiling are served by closing the longest-idle connection, never refused.
+        out.set_rejected_connections(0);
+        out.set_timed_out_connections(self.counts.timed_out);
+        out.set_continuity_unknown(true);
+        self.encode_kernel(out.reborrow());
+        match &self.failure {
+            Some(value) => out.init_failure().set_value(value),
+            None => out.init_failure().set_absent(()),
+        }
+    }
+
+    /// The UDP queue: gauges, the reader's full-queue waits, restamped and lost datagrams. A TCP
+    /// listener has no queue and reports zeros.
+    fn encode_queue(&self, mut out: crate::sparrow_capnp::syslog_listener_status::Builder<'_>) {
+        let udp = self.definition.transport == SyslogTransport::Udp;
+        out.set_queued_datagrams(u32::try_from(self.queued_datagrams).unwrap_or(u32::MAX));
+        out.set_queued_bytes(self.queued_bytes);
+        out.set_hold_bytes(if udp {
+            self.definition.hold_bytes() as u64
+        } else {
+            0
+        });
+        out.set_reader_full_waits(self.counts.reader_full_waits);
+        let running = self.waiting_since.map(|since| since.elapsed());
+        let longest = running
+            .unwrap_or_default()
+            .max(Duration::from_millis(self.counts.reader_full_longest_ms));
+        out.set_reader_full_longest_ms(u64::try_from(longest.as_millis()).unwrap_or(u64::MAX));
+        out.set_restamped(self.counts.restamped);
+        out.set_restamped_past_watermark(self.counts.restamped_past_watermark);
+        out.set_lost_at_shutdown(self.counts.lost_at_shutdown);
+        out.set_lost_at_shutdown_bytes(self.counts.lost_at_shutdown_bytes);
+    }
+
+    /// The UDP kernel evidence. A count is written only when it was read; otherwise the count is
+    /// zero, `kernel_drops_unknown` is set and the reason is stated.
+    fn encode_kernel(&self, mut out: crate::sparrow_capnp::syslog_listener_status::Builder<'_>) {
+        use crate::sparrow_capnp::KernelCounterState;
+        use crate::udp_kernel::Counter;
+        if self.definition.transport != SyslogTransport::Udp {
+            out.set_kernel_drops_unknown(false);
+            out.set_kernel_counter_state(KernelCounterState::NotApplicable);
+            out.reborrow().init_kernel_counter_reason().set_absent(());
+            out.init_rcvbuf_enlarge_error().set_absent(());
+            return;
+        }
+        let unattached =
+            Counter::Unavailable("no kernel counter is attached to this listener".into());
+        let counter = self
+            .kernel
+            .as_ref()
+            .map_or(&unattached, |kernel| &kernel.counter);
+        if let Some(kernel) = &self.kernel {
+            out.set_rcvbuf_requested_bytes(kernel.buffer.requested as u64);
+            out.set_rcvbuf_granted_bytes(kernel.buffer.granted as u64);
+            out.set_kernel_counter_final(kernel.finished);
+            match &kernel.buffer.enlarge_error {
+                Some(error) => {
+                    out.set_rcvbuf_enlarge_failures(1);
+                    out.reborrow().init_rcvbuf_enlarge_error().set_value(error);
+                }
+                None => out.reborrow().init_rcvbuf_enlarge_error().set_absent(()),
+            }
+        }
+        match counter {
+            Counter::Available(drops) => {
+                out.set_kernel_drops_unknown(false);
+                out.set_kernel_drops(*drops);
+                out.set_kernel_counter_state(KernelCounterState::Available);
+                out.init_kernel_counter_reason().set_absent(());
+            }
+            Counter::Unavailable(reason) => {
+                out.set_kernel_drops_unknown(true);
+                out.set_kernel_counter_state(KernelCounterState::Unavailable);
+                out.init_kernel_counter_reason().set_value(reason);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn poisoned_syslog_registry_refuses_both_discovery_paths_with_typed_failure() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let dir = tempfile::tempdir().unwrap();
+                let data = dir.path().join("store");
+                let config = sparrow_test_support::write_server_config(
+                    dir.path(),
+                    &data,
+                    &data.join("rpc.sock"),
+                );
+                let store = crate::ServerConfig::read(&config)
+                    .unwrap()
+                    .open_store()
+                    .unwrap();
+                let sid = store.store_id().unwrap();
+                let registry = SyslogRegistry::default();
+                let poisoning = registry.clone();
+                assert!(
+                    std::thread::spawn(move || {
+                        let _locked = poisoning.0.lock().unwrap();
+                        panic!("injected syslog registry owner failure");
+                    })
+                    .join()
+                    .is_err()
+                );
+                let client: crate::sparrow_capnp::sparrow::Client = capnp_rpc::new_client(
+                    crate::Rpc::new(store.clone(), Arc::new(Semaphore::new(4)), 100)
+                        .with_syslog(registry),
+                );
+                let mut request = client.sources_list_request();
+                let mut query = request.get().init_query();
+                query.set_store_id(&sid);
+                query.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                query.reborrow().init_source().set_absent(());
+                query.reborrow().init_cursor().set_absent(());
+                query.set_page_size(100);
+                query.set_scan_budget(10000);
+                let response = request.send().promise.await.unwrap();
+                let crate::sparrow_capnp::result::Error(error) = response
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap()
+                else {
+                    panic!("poisoned source registry published a page")
+                };
+                assert_eq!(
+                    error.unwrap().get_code().unwrap().to_str().unwrap(),
+                    "STORAGE_FAILURE"
+                );
+                let mut request = client.syslog_listener_get_request();
+                let mut query = request.get().init_query();
+                query.set_store_id(&sid);
+                query.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                query.set_source("source");
+                query.set_id("listener");
+                let response = request.send().promise.await.unwrap();
+                let crate::sparrow_capnp::result::Error(error) = response
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .which()
+                    .unwrap()
+                else {
+                    panic!("poisoned listener registry published a lookup")
+                };
+                assert_eq!(
+                    error.unwrap().get_code().unwrap().to_str().unwrap(),
+                    "STORAGE_FAILURE"
+                );
+                assert_eq!(
+                    store.status(crate::now().unwrap()).unwrap()["source_read_handles"].as_str(),
+                    Some("0")
+                );
+            })
+            .await;
+    }
+
+    /// INVARIANT: below the free-space floor a packet is answered `Pressured`, not refused, so
+    /// nothing is counted refused or discarded here and the intake worker does not fail.
+    #[tokio::test]
+    async fn packet_refused_below_the_free_space_floor_keeps_intake_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let config =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let base = std::fs::read_to_string(&config).unwrap();
+        let floor = "min_free_bytes = 1048576";
+        assert!(base.contains(floor));
+        std::fs::write(
+            &config,
+            base.replace(floor, "min_free_bytes = 9223372036854775807"),
+        )
+        .unwrap();
+        let store = crate::ServerConfig::read(&config)
+            .unwrap()
+            .open_store()
+            .unwrap();
+        let definition = SyslogListener {
+            id: "listener".into(),
+            address: "127.0.0.1:0".parse().unwrap(),
+            source: "source".into(),
+            transport: SyslogTransport::Udp,
+            framing: None,
+            max_message_bytes: 480,
+            max_connections: 1,
+            read_timeout_ms: 1000,
+            hold_bytes: None,
+        };
+        let metrics = Metrics(Arc::new(Mutex::new(Status::new(
+            sparrow_core::SyslogReceiver::new("listener", "udp").unwrap(),
+            definition.clone(),
+            definition.address,
+        ))));
+        let published = publish(
+            store.clone(),
+            "source".into(),
+            Arc::from(&b"<34>refused"[..]),
+            &metrics,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(published, Published::Pressured);
+        let status = metrics.snapshot().unwrap();
+        assert_eq!(status.counts.refused, 0);
+        assert_eq!(status.failure, None);
+        assert_eq!(store.durability_status().unwrap().failure, None);
+    }
+
+    #[tokio::test]
+    async fn failed_intake_joins_blocking_publication_and_retains_all_child_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("publication");
+        let published = path.clone();
+        let (stop, mut stopped) = watch::channel(false);
+        let (entered, running) = tokio::sync::oneshot::channel();
+        let (release, paused) = std::sync::mpsc::channel();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                paused.recv().unwrap();
+                std::fs::write(&published, b"admitted publication")?;
+                std::fs::File::open(&published)?.sync_all()?;
+                Ok::<_, io::Error>(())
+            })
+            .await
+            .map_err(io::Error::other)??;
+            Err(io::Error::other("publication completion failure"))
+        });
+        running.await.unwrap();
+        tasks.spawn(async { Err(io::Error::other("listener failure")) });
+        tasks.spawn(async { panic!("intake task panic") });
+        let mut idle = stopped.clone();
+        tasks.spawn(async move {
+            idle.changed().await.map_err(io::Error::other)?;
+            assert!(*idle.borrow());
+            Ok(())
+        });
+        let supervisor = tokio::spawn(async move { finish_tasks(Ok(()), &mut tasks, &stop).await });
+        tokio::time::timeout(Duration::from_secs(5), stopped.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(*stopped.borrow());
+        assert!(
+            !supervisor.is_finished(),
+            "admitted publication was not joined"
+        );
+        assert!(!path.exists());
+        release.send(()).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), supervisor)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        for cause in [
+            "listener failure",
+            "intake task panic",
+            "publication completion failure",
+        ] {
+            assert!(error.contains(cause), "lost {cause}: {error}");
+        }
+        assert_eq!(std::fs::read(path).unwrap(), b"admitted publication");
+    }
+
+    /// Read the next frame of `input` the way the listener does: first byte, then the rest.
+    async fn next_frame<R: AsyncRead + Unpin>(
+        stream: &mut R,
+        framing: SyslogFraming,
+        maximum: usize,
+    ) -> Option<Frame> {
+        let first = read_first(stream).await.unwrap()?;
+        let mut partial = Partial::default();
+        let end = read_frame(stream, framing, maximum, first, &mut partial)
+            .await
+            .unwrap();
+        Some(partial.into_frame(end))
+    }
+
+    /// INVARIANT: a well-formed frame is read byte-exact in every framing, whatever the
+    /// transport's chunking (a two-byte pipe here), with the trailer excluded.
+    #[tokio::test]
+    async fn configured_frames_preserve_octets_and_delimiters() {
+        for (framing, input, expected) in [
+            (
+                SyslogFraming::OctetCounting,
+                b"5 <34>x5 <34>x".as_slice(),
+                b"<34>x".as_slice(),
+            ),
+            (SyslogFraming::Lf, b"abc\r\nabc\r\n", b"abc\r"),
+            (SyslogFraming::CrLf, b"a\nb\r\na\nb\r\n", b"a\nb"),
+        ] {
+            let (mut reader, mut writer) = tokio::io::duplex(2);
+            let input = input.to_vec();
+            let writing = tokio::spawn(async move {
+                tokio::io::AsyncWriteExt::write_all(&mut writer, &input)
+                    .await
+                    .unwrap();
+            });
+            for _ in 0..2 {
+                let frame = next_frame(&mut reader, framing, expected.len())
+                    .await
+                    .unwrap();
+                assert_eq!(frame.bytes, expected);
+                assert!(frame.fault.is_none() && !frame.truncated);
+            }
+            assert!(
+                next_frame(&mut reader, framing, expected.len())
+                    .await
+                    .is_none()
+            );
+            writing.await.unwrap();
+        }
+    }
+
+    /// Value: an octet-counted frame above `max_message_bytes` is a log the store can hold,
+    /// so it is kept whole; only bytes above the store's 65536 ceiling are cut, counted, and
+    /// dropped as they arrive, leaving the next frame in sync on the same stream.
+    #[tokio::test]
+    async fn octet_counted_oversize_is_kept_whole_to_the_store_ceiling_then_cut_and_counted() {
+        let ceiling = sparrow_core::SYSLOG_MESSAGE_BYTES;
+        let mut input = Vec::new();
+        for size in [600, ceiling, ceiling + 1, 99_999] {
+            input.extend_from_slice(format!("{size} ").as_bytes());
+            input.extend(std::iter::repeat_n(b'x', size));
+        }
+        input.extend_from_slice(b"5 <34>y");
+        let mut input = input.as_slice();
+        for (kept, truncated) in [
+            (600, false),
+            (ceiling, false),
+            (ceiling, true),
+            (ceiling, true),
+        ] {
+            let frame = next_frame(&mut input, SyslogFraming::OctetCounting, 480)
+                .await
+                .unwrap();
+            assert_eq!(frame.bytes.len(), kept);
+            assert!(frame.bytes.iter().all(|byte| *byte == b'x'));
+            assert_eq!((frame.truncated, frame.fault.is_none()), (truncated, true));
+        }
+        let frame = next_frame(&mut input, SyslogFraming::OctetCounting, 480)
+            .await
+            .unwrap();
+        assert_eq!(frame.bytes, b"<34>y");
+    }
+
+    /// Value: a line above `max_message_bytes` keeps its first `max_message_bytes` bytes and
+    /// the next line is intact, in LF and CRLF, whether the overflow is one byte or a megabyte;
+    /// an exactly full line is not cut.
+    #[tokio::test]
+    async fn oversize_lines_keep_the_prefix_and_resume_at_the_newline() {
+        for (framing, terminator) in [
+            (SyslogFraming::Lf, b"\n".as_slice()),
+            (SyslogFraming::CrLf, b"\r\n".as_slice()),
+        ] {
+            let mut input = Vec::new();
+            for length in [480, 481, 1_000_000] {
+                input.extend(std::iter::repeat_n(b'a', length));
+                input.extend_from_slice(terminator);
+            }
+            input.extend_from_slice(b"next");
+            input.extend_from_slice(terminator);
+            let mut input = input.as_slice();
+            for truncated in [false, true, true] {
+                let frame = next_frame(&mut input, framing, 480).await.unwrap();
+                assert_eq!(frame.bytes, vec![b'a'; 480]);
+                assert_eq!((frame.truncated, frame.fault.is_none()), (truncated, true));
+            }
+            let frame = next_frame(&mut input, framing, 480).await.unwrap();
+            assert_eq!(frame.bytes, b"next");
+        }
+    }
+
+    /// Value: a bad octet-count start or a frame cut by end of stream is still evidence. The
+    /// bytes read are kept as a malformed packet with a framing fault, the bad start's line is
+    /// kept whole, and the next frame after its newline is read normally.
+    #[tokio::test]
+    async fn bad_octet_start_and_cut_frames_keep_their_bytes_and_resynchronise() {
+        let framing = SyslogFraming::OctetCounting;
+        let mut input = b"<34>lf sender\n123456 digits\n05 zero\n6 <34>ok9 short".as_slice();
+        for expected in [b"<34>lf sender".as_slice(), b"123456 digits", b"05 zero"] {
+            let frame = next_frame(&mut input, framing, 480).await.unwrap();
+            assert_eq!(frame.bytes, expected);
+            assert!(matches!(frame.fault, Some(Fault::Framing(_))));
+        }
+        let frame = next_frame(&mut input, framing, 480).await.unwrap();
+        assert_eq!(
+            (frame.bytes.as_slice(), frame.fault.is_none()),
+            (&b"<34>ok"[..], true)
+        );
+        let frame = next_frame(&mut input, framing, 480).await.unwrap();
+        assert_eq!(frame.bytes, b"9 short");
+        assert!(matches!(frame.fault, Some(Fault::Framing(_))));
+        assert!(next_frame(&mut input, framing, 480).await.is_none());
+    }
+
+    /// Value: a frame cut near or above the store's 65536-byte ceiling is still kept. Its
+    /// header counts toward the stored packet, so the bytes published are capped at the ceiling
+    /// and the cut is counted; otherwise the store would refuse the whole frame.
+    #[tokio::test]
+    async fn a_cut_frame_at_the_store_ceiling_is_published_capped_and_counted() {
+        let ceiling = sparrow_core::SYSLOG_MESSAGE_BYTES;
+        let mut octets = b"70000 ".to_vec();
+        octets.extend(std::iter::repeat_n(b'x', ceiling));
+        let mut line = vec![b'y'; ceiling + 5];
+        line.push(b'z');
+        for (framing, mut input) in [
+            (SyslogFraming::OctetCounting, octets.as_slice()),
+            (SyslogFraming::CrLf, line.as_slice()),
+        ] {
+            let frame = next_frame(&mut input, framing, ceiling).await.unwrap();
+            assert_eq!(frame.bytes.len(), ceiling);
+            assert!(frame.truncated);
+            assert!(matches!(frame.fault, Some(Fault::Framing(_))));
+        }
+    }
+
+    /// Value: a daemon that stops inside a frame publishes the bytes it already read as a
+    /// malformed packet instead of dropping them, and counts the cut.
+    #[tokio::test]
+    async fn stopping_inside_a_frame_publishes_the_bytes_read() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        let (stop, stopped) = watch::channel(false);
+        let roster = Arc::new(Roster::default());
+        let lease = roster.enroll().unwrap();
+        let metrics = fixture.metrics.clone();
+        let store = fixture.store.clone();
+        let spill = fixture.spill.clone();
+        let reading = tokio::spawn(async move {
+            receive_tcp(
+                receiver,
+                &metrics,
+                store,
+                Arc::new(Semaphore::new(4)),
+                stopped,
+                lease,
+                PressureHold::new(Default::default(), spill),
+            )
+            .await
+        });
+        // Wait until the connection idles at the boundary, then send the partial frame and wait
+        // until its first byte has put it inside the frame.
+        let idle_is = |idle: bool| {
+            roster
+                .slots
+                .lock()
+                .unwrap()
+                .1
+                .values()
+                .all(|slot| slot.idle_since.is_some() == idle)
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !idle_is(true) {
+                tokio::task::yield_now().await;
+            }
+            tokio::io::AsyncWriteExt::write_all(&mut sender, b"20 <34>half")
+                .await
+                .unwrap();
+            while !idle_is(false) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        stop.send_replace(true);
+        reading.await.unwrap().unwrap();
+        let counts = fixture.metrics.snapshot().unwrap().counts;
+        assert_eq!((counts.accepted, counts.framing_failures), (1, 1));
+        assert_eq!(counts.refused, 0);
+    }
+
+    pub(super) struct Listener {
+        pub(super) _dir: tempfile::TempDir,
+        pub(super) store: sparrow_core::Store,
+        pub(super) metrics: Metrics,
+        pub(super) wake: PressureWake,
+        pub(super) operations: Arc<Semaphore>,
+        pub(super) spill: Arc<Spill>,
+        /// Keeps the floor's resume edge wired to `wake`, as the daemon wires it.
+        pub(super) resumes: std::cell::RefCell<Vec<sparrow_core::ResumeSubscription>>,
+    }
+
+    impl Listener {
+        pub(super) fn wire_resume(&self) {
+            self.resumes.borrow_mut().push(
+                self.store
+                    .space_floor()
+                    .subscribe_resume(self.wake.resume_waker(|| {})),
+            );
+        }
+    }
+
+    pub(super) fn listener(
+        transport: SyslogTransport,
+        connections: usize,
+        timeout_ms: u32,
+    ) -> Listener {
+        listener_with(transport, connections, timeout_ms, false)
+    }
+
+    /// A listener whose store archives before deleting, so it has an archive fence.
+    pub(super) fn listener_with(
+        transport: SyslogTransport,
+        connections: usize,
+        timeout_ms: u32,
+        archiving: bool,
+    ) -> Listener {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let config =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        if archiving {
+            let text = std::fs::read_to_string(&config).unwrap();
+            let table = format!(
+                "\n[archive]\ndir = \"{}\"\n",
+                dir.path().join("nas").display()
+            );
+            std::fs::write(&config, text + &table).unwrap();
+        }
+        let store = crate::ServerConfig::read(&config)
+            .unwrap()
+            .open_store()
+            .unwrap();
+        let tcp = transport == SyslogTransport::Tcp;
+        let definition = SyslogListener {
+            id: "listener".into(),
+            address: "127.0.0.1:0".parse().unwrap(),
+            source: "source".into(),
+            transport,
+            framing: tcp.then_some(SyslogFraming::OctetCounting),
+            max_message_bytes: 480,
+            max_connections: connections,
+            read_timeout_ms: timeout_ms,
+            hold_bytes: None,
+        };
+        let metrics = Metrics(Arc::new(Mutex::new(Status::new(
+            sparrow_core::SyslogReceiver::new(
+                "listener",
+                if tcp { "tcp_octet_counting" } else { "udp" },
+            )
+            .unwrap(),
+            definition.clone(),
+            definition.address,
+        ))));
+        let spill = Arc::new(Spill::new(&dir.path().join("spill"), "listener"));
+        Listener {
+            _dir: dir,
+            store,
+            metrics,
+            wake: PressureWake::default(),
+            operations: Arc::new(Semaphore::new(4)),
+            spill,
+            resumes: std::cell::RefCell::default(),
+        }
+    }
+
+    async fn until(metrics: &Metrics, done: impl Fn(&Status) -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !done(&metrics.snapshot().unwrap()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("listener did not reach the expected counters");
+    }
+
+    async fn serve(
+        socket: Socket,
+        fixture: &Listener,
+    ) -> (watch::Sender<bool>, tokio::task::JoinHandle<io::Result<()>>) {
+        let (stop, stopped) = watch::channel(false);
+        let task = tokio::spawn(listen(
+            socket,
+            fixture.metrics.clone(),
+            fixture.store.clone(),
+            fixture.operations.clone(),
+            stopped,
+            stop.clone(),
+            PressureHold::new(fixture.wake.clone(), fixture.spill.clone()),
+        ));
+        (stop, task)
+    }
+
+    /// Value: a sender that stalls inside a frame loses nothing already received: the bytes
+    /// read are published as a malformed packet and `timed_out` is counted. Only a stall
+    /// inside a frame is a fault, so the stream is closed after it.
+    #[tokio::test]
+    async fn a_stall_inside_a_frame_publishes_the_bytes_read_and_counts_timed_out() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 50);
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"20 <34>half")
+            .await
+            .unwrap();
+        let (_stop, stopped) = watch::channel(false);
+        let lease = Arc::new(Roster::default()).enroll().unwrap();
+        receive_tcp(
+            receiver,
+            &fixture.metrics,
+            fixture.store.clone(),
+            Arc::new(Semaphore::new(4)),
+            stopped,
+            lease,
+            PressureHold::new(Default::default(), fixture.spill.clone()),
+        )
+        .await
+        .unwrap();
+        let counts = fixture.metrics.snapshot().unwrap().counts;
+        assert_eq!((counts.accepted, counts.timed_out), (1, 1));
+        assert_eq!(counts.framing_failures + counts.refused, 0);
+    }
+
+    /// Value: a sender quiet between frames is not faulty. The deadline starts at a frame's
+    /// first byte, so a pause far past it at a boundary costs no count and no connection, and
+    /// the next frame is kept.
+    #[tokio::test]
+    async fn an_idle_sender_at_a_frame_boundary_is_not_a_fault() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 50);
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        let (_stop, stopped) = watch::channel(false);
+        let lease = Arc::new(Roster::default()).enroll().unwrap();
+        let metrics = fixture.metrics.clone();
+        let store = fixture.store.clone();
+        let spill = fixture.spill.clone();
+        let reading = tokio::spawn(async move {
+            receive_tcp(
+                receiver,
+                &metrics,
+                store,
+                Arc::new(Semaphore::new(4)),
+                stopped,
+                lease,
+                PressureHold::new(Default::default(), spill),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>x")
+            .await
+            .unwrap();
+        until(&fixture.metrics, |status| status.counts.accepted == 1).await;
+        assert!(!reading.is_finished());
+        drop(sender);
+        reading.await.unwrap().unwrap();
+        let counts = fixture.metrics.snapshot().unwrap().counts;
+        assert_eq!(counts.timed_out + counts.framing_failures, 0);
+    }
+
+    /// Value: at the connection ceiling a new sender is served, not refused: the connection
+    /// idle longest is closed at its frame boundary (the daemon closes it, with nothing
+    /// unread), and the arrival's frame is then kept.
+    #[tokio::test]
+    async fn a_new_connection_at_the_ceiling_closes_the_longest_idle_one() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        let (stop, task) = serve(Socket::Tcp(tcp), &fixture).await;
+        let mut idle = tokio::net::TcpStream::connect(address).await.unwrap();
+        until(&fixture.metrics, |status| status.active_connections == 1).await;
+        let mut arrival = tokio::net::TcpStream::connect(address).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut arrival, b"5 <34>x")
+            .await
+            .unwrap();
+        let mut byte = [0_u8];
+        assert_eq!(idle.read(&mut byte).await.unwrap(), 0);
+        until(&fixture.metrics, |status| status.counts.accepted == 1).await;
+        assert_eq!(fixture.metrics.snapshot().unwrap().counts.timed_out, 0);
+        stop.send_replace(true);
+        task.await.unwrap().unwrap();
+    }
+
+    /// Value (#257): below the free-space floor the accept loop stopped accepting, so a sender
+    /// connecting then sat in the kernel backlog with nothing said. Protects: a connection made
+    /// while the floor is paused is accepted, its frame is taken off the wire and held (#243),
+    /// and the frame is stored when free space returns, with the connection ceiling unchanged.
+    /// Fails on the old accept pause: the connection is never counted active.
+    #[tokio::test]
+    async fn a_connection_made_while_the_floor_is_paused_is_accepted_and_its_frame_held_then_stored()
+     {
+        let fixture = listener(SyslogTransport::Tcp, 2, 60_000);
+        let floor = fixture.store.space_floor();
+        floor.set_free_for_tests(Some(0));
+        fixture.wire_resume();
+        assert!(floor.observe(1).unwrap().is_some());
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        let (stop, task) = serve(Socket::Tcp(tcp), &fixture).await;
+        // The loop has run its first turn, so an accept pause would already be in force.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let mut sender = tokio::net::TcpStream::connect(address).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>a")
+            .await
+            .unwrap();
+        until(&fixture.metrics, |status| {
+            status.active_connections == 1 && frame_taken(status)
+        })
+        .await;
+        assert_eq!(fixture.metrics.snapshot().unwrap().counts.accepted, 0);
+        floor.set_free_for_tests(None);
+        assert!(floor.observe(2).unwrap().is_none());
+        until(&fixture.metrics, |status| status.counts.accepted == 1).await;
+        assert_eq!(stored_lengths(&fixture.store), [5]);
+        drop(sender);
+        stop.send_replace(true);
+        task.await.unwrap().unwrap();
+    }
+
+    /// One frame is held: taken off the wire and not read again until it is stored.
+    pub(super) fn frame_taken(status: &Status) -> bool {
+        status.holding.len() == 1
+    }
+
+    /// Lengths of the stored syslog packets in durable observation order.
+    pub(super) fn stored_lengths(store: &sparrow_core::Store) -> Vec<u64> {
+        let mut records = store.records(crate::now().unwrap()).unwrap();
+        records.sort_by_key(|record| record.receiver.as_ref().map(|position| position.sequence));
+        records
+            .iter()
+            .map(|record| record.byte_end - record.byte_start)
+            .collect()
+    }
+
+    /// Run one connection's receiver over `receiver` until it returns.
+    fn connection(
+        fixture: &Listener,
+        receiver: tokio::io::DuplexStream,
+        stopped: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<io::Result<()>> {
+        let metrics = fixture.metrics.clone();
+        let store = fixture.store.clone();
+        let lease = Arc::new(Roster::default()).enroll().unwrap();
+        let wake = fixture.wake.clone();
+        let operations = fixture.operations.clone();
+        let spill = fixture.spill.clone();
+        tokio::spawn(async move {
+            receive_tcp(
+                receiver,
+                &metrics,
+                store,
+                operations,
+                stopped,
+                lease,
+                PressureHold::new(wake, spill),
+            )
+            .await
+        })
+    }
+
+    /// Lift the pressure the tests apply and tell every holder, as the maintenance duty does.
+    pub(super) fn relieve(fixture: &Listener) {
+        fixture.store.space_floor().refuse_writes_for_tests(false);
+        fixture.wake.wake();
+    }
+
+    /// Value (#243): a frame the store refuses under STORAGE_PRESSURE is a log in hand, so it
+    /// is kept, not discarded: the same bytes are retried, the next frame is not read, so the
+    /// sender's window closes and it holds, and the connection stays open. When pressure
+    /// clears both frames are stored, in order, and nothing is counted refused.
+    #[tokio::test]
+    async fn a_frame_refused_by_pressure_is_held_unread_past_and_published_when_it_clears() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        fixture.store.space_floor().refuse_writes_for_tests(true);
+        let (mut sender, receiver) = tokio::io::duplex(16);
+        let (_stop, stopped) = watch::channel(false);
+        let reading = connection(&fixture, receiver, stopped);
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>a")
+            .await
+            .unwrap();
+        // The second frame is larger than the pipe, so it can only finish once it is read.
+        let writing = tokio::spawn(async move {
+            tokio::io::AsyncWriteExt::write_all(&mut sender, b"20 <34>bbbbbbbbbbbbbbbb")
+                .await
+                .unwrap();
+            sender
+        });
+        until(&fixture.metrics, frame_taken).await;
+        assert!(
+            !writing.is_finished(),
+            "the next frame was read while the first was held"
+        );
+        assert!(
+            !reading.is_finished(),
+            "the held frame's connection was closed"
+        );
+        relieve(&fixture);
+        until(&fixture.metrics, |status| status.counts.accepted == 2).await;
+        let sender = writing.await.unwrap();
+        let counts = fixture.metrics.snapshot().unwrap().counts;
+        assert_eq!(
+            counts.refused + counts.timed_out + counts.framing_failures,
+            0
+        );
+        assert_eq!(stored_lengths(&fixture.store), [5, 20]);
+        drop(sender);
+        reading.await.unwrap().unwrap();
+    }
+
+    /// Value (#428): a frame the listener took off the wire, which the store still refuses when
+    /// the daemon stops, is spilled beside the store and is not counted refused. The next start
+    /// publishes it, and the spill file is removed once the store has taken it.
+    #[tokio::test]
+    async fn a_frame_held_at_a_stop_under_pressure_is_spilled_and_published_at_the_next_start() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        fixture.store.space_floor().refuse_writes_for_tests(true);
+        let (mut sender, receiver) = tokio::io::duplex(16);
+        let (stop, stopped) = watch::channel(false);
+        let reading = connection(&fixture, receiver, stopped);
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>a")
+            .await
+            .unwrap();
+        until(&fixture.metrics, frame_taken).await;
+        stop.send_replace(true);
+        reading.await.unwrap().unwrap();
+        let counts = fixture.metrics.snapshot().unwrap().counts;
+        assert_eq!((counts.refused, counts.accepted), (0, 0));
+        let spilled = fixture.spill.read().unwrap();
+        assert_eq!(spilled.frames.len(), 1);
+        assert_eq!(spilled.frames[0].source, "source");
+        assert!(stored_lengths(&fixture.store).is_empty());
+        relieve(&fixture);
+        assert!(drain(&fixture, false).await.unwrap());
+        assert_eq!(stored_lengths(&fixture.store), [5]);
+        assert!(!fixture.spill.path().exists());
+        drop(sender);
+    }
+
+    /// Value (#428): a stop that cannot write the spill fails, so the loss is reported as a
+    /// failure of the stop and not as a count. The frame is not kept anywhere else.
+    #[tokio::test]
+    async fn a_spill_that_cannot_be_written_fails_the_stop() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        fixture.store.space_floor().refuse_writes_for_tests(true);
+        // A regular file where the spill directory must be makes every spill write fail.
+        let blocked = fixture._dir.path().join("blocked");
+        std::fs::write(&blocked, b"").unwrap();
+        let spill = Arc::new(Spill::new(&blocked, "listener"));
+        let (mut sender, receiver) = tokio::io::duplex(16);
+        let (stop, stopped) = watch::channel(false);
+        let lease = Arc::new(Roster::default()).enroll().unwrap();
+        let metrics = fixture.metrics.clone();
+        let store = fixture.store.clone();
+        let operations = fixture.operations.clone();
+        let wake = fixture.wake.clone();
+        let reading = tokio::spawn(async move {
+            receive_tcp(
+                receiver,
+                &metrics,
+                store,
+                operations,
+                stopped,
+                lease,
+                PressureHold::new(wake, spill),
+            )
+            .await
+        });
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>a")
+            .await
+            .unwrap();
+        until(&fixture.metrics, frame_taken).await;
+        stop.send_replace(true);
+        let error = reading.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("syslog spill"), "{error}");
+        assert_eq!(fixture.metrics.snapshot().unwrap().counts.refused, 0);
+        drop(sender);
+    }
+
+    /// Run the start-time drain of the fixture's spill, with a stop requested or not.
+    async fn drain(fixture: &Listener, stopped: bool) -> io::Result<bool> {
+        let (_stop_sender, mut stop) = watch::channel(stopped);
+        let mut waiter = fixture.wake.subscribe();
+        publish_spilled(
+            &fixture.store,
+            &fixture.spill,
+            &fixture.metrics,
+            &fixture.operations,
+            &mut stop,
+            &mut waiter,
+        )
+        .await
+    }
+
+    /// Value (#428): a stop that ends the start-time drain under pressure keeps every frame the
+    /// store has not taken, in order, in the file; the next drain publishes them all.
+    #[tokio::test]
+    async fn a_drain_stopped_by_pressure_keeps_every_untaken_frame_in_order() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        fixture.spill.append("source", b"<34>a").unwrap();
+        fixture.spill.append("source", b"<34>bb").unwrap();
+        fixture.store.space_floor().refuse_writes_for_tests(true);
+        assert!(!drain(&fixture, true).await.unwrap());
+        assert_eq!(fixture.spill.read().unwrap().frames.len(), 2);
+        relieve(&fixture);
+        assert!(drain(&fixture, false).await.unwrap());
+        assert_eq!(stored_lengths(&fixture.store), [5, 6]);
+        assert!(!fixture.spill.path().exists());
+    }
+
+    /// Value (#428): a spilled frame the store refuses, not for pressure, fails the listener and
+    /// keeps its file, so the frame is neither accepted behind nor lost.
+    #[tokio::test]
+    async fn a_spilled_frame_the_store_refuses_keeps_the_file_and_fails_the_listener() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        fixture.spill.append("source", b"<34>a").unwrap();
+        fixture
+            .store
+            .space_floor()
+            .refuse_next_write_for_tests("RESOURCE_LIMIT");
+        let error = drain(&fixture, false).await.unwrap_err();
+        assert!(
+            error.to_string().contains("was refused by the store"),
+            "{error}"
+        );
+        assert_eq!(fixture.spill.read().unwrap().frames.len(), 1);
+    }
+
+    /// Value (#428): a record cut off at the end of a spill file, as a crash leaves it, is
+    /// dropped and counted in the bytes it cost; the frames before it are kept.
+    #[tokio::test]
+    async fn a_record_cut_off_at_the_end_of_a_spill_file_is_dropped_and_the_frames_before_it_kept()
+    {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        fixture.spill.append("source", b"<34>a").unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(fixture.spill.path())
+            .unwrap();
+        std::io::Write::write_all(&mut file, &[5, 0, 0, 0, b'x']).unwrap();
+        let spilled = fixture.spill.read().unwrap();
+        assert_eq!(spilled.frames.len(), 1);
+        assert_eq!(spilled.torn_bytes, 5);
+    }
+
+    /// Value (#428): a scratch file an interrupted rewrite left beside a spill file is not a file
+    /// no listener owns, so it does not fail the start check, and the drain removes it, because
+    /// the spill file still holds every frame the scratch file copied.
+    #[tokio::test]
+    async fn an_interrupted_rewrite_leaves_a_scratch_file_that_neither_fails_the_start_nor_survives_the_drain()
+     {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        fixture.spill.append("source", b"<34>a").unwrap();
+        std::fs::write(fixture.spill.partial_path(), b"stale").unwrap();
+        let definition = fixture.metrics.snapshot().unwrap().definition;
+        let dir = fixture.spill.path().parent().unwrap();
+        check_spill_owners(dir, &[definition]).unwrap();
+        assert!(drain(&fixture, false).await.unwrap());
+        assert_eq!(stored_lengths(&fixture.store), [5]);
+        assert!(!fixture.spill.partial_path().exists());
+    }
+
+    /// Value (#428): a TCP listener whose spill directory cannot be written fails the start with
+    /// the directory and the install steps named, so a stop under pressure never discovers the
+    /// missing precondition; a configuration without a TCP listener needs no directory. A spill
+    /// file left behind by a removed listener fails the start whatever the configuration holds,
+    /// so its frames are never stranded unreported.
+    #[tokio::test]
+    async fn the_start_check_requires_a_writable_spill_directory_only_for_tcp_and_refuses_unowned_files_always()
+     {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        let definition = fixture.metrics.snapshot().unwrap().definition;
+        let blocker = fixture
+            .spill
+            .path()
+            .parent()
+            .unwrap()
+            .join("not-a-directory");
+        std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+        std::fs::write(&blocker, b"file").unwrap();
+        let dir = blocker.join("syslog-spill");
+        let error = check_spill_owners(&dir, std::slice::from_ref(&definition)).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains(&dir.display().to_string()), "{text}");
+        assert!(text.contains("Syslog TCP listener install steps"), "{text}");
+        check_spill_owners(&dir, &[]).unwrap();
+        // A spill file survives its listener's removal: the start fails instead of stranding it.
+        let kept = listener(SyslogTransport::Tcp, 1, 60_000);
+        kept.spill.append("source", b"<34>a").unwrap();
+        let owner = kept.metrics.snapshot().unwrap().definition;
+        let spill_dir = kept.spill.path().parent().unwrap();
+        check_spill_owners(spill_dir, &[owner]).unwrap();
+        let error = check_spill_owners(spill_dir, &[]).unwrap_err();
+        assert!(error.to_string().contains("not owned"), "{error}");
+    }
+
+    /// Value (#243): a hold is visible while it lasts, which an operator needs to tell a
+    /// sender held by the daemon from a silent one. Status carries the frames held now, the
+    /// frame counted once for its reason however often it is retried, and the longest wait,
+    /// running or finished, through the wire encoding and its JSON rendering. The hold
+    /// outlasts the 1 s read timeout and must not trip it. Time is the paused test clock, so
+    /// no wall time passes.
+    #[tokio::test(start_paused = true)]
+    async fn a_hold_shows_in_status_with_its_reason_and_longest_wait() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 1000);
+        fixture.store.space_floor().refuse_writes_for_tests(true);
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        let (_stop, stopped) = watch::channel(false);
+        let reading = connection(&fixture, receiver, stopped);
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>a")
+            .await
+            .unwrap();
+        // No timeout guard here: with a paused clock an idle runtime would fire it early.
+        yield_until("the frame is held", || {
+            frame_taken(&fixture.metrics.snapshot().unwrap())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let held = fixture.metrics.snapshot().unwrap();
+        assert!(held.longest_hold() >= Duration::from_secs(5));
+        assert_eq!(
+            (
+                held.counts.holds_storage_pressure,
+                held.counts.holds_no_permit
+            ),
+            (1, 0)
+        );
+        assert_eq!(wire_fields(&held).0, (1, 1, 0));
+        relieve(&fixture);
+        yield_until("the frame is stored", || {
+            fixture.metrics.snapshot().unwrap().counts.accepted != 0
+        })
+        .await;
+        let done = fixture.metrics.snapshot().unwrap();
+        assert!(done.holding.is_empty());
+        assert!(done.counts.longest_hold_ms >= 5000);
+        assert_eq!(done.counts.holds_storage_pressure, 1);
+        assert_eq!(done.counts.timed_out + done.counts.framing_failures, 0);
+        let ((frames, pressure, permit), longest, json) = wire_fields(&done);
+        assert_eq!((frames, pressure, permit), (0, 1, 0));
+        assert!(longest >= 5000);
+        assert_eq!(json["held_frames"].as_u64(), Some(0));
+        assert_eq!(json["holds_storage_pressure"].as_str(), Some("1"));
+        assert_eq!(json["holds_no_permit"].as_str(), Some("0"));
+        assert_eq!(
+            json["longest_hold_ms"].as_str(),
+            Some(longest.to_string().as_str())
+        );
+        drop(sender);
+        reading.await.unwrap().unwrap();
+    }
+
+    /// The hold fields of a status as the wire carries them: held now, held for pressure, held
+    /// for a permit; the longest hold in milliseconds; and the JSON rendering of the listener.
+    fn wire_fields(status: &Status) -> ((u32, u64, u64), u64, purrdf_lex::json::Value) {
+        let mut message = capnp::message::Builder::new_default();
+        status.encode(message.init_root::<crate::sparrow_capnp::syslog_listener_status::Builder>());
+        let reader = message
+            .get_root_as_reader::<crate::sparrow_capnp::syslog_listener_status::Reader>()
+            .unwrap();
+        (
+            (
+                reader.get_held_frames(),
+                reader.get_holds_storage_pressure(),
+                reader.get_holds_no_permit(),
+            ),
+            reader.get_longest_hold_ms(),
+            crate::syslog_wire::listener(reader).unwrap(),
+        )
+    }
+
+    /// The listener's JSON rendering after the wire encoding, as status shows it.
+    pub(super) fn status_json(status: &Status) -> purrdf_lex::json::Value {
+        wire_fields(status).2
+    }
+
+    /// Value (#254): status states the receive buffer and the kernel drop count of a UDP
+    /// listener through the wire and its JSON, and a TCP listener states neither applies.
+    #[test]
+    fn udp_status_carries_buffer_sizes_and_the_kernel_drop_count() {
+        let udp = listener(SyslogTransport::Udp, 1, 1000);
+        let buffer = crate::udp_kernel::Buffer {
+            requested: 8 << 20,
+            granted: 16 << 20,
+            enlarge_error: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("udp");
+        std::fs::write(
+            &table,
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n  1: 0100007F:0202 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 777 2 0000000000000000 42\n",
+        )
+        .unwrap();
+        udp.metrics
+            .update(|status| {
+                status.kernel = Some(crate::udp_kernel::Kernel::at(table, 777, buffer));
+                Ok(())
+            })
+            .unwrap();
+        let json = status_json(&udp.metrics.snapshot().unwrap());
+        assert_eq!(json["rcvbuf_requested_bytes"].as_str(), Some("8388608"));
+        assert_eq!(json["rcvbuf_granted_bytes"].as_str(), Some("16777216"));
+        assert_eq!(json["kernel_drops"].as_str(), Some("42"));
+        assert_eq!(json["kernel_counter_state"].as_str(), Some("available"));
+        assert_eq!(json["kernel_drops_unknown"].as_bool(), Some(false));
+        let tcp = status_json(
+            &listener(SyslogTransport::Tcp, 1, 1000)
+                .metrics
+                .snapshot()
+                .unwrap(),
+        );
+        assert_eq!(tcp["kernel_counter_state"].as_str(), Some("not_applicable"));
+        assert_eq!(tcp["kernel_drops_unknown"].as_bool(), Some(false));
+    }
+
+    /// Value (#254): when the kernel counter cannot be read (a unit hiding /proc/self/net, a
+    /// missing file) status says unavailable with the reason, flags the drops unknown and
+    /// reports no count, so an operator never reads a guessed zero as "no loss".
+    #[test]
+    fn an_unreadable_kernel_counter_is_reported_unavailable_with_no_count() {
+        let udp = listener(SyslogTransport::Udp, 1, 1000);
+        let dir = tempfile::tempdir().unwrap();
+        let buffer = crate::udp_kernel::Buffer {
+            requested: 8 << 20,
+            granted: 425_984,
+            enlarge_error: None,
+        };
+        udp.metrics
+            .update(|status| {
+                status.kernel = Some(crate::udp_kernel::Kernel::at(
+                    dir.path().join("hidden"),
+                    777,
+                    buffer,
+                ));
+                Ok(())
+            })
+            .unwrap();
+        let json = status_json(&udp.metrics.snapshot().unwrap());
+        assert_eq!(json["kernel_counter_state"].as_str(), Some("unavailable"));
+        assert_eq!(json["kernel_drops_unknown"].as_bool(), Some(true));
+        assert_eq!(json["kernel_drops"].as_str(), Some("0"));
+        assert_eq!(json["rcvbuf_granted_bytes"].as_str(), Some("425984"));
+        assert!(
+            json["kernel_counter_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("hidden"))
+        );
+    }
+
+    /// Value (#254): the count is read at the events, not at bind. A status request through the
+    /// registry must pick up drops that happened since the last read, and once the listener has
+    /// stopped its final count must survive later status requests even though the closed
+    /// socket's row has left the kernel table. Both would be silently wrong otherwise: a stale
+    /// zero marked available, or a lost count.
+    #[test]
+    fn a_status_request_rereads_the_counter_and_a_stopped_listener_keeps_its_final_count() {
+        let udp = listener(SyslogTransport::Udp, 1, 1000);
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("udp");
+        let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n";
+        let row = |drops: u64| {
+            format!(
+                "  1: 0100007F:0202 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 777 2 0000000000000000 {drops}\n"
+            )
+        };
+        std::fs::write(&table, format!("{header}{}", row(5))).unwrap();
+        let buffer = crate::udp_kernel::Buffer {
+            requested: 8 << 20,
+            granted: 16 << 20,
+            enlarge_error: None,
+        };
+        udp.metrics
+            .update(|status| {
+                status.kernel = Some(crate::udp_kernel::Kernel::at(table.clone(), 777, buffer));
+                Ok(())
+            })
+            .unwrap();
+        let registry = SyslogRegistry::default();
+        registry.0.lock().unwrap().push(udp.metrics.clone());
+        let drops = |registry: &SyslogRegistry| {
+            let status = registry.snapshot().unwrap().remove(0);
+            let kernel = status.kernel.clone().unwrap();
+            (kernel.counter, kernel.finished, status_json(&status))
+        };
+        assert_eq!(drops(&registry).0, crate::udp_kernel::Counter::Available(5));
+        std::fs::write(&table, format!("{header}{}", row(9))).unwrap();
+        assert_eq!(drops(&registry).0, crate::udp_kernel::Counter::Available(9));
+        // The reader stops; the socket closes and its row leaves the table.
+        std::fs::write(&table, format!("{header}{}", row(12))).unwrap();
+        udp.metrics.finish_kernel().unwrap();
+        std::fs::write(&table, header).unwrap();
+        let (counter, finished, json) = drops(&registry);
+        assert_eq!(counter, crate::udp_kernel::Counter::Available(12));
+        assert!(finished);
+        assert_eq!(json["kernel_drops"].as_str(), Some("12"));
+        assert_eq!(json["kernel_counter_final"].as_bool(), Some(true));
+        assert!(
+            printed::lines()
+                .iter()
+                .any(|line| line.contains("final count"))
+        );
+    }
+
+    /// Value (#254): a refused enlarge is shown in status as an error text and a count, with the
+    /// size the socket kept, and the listener still reports its drop counter.
+    #[test]
+    fn a_refused_enlarge_shows_in_status_with_its_error_and_the_kept_size() {
+        let udp = listener(SyslogTransport::Udp, 1, 1000);
+        let dir = tempfile::tempdir().unwrap();
+        let buffer = crate::udp_kernel::Buffer {
+            requested: 8 << 20,
+            granted: 212_992,
+            enlarge_error: Some("cannot set SO_RCVBUF: permission denied".into()),
+        };
+        udp.metrics
+            .update(|status| {
+                status.kernel = Some(crate::udp_kernel::Kernel::at(
+                    dir.path().join("udp"),
+                    1,
+                    buffer,
+                ));
+                Ok(())
+            })
+            .unwrap();
+        let json = status_json(&udp.metrics.snapshot().unwrap());
+        assert_eq!(json["rcvbuf_enlarge_failures"].as_str(), Some("1"));
+        assert_eq!(json["rcvbuf_granted_bytes"].as_str(), Some("212992"));
+        assert!(
+            json["rcvbuf_enlarge_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("permission denied"))
+        );
+    }
+
+    /// Value (#243): a frame waiting for an operation permit is held and counted as such, not
+    /// as pressure, and is stored once a permit frees. The test holds every permit itself.
+    #[tokio::test]
+    async fn a_frame_waiting_for_an_operation_permit_is_held_and_counted_as_no_permit() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        let permits = fixture
+            .operations
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        let (_stop, stopped) = watch::channel(false);
+        let reading = connection(&fixture, receiver, stopped);
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>a")
+            .await
+            .unwrap();
+        until(&fixture.metrics, frame_taken).await;
+        let held = fixture.metrics.snapshot().unwrap();
+        assert_eq!(
+            (
+                held.counts.holds_no_permit,
+                held.counts.holds_storage_pressure
+            ),
+            (1, 0)
+        );
+        assert_eq!(held.counts.accepted, 0);
+        drop(permits);
+        until(&fixture.metrics, |status| status.counts.accepted == 1).await;
+        let done = fixture.metrics.snapshot().unwrap();
+        assert!(done.holding.is_empty());
+        assert_eq!(
+            (
+                done.counts.holds_no_permit,
+                done.counts.holds_storage_pressure
+            ),
+            (1, 0)
+        );
+        assert_eq!(stored_lengths(&fixture.store), [5]);
+        drop(sender);
+        reading.await.unwrap().unwrap();
+    }
+
+    /// Value (#245): `enter(NoPermit)` runs once before the permit wait, so a wait that began
+    /// inside the report interval and outlasted it was never announced. Protects: with a
+    /// recent announcement, a frame waiting for a permit is silent at entry, still silent
+    /// after the interval passes with no event (no timer), and the observer tick announces it
+    /// as a printed `no_permit` line; the wait keeps its place and the frame is then stored.
+    #[tokio::test(start_paused = true)]
+    async fn a_permit_wait_is_announced_by_the_observer_tick_after_the_interval() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 1000);
+        // An announcement a moment ago, as an earlier episode would have left.
+        fixture
+            .metrics
+            .update(|status| {
+                status.announced_at = Some(tokio::time::Instant::now());
+                Ok(())
+            })
+            .unwrap();
+        let permits = fixture
+            .operations
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        let (_stop, stopped) = watch::channel(false);
+        let reading = connection(&fixture, receiver, stopped);
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>a")
+            .await
+            .unwrap();
+        yield_until("the frame waits for a permit", || {
+            frame_taken(&fixture.metrics.snapshot().unwrap())
+        })
+        .await;
+        let announced = || {
+            fixture
+                .metrics
+                .snapshot()
+                .unwrap()
+                .episode
+                .as_ref()
+                .map(|episode| episode.announced)
+        };
+        assert_eq!(announced(), Some(false), "suppressed inside the interval");
+        tokio::time::advance(HOLD_REPORT_INTERVAL + Duration::from_secs(1)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(announced(), Some(false), "no timer announces the wait");
+        assert!(printed::lines().is_empty());
+        fixture.wake.observe_tick();
+        yield_until("the tick announces the wait", || announced() == Some(true)).await;
+        assert_eq!(
+            printed::lines(),
+            [
+                "sparrowd: syslog listener listener: holding 1 frame(s) under no_permit; each sender's TCP window closes until it clears"
+            ]
+        );
+        drop(permits);
+        yield_until("the frame is stored", || {
+            fixture.metrics.snapshot().unwrap().counts.accepted == 1
+        })
+        .await;
+        drop(sender);
+        reading.await.unwrap().unwrap();
+    }
+
+    /// Let every task the paused clock has made ready run to its next wait, including the
+    /// blocking store call a re-offered frame would start: yield so the frame reaches it, wait
+    /// for a blocking store call that takes the writer lock after it (a flush), then yield so
+    /// the frame handles its answer. A negative assertion made after this sees a timer's work.
+    pub(super) async fn settle(fixture: &Listener) {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let store = fixture.store.clone();
+        tokio::task::spawn_blocking(move || store.flush())
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Yield until `done` holds, failing with `what` after a wall-clock bound instead of
+    /// hanging. Not a timeout future: under a paused clock an idle runtime would fire that
+    /// early, while the blocking store call still runs.
+    pub(super) async fn yield_until(what: &str, done: impl Fn() -> bool) {
+        let began = std::time::Instant::now();
+        while !done() {
+            assert!(
+                began.elapsed() < Duration::from_secs(30),
+                "did not happen within 30 s: {what}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Start a connection whose first frame is held under a pause observed through the
+    /// measured free space, the way a nearly full volume pauses the floor. The floor's resume
+    /// edge is wired as the daemon wires it. Returns the connection, the sender and the
+    /// refusals counted so far, once the frame is held.
+    async fn held_under_observed_pause(
+        fixture: &Listener,
+    ) -> (
+        tokio::task::JoinHandle<io::Result<()>>,
+        tokio::io::DuplexStream,
+        watch::Sender<bool>,
+        u64,
+    ) {
+        let floor = fixture.store.space_floor();
+        floor.set_free_for_tests(Some(0));
+        fixture.wire_resume();
+        assert!(floor.observe(1).unwrap().is_some());
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        let (stop, stopped) = watch::channel(false);
+        let reading = connection(fixture, receiver, stopped);
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>a")
+            .await
+            .unwrap();
+        // No timeout guard here: with a paused clock an idle runtime would fire it early.
+        yield_until("the frame is held", || {
+            frame_taken(&fixture.metrics.snapshot().unwrap())
+        })
+        .await;
+        (reading, sender, stop, floor.status().refused_writes)
+    }
+
+    /// Yield until the held frame has been offered to the store `more` times again.
+    async fn until_offered_again(fixture: &Listener, refused: u64) {
+        yield_until("the held frame is offered again", || {
+            fixture.store.space_floor().status().refused_writes > refused
+        })
+        .await;
+    }
+
+    /// Value (#247): a held frame owned a 50 ms to 1 s doubling timer, a retry on a clock
+    /// while nothing could change. Protects: with no signal an hour of time passes and the
+    /// frame is not offered again; the one observer tick wakes it to evaluate, and free space
+    /// that returned with no edge seen (another process freed it) ends the hold at that tick.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_frame_has_no_timer_and_is_evaluated_again_only_by_the_observer_tick() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 1000);
+        let (reading, sender, _stop, refused) = held_under_observed_pause(&fixture).await;
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(fixture.store.space_floor().status().refused_writes, refused);
+        // The pause persists at the tick: the frame is offered again and stays held.
+        fixture.wake.observe_tick();
+        until_offered_again(&fixture, refused).await;
+        assert_eq!(fixture.metrics.snapshot().unwrap().counts.accepted, 0);
+        // Free space returned and no observation saw the edge; the next tick ends the hold.
+        fixture.store.space_floor().set_free_for_tests(None);
+        fixture.wake.observe_tick();
+        yield_until("the frame is stored", || {
+            fixture.metrics.snapshot().unwrap().counts.accepted != 0
+        })
+        .await;
+        assert_eq!(stored_lengths(&fixture.store), [5]);
+        drop(sender);
+        reading.await.unwrap().unwrap();
+    }
+
+    /// Value (#247): the main loop observes the floor every second beside maintenance, and
+    /// whichever sees the resume edge consumes it; maintenance compared counters around its
+    /// own observation, so an edge the main loop took woke nobody. Protects: the edge itself
+    /// wakes the held frame, from any observer, with no tick and no time passing.
+    #[tokio::test(start_paused = true)]
+    async fn the_floor_resume_wakes_a_held_frame_from_any_observer_with_no_timer() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 1000);
+        let (reading, sender, _stop, _) = held_under_observed_pause(&fixture).await;
+        // The sender closes while its frame is held; nothing already read is lost (#243).
+        drop(sender);
+        let floor = fixture.store.space_floor();
+        floor.set_free_for_tests(None);
+        // This observer is not maintenance; it consumes the edge.
+        assert!(floor.observe(2).unwrap().is_none());
+        assert_eq!(floor.status().resumes, 1);
+        yield_until("the frame is stored", || {
+            fixture.metrics.snapshot().unwrap().counts.accepted != 0
+        })
+        .await;
+        assert_eq!(stored_lengths(&fixture.store), [5]);
+        reading.await.unwrap().unwrap();
+        let counts = fixture.metrics.snapshot().unwrap().counts;
+        assert_eq!(
+            counts.refused + counts.framing_failures + counts.timed_out,
+            0
+        );
+    }
+
+    /// Value (#243, #247): a long hold is always announced. An episode that starts inside the
+    /// report interval is suppressed at entry and is announced by the frame's next offer once
+    /// the interval has passed; the frame owns no timer now, so only the observer tick can
+    /// make that offer. Protects: with the interval passed and no other event the episode
+    /// stays unannounced until the tick, then is announced.
+    #[tokio::test(start_paused = true)]
+    async fn a_suppressed_hold_is_announced_by_the_observer_tick_after_the_interval() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 1000);
+        let (reading, mut sender, _stop, _) = held_under_observed_pause(&fixture).await;
+        let announced = || {
+            fixture
+                .metrics
+                .snapshot()
+                .unwrap()
+                .episode
+                .as_ref()
+                .map(|episode| episode.announced)
+        };
+        assert_eq!(announced(), Some(true), "the first episode is announced");
+        // End it, then pause again so a second episode starts inside the interval.
+        let floor = fixture.store.space_floor();
+        floor.set_free_for_tests(None);
+        assert!(floor.observe(2).unwrap().is_none());
+        yield_until("the first frame is stored", || {
+            fixture.metrics.snapshot().unwrap().counts.accepted == 1
+        })
+        .await;
+        floor.set_free_for_tests(Some(0));
+        assert!(floor.observe(3).unwrap().is_some());
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>b")
+            .await
+            .unwrap();
+        yield_until("the second frame is held", || {
+            frame_taken(&fixture.metrics.snapshot().unwrap())
+        })
+        .await;
+        assert_eq!(
+            announced(),
+            Some(false),
+            "inside the interval it is suppressed"
+        );
+        let refused = floor.status().refused_writes;
+        tokio::time::advance(HOLD_REPORT_INTERVAL + Duration::from_secs(1)).await;
+        settle(&fixture).await;
+        assert_eq!(announced(), Some(false), "no timer re-offers the frame");
+        assert_eq!(floor.status().refused_writes, refused);
+        let before = printed::lines().len();
+        fixture.wake.observe_tick();
+        yield_until("the tick announces the episode", || {
+            announced() == Some(true)
+        })
+        .await;
+        // The chain ends in the printed line an operator reads, not only the flag.
+        let lines = printed::lines();
+        assert_eq!(lines.len(), before + 1, "{lines:?}");
+        assert_eq!(
+            lines.last().unwrap(),
+            "sparrowd: syslog listener listener: holding 1 frame(s) under storage_pressure; each sender's TCP window closes until it clears"
+        );
+        drop(sender);
+        floor.set_free_for_tests(None);
+        fixture.wake.wake();
+        reading.await.unwrap().unwrap();
+    }
+
+    /// Value (#243): a refusal no retry changes (`RESOURCE_LIMIT`) is not held. It keeps its
+    /// counted discard and closes the connection as before, where holding it would stall the
+    /// sender forever.
+    #[tokio::test]
+    async fn a_permanent_refusal_is_counted_not_held() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        fixture
+            .store
+            .space_floor()
+            .refuse_next_write_for_tests("RESOURCE_LIMIT");
+        let (mut sender, receiver) = tokio::io::duplex(64);
+        let (_stop, stopped) = watch::channel(false);
+        let reading = connection(&fixture, receiver, stopped);
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>a")
+            .await
+            .unwrap();
+        reading.await.unwrap().unwrap();
+        let status = fixture.metrics.snapshot().unwrap();
+        assert_eq!((status.counts.refused, status.counts.accepted), (1, 0));
+        assert_eq!(
+            (
+                status.counts.holds_storage_pressure,
+                status.counts.holds_no_permit
+            ),
+            (0, 0)
+        );
+        assert!(status.holding.is_empty() && status.counts.longest_hold_ms == 0);
+    }
+
+    /// Value (#243): the journal keeps its promise to an operator. The first episode is
+    /// announced and its end journaled. An episode that starts inside the report interval is
+    /// not announced then, but is once its retries pass the interval, and its end is journaled
+    /// with the count and the longest wait; a short suppressed episode leaves no lines.
+    #[test]
+    fn a_long_hold_is_always_announced_and_its_end_journaled() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 1000);
+        let mut status = fixture.metrics.snapshot().unwrap();
+        let t0 = tokio::time::Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let hold = |status: &mut Status, id: &mut Option<u64>, secs| {
+            status
+                .hold(id, &mut [false; 3], HoldReason::StoragePressure, at(secs))
+                .unwrap()
+        };
+        let mut first = None;
+        assert!(hold(&mut status, &mut first, 0).is_some());
+        assert!(hold(&mut status, &mut first, 1).is_none());
+        let line = status.release(first.unwrap(), at(2)).unwrap();
+        assert!(
+            line.contains("1 frame(s) held, longest wait 2000 ms"),
+            "{line}"
+        );
+        let mut second = None;
+        assert!(hold(&mut status, &mut second, 10).is_none());
+        assert!(hold(&mut status, &mut second, 59).is_none());
+        assert!(hold(&mut status, &mut second, 61).is_some());
+        let line = status.release(second.unwrap(), at(100)).unwrap();
+        assert!(
+            line.contains("1 frame(s) held, longest wait 90000 ms"),
+            "{line}"
+        );
+        let mut third = None;
+        assert!(hold(&mut status, &mut third, 101).is_none());
+        assert!(status.release(third.unwrap(), at(102)).is_none());
+    }
+
+    /// Value (#243, #428): shutdown interrupts a hold and the frame in hand is accounted once:
+    /// stored when the store takes it by then, and spilled beside the store, not counted
+    /// refused, when pressure persists.
+    #[tokio::test]
+    async fn stopping_during_a_hold_publishes_the_frame_or_counts_it() {
+        for cleared in [false, true] {
+            let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+            fixture.store.space_floor().refuse_writes_for_tests(true);
+            let (mut sender, receiver) = tokio::io::duplex(64);
+            let (stop, stopped) = watch::channel(false);
+            let reading = connection(&fixture, receiver, stopped);
+            tokio::io::AsyncWriteExt::write_all(&mut sender, b"5 <34>a")
+                .await
+                .unwrap();
+            until(&fixture.metrics, frame_taken).await;
+            if cleared {
+                relieve(&fixture);
+            }
+            stop.send_replace(true);
+            reading.await.unwrap().unwrap();
+            let counts = fixture.metrics.snapshot().unwrap().counts;
+            assert_eq!(
+                (counts.accepted, counts.refused),
+                (if cleared { 1 } else { 0 }, 0)
+            );
+            assert_eq!(
+                fixture.spill.read().unwrap().frames.len(),
+                usize::from(!cleared)
+            );
+        }
+    }
+
+    /// Value (#243): a connection holding a frame is not idle. At the connection ceiling an
+    /// arrival does not reclaim it; the holder's frame is stored when pressure clears, and only
+    /// then, idle at a boundary, is it reclaimed for the arrival, whose frame is then kept.
+    #[tokio::test]
+    async fn a_holder_at_the_ceiling_is_not_reclaimed_until_it_is_idle() {
+        let fixture = listener(SyslogTransport::Tcp, 1, 60_000);
+        fixture.store.space_floor().refuse_writes_for_tests(true);
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        let (stop, task) = serve(Socket::Tcp(tcp), &fixture).await;
+        let mut holder = tokio::net::TcpStream::connect(address).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut holder, b"5 <34>a")
+            .await
+            .unwrap();
+        until(&fixture.metrics, frame_taken).await;
+        let mut arrival = tokio::net::TcpStream::connect(address).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut arrival, b"20 <34>bbbbbbbbbbbbbbbb")
+            .await
+            .unwrap();
+        relieve(&fixture);
+        let mut byte = [0_u8];
+        assert_eq!(holder.read(&mut byte).await.unwrap(), 0);
+        until(&fixture.metrics, |status| status.counts.accepted == 2).await;
+        assert_eq!(stored_lengths(&fixture.store), [5, 20]);
+        let counts = fixture.metrics.snapshot().unwrap().counts;
+        assert_eq!(
+            counts.refused + counts.timed_out + counts.framing_failures,
+            0
+        );
+        stop.send_replace(true);
+        task.await.unwrap().unwrap();
+    }
+
+    /// Value: a UDP datagram above `max_message_bytes` but within the store ceiling is kept
+    /// whole, not discarded as truncated; nothing is cut, so nothing is counted as cut.
+    #[tokio::test]
+    async fn a_udp_datagram_above_the_configured_size_is_kept_whole() {
+        let fixture = listener(SyslogTransport::Udp, 1, 1000);
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let (stop, task) = serve(Socket::Udp(socket), &fixture).await;
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(&vec![b'x'; 481], address).await.unwrap();
+        sender.send_to(&vec![b'x'; 65507], address).await.unwrap();
+        until(&fixture.metrics, |status| status.counts.accepted == 2).await;
+        assert_eq!(fixture.metrics.snapshot().unwrap().counts.truncated, 0);
+        stop.send_replace(true);
+        task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn syslog_config_has_explicit_local_authority_and_transport_specific_bounds() {
+        let valid = SyslogListener {
+            id: "test".into(),
+            address: "127.0.0.1:0".parse().unwrap(),
+            source: "syslog".into(),
+            transport: SyslogTransport::Tcp,
+            framing: Some(SyslogFraming::OctetCounting),
+            max_message_bytes: 480,
+            max_connections: 1,
+            read_timeout_ms: 1000,
+            hold_bytes: None,
+        };
+        validate(std::slice::from_ref(&valid)).unwrap();
+        for (transport, framing, connections, size, address) in [
+            (SyslogTransport::Tcp, None, 1, 480, "127.0.0.1:0"),
+            (SyslogTransport::Udp, valid.framing, 1, 480, "127.0.0.1:0"),
+            (SyslogTransport::Udp, None, 2, 480, "127.0.0.1:0"),
+            (SyslogTransport::Tcp, valid.framing, 1, 479, "127.0.0.1:0"),
+            (SyslogTransport::Tcp, valid.framing, 17, 480, "127.0.0.1:0"),
+            (SyslogTransport::Tcp, valid.framing, 1, 480, "0.0.0.0:514"),
+        ] {
+            let mut invalid = valid.clone();
+            invalid.transport = transport;
+            invalid.framing = framing;
+            invalid.max_connections = connections;
+            invalid.max_message_bytes = size;
+            invalid.address = address.parse().unwrap();
+            assert!(validate(&[invalid]).is_err());
+        }
+        assert!(validate(&[valid.clone(), valid.clone()]).is_err());
+        // hold_bytes is a UDP key with a range, and all listeners together have a cap.
+        let datagram = |id: &str, bytes: Option<usize>| SyslogListener {
+            id: id.into(),
+            transport: SyslogTransport::Udp,
+            framing: None,
+            hold_bytes: bytes,
+            ..valid.clone()
+        };
+        validate(&[
+            datagram("a", Some(MIN_HOLD_BYTES)),
+            datagram("b", Some(MAX_TOTAL_HOLD_BYTES - MIN_HOLD_BYTES)),
+        ])
+        .unwrap();
+        validate(&[datagram("a", Some(MAX_HOLD_BYTES))]).unwrap();
+        assert_eq!(MAX_HOLD_BYTES, MAX_TOTAL_HOLD_BYTES);
+        for bytes in [MIN_HOLD_BYTES - 1, MAX_HOLD_BYTES + 1] {
+            assert!(validate(&[datagram("a", Some(bytes))]).is_err());
+        }
+        let mut tcp = valid.clone();
+        tcp.hold_bytes = Some(MIN_HOLD_BYTES);
+        assert!(validate(&[tcp]).is_err());
+        let each = MAX_TOTAL_HOLD_BYTES / 2;
+        validate(&[datagram("a", Some(each)), datagram("b", Some(each))]).unwrap();
+        assert!(validate(&[datagram("a", Some(each)), datagram("b", Some(each + 1))]).is_err());
+        let defaults: Vec<_> = (0..4).map(|n| datagram(&n.to_string(), None)).collect();
+        validate(&defaults).unwrap();
+    }
+
+    /// Value (#445): a store answering `STORAGE_FAILURE` ended the listener, and with it the
+    /// daemon. Protects, on the real publication path: the packet is held (counted in
+    /// `holds_store_failure`), the listener's status and the journal name the failure, the packet
+    /// is offered again on its own clock with no pressure wake, and it is stored once the store
+    /// takes it, with the failure text cleared.
+    #[tokio::test(start_paused = true)]
+    async fn a_store_failure_holds_the_packet_and_stores_it_when_the_store_recovers() {
+        let fixture = listener(SyslogTransport::Udp, 1, 1000);
+        fixture
+            .store
+            .space_floor()
+            .refuse_next_write_for_tests("STORAGE_FAILURE");
+        let (_stop, mut stopped) = watch::channel(false);
+        let mut waiter = fixture.wake.subscribe();
+        let published = publish_held(
+            &fixture.store,
+            "source",
+            Packet {
+                bytes: Arc::from(&b"<34>held"[..]),
+                intake: Intake::Tcp,
+            },
+            &fixture.metrics,
+            &fixture.operations,
+            &mut stopped,
+            &mut waiter,
+        )
+        .await
+        .unwrap();
+        assert_eq!(published, Published::Stored);
+        let status = fixture.metrics.snapshot().unwrap();
+        assert_eq!(status.counts.holds_store_failure, 1);
+        assert_eq!(status.counts.accepted, 1);
+        assert_eq!(status.failure, None);
+        assert!(
+            printed::lines()
+                .iter()
+                .any(|line| line.contains("the store failed a write")),
+        );
+    }
+
+    /// Value (#445): any listener error ended every listener and the daemon. Protects: a TCP
+    /// listener whose spill cannot be read is counted and bound again with a backoff while the
+    /// daemon's group stays up, and once the cause is cleared the same supervisor serves a
+    /// connection on the new binding; a stop then ends it cleanly.
+    #[tokio::test]
+    async fn a_failed_listener_is_bound_again_and_serves_once_its_cause_clears() {
+        let fixture = listener(SyslogTransport::Tcp, 2, 1000);
+        // A directory where the spill file belongs: reading it fails until it is removed.
+        std::fs::create_dir_all(fixture.spill.path()).unwrap();
+        let socket = Socket::Tcp(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let (stop, stopped) = watch::channel(false);
+        let task = tokio::spawn(supervise(
+            socket,
+            fixture.metrics.clone(),
+            fixture.store.clone(),
+            fixture.operations.clone(),
+            stopped,
+            PressureHold::new(fixture.wake.clone(), fixture.spill.clone()),
+        ));
+        until(&fixture.metrics, |status| {
+            status.counts.listener_errors >= 2
+        })
+        .await;
+        assert!(
+            !task.is_finished(),
+            "the supervisor ended with its listener"
+        );
+        std::fs::remove_dir(fixture.spill.path()).unwrap();
+        let began = std::time::Instant::now();
+        while fixture.metrics.snapshot().unwrap().counts.accepted == 0 {
+            assert!(began.elapsed() < Duration::from_secs(30), "no frame stored");
+            let address = fixture.metrics.snapshot().unwrap().address;
+            if let Ok(mut connection) = tokio::net::TcpStream::connect(address).await {
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut connection, b"5 <34>a").await;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            printed::lines()
+                .iter()
+                .any(|line| line.contains("bound again")),
+        );
+        stop.send_replace(true);
+        task.await.unwrap().unwrap();
+    }
+}

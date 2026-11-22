@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+
+[package]
+name = "sparrow-test-support"
+version = "0.1.0"
+description = "Internal fixtures and process harnesses for Sparrow tests"
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license.workspace = true
+
+[dependencies]
+sparrow-core = { path = "../sparrow-core", features = ["test-support"] }
+rocksdb.workspace = true
+purrdf-lex.workspace = true
+purrdf.workspace = true
+
+[dev-dependencies]
+rustix.workspace = true
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,630 @@
+// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+
+//! Store-owned graph membership; RDF meaning and query execution stay in PurRDF.
+
+use super::*;
+use crate::storage::temporal_index::{TemporalRows, row_bound};
+use crate::storage::{
+    catalog_lease::{CaptureAdmission, SCAN_BYTES},
+    diagnostic,
+};
+use crate::{DiagnosticCoverage, QueryCancellation, QueryScope};
+use std::time::Instant;
+
+fn catalog_entry(
+    budget: &Budget,
+    id: &str,
+    bytes: &[u8],
+    admission: &mut CaptureAdmission<'_>,
+) -> Result<(), Error> {
+    admission.entry(bytes.len())?;
+    budget
+        .admit_bytes((id.len() + bytes.len()) as u64)
+        .map_err(|error| Error::clone(&error))
+}
+
+fn artifact_catalog(
+    writer: &crate::storage::Writer,
+    budget: &Budget,
+    admission: &mut CaptureAdmission<'_>,
+    key: &[u8],
+    value: &[u8],
+) -> Result<crate::storage::manifest_retire::Header, Error> {
+    use crate::storage::artifact_rdf;
+    crate::storage::temporal_index::check_width(artifact_rdf::TIME, key, value)?;
+    admission.entry(key.len() + value.len())?;
+    let id = std::str::from_utf8(value)
+        .map_err(|_| Error::new("STORAGE_FAILURE", "invalid artifact receipt identity"))?;
+    if !id.starts_with("artifact:") || id.len() <= 9 {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "artifact receipt requires an artifact identity",
+        ));
+    }
+    let bytes = writer.db.get_pinned(id)?.ok_or_else(|| {
+        Error::new(
+            "STORAGE_FAILURE",
+            "artifact receipt references a missing catalog",
+        )
+    })?;
+    budget
+        .admit_bytes((id.len() + bytes.len()) as u64)
+        .map_err(|error| Error::clone(&error))?;
+    let header = artifact_rdf::catalog(&writer.db, id, &bytes, admission.remaining)?;
+    if header.record_count == 0 {
+        budget
+            .request(row_bound("empty-time:"), false)
+            .map_err(|error| Error::clone(&error))?;
+        if writer
+            .db
+            .get_pinned(crate::storage::recordless::key_parts(
+                header.artifact.received_at,
+                id,
+            ))?
+            .as_deref()
+            != Some(id.as_bytes())
+        {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "empty artifact receipt index is missing or inconsistent",
+            ));
+        }
+    }
+    if key != artifact_rdf::time_key(header.artifact.received_at, id).as_bytes()
+        || header.artifact.evicted
+    {
+        return Err(Error::new(
+            "STORAGE_FAILURE",
+            "artifact receipt index disagrees with its catalog",
+        ));
+    }
+    Ok(header)
+}
+
+/// Coverage of a completed graph-owner capture, independently of query certainty.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RdfScopeCoverage {
+    /// Chronological candidates visited, before liveness/source/diagnostic filters.
+    pub visited: u64,
+    /// Known selected record occurrences, never a count of shared content graphs.
+    /// The exact total is unknown when diagnostic membership is incomplete.
+    pub selected_records: u64,
+    /// Artifact candidates visited independently of record occurrences.
+    pub artifacts_visited: u64,
+    /// Proven complete-artifact membership; no content projection is implied.
+    pub selected_artifacts: u64,
+    /// Otherwise eligible empty artifacts lacking requested diagnostic dimensions.
+    pub artifact_diagnostic_unknown: u64,
+    /// Selected occurrences with a ready content projection.
+    pub content_ready: u64,
+    /// Selected occurrences with a failed content projection.
+    pub content_failed: u64,
+    /// Selected occurrences to which content projection does not apply.
+    pub content_not_applicable: u64,
+    /// Diagnostic membership evidence from the shared record matcher.
+    pub diagnostics: DiagnosticCoverage,
+    /// Catalog reads admitted across reference expansion and candidate loading.
+    pub catalog_entries: usize,
+    /// Known source-event times among selected occurrences, independently of RDF readiness.
+    pub event_time_known: u64,
+    /// Selected occurrences whose source-time profile depends on a failed JSON projection.
+    /// Their receipt-time placement is not ready evidence for a strict event-clock read.
+    pub event_time_projection_failed: u64,
+    /// Known declared diagnostic values among selected occurrences, by dimension.
+    pub diagnostic_known: std::collections::BTreeMap<crate::DiagnosticDimension, u64>,
+    /// Selected record metadata graphs without a source event time whose stored rows lack
+    /// `eventTimeFallback`. The view derives the `eventTimeFallback` and `eventTimeBasis`
+    /// facts from the record's receipt time, and this counts the graphs served that way.
+    /// It is a permanent read-time count, not pending work: new graphs never store the
+    /// facts, so it does not fall to zero.
+    pub event_fallback_pending: u64,
+}
+
+impl RdfScopeCoverage {
+    /// All requested applicable content is ready and membership is known.
+    pub fn complete(&self) -> bool {
+        self.diagnostics.complete(false)
+            && self.content_failed == 0
+            && self.artifact_diagnostic_unknown == 0
+    }
+}
+
+impl StoredRdfView<'_> {
+    fn include_owner(&mut self, id: &str) -> Result<(), ReadError> {
+        if id.starts_with("record:") || id.starts_with("artifact:") {
+            let marker = self
+                .snapshot
+                .get_pinned(format!("provenance-rdf:{id}"))
+                .map_err(|e| self.budget.fail(e.into()))?;
+            if marker.as_deref() != Some([].as_slice()) {
+                return Err(self.budget.fail(Error::new(
+                    "STORAGE_FAILURE",
+                    "occurrence provenance RDF marker missing or invalid",
+                )));
+            }
+        }
+        let owner = self
+            .term_id_by_value(&TermValue::iri(rdf_index::graph_iri(id)))?
+            .ok_or_else(|| {
+                self.budget
+                    .fail(Error::new("STORAGE_FAILURE", "RDF graph owner missing"))
+            })?;
+        if !self.owners.contains(&ordinal(owner)) {
+            Arc::get_mut(&mut self._scope)
+                .expect("scope capture precedes owned query admission")
+                .grow(512)?;
+            self.owners.insert(ordinal(owner));
+            self.allow_owner_rows(id)?;
+        }
+        Ok(())
+    }
+
+    /// Raise the read ceilings by the allowance for each row of `id`'s stored graph, when the
+    /// view has one. The manifest is the rows the scope will read for this owner.
+    fn allow_owner_rows(&self, id: &str) -> Result<(), ReadError> {
+        let Some(allowance) = self.row_allowance else {
+            return Ok(());
+        };
+        let manifest = self
+            .snapshot
+            .get_pinned(format!("rdf:graph:{id}"))
+            .map_err(|e| self.budget.fail(e.into()))?;
+        let Some(manifest) = manifest else {
+            return Ok(());
+        };
+        let rows: u64 = rdf_index::manifest_stream_counts(&manifest)
+            .map_err(|e| self.budget.fail(e))?
+            .iter()
+            .sum();
+        self.budget.allow(
+            rows.saturating_mul(allowance.requests),
+            rows.saturating_mul(allowance.row_visits),
+        );
+        Ok(())
+    }
+
+    /// Add one artifact's graph owner. An artifact with no RDF ownership marker was retired
+    /// before the store was fenced and has no graph; that is `false`, not an error.
+    pub(super) fn include_artifact_owner(&mut self, id: &str) -> Result<bool, ReadError> {
+        let marker = self.point(format!("artifact-rdf:{id}").as_bytes(), 8)?;
+        if marker.is_none() {
+            return Ok(false);
+        }
+        drop(marker);
+        let manifest = self
+            .point(format!("rdf:graph:{id}").as_bytes(), 65536)?
+            .ok_or_else(|| {
+                self.budget
+                    .fail(Error::new("STORAGE_FAILURE", "artifact RDF graph missing"))
+            })?;
+        drop(manifest);
+        self.include_owner(id)?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn include_artifact(
+        &mut self,
+        writer: &crate::storage::Writer,
+        header: &crate::storage::manifest_retire::Header,
+        matched_artifacts: &BTreeSet<String>,
+        scope: &QueryScope,
+        layers: RdfGraphLayers,
+        now: u64,
+        protected: &BTreeSet<String>,
+        coverage: &mut RdfScopeCoverage,
+    ) -> Result<(), ReadError> {
+        let artifact = &header.artifact;
+        coverage.artifacts_visited += 1;
+        if !writer.live_artifact(artifact, now, protected)
+            || !scope.matches_source(&artifact.source)
+        {
+            return Ok(());
+        }
+        if !scope.diagnostics.is_empty() && header.record_count != 0 {
+            if !matched_artifacts.contains(&artifact.id) {
+                return Ok(());
+            }
+        } else if !scope.diagnostics.is_empty() {
+            coverage.artifact_diagnostic_unknown += 1;
+            if scope.require_complete_index {
+                return Err(self.budget.fail(Error::new("EVIDENCE_INCOMPLETE","selected recordless artifact has no diagnostic record; omit diagnostic filters or select records")));
+            }
+            return Ok(());
+        }
+        coverage.selected_artifacts += 1;
+        if layers.metadata {
+            let marker = format!("artifact-rdf:{}", artifact.id);
+            let value = self.point(marker.as_bytes(), 8)?.ok_or_else(|| {
+                self.budget.fail(Error::new(
+                    "STORAGE_FAILURE",
+                    "artifact RDF ownership marker missing",
+                ))
+            })?;
+            if value.as_ref() != artifact.received_at.to_be_bytes() {
+                return Err(self.budget.fail(Error::new(
+                    "STORAGE_FAILURE",
+                    "artifact RDF receipt marker disagrees with its catalog",
+                )));
+            }
+            drop(value);
+            let graph = format!("rdf:graph:{}", artifact.id);
+            let manifest = self.point(graph.as_bytes(), 65536)?.ok_or_else(|| {
+                self.budget
+                    .fail(Error::new("STORAGE_FAILURE", "artifact RDF graph missing"))
+            })?;
+            drop(manifest);
+            self.include_owner(&artifact.id)?;
+        }
+        Ok(())
+    }
+
+    /// One graph-layer/readiness law for explicit and filtered record capture.
+    pub(super) fn include_record(
+        &mut self,
+        record: &Record,
+        layers: RdfGraphLayers,
+        strict: bool,
+        coverage: &mut RdfScopeCoverage,
+    ) -> Result<(), ReadError> {
+        match &record.event_time {
+            crate::EventTime::Known { .. } => coverage.event_time_known += 1,
+            crate::EventTime::Unknown { reason, .. } if reason == "projection_failed" => {
+                coverage.event_time_projection_failed += 1;
+            }
+            crate::EventTime::Unknown { .. } => {}
+        }
+        for (dimension, value) in &record.diagnostics.fields {
+            if matches!(value, crate::DiagnosticValue::Known { .. }) {
+                *coverage.diagnostic_known.entry(*dimension).or_default() += 1;
+            }
+        }
+        if layers.metadata {
+            self.include_owner(&record.id)?;
+            if !matches!(record.event_time, crate::EventTime::Known { .. })
+                && self.fallback_pending(&record.id)?
+            {
+                coverage.event_fallback_pending += 1;
+                self.owe_fallback(record)?;
+            }
+        }
+        if layers.diagnostic
+            && let Some(owner) = diagnostic::graph_owner(record)
+        {
+            self.include_owner(&owner)?;
+        }
+        if !layers.content {
+            return Ok(());
+        }
+        if record.rdf_projection_id.is_empty() {
+            coverage.content_not_applicable += 1;
+            return Ok(());
+        }
+        let status = {
+            let _decode = self.budget.reserve(4096 * 64)?;
+            let key = format!("rdf:state:{}", record.rdf_projection_id);
+            let bytes = self.point(key.as_bytes(), 4096)?.ok_or_else(|| {
+                self.budget.fail(Error::new(
+                    "STORAGE_FAILURE",
+                    "RDF projection state missing",
+                ))
+            })?;
+            let state = crate::storage::parse(&bytes).map_err(|e| self.budget.fail(e))?;
+            crate::storage::read_field::<String>(&state, "state")
+                .map_err(|e| self.budget.fail(e))?
+        };
+        match status.as_str() {
+            "complete" => {
+                coverage.content_ready += 1;
+                self.include_owner(&record.rdf_projection_id)?;
+            }
+            "failed" => {
+                coverage.content_failed += 1;
+                if strict {
+                    return Err(self.budget.fail(Error::new(
+                        "EVIDENCE_INCOMPLETE",
+                        "selected record RDF projection failed; inspect its diagnostic",
+                    )));
+                }
+            }
+            _ => {
+                return Err(self.budget.fail(Error::new(
+                    "STORAGE_FAILURE",
+                    "invalid RDF projection state",
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Which RDF snapshot slot a read takes. Each slot admits one snapshot at a time, and the two
+/// are independent: an archive prepare, which can run for tens of seconds, never refuses a
+/// query, and a query never refuses it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadSlot {
+    /// SPARQL and every other ordinary RDF read.
+    Query,
+    /// The archive's segment read.
+    Archive,
+}
+
+impl ReadSlot {
+    /// How a read in this slot ends its lease: a query at the lease's length, the archive's
+    /// segment read only after a lease's length without progress (#328), so a segment that
+    /// is still reading is never cut off for its size.
+    pub(super) fn lease(self) -> LeaseRenewal {
+        match self {
+            Self::Query => LeaseRenewal::Fixed,
+            Self::Archive => LeaseRenewal::OnProgress,
+        }
+    }
+}
+
+/// The store's RDF snapshot slots, one owner per [`ReadSlot`].
+#[derive(Debug, Default)]
+pub(crate) struct ReadSlots {
+    query: std::sync::Mutex<()>,
+    archive: std::sync::Mutex<()>,
+}
+
+impl Store {
+    pub(crate) fn rdf_read_lease(
+        &self,
+        slot: ReadSlot,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, ReadError> {
+        let (owner, refusal) = match slot {
+            ReadSlot::Query => (
+                &self.rdf_read.query,
+                "store already has an active query RDF snapshot; retry after its lease ends",
+            ),
+            ReadSlot::Archive => (
+                &self.rdf_read.archive,
+                "store already has an active archive RDF snapshot; retry after its lease ends",
+            ),
+        };
+        owner.try_lock().map_err(|error| {
+            Arc::new(match error {
+                std::sync::TryLockError::WouldBlock => Error::new("RESOURCE_LIMIT", refusal),
+                std::sync::TryLockError::Poisoned(_) => {
+                    Error::new("STORAGE_FAILURE", "RDF snapshot admission owner poisoned")
+                }
+            })
+        })
+    }
+
+    /// Capture live, artifact, record or pin membership with the shared temporal
+    /// and diagnostic filters, then execute against that same native snapshot.
+    /// `scope.limit` is a future result-page ceiling, never a membership truncation.
+    /// Exhausted capture admission refuses the whole operation before its callback.
+    /// The callback runs without the writer lock; cancellation remains effective
+    /// at the native source/governor checkpoints throughout query execution.
+    pub fn with_rdf_scope<T>(
+        &self,
+        scope: &QueryScope,
+        layers: RdfGraphLayers,
+        now: u64,
+        limits: RdfReadLimits,
+        cancellation: &QueryCancellation,
+        operation: impl FnOnce(&StoredRdfView<'_>, &RdfScopeCoverage) -> T,
+    ) -> Result<T, ReadError> {
+        self.capture_rdf_scope(
+            (scope, None, false),
+            layers,
+            now,
+            limits,
+            cancellation,
+            operation,
+        )
+    }
+
+    pub(super) fn capture_rdf_scope<T>(
+        &self,
+        selection: (&QueryScope, Option<&crate::CorrelationCapture>, bool),
+        layers: RdfGraphLayers,
+        now: u64,
+        limits: RdfReadLimits,
+        cancellation: &QueryCancellation,
+        operation: impl FnOnce(&StoredRdfView<'_>, &RdfScopeCoverage) -> T,
+    ) -> Result<T, ReadError> {
+        let (scope, correlation, text) = selection;
+        scope.validate().map_err(Arc::new)?;
+        cancellation.checkpoint().map_err(Arc::new)?;
+        let _lease = self.rdf_read_lease(ReadSlot::Query)?;
+        let writer = self.lock().map_err(Arc::new)?;
+        let db = Arc::clone(&writer.db);
+        let mut view = StoredRdfView::new_cancellable(
+            &db,
+            limits,
+            &[],
+            cancellation.clone(),
+            LeaseRenewal::Fixed,
+        )?;
+        view.scoped = scope.restricts_membership();
+        if correlation.is_some() {
+            // The correlation recipe never reads the backfilled facts.
+            view.fallback = None;
+        }
+        if text {
+            Arc::get_mut(&mut view._scope)
+                .expect("text setup precedes native owned-query admission")
+                .grow(4096)?;
+            view.text_scope = Some(super::text_relations::TextScope::new(
+                writer.config.text_analyzer.clone(),
+                scope.scan_budget,
+                &writer.id,
+                view.snapshot_sequence_number(),
+            ));
+        }
+        // Shared catalog admission charges every decoded entry at 64x encoded
+        // bytes. Keep this whole capture allowance live until temporary maps drop.
+        let _catalog = view.budget.reserve(SCAN_BYTES as u64)?;
+        let mut remaining = SCAN_BYTES;
+        let pin_maximum = writer
+            .config
+            .max_pin_members
+            .saturating_mul(128)
+            .saturating_add(4096);
+        let budget = Arc::clone(&view.budget);
+        // All reference-expansion catalog bodies together fit this encoded
+        // bound under the shared 64x charge. Admit it before any such read.
+        budget.request((SCAN_BYTES / 64) as u64, false)?;
+        let protected = writer
+            .protected_matching(
+                now,
+                |_| true,
+                || {
+                    budget
+                        .request(pin_maximum as u64, true)
+                        .and_then(|_| budget.reserve((pin_maximum as u64).saturating_mul(64)))
+                        .map_err(|error| Error::clone(&error))
+                },
+                Some(pin_maximum),
+                Some(&mut remaining),
+            )
+            .map_err(|e| budget.fail(e))?;
+        let mut scanned = 0;
+        let mut admission = CaptureAdmission {
+            cancellation,
+            started: Instant::now(),
+            scan_budget: scope.scan_budget,
+            scanned: &mut scanned,
+            remaining: &mut remaining,
+        };
+        let selection = writer
+            .query_selection_membership(&scope.selection, now, &protected, Some(&mut admission))
+            .map_err(|e| budget.fail(e))?;
+        if let Some(crate::CorrelationCapture {
+            selector: crate::CorrelationSelector::Evidence(ids),
+            ..
+        }) = correlation
+        {
+            writer
+                .query_selection_membership(
+                    &crate::QuerySelection::Evidence(ids.clone()),
+                    now,
+                    &protected,
+                    Some(&mut admission),
+                )
+                .map_err(|error| budget.fail(error))?;
+        }
+        Arc::get_mut(&mut view._scope)
+            .expect("scope capture precedes owned query admission")
+            .grow(crate::QUERY_SCOPE_WORKSPACE_BYTES as u64)?;
+        view.scope_receipt = Some(
+            crate::storage::scope_receipt::capture(&writer.id, scope, selection.as_ref())
+                .map_err(|error| budget.fail(error))?,
+        );
+        let (members, artifacts) = match selection {
+            Some(members) => (Some(members.records), Some(members.artifact_times)),
+            None => (None, None),
+        };
+        let mut candidates = writer
+            .query_candidates_from_members(scope, members, |id| {
+                writer.get_admitted(id, |bytes| {
+                    catalog_entry(&budget, id, bytes, &mut admission)
+                })
+            })
+            .map_err(|e| budget.fail(e))?;
+        let mut coverage = RdfScopeCoverage::default();
+        let mut matched_artifacts = BTreeSet::new();
+        loop {
+            budget.request(row_bound("time:"), true)?;
+            let Some(record) = candidates.next() else {
+                break;
+            };
+            let record = record.map_err(|e| budget.fail(e))?;
+            coverage.visited += 1;
+            if !writer.live_record(&record, now, &protected)
+                || !scope.matches_source(&record.source)
+                || !writer
+                    .matches_diagnostic_scope(
+                        scope,
+                        &record,
+                        &mut coverage.diagnostics,
+                        scope.require_complete_index,
+                    )
+                    .map_err(|e| budget.fail(e))?
+            {
+                continue;
+            }
+            writer
+                .validate_event_record(&record)
+                .map_err(|e| budget.fail(e))?;
+            coverage.selected_records += 1;
+            if !scope.diagnostics.is_empty() {
+                matched_artifacts.insert(record.artifact_id.clone());
+            }
+            view.include_record(&record, layers, scope.require_complete_index, &mut coverage)?;
+            view.include_text(&record, scope.require_complete_index)?;
+        }
+        drop(candidates);
+        // Whole-artifact membership is independent of its record expansion.
+        if let Some(members) = artifacts {
+            for (id, time) in members {
+                if time < scope.received_from || time >= scope.received_before {
+                    continue;
+                }
+                let key = crate::storage::artifact_rdf::time_key(time, &id);
+                budget.request(row_bound(crate::storage::artifact_rdf::TIME), true)?;
+                let value = writer
+                    .db
+                    .get_pinned(&key)
+                    .map_err(|e| budget.fail(e.into()))?
+                    .ok_or_else(|| {
+                        budget.fail(Error::new(
+                            "STORAGE_FAILURE",
+                            "selected artifact temporal index missing",
+                        ))
+                    })?;
+                let artifact =
+                    artifact_catalog(&writer, &budget, &mut admission, key.as_bytes(), &value)
+                        .map_err(|e| budget.fail(e))?;
+                view.include_artifact(
+                    &writer,
+                    &artifact,
+                    &matched_artifacts,
+                    scope,
+                    layers,
+                    now,
+                    &protected,
+                    &mut coverage,
+                )?;
+            }
+        } else {
+            let mut rows = TemporalRows::new(
+                crate::storage::artifact_rdf::TIME,
+                scope.received_from,
+                scope.received_before,
+                |options| writer.db.raw_iterator_opt(options),
+            );
+            loop {
+                budget.request(row_bound(crate::storage::artifact_rdf::TIME), true)?;
+                let Some(artifact) = rows.read_next(|key, value| {
+                    artifact_catalog(&writer, &budget, &mut admission, key, value)
+                }) else {
+                    break;
+                };
+                let artifact = artifact.map_err(|e| budget.fail(e))?;
+                view.include_artifact(
+                    &writer,
+                    &artifact,
+                    &matched_artifacts,
+                    scope,
+                    layers,
+                    now,
+                    &protected,
+                    &mut coverage,
+                )?;
+            }
+        }
+        coverage.catalog_entries = scanned;
+        drop(matched_artifacts);
+        drop(protected);
+        drop(_catalog);
+        drop(writer);
+        purrdf::dataset_view::checkpointed_drain(&view, |view| operation(view, &coverage))
+            .map_err(|failure| failure.error)
+    }
+}

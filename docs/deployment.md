@@ -1,0 +1,691 @@
+<!--
+SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+-->
+
+# Installing Sparrow on Linux
+
+The example deployment lives in [`deploy/`](../deploy/README.md): a system
+unit, `sparrow.service`, running as the `sparrow` user, with its store and private socket under `/var/lib/sparrow/store`,
+its consume roots under `/var/lib/sparrow/intake` and its configuration in
+`/etc/sparrow`. `deploy/README.md` walks from a scratch clone to a running,
+verified service, `deploy/RECOVERY.md` covers failures and rollback,
+and `deploy/MANUAL.md` runs the daemon by hand. This document explains the
+configuration and the behavior those procedures rely on.
+
+## Kept images
+
+Install the helper census with `make install-census`, then run `make check`.
+Commit through the normal verification hook and run `make install-bin`.
+It builds the release daemon, CLI, recovery probe and role stamp
+through cargo and copies them into `./bin` with
+`cp --reflink=auto` under revision-qualified names:
+`bin/sparrowd-schemaN-REV`, `bin/sparrow-schemaN-REV`,
+`bin/sparrow-recovery-schemaN-REV` and `bin/sparrow-stamp-schemaN-REV` (the
+offline role stamp), where `N` is the client schema version and
+`REV` the short commit. It also copies the five native CBOR lexicons, with
+their provenance manifest, notices and licenses, from the PurRDF revision the
+lockfile resolves into `bin/lexicons-PURRDF_REV/`. It refuses an uncommitted
+tree and never overwrites a kept name with other bytes. `./bin` is ignored by
+Git, and a kept image survives the automatic cull of `target/`. The copy is a
+reflink only when `target/` and the checkout share a filesystem; otherwise
+`./bin` holds full copies (about the size of the images).
+`deploy/install.sh` and `deploy/start.sh` install from `./bin` into
+`/usr/local/libexec/sparrow` with `cp --reflink=auto`, so every deployed image
+has a kept source copy, and never overwrite an executing image.
+
+## Configuration
+
+Configuration supplies the store/socket paths, disk budget, maintenance reserve,
+operation ceilings and intake definitions. `deploy/config/server.toml.example`
+is the deployment template; `config/development.toml.example` (store under
+`/srv/sparrow-dev`) is an example for owned synthetic intake, not a production
+configuration; copy it to the gitignored `config/development.toml` to use it. Copy the
+lexicon bundle from `./bin` into a revision-qualified directory (install.sh
+does this under `/usr/local/share/sparrow/`) and configure `text_lexicon_dir`
+to that installed bundle; the daemon's native analyzer resolver verifies the
+required artifact identities before serving. Runtime configuration must not
+depend on an editable sibling checkout. Preserve an existing store's
+configuration and catalog watch revisions during migration. Consume entries
+seed only a missing catalog; typed watch administration controls later
+changes. Never add production sample directories as destructive watches merely
+because they were sample inputs.
+
+Configure producer spools on local storage outside every consume root.
+Each writer requires its own private directory (mode `0700`). Size
+`spool_max_bytes` for the expected offline interval and retain free space for
+metadata and checkpoint replacement. Resume with the same source and spool
+directory. The SDK drains and removes confirmed segments automatically.
+For an explicit drain, run the `sparrow-client` example
+`producer ENDPOINT SOURCE lossless SPOOL_DIR 0 1 drain` after the previous
+writer releases the directory. Inspect its final JSON progress and exit code.
+
+The first conditional sealed request eligible for new publication enables the receipt-retirement
+watermark and its raw writer format. Use a daemon that supports store writer
+families 407 through 461 when reopening an upgraded store. To roll back to an
+older binary, restore a compatible pre-upgrade store snapshot. See
+[publication and durability](architecture.md#61-publication-and-durability).
+
+Upgrade the CLI with the daemon when the wire schema changes. Producers that
+support `sparrow-producer/1` can connect across compatible schema versions.
+Upgrade producers built before profile negotiation with the daemon. The live
+store's writer format is independent of its wire schema. [Producer contract](interfaces.md#producer-contract-sparrow-producer1)
+
+`instance_role` (`"production"` or `"scratch"`, optional) fixes the role of a
+store when the daemon creates it, and `discover` and `status` report it as
+`instanceRole` (`unspecified` for a store with no role). At startup a configured
+role that differs from the stored one stops the daemon with a message naming both
+values. A configured role on a store that has none also stops it; that message
+names only the configured role and offers two remedies: remove the key, or stamp
+the store as a separate administrative step (see [Stamp the role](#stamp-the-role)). The
+role never changes after creation, and the daemon does not stamp an existing store.
+Leave the key out of a configuration for a store that has no role row.
+
+#### Stamp the role
+
+`bin/sparrow-stamp-schemaN-REV DATA_DIR production|scratch`, installed by
+`make install-bin` beside the other images, writes the one `instance_role` row into
+a stopped store that has none. It runs only with the daemon stopped: the daemon
+holds the store's lock while it runs, so a running daemon makes the tool refuse
+(`CONFLICT`). It opens the existing store without the daemon's open path, so no
+format upgrade, fence or migration runs, and writes the single row with a synced
+write. It writes nothing else and changes no format. It prints `store_id` and
+`instance_role`, which the administrator records. It refuses, leaving the store
+unchanged, a store that already has a role row (`CONFLICT`, naming it; a stored
+role never changes), a store at a format this build does not know
+(`UNSUPPORTED`; run it from the build that opens the store) and a directory that is
+not a Sparrow store (`INVALID_ARGUMENT`).
+
+After the stamp, start the daemon with the key set to the stamped word or absent;
+`sparrow SOCK discover` reports the role. Running the tool against the live store is
+a lifecycle act for the administrator; no procedure runs it unasked.
+
+`deploy/test-instance.sh` writes `instance_role = "scratch"` into the scratch
+configuration it generates, together with an ingest socket for senders, a disk
+budget and a free-space floor sized for a test load, and an `archive` table only
+when `SPARROW_TEST_ARCHIVE_DIR` names a directory.
+A scratch store created before roles existed has no role row, so the daemon
+refuses to start on it; `test-instance.sh setup` detects it and asks for
+`test-instance.sh purge` followed by a fresh `setup`. `deploy/README.md`,
+"Test instance", gives the paths and teardown steps.
+
+`max_concurrent_requests` admits simultaneous storage work, including intake
+workers (1..64). `max_rpc_connections` independently admits Unix and TCP RPC
+streams from one shared ceiling (1..256, default 16). An idle agent capability
+holds a transport lease without consuming a storage permit. The existing
+60-second connection lease still applies. The daemon takes a connection slot
+before it accepts a peer, so a peer beyond the connection ceiling waits in the
+kernel's listen backlog and is served when a slot frees (a connection ends or
+its lease expires); it is no longer reset. A stalled peer therefore holds its
+slot until the lease expires. An intake operation (ingest, events, imports,
+flush, pins, discovery) that finds every storage permit taken waits for one, in
+arrival order, for at most 3 seconds, then receives the retryable
+`RESOURCE_LIMIT`. About a quarter of the permits (rounded up, none when there is
+only one) are reserved: queries and status reads may hold the rest, so a query
+storm cannot starve ingest, and a read beyond its share is refused at once. These
+are separate finite resource budgets; `status` reports each wait.
+
+Sparrow has no configurable per-artifact byte limit. A large artifact ingests
+through the staged import within `disk_budget` and `min_free_bytes`, up to one
+fixed bound: an import above 8515420160 bytes (about 7.93 GiB) is refused before
+upload with a non-retryable `INVALID_ARGUMENT` (advertised as
+`Discovery.maxImportBytes`). That is the largest artifact whose catalog row one
+expiry or eviction pass can read, and it is below what one atomic publication can
+carry. A single document above
+128 MiB is stored as consecutive raw records, so within the bound expiry and
+eviction retire it in
+bounded passes. That guarantee also needs pins to stay within their store-wide
+caps of 606 pin rows and 36594 pinned members; creating or extending a pin past
+either cap is refused with `RESOURCE_LIMIT`, and releasing a pin always succeeds.
+A consume watch splits an over-bound file into ordered parts when the daemon
+advertises the required limits. The watch keeps the claim and names the
+refusal in status if those limits are unavailable. The shipper may refuse an
+over-bound non-line file before it reaches the watch.
+[Part sets](interfaces.md#part-sets-for-consume-roots-280)
+
+`min_free_bytes` (default 4 GiB) is a floor on free space in the filesystem
+that holds `data_dir`. `disk_budget` bounds only the store's own bytes, while
+other programs on the host can fill the same disk. A write that fails because
+the disk is full latches durability uncertain, and writes are refused until the proof of
+durability succeeds or the store is reopened. To avoid that, every write is checked first: below the floor it is refused with a
+retryable `STORAGE_PRESSURE`, and buffered writes that were already accepted
+are still synchronized. The daemon checks free space every second. Below the
+floor it keeps accepting Unix, ingest and TCP connections, including syslog TCP
+connections: the connection ceiling and the 60-second lease still bound
+them. It answers every write with the retryable `STORAGE_PRESSURE` carrying the
+`freeSpaceFloor` class, so a producer knows the floor is the cause and holds
+(the Rust client keeps its batch and retries), and it serves reads, with the
+disk a query stages limited to 32 MiB in total, within the free space above half the floor.
+It claims no consumed files and runs only WAL synchronization; consume and tail
+watches keep their files. A syslog TCP frame is held and its sender waits.
+Syslog UDP datagrams that still arrive are read and queued by each UDP listener,
+up to its `hold_bytes` (default 64 MiB; the sum over listeners at most 512 MiB), and
+published in order when writes resume. Beyond that the reader stops and the kernel
+buffer takes the arrivals, and the kernel counts the datagrams it drops. A crash
+or forced kill loses the queue and kernel buffer without reporting those losses.
+Size `hold_bytes` against
+`MemoryHigh` and see `docs/interfaces.md` for what a clean stop counts.
+Status reports `floorPause` counters (connections accepted, writes refused, reads
+served while paused). The daemon logs a line when a pause begins, one a minute while
+it lasts and one when it ends. A daemon-side file spool is not built; UDP is held in
+the daemon's memory and then the kernel buffer only. At startup it waits for the maintenance
+reserve plus the write-ahead log an unclean stop left (the open replays it) before opening the store, so a restart on a full disk does not use up the
+unit's bounded restarts; below the floor alone it opens and serves reads. If a write
+still fails with durability uncertain, for example because another program
+filled the disk between checks, writes are refused with the retryable
+`STORAGE_PRESSURE`. The maintenance worker leaves the store alone while free space is
+below RocksDB's 32 MiB recovery buffer, proves durability once space has been adequate for
+15 seconds, and clears the latch in place when the proof succeeds. If it still
+cannot establish durability after 120 seconds of adequate space, the daemon
+replaces the storage session in the same process. Writes and old RPC
+capabilities are fenced during the transition. Watch for the named recovery
+state and the matching store identity when it resumes.
+[Session replacement](interfaces.md#daemon-teardown)
+
+Each UDP syslog socket asks for an 8 MiB receive buffer. The kernel clamps the
+request to `net.core.rmem_max` (stock 212992) and stores twice the result; the
+unit cannot force more, so raise the sysctl on the host if status shows a small
+grant. The unit sets `ProcSubset=pid`, which hides `/proc/sys`, so the daemon
+cannot read `rmem_max`: status reports the granted size read back from the
+socket. The daemon reads the socket's kernel drop count from
+`/proc/self/net/udp`, which stays visible under that setting.
+
+Public TCP requires `rpc_tcp_secret_file`. Generate a random secret with mode
+0600, for example `sudo sh -c 'umask 077; head -c 32 /dev/urandom > /etc/sparrow/tcp.secret'`,
+and do not use a passphrase: an observer of one CHAP exchange can test guesses
+offline. The unit passes it to the daemon as a systemd credential, so
+`rpc_tcp_secret_file` names `/run/credentials/sparrow.service/tcp.secret`.
+Copy the same file privately to each remote agent host and pass it with
+`sparrow --secret-file PATH tcp://ADDRESS:518 COMMAND`. Producers that only
+discover, ingest and import need no secret. CHAP does not encrypt traffic or
+authenticate the server, so restrict the listener to trusted networks.
+
+Port 518 is below 1024. The unit grants `CAP_NET_BIND_SERVICE` as an ambient
+capability and holds nothing else in its bounding set; no file capability is
+set on any image, and copying an image therefore needs no `setcap`. The client
+needs no capability.
+
+The private Unix socket is `rpc.sock` directly inside `data_dir`. The daemon
+sets `data_dir` to mode 0710 at start and the socket to 0660 each time it binds it (at
+start, and again when the name was removed while it ran), so
+members of the daemon's group can connect and cannot list or read the store;
+store files stay owner-only under the unit's `UMask=0077`. Only the administrator and the shipper's user
+belong to that group, for the CLI and administration. Producers ingest
+through the ingest-only group socket below, not this socket.
+
+### Syslog TCP listener install steps
+
+A `[[syslog]]` listener with `transport = "tcp"` keeps the frames it holds at a stop in
+`/var/lib/sparrow/syslog-spill`, beside the store: a frame the store still refuses for pressure when the
+daemon stops is written there and published at the next start (`docs/interfaces.md`, syslog TCP).
+The shipped unit, profile and tmpfiles entry do not grant that directory, so the host needs these
+steps before the first such listener is configured, and the daemon refuses to start with an error
+naming the directory when it cannot write there:
+
+1. Add `d /var/lib/sparrow/syslog-spill 0700 sparrow sparrow -` to `/etc/tmpfiles.d/sparrow.conf` and run
+   `systemd-tmpfiles --create sparrow.conf`.
+2. Add `/var/lib/sparrow/syslog-spill` to the unit's `ReadWritePaths=` and run `systemctl daemon-reload`.
+3. Add `/var/lib/sparrow/syslog-spill/ rw,` and `/var/lib/sparrow/syslog-spill/** rwk,` to
+   `/etc/apparmor.d/sparrow` and reload the profile with `apparmor_parser -r`.
+4. Restart the daemon on the new unit.
+
+These write permissions are required only for TCP listeners. Startup still scans
+the spill directory even when no syslog listener is configured. If it names a
+file without a matching TCP listener, restore that listener to replay the file
+or move the file out of the spill directory by hand.
+
+### Ingest-only group socket
+
+Daemons that run as other accounts log into Sparrow
+through a second Unix socket. It admits only producer operations (`discover`,
+`ingest`, the import operations, `eventsIngest` and `flush`) and refuses every
+other operation with `PERMISSION_DENIED`. Each artifact and record it accepts
+records the caller's uid, gid and pid, which the kernel reports for the
+connection (`SO_PEERCRED`).
+
+1. Create the group and add each producer account to it:
+
+   ```bash
+   sudo groupadd --system sparrow-ingest
+   sudo usermod -aG sparrow-ingest PRODUCER_ACCOUNT
+   ```
+
+2. Install the tmpfiles entry, which creates `/run/sparrow-ingest` owned by the
+   daemon's account, group `sparrow-ingest`, mode 2750, at every boot:
+
+   ```bash
+   sudo install -m 0644 packaging/tmpfiles/sparrow-ingest.conf /etc/tmpfiles.d/
+   sudo systemd-tmpfiles --create /etc/tmpfiles.d/sparrow-ingest.conf
+   ```
+
+   Edit the owner in the entry if the daemon runs as another account.
+
+3. Set the three keys above the first table in `server.toml` and restart:
+
+   ```toml
+   ingest_socket_path = "/run/sparrow-ingest/ingest.sock"
+   ingest_socket_gid = 948          # getent group sparrow-ingest | cut -d: -f3
+   max_ingest_connections = 16      # optional; 1..256, default 16
+   ```
+
+The socket's directory must be outside `data_dir`. At startup the daemon
+refuses to start unless that directory is a real directory, not a symbolic
+link, owned by the daemon's uid, with group `ingest_socket_gid` and mode exactly
+2750. After binding, the socket must have that group, inherited from the setgid
+directory, and the daemon sets mode 0660; a mismatch also stops startup. The
+daemon's own account does not need to be in the group: it owns the directory,
+and the setgid bit, not its membership, gives the socket the group.
+
+`max_ingest_connections` is a ceiling separate from `max_rpc_connections`, so
+producers cannot use up the connections the CLI and MCP need. Over it, a
+producer connection waits in the kernel backlog until a slot frees and is not
+reset. A connection whose credentials the kernel cannot report is refused and
+logged. `status` lists the socket's path, group, ceiling, active connections,
+refused connections, ceiling waits and lease expiries. An import is bound
+to the account that began it; another account's attempt to continue it is
+refused with `PERMISSION_DENIED`. A query-only daemon refuses
+`ingest_socket_path`.
+
+Validate the unit files, and their security exposure, without loading them.
+Before `install.sh` has run, `verify` reports that
+`/usr/local/libexec/sparrow/sparrowd` is missing; that line is expected, and
+only the exposure score is meaningful then:
+
+```bash
+systemd-analyze verify deploy/systemd/sparrow.service
+systemd-analyze security --offline=yes deploy/systemd/sparrow.service
+```
+
+For a migration, capture the current typed status, image identity, unit and
+configuration, and follow `deploy/README.md`, "Moving a running service". Stop
+the old Sparrow unit through its SIGINT shutdown path and verify it is
+terminal, with its Unix socket removed. Never open two owners on one store.
+Verify store identity, schema/format, retained counts, watches, byte reads and
+saved mutation retries over Unix and TCP after adoption. Stop the new unit
+before reverting an image/configuration; reverting a binary alone cannot undo a
+store-format upgrade.
+
+## Recovery qualification
+
+For isolated recovery qualification, work on a disposable copy of a store, made while its
+daemon is stopped, in a separate empty directory, and copy the deployment configuration with
+`data_dir` and `socket_path` changed to that directory. Keep the source immutable. The recovery
+example uses the existing configuration/store readers directly, without starting
+listeners, maintenance or saved watch workers:
+
+```bash
+bin/sparrow-recovery-schemaN-REV restored.toml EXPECTED_STORE RFC3339 EVIDENCE_ID...
+```
+
+`make install-bin` keeps the probe in `./bin`; without it, build it with
+`cargo build --locked --release -p sparrow-server --example recovery` and run
+`target/release/examples/recovery` instead.
+
+Supply explicit artifact, record or finished file-generation IDs from captured
+discovery pages, following every continuation. The example admits at most 1024
+distinct targets and 1 GiB of aggregate reads, with 1 MiB byte calls. It checks
+store identity, retained/complete-byte eligibility and native byte integrity;
+streams native BLAKE3 over each target; compares full artifacts with their
+catalog payload identity; and reports existing native RDF inspection for records.
+Compare target bytes/hashes and RDF inspection with independently captured
+evidence. The output is one native JSON report after all checks; a failure has
+nonzero exit status and no successful stdout prefix. Missing dependencies,
+unfinished generations and expired evidence are failures, not skipped targets.
+
+This is a selected-evidence recovery probe, not a whole-engine integrity scrub or
+a query-performance qualification. Its target report defines its coverage. A
+missing blob may not affect a small inline target, so include all required
+evidence when qualifying a copy. Opening a store can perform required format
+upgrades; always work on a disposable copy. A live store is protected
+by the existing single-owner database lock. The example never activates its
+saved source paths, even when the copied watch catalog names original roots.
+
+## Unit behavior
+
+The unit uses SIGINT because the daemon implements worker drain and WAL fencing
+on that signal. It gives shutdown 120 seconds and reports failure if the process
+cannot exit. It restarts on failure, including host OOM kills, after 10 seconds.
+Startup takes the store's exclusive lock before it removes a refused stale Unix
+socket, so a restart never creates a second writer. Five failed starts within
+ten minutes stop the unit for diagnosis, such as missing dependencies or a
+refused store open. Never remove a socket by hand until the prior owner is
+proven terminal. As a system unit enabled under `multi-user.target`, it starts
+at boot without a login session.
+
+The kernel protects 1 GiB of the daemon's memory from reclaim (`MemoryLow`),
+throttles it above 2 GiB (`MemoryHigh`) and kills it at 4 GiB (`MemoryMax`), so
+a leak cannot deepen host-wide memory pressure. The daemon runs at nice
+-20 with best-effort IO priority 0, so other work yields to it under
+contention. `CPUQuota=100%` holds the daemon to one core and
+`IOWeight=20` makes it yield disk to the host's other services: a
+sustained deep-JSON backlog can saturate a host's CPU and disk, and under
+these limits ingest slows instead.
+
+`LimitNOFILE=65536` gives the store its descriptors. At open the store reads
+its soft `RLIMIT_NOFILE`, keeps 1024 descriptors for sockets, connections,
+logs, the WAL, intake and archive files, and gives the rest to RocksDB's
+table cache (`max_open_files`), which closes the least recently used table
+file instead of exceeding it. Below a soft limit of 2048 the store refuses to
+open, naming `LimitNOFILE=65536`. The reserve covers the connection ceilings
+at their defaults and one descriptor per watched directory at the
+configured coverage; ceilings and watch coverage near 1024 need a higher limit. The
+startup line ends `nofile=N max_open_files=M`. Tests and `make check` open
+stores too, so they need a shell whose `ulimit -Sn` is at least 2048. A unit
+that sets no limit inherits the manager's soft 1024, which a store of about 900 table
+files exhausts. Journal output is available through `journalctl -u sparrow.service`.
+
+The system unit filters system calls: `SystemCallFilter=@system-service`, then
+`~@privileged @resources`, then `sched_setscheduler setpriority`. systemd applies
+the entries in order, the first sets the default and each later one adds or
+removes calls, so the last entry returns exactly those two calls from the
+denied `@resources` group and leaves the rest of it denied. RocksDB's
+low-priority pool calls them: the store lowers that pool's CPU priority so
+compactions yield to intake and to flushes, which run in the high-priority pool
+at unchanged priority (this holds write stalls to 0.1 percent of the time,
+against 6.5 percent without it). Each low-pool thread makes
+`sched_setscheduler(SCHED_OTHER)` and `setpriority(PRIO_PROCESS, 19)` once,
+before its first job. A filter without the entry kills the daemon with SIGSYS
+and a core dump at the first low-pool job, usually a compaction, shortly after
+start, and the unit restarts into the same death. The two calls only lower
+priority here: the unit keeps no capability but `CAP_NET_BIND_SERVICE`, sets
+`NoNewPrivileges=yes`, and with `RestrictRealtime=yes` and the kernel's own
+checks refuses real-time policies; `SCHED_OTHER` is not one. `ioprio_set`, also in
+`@resources`, stays denied because the store never lowers I/O priority.
+`deploy/install.sh` installs `deploy/systemd/sparrow.service` as
+`/etc/systemd/system/sparrow.service`; `deploy/test-instance.sh` renders the
+test unit from the same file, so both carry the entry. `sparrow-ship.service` runs no RocksDB and keeps the two-entry
+filter.
+
+After a release that changes the table options profile, the daemon rewrites
+older table files once in the background. `sparrow SOCKET status` reports it as
+`recompression`: `running`, `paused` with a `waiting` reason, or `complete`,
+with the older tables' `remaining_bytes` and any latched `failure`. RocksDB's
+own periodic compaction does the work one file at a time, below
+size-triggered compaction. The daemon turns it off while pressure maintenance
+is outstanding or a job's 1 GiB of headroom would not fit the data allowance
+or the free-space floor. The rewrite resumes after a restart, and a running
+job is aborted when the store closes, so shutdown does not wait for it.
+
+The first open of a store written before schema 69 serves at once and runs the
+owner-to-graph index build and the other online migrations in the
+background (see "Online store migrations" in the interfaces). `status` reports
+them under `migrations` with `done`, `total`, `watermark` and any `failure`, and
+the journal logs a progress line every 64 pages and a completion line per
+migration. A restart resumes after the last committed page.
+
+Schema 70 and later images first seed the store counters, the `store-counters`
+migration, ahead of the others. Until it completes, `status` reports
+`counts=pending` and every migration's `total` as `counting`; `live_records`
+and the two unique counts then cover only the keys seeded so far and are not
+totals. Every consumer of those counts says so rather than printing a partial
+number as a total: the closing line logs `unique_payload_chunks=pending`.
+`tools/install-bin.sh` names the pair from `SCHEMA_VERSION`, so a
+schema N build installs as `sparrowd-schemaN-REV` and `sparrow-schemaN-REV`.
+
+## Shipping finished files from producers that keep them
+
+A consume watch owns its root: it deletes each file after publication. Never make a producer's own directory a consume root.
+`deploy/libexec/sparrow-ship` copies finished files from such directories
+into a private queue under its `state_dir`, then feeds queued items into
+Sparrow-owned roots. It only reads the originals. Each `[[source]]` in its
+TOML configuration (see `deploy/config/ship.toml.example`) names the consume
+root `intake_root/NAME`, the source directory, a glob and one finishing rule:
+
+- `daily`: dated files; the newest name may still be appended to.
+- `sealed`: rotated segments, finished once `NAME.manifest.json` exists.
+- `settled`: written-once documents, finished after a quiet period.
+
+Every rule also requires `settle_seconds` without modification. Small files are
+reflink copies, sharing extents on btrfs. Line-oriented files (`jsonl`, `log`)
+above `max_chunk_bytes` or `max_chunk_lines` are split on line boundaries into
+`NAME.partNNNNN.EXT` chunks. An unterminated final line counts as a record.
+Set `max_chunk_lines` to an integer from 1 through 32,768.
+Other formats, such as single JSON documents, are
+shipped whole up to Sparrow's 7.93 GiB import bound; a larger file is reported
+as a failed file on every run and never queued. The removed `max_whole_bytes` key must be deleted
+from the shipper configuration; a configuration that still sets it is refused
+before anything ships. The split matters for two reasons. The consume worker moves a file
+the daemon refuses at an input bound, such as one over the record limit, into a quarantine
+directory beside the watch root and retires its claim; it is never published (see
+[Quarantining a permanently refused source](interfaces.md#quarantining-a-permanently-refused-source)).
+Every other failed publication retries without limit, backing off from five seconds to one
+attempt every 15 minutes after consecutive failures. Deadline expiries back off too, even when the
+resumed claim advances, so a chunk that needs many attempts finishes later. Keep
+`max_chunk_lines` below the server's `max_records`. A consume publication has a
+45-second deadline.
+Retries resume the durable upload and preparation, but each expiry spends the
+single consume worker. Ingest time grows faster than artifact size for deeply
+nested JSON: under a host load average near 45, 17 KiB-per-line
+records took 1.5 seconds for 0.95 MB, 19 seconds for 2.2 MB and 47 seconds for
+4.4 MB. The example's 1 MiB `max_chunk_bytes` keeps such chunks well inside the
+deadline.
+
+`sparrow-ship` refuses its configuration at load, before it reads or writes anything,
+when a source `dir` equals, contains or lies inside `intake_root` or `state_dir`. It
+compares real paths, so a symlink does not hide the overlap, and the error names the
+source, both paths and the key. Such a source would ship the shipper's own queue,
+ledgers and intake items again on every run.
+
+`sparrowd` refuses a consume or tail watch root that equals, contains or lies inside
+`data_dir`, `socket_path`, `ingest_socket_path` or `archive.dir`, naming
+the watch and both paths. It applies the rule to the `consume` seeds in `server.toml`
+when it loads them, to the stored catalog at startup, and to every `watch put`. The
+check is lexical. `server.toml` names no log file, so the daemon cannot check where its
+standard error is redirected; keep any such file outside every watch root.
+
+Each file is staged completely and checked against the original's size and
+identity before any part of it is queued. Its copies or chunks then enter the
+queue together, the queue directory is synchronized, and a per-source ledger
+under `state_dir` records the shipped identity (inode, size,
+modification time). The device number is not part of it, because it can change
+at boot; older four-field ledger lines that lead with the device are read as the
+same entry. Inode reuse after a delete and create is not detected, and the
+device number never detected that either. A crash between queueing and recording
+the identity queues the file again. Each run
+then feeds the oldest queued items into their roots while the bytes waiting in
+all roots together stay within `max_pending_bytes`; an item larger than that
+budget is fed only into empty roots. Each move synchronizes the root and the
+queue. An identical item already waiting under the same name is dropped as a
+leftover of an interrupted run, and a different one waits until Sparrow
+consumes the earlier copy. A finished file that changes later has a new
+identity and is shipped again whole, so its earlier records appear twice.
+`max_files_per_run` and `max_queue_bytes` bound queueing, so a backlog drains
+over successive runs. Failures exit nonzero and leave originals untouched for
+the next run.
+
+If a source ledger cannot be read or has a malformed entry, the shipper names
+the source and ledger and pauses queueing and reaping for that source. It still
+feeds previously staged items and processes healthy sources. Restore the
+affected ledger before the next run to resume queueing and reaping.
+
+`state_dir` must be on the same filesystem as `intake_root`, because each
+queued item is renamed into its root; production keeps both under `/var/lib/sparrow`.
+The daemon runs as its own user and reads each item through its group, so the
+shipper sets every staged item to mode 0640, and `state_dir` is setgid to the
+daemon's group (`deploy/README.md`, "Permissions"). Create each consume root
+and its watch before the first run. `deploy/install.sh` installs the shipper
+and `sparrow-ship.service`, a system unit that runs it as the `sparrow-ship` user,
+with `sparrow-ship.timer`.
+
+The timer runs five minutes after each completed run. Shipped data arrives when
+its producer finishes a file, not as it is written.
+
+### Deleting acknowledged spool files
+
+A source with `delete_acknowledged = true` is a spool the shipper owns, such as
+a spool of another service's journal lines; never set it on a producer's own directory.
+At the end of each run the shipper deletes a finished file of that source once
+the store holds every byte of it, and nothing else ever deletes one. It hashes
+each part the file ships as (the whole file, or each line-bounded part, split
+exactly as when it was queued) with `b3sum` and asks the store
+`sparrow SOCKET payload STORE_ID blake3:HEX`. The file goes only when every part
+lists an artifact, which the store answers only while it holds all of that
+artifact's bytes ([Payload id index](interfaces.md#payload-id-index-store-format)).
+The shipper also accepts a matching whole-file artifact for files an earlier shipper
+sent whole because it excluded the unterminated last record from the count.
+A file that is still queued, waiting in a consume root, refused under storage
+pressure, quarantined, or held once and since retired lists nothing and stays.
+The ledger keeps its entry either way.
+
+The source needs the top-level keys `sparrow` (the CLI) and `socket` (the store
+socket the CLI queries), and `b3sum` on the path; the configuration is refused
+at load without them. While the store does not answer, the run reports
+`store unreachable` and deletes nothing, however long the outage lasts, without
+failing.
+
+Deletion takes two runs, because a spool script opens a file by name and appends
+a line a moment later, so a line can land in a file the store already holds. In
+the run that finds every part of a file held, the shipper links the file to
+`.reaping-NAME` and unlinks NAME, which neither the shipper nor the spool scripts read; a script
+that opens NAME afterwards creates a new file under it. At its next run the
+shipper looks at each `.reaping-` file again and deletes it only if the store
+holds the entire file and its identity is stable through the lookup.
+A file that now holds a line the store
+lacks goes back under NAME (under `NAME-late-NS` when NAME exists again) and
+ships like any finished file, so those lines appear twice at most. A file whose
+parts the store held and has since retired goes back too and stays in the spool.
+The run reports how many files it deleted, set aside, and did not find
+acknowledged. The parts are cut with the shipper's current `max_chunk_bytes` and
+`max_chunk_lines`. A change can make the reaper hash a different partition from
+the one originally queued. The ledger still skips the unchanged original.
+
+For a quarantined spool file, find the retired claim with `watch list` and
+read its `.refusal` sidecar. Correct the source format or chunk limits as
+needed. Prepare parts that match the corrected shipper settings outside the
+watch root on the same filesystem. Rename the completed parts into the
+matching consume root under fresh names. Keep the original and its ledger
+entry. Verify each part through the payload lookup. Until all current parts
+are held, the shipper reports the original as `not yet acknowledged` on each
+run. Once they are held, the two-run deletion applies.
+
+## Archive and backups
+
+Sparrow backs up nothing except the age-out to GTS files on a network share: the archive worker
+(docs/interfaces.md, "Archive-before-delete gate") writes each aged-out segment under `[archive] dir`, for example
+`/mnt/archive/sparrow-archive`, before the store retires it. The worker is implemented
+and is off unless the configuration enables it; see [Archive status](archive-format.md#archive-status). Sparrow takes no online store
+backup, so the configuration keys `backup_root` and `backup_keep` do not exist. The server file refuses unknown keys, so a `server.toml` that still
+names either one fails to load with the parser's `unknown field` error: delete the lines.
+
+The archive worker also refuses to write when `[archive] dir` is not on its own mount. An
+unmounted NFS share leaves its mount point as an ordinary directory on the local root disk, and
+writing archives there would fill it. Two checks apply, in order: the directory's device must
+differ from `/`'s, and its filesystem type must be a network filesystem (NFS, SMB/CIFS, Ceph, AFS,
+9P, Lustre, NCP, Coda) or differ from `/`'s type. The second closes the case of an unmounted share
+whose parent is another local mount of the root's type, such as a btrfs subvolume under `/home`.
+The refusal is the named error "archive directory ... is not on its expected mount", which names
+the device or filesystem type found, is journaled on the pass failure line, and writes, moves and
+deletes nothing; the daemon itself starts and serves as before, and the worker retries on its next
+pass. A second local btrfs disk mounted as the archive is refused too, with no override. A mount
+point inside a local filesystem of a type other than `/`'s passes both checks, and when it is
+empty the worker adopts it by writing `STORE_ID`, so segments would go to the local disk;
+`STORE_ID` stops only a directory with content or another store's id. Set `[archive] dir` to a
+directory inside the share (as `/mnt/archive/sparrow-archive` is), never to the mount
+point itself: an unmounted share leaves no such subdirectory, so the root is missing and refused.
+
+Enable the archive only after the share is mounted. Create the directory inside
+the mount with read and write access for the `sparrow` service account. In a
+systemd service drop-in, add `ReadWritePaths=-/mnt/archive/sparrow-archive`
+with your configured path. The leading hyphen lets the daemon start when the
+mount is absent. Grant the same directory `rw` and its contents `rwk` in
+AppArmor, then reload systemd and the profile. Check `archive_worker` in
+status after enabling `[archive]`, and verify a committed segment with
+`sparrow-archive verify`. [Offline commands](archive-format.md#10-readers)
+
+The worker writes `STORE_ID` itself. On its first pass, a directory that is on its mount and
+empty (no entry at all, apart from a `STORE_ID.partial` left by an interrupted first pass) gets a
+`STORE_ID` holding this store's id and a newline, written durably (temp file, fsync, rename,
+directory fsync). An existing `STORE_ID` naming this store is accepted as is; one naming another
+store is refused and never overwritten. A directory that holds any other entry but no `STORE_ID`,
+such as segments whose id file was lost, is refused and not adopted: write the id by hand only
+once you have confirmed the directory is this store's archive.
+
+If a filesystem operation exceeds `io_timeout_secs`, the archive worker
+reports `ARCHIVE_OVERRAN` with the step and path and leaves the watermark where
+it was. The filesystem worker keeps its single slot until the call returns.
+Shutdown can release the store while that call remains blocked. A later pass
+verifies any segment files the call left before advancing the watermark.
+[Archive write protocol](archive-format.md#8-write-protocol)
+
+## Part sets and older builds
+
+A consume root that holds a file above the import bound is split into parts and a
+manifest by this build. An older build that meets an unrecorded set claim stalls on
+that claim only, loudly: the claim stays pending, the source file stays in place,
+and the failure is logged and recorded; run this build to finish it. A set claim
+that this build has recorded but not yet removed cannot be finished by any build
+once an older build has run the expiry sweep on the store more than two days after
+the manifest was accepted: the sweep deletes the manifest's receipt, which this
+build needs to prove the publication before it removes the source. Do not run an
+older build on a store that holds recorded set claims that are not removed. If it
+has happened, follow the recovery steps below. No shipped command clears such a
+claim yet; until then the claim stays
+pending, the source stays in place, the stored manifest and parts remain, and the
+claim holds one of the sixteen pending-claim slots (`MAX_CONSUMPTION_JOURNALS` =
+16), so sixteen such claims stop all new claims on that daemon. One stuck claim
+does not block the others, because the worker takes any due claim; each failed
+attempt does drop the shared consume connection, so every retry costs a
+reconnect. This build does not upload a stuck claim again: on each retry it records
+the named failure and nothing else. An older build also lets an ingest-socket
+producer write a `consumeset:` request id; this build refuses such a manifest
+receipt by name. There is no stored-format fence. Clear every publish hold
+(`publish_hold`, see "Publish hold") before any older build runs: an older build
+refuses a catalog that carries a hold, by naming the field.
+
+Recovery for a recorded set claim whose manifest receipt is gone:
+
+1. Stop the older build and run this build. It protects every receipt still
+   present; it does not restore a deleted one.
+2. List the affected claims with `watch claims` or by ingestion status. A claim is
+   affected when its pending reason or status names the missing publication
+   receipt.
+3. Confirm the data is published: compare the artifact ids the manifest lists
+   (the manifest is the claim's `published_artifact`) with the artifacts present
+   in the store. Keep the source in place under the claim's private name in the
+   root's `.sparrow-inflight/`.
+4. Do not delete the source by hand. A hand deletion does not clear the claim:
+   recovery of a missing source still needs the proof and fails the same way.
+5. Leave the claim pending. It holds a journal slot and its attempt text keeps
+   naming the state. No shipped command clears it yet.
+
+## Publish hold
+
+A watch definition carries `publish_hold`, false unless an administrator sets it with a
+watch put. A held finished-file watch still detects and claims files: each claim is
+journaled and moved into the root's `.sparrow-inflight/` as an interrupted claim is,
+and then it waits. Nothing is published, dropped or cancelled, and the wait has no
+deadline. Clearing the hold with another watch put (a put that omits the field clears
+it) lets the claims publish in pending order. A tail watch cannot be held.
+
+The hold exists for an administrator's deliberate pause of one watch. It is not a way to refuse input: held files are still taken
+from the producer, and a held claim keeps one of the sixteen pending-claim slots
+(`MAX_CONSUMPTION_JOURNALS`) until the hold clears.
+
+A hold never stops another watch or a tail. A held watch reserves at most four
+files; further ready files stay in the producer's directory, unclaimed and
+untouched, and are claimed in order once the hold clears and slots free. All held
+watches together hold at most twelve pending claims (the sixteen slots less four), so
+at least four slots stay free for unheld watches and tail generations; a held claim
+that would take the total past twelve waits instead. Status names the state: `publish_hold`, `held_claims` (the watch's
+pending finished-file claims) and `oldest_held_first_seen`, which is the
+reservation time of the oldest of those claims. It is not the time the hold was
+set, so a claim that waited before the hold shows its own age. The daemon writes
+one `WARNING` line per hold at start and when a hold is set.
+
+A catalog that carries a hold is refused by older builds, which name the
+`publish_hold` field: clear every hold before an older build runs.
+
+A held claim whose move into `.sparrow-inflight/` fails is recorded as a pending
+attempt and logged once, and again only when the failure text changes.
+
+A part of a set keeps its receipt for as long as its claim's journal exists, as the manifest
+receipt does. A part sent again after an outage, even one longer than two days, with the same
+cut returns its saved receipt for as long as its artifact is stored, and is not stored a second
+time, so a records query over the source returns its bytes once. A part whose artifact eviction
+or deletion retired is sent again from the claim's source, and its bytes come back under a new
+publication time; while only some of its records are retired the claim is pending and nothing is
+sent. A resumed set reads the daemon's recorded parts on every attempt and cuts only the rest
+under the advertised limits as they stand, so a change of limits is absorbed. A recorded part
+whose span the new limits no longer admit cannot be cut again, because later parts start where
+it ends: the claim stays pending, holding its source, until limits that admit that span are
+restored. No retirement removes such a claim while its source is held.

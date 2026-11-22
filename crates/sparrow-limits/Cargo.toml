@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+
+[package]
+name = "sparrow-limits"
+version = "0.1.1"
+description = "Shared admission limits for Sparrow producers and storage"
+documentation = "https://docs.rs/sparrow-limits"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
+license.workspace = true
+
+[lints]
+workspace = true

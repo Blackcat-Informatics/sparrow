@@ -1,0 +1,553 @@
+#!/usr/bin/python3 -I
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+"""Copy finished producer files into Sparrow consume roots without touching originals.
+
+Consume watches take ownership of a file and delete it after publication, so a
+producer's own directory must never be a consume root. This shipper reads each
+configured source directory, selects files the producer has finished writing,
+and copies them into a private queue under `state_dir/queue/NAME`. Each run then
+feeds queued items into `intake_root/NAME`, where a consume watch with the same
+NAME ingests and removes them. Originals are only read.
+
+Small files are reflink copies, which share extents on btrfs. Line-oriented files
+above the chunk limits are split on line boundaries so that no artifact can
+exceed the per-artifact record limit or the consume publication deadline; a
+refused publication would otherwise be retried indefinitely. Every other format
+is shipped whole up to `MAX_IMPORT_BYTES`, about 7.93 GiB, the largest artifact
+whose catalog row one Sparrow retirement pass can read. Sparrow splits a whole
+document above 128 MiB into raw records itself. A larger file is reported as a
+failure on every run and never queued, because Sparrow refuses it before upload.
+
+Feeding keeps the bytes waiting in all consume roots together within
+`max_pending_bytes`, so a store stop's drain wait stays bounded however large a
+source file is. An item larger than the budget is fed only when every consume
+root is empty, and then alone.
+
+A ledger per source records each shipped identity (inode, size and modification
+time) after all of its copies are durably queued. The device number is not part
+of it, because it can change at boot (btrfs renumbers it), which would ship every
+file again. Older ledger lines carry the device as a fourth, leading field and
+are read as the same entry. Inode reuse after a delete and create is not
+detected, and the device number never detected that either. A crash between
+queueing and recording the identity queues the file again; an identical item already waiting in a root
+is recognized and dropped, and a different one waits until Sparrow consumes the
+earlier copy. A finished file that later changes has a new identity and is
+shipped again whole.
+
+A source with `delete_acknowledged = true` is a spool the shipper owns, and the
+shipper deletes one of its finished files once the store holds every byte of it.
+The acknowledgement is the store's payload-id index: each part the file ships as
+(the whole file, or each line-bounded part) is hashed with BLAKE3 and looked up
+with `sparrow SOCKET payload STORE blake3:HEX`. A file is deleted only when every
+part lists at least one artifact, which the store answers only while it holds all
+of that artifact's bytes. Nothing else removes a file. A file still queued,
+waiting in a consume root, refused under storage pressure or quarantined has no
+held artifact, so it stays. While the store is unreachable nothing is deleted,
+however long that lasts, and the run reports it without failing. A file whose
+parts the store once held but has since retired also stays.
+"""
+
+import fcntl
+import filecmp
+import json
+import locale
+import os
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+RULES = ("daily", "sealed", "settled")
+# sparrow_core::MAX_IMPORT_BYTES: the largest input one retirement pass can read back
+# as an artifact. A Rust test asserts that this literal equals the constant.
+MAX_IMPORT_BYTES = 8515420160
+# The store's sealed-import record bound, derived from source context admission.
+MAX_CHUNK_LINES = 32768
+LINE_FORMATS = ("jsonl", "log")
+
+
+def fail(message):
+    sys.exit(f"sparrow-ship: {message}")
+
+
+def refuse_overlap(path, source, config):
+    """Refuse a source directory that equals, contains or lies inside the shipper's own trees.
+
+    The shipper writes `intake_root` and `state_dir`; a source that overlaps either would
+    ship its own queue, ledgers or consumed items again on every run. Real paths are
+    compared, so a symlink cannot hide the overlap; the two output trees may not exist yet.
+    """
+    directory = Path(source["dir"]).resolve()
+    for key in ("intake_root", "state_dir"):
+        tree = Path(config[key]).resolve()
+        if directory == tree or directory.is_relative_to(tree) or tree.is_relative_to(directory):
+            fail(f"{path}: source {source['name']}: dir {source['dir']} (real path {directory}) "
+                 f"overlaps {key} {config[key]} (real path {tree}); a source directory may not "
+                 f"equal, contain or lie inside {key}. Move the source or change {key}")
+
+
+def load_config(path):
+    with open(path, "rb") as handle:
+        config = tomllib.load(handle)
+    if "max_whole_bytes" in config:
+        fail(f"{path}: `max_whole_bytes` was removed; unsplittable formats now ship whole "
+             f"up to Sparrow's {MAX_IMPORT_BYTES}-byte import bound. Delete the key and rerun")
+    for key in ("intake_root", "state_dir", "max_chunk_bytes", "max_chunk_lines",
+                "max_files_per_run", "max_pending_bytes", "max_queue_bytes"):
+        if key not in config:
+            fail(f"{path}: missing required key `{key}`")
+    max_lines = config["max_chunk_lines"]
+    if type(max_lines) is not int or not 1 <= max_lines <= MAX_CHUNK_LINES:
+        fail(f"{path}: `max_chunk_lines` must be an integer from 1 to {MAX_CHUNK_LINES}")
+    names = set()
+    for source in config.get("source", []):
+        for key in ("name", "dir", "pattern", "rule", "format", "settle_seconds"):
+            if key not in source:
+                fail(f"{path}: source missing required key `{key}`")
+        if source["rule"] not in RULES:
+            fail(f"{path}: source {source['name']}: rule must be one of {RULES}")
+        if source["name"] in names or "/" in source["name"] or source["name"].startswith("."):
+            fail(f"{path}: source names must be unique plain directory names")
+        names.add(source["name"])
+        if not Path(source["dir"]).is_dir():
+            fail(f"source {source['name']}: {source['dir']} is not a readable directory")
+        refuse_overlap(path, source, config)
+    if not names:
+        fail(f"{path}: no [[source]] entries")
+    reaping = [source["name"] for source in config["source"]
+               if source.get("delete_acknowledged", False)]
+    for source in config["source"]:
+        if not isinstance(source.get("delete_acknowledged", False), bool):
+            fail(f"{path}: source {source['name']}: delete_acknowledged must be true or false")
+    if reaping:
+        for key in ("sparrow", "socket"):
+            if key not in config:
+                fail(f"{path}: sources {reaping} set delete_acknowledged, which needs the "
+                     f"top-level key `{key}` (the sparrow CLI and the store socket it queries)")
+        if not os.access(config["sparrow"], os.X_OK):
+            fail(f"{path}: sparrow {config['sparrow']} is not an executable file; "
+                 "set `sparrow` to the installed CLI")
+        if shutil.which("b3sum") is None:
+            fail(f"{path}: sources {reaping} set delete_acknowledged, which hashes parts with "
+                 "b3sum; install b3sum (package b3sum) or remove the key")
+    return config
+
+
+def identity(stat):
+    return f"{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def ledger_keys(ledger_path):
+    """Return the identities a ledger records, reading legacy `dev:` lines as the same entry."""
+    keys = set()
+    encoding = locale.getpreferredencoding(False)
+    # Only LF terminates a ledger entry. A carriage return can be part of its filename.
+    with open(ledger_path, "rb") as handle:
+        for number, raw in enumerate(handle, 1):
+            try:
+                line = raw.decode(encoding)
+            except UnicodeDecodeError as error:
+                raise ValueError(f"line {number}: {error}") from error
+            key, separator, filename = line.removesuffix("\n").partition("\t")
+            fields = key.split(":")
+            numbers = fields[:-1] + [fields[-1].removeprefix("-")]
+            if (
+                not line.endswith("\n")
+                or not separator
+                or not filename
+                or len(fields) not in (3, 4)
+                or not all(field.isascii() and field.isdecimal() for field in numbers)
+            ):
+                raise ValueError(
+                    f"line {number}: expected a complete inode:size:mtime_ns entry "
+                    "or legacy dev:inode:size:mtime_ns entry followed by a tab and a filename"
+                )
+            keys.add(":".join(fields[-3:]))
+    return keys
+
+
+def is_regular(stat):
+    return (stat.st_mode & 0o170000) == 0o100000
+
+
+def fsync_directory(path):
+    directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def finished(source, now):
+    """Return (path, stat) for files the producer has finished, oldest name first."""
+    directory = Path(source["dir"])
+    candidates = sorted(
+        path for path in directory.glob(source["pattern"])
+        if not path.name.startswith(".") and path.name not in source.get("exclude", [])
+    )
+    if source["rule"] == "daily" and candidates:
+        # The newest dated file may still be appended to.
+        candidates = candidates[:-1]
+    selected = []
+    for path in candidates:
+        try:
+            stat = path.lstat()
+        except FileNotFoundError:
+            continue
+        if not is_regular(stat):
+            continue
+        if now - stat.st_mtime < source["settle_seconds"]:
+            continue
+        if source["rule"] == "sealed" and not path.with_name(path.name + ".manifest.json").is_file():
+            continue
+        selected.append((path, stat))
+    return selected
+
+
+def waiting(directory):
+    """Return (name, size) for regular non-hidden files, tolerating concurrent removal."""
+    files = []
+    for entry in os.scandir(directory):
+        if entry.name.startswith("."):
+            continue
+        try:
+            stat = entry.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue  # Sparrow claimed the file during the scan.
+        if is_regular(stat):
+            files.append((entry.name, stat.st_size))
+    return sorted(files)
+
+
+def chunks(path, max_bytes, max_lines):
+    """Yield successive lists of complete lines bounded by bytes and line count."""
+    lines, size = [], 0
+    with open(path, "rb") as handle:
+        for line in handle:
+            if lines and (size + len(line) > max_bytes or len(lines) >= max_lines):
+                yield lines
+                lines, size = [], 0
+            lines.append(line)
+            size += len(line)
+    if lines:
+        yield lines
+
+
+def pieces(source, path, stat, config):
+    """Return the parts (None for whole) and whether an old shipper could have sent it whole."""
+    max_bytes, max_lines = config["max_chunk_bytes"], config["max_chunk_lines"]
+    if source["format"] not in LINE_FORMATS:
+        return None, False
+    legacy_whole = False
+    if stat.st_size <= max_bytes:
+        with open(path, "rb") as handle:
+            payload = handle.read(stat.st_size + 1)
+        if len(payload) == stat.st_size:
+            newlines = payload.count(b"\n")
+            has_tail = bool(payload) and not payload.endswith(b"\n")
+            if newlines + has_tail <= max_lines:
+                return None, False
+            # The old whole-file path counted only delimiters. Such a file could
+            # already be held when its extra record fits under the store bound.
+            legacy_whole = newlines == max_lines and max_lines < MAX_CHUNK_LINES
+    return chunks(path, max_bytes, max_lines), legacy_whole
+
+
+def enqueue(source, path, stat, config, queue, staging):
+    """Stage a complete copy of one finished file, verify it, then queue it durably.
+
+    Queue names carry an order prefix; the name fed into the consume root drops it.
+    """
+    flat = str(path.relative_to(source["dir"])).replace("/", "__")
+    parts, _ = pieces(source, path, stat, config)
+    whole = parts is None
+    if whole and stat.st_size > MAX_IMPORT_BYTES:
+        raise RuntimeError(f"{stat.st_size} bytes exceeds Sparrow's {MAX_IMPORT_BYTES}-byte "
+                           "import bound (about 7.93 GiB); split the file and ship the parts")
+    order = f"{time.time_ns():020d}"
+    staged, written = [], 0
+    if whole:
+        staged.append(staging / f"{order}-00000-{flat}")
+        subprocess.run(["cp", "--reflink=auto", "--", str(path), str(staged[0])], check=True)
+        written = staged[0].stat().st_size
+    else:
+        stem, dot, suffix = flat.rpartition(".")
+        if not dot:
+            stem, suffix = flat, source["format"]
+        for index, lines in enumerate(parts):
+            staged.append(staging / f"{order}-{index:05d}-{stem}.part{index:05d}.{suffix}")
+            with open(staged[-1], "wb") as handle:
+                handle.writelines(lines)
+                written += handle.tell()
+    if written != stat.st_size or identity(path.stat()) != identity(stat):
+        for leftover in staged:
+            leftover.unlink()
+        raise RuntimeError(f"{path} changed while it was copied")
+    for item in staged:
+        # The daemon runs as its own user and reads the item through its group:
+        # state_dir is setgid to that group, and a reflink copy takes the
+        # producer's mode, which may give the group nothing. Set it explicitly.
+        os.chmod(item, 0o640)
+        with open(item, "rb") as handle:
+            os.fsync(handle.fileno())
+    for item in staged:
+        os.rename(item, queue / item.name)
+    fsync_directory(queue)
+    return written
+
+
+def feed(config, intake, queues):
+    """Move queued items into consume roots while all roots stay within the budget."""
+    budget = config["max_pending_bytes"]
+    pending = sum(size for name in queues for _, size in waiting(intake / name))
+    fed = dict.fromkeys(queues, 0)
+    blocked = set()
+    progress = True
+    while progress:
+        progress = False
+        for name, queue in queues.items():
+            if name in blocked:
+                continue
+            items = waiting(queue)
+            if not items:
+                continue
+            item, size = items[0]
+            root = intake / name
+            target = root / item.split("-", 2)[2]
+            if target.exists():
+                try:
+                    same = filecmp.cmp(queue / item, target, shallow=False)
+                except FileNotFoundError:
+                    blocked.add(name)  # Sparrow claimed the earlier copy; decide next run.
+                    continue
+                if same:
+                    (queue / item).unlink()  # Placed by an interrupted earlier run.
+                    fsync_directory(queue)
+                    progress = True
+                else:
+                    blocked.add(name)  # Wait until Sparrow consumes the earlier copy.
+                continue
+            if pending and pending + size > budget:
+                return fed
+            os.rename(queue / item, target)
+            fsync_directory(root)
+            fsync_directory(queue)
+            pending += size
+            fed[name] += 1
+            progress = True
+    return fed
+
+
+class StoreUnreachable(Exception):
+    """The store did not answer; no file may be deleted on its behalf."""
+
+
+class Store:
+    """Payload-id lookups through the sparrow CLI against one store socket."""
+
+    def __init__(self, config):
+        self.command = [config["sparrow"], config["socket"]]
+        self.store_id = self.query(["discover"])["store_id"]
+
+    def query(self, arguments):
+        result = subprocess.run(self.command + arguments, capture_output=True)
+        if result.returncode != 0:
+            reason = result.stderr.decode(errors="replace").strip().splitlines()
+            raise StoreUnreachable(reason[-1] if reason else f"exit {result.returncode}")
+        return json.loads(result.stdout)
+
+    def holds(self, digest):
+        """Whether the store holds every byte of at least one artifact with this BLAKE3 digest."""
+        page = self.query(["payload", self.store_id, f"blake3:{digest}", "--page-size", "1"])
+        return bool(page["artifact_ids"])
+
+
+def blake3(data=None, path=None):
+    argv = ["b3sum", "--no-names"] + (["--", str(path)] if path else [])
+    result = subprocess.run(argv, input=data, capture_output=True, check=True)
+    return result.stdout.decode().strip()
+
+
+REAP_PREFIX = ".reaping-"
+
+
+def acknowledged(source, path, stat, config, store):
+    """Check the whole file or its parts against the payload index, or return None if it vanished."""
+    parts, legacy_whole = pieces(source, path, stat, config)
+    confirmed = (parts is None or legacy_whole) and store.holds(blake3(path=path))
+    if parts is not None and not confirmed:
+        checked = 0
+        for lines in parts:
+            data = b"".join(lines)
+            if not store.holds(blake3(data=data)):
+                break
+            checked += len(data)
+        else:
+            # A changing split can yield no parts or cover only part of the original file.
+            confirmed = 0 < checked == stat.st_size
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        return None
+    return confirmed and identity(current) == identity(stat)
+
+
+def late_name(original):
+    """A name that matches the source pattern and no existing file: where lines go that were
+    appended to a file after the store acknowledged it, when its own name is in use again."""
+    stem, dot, suffix = original.name.rpartition(".")
+    return original.with_name(f"{stem}-late-{time.time_ns()}{dot}{suffix}")
+
+
+def settle_set_aside(source, config, store):
+    """Decide every file an earlier run set aside, by what it holds now.
+
+    A spool script opens a file by name and appends a line a moment later, so a line can land
+    in a file after it was acknowledged and set aside. The set-aside file is therefore deleted a
+    run later, and only if the store holds every part of its current bytes and its identity
+    stays stable during lookup. Otherwise a hard link restores its original name, or a
+    `-late-` name if that name is in use. On later runs, queueing skips a restored file whose
+    inode, size and modification time still match its shipped ledger entry. Reaping counts it
+    as not acknowledged until the store holds its current bytes. Returns the number deleted.
+    """
+    deleted = 0
+    directory = Path(source["dir"])
+    for aside in sorted(directory.glob(f"**/{REAP_PREFIX}*")):
+        try:
+            stat = aside.lstat()
+        except FileNotFoundError:
+            continue
+        confirmed = acknowledged(source, aside, stat, config, store)
+        if confirmed is None:
+            continue
+        if not confirmed:
+            original = aside.with_name(aside.name[len(REAP_PREFIX):])
+            try:
+                os.link(aside, original)
+            except FileExistsError:
+                os.link(aside, late_name(original))
+            aside.unlink()
+        else:
+            aside.unlink()
+            deleted += 1
+        fsync_directory(aside.parent)
+    return deleted
+
+
+def reap(source, config, store, now):
+    """Set aside the finished files of a spool source whose every part the store holds.
+
+    Returns (deleted, set_aside, unacknowledged). No file is deleted in the run that finds a
+    file acknowledged: its bytes move to `.reaping-NAME` (a hard link; NAME is then unlinked), which the shipper and the spool scripts
+    ignore, and `settle_set_aside` decides it on the next run. A set-aside name that is already
+    taken is left alone.
+    """
+    deleted = settle_set_aside(source, config, store)
+    set_aside = unacknowledged = 0
+    for path, stat in finished(source, now):
+        confirmed = acknowledged(source, path, stat, config, store)
+        if confirmed is None:
+            continue
+        if not confirmed:
+            unacknowledged += 1
+            continue
+        aside = path.with_name(REAP_PREFIX + path.name)
+        try:
+            os.link(path, aside)
+        except FileExistsError:
+            continue
+        except FileNotFoundError:
+            continue
+        os.unlink(path)
+        fsync_directory(path.parent)
+        set_aside += 1
+    return deleted, set_aside, unacknowledged
+
+
+def run(config):
+    intake = Path(config["intake_root"])
+    state = Path(config["state_dir"])
+    state.mkdir(parents=True, exist_ok=True)
+    # One shipper runs at a time.
+    lock = open(state / "lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    staging = state / ".staging"
+    staging.mkdir(exist_ok=True)
+    for leftover in staging.iterdir():
+        leftover.unlink()
+    queues = {}
+    for source in config["source"]:
+        if not (intake / source["name"]).is_dir():
+            fail(f"consume root {intake / source['name']} is missing; create it and its watch first")
+        queues[source["name"]] = state / "queue" / source["name"]
+        queues[source["name"]].mkdir(parents=True, exist_ok=True)
+    queued = sum(size for queue in queues.values() for _, size in waiting(queue))
+    now = time.time()
+    failures = 0
+    blocked_ledgers = 0
+    reaped = []
+    for source in config["source"]:
+        name = source["name"]
+        ledger_path = state / f"{name}.ledger"
+        try:
+            shipped = ledger_keys(ledger_path)
+        except FileNotFoundError:
+            shipped = set()
+        except (OSError, ValueError) as error:
+            blocked_ledgers += 1
+            print(
+                f"sparrow-ship: {name}: cannot read ledger {ledger_path}: {error}. "
+                "Restore a valid ledger to resume queueing and reaping this source",
+                file=sys.stderr,
+            )
+            continue
+        if source.get("delete_acknowledged", False):
+            reaped.append(source)
+        count = 0
+        with open(ledger_path, "a") as ledger:
+            for path, stat in finished(source, now):
+                key = identity(stat)
+                if key in shipped:
+                    continue
+                if count >= config["max_files_per_run"]:
+                    print(f"sparrow-ship: {source['name']}: per-run file limit reached; resuming next run")
+                    break
+                if queued and queued >= config["max_queue_bytes"]:
+                    print(f"sparrow-ship: {source['name']}: queue full; resuming next run")
+                    break
+                try:
+                    queued += enqueue(source, path, stat, config, queues[source["name"]], staging)
+                except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+                    failures += 1
+                    print(f"sparrow-ship: {source['name']}: {path}: {error}", file=sys.stderr)
+                    continue
+                ledger.write(f"{key}\t{path.relative_to(source['dir'])}\n")
+                ledger.flush()
+                os.fsync(ledger.fileno())
+                shipped.add(key)
+                count += 1
+        print(f"sparrow-ship: {source['name']}: queued {count}")
+    for name, count in feed(config, intake, queues).items():
+        print(f"sparrow-ship: {name}: fed {count}")
+    if reaped:
+        try:
+            store = Store(config)
+            for source in reaped:
+                deleted, set_aside, kept = reap(source, config, store, time.time())
+                print(f"sparrow-ship: {source['name']}: deleted {deleted} acknowledged, "
+                      f"set aside {set_aside}, not yet acknowledged {kept}")
+        except StoreUnreachable as error:
+            print(f"sparrow-ship: store unreachable ({error}); no further spool file deleted")
+    if blocked_ledgers:
+        fail(f"{blocked_ledgers} source ledger(s) need repair. {failures} file(s) failed to queue")
+    if failures:
+        fail(f"{failures} file(s) failed; originals are untouched and will be retried")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        fail("usage: sparrow-ship CONFIG.toml")
+    run(load_config(sys.argv[1]))

@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+
+[package]
+name = "sparrow-archive"
+version = "0.1.0"
+description = "Offline verification and exact-byte extraction of Sparrow GTS archives"
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "sparrow_archive"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sparrow-archive"
+path = "src/main.rs"
+
+[dependencies]
+sparrow-core = { path = "../sparrow-core" }
+purrdf.workspace = true
+
+[dev-dependencies]
+sparrow-test-support = { path = "../sparrow-test-support" }
+tempfile = "3"
+
+[lints]
+workspace = true

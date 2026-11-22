@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+#
+# Configuration template, installed as /etc/sparrow/server.toml (root:sparrow 0640) by
+# deploy/install.sh when that file is absent. It holds no secret: rpc_tcp_secret_file names the
+# credential systemd hands the unit (LoadCredential=tcp.secret:/etc/sparrow/tcp.secret), so the
+# secret itself stays in /etc/sparrow/tcp.secret, root 0600. Unknown keys are errors.
+
+socket_path = "/var/lib/sparrow/store/rpc.sock"
+data_dir = "/var/lib/sparrow/store"
+
+# The public Cap'n Proto listener. Anonymous peers may discover, ingest and import;
+# everything else needs a CHAP session with this secret.
+rpc_tcp_address = "0.0.0.0:518"
+rpc_tcp_secret_file = "/run/credentials/sparrow.service/tcp.secret"
+
+# The store's own bytes; other programs share the disk, which min_free_bytes guards (default
+# 4 GiB): below it the daemon refuses writes (keeping connections and reads) instead of failing a write.
+disk_budget = 53687091200
+maintenance_reserve = 67108864
+min_free_bytes = 4294967296
+
+max_records = 100000
+max_pin_members = 10000
+max_concurrent_requests = 4
+max_rpc_connections = 16
+buffered_flush_interval_ms = 2000
+
+# The five native CBOR lexicons, installed by deploy/install.sh from ./bin/lexicons-REV, where
+# REV is the PurRDF revision in Cargo.toml. Replace REV with the installed directory's suffix.
+text_lexicon_dir = "/usr/local/share/sparrow/lexicons-REV/artifacts"
+
+# Consume watches live in the store's catalog; an entry here only seeds a missing catalog. Add
+# roots with `sparrow /var/lib/sparrow/store/rpc.sock watch put ...` (deploy/config/watch.toml.example).
+
+# The archive table is absent: the daemon runs no archive worker, and the unit and profile do
+# not grant its path. See docs/archive-format.md, "Archive status".

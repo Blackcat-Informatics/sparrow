@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+
+[workspace]
+resolver = "3"
+members = ["crates/sparrow-access", "crates/sparrow-server/tests", "crates/sparrow-limits", "crates/sparrow-archive", "crates/sparrow-core", "crates/sparrow-client", "crates/sparrow-server", "crates/sparrow-test-support"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98"
+authors = ["Blackcat Informatics Inc."]
+repository = "https://github.com/Blackcat-Informatics/sparrow"
+readme = "README.md"
+keywords = ["logging", "diagnostics", "rocksdb", "sparql"]
+categories = ["development-tools::debugging"]
+publish = false
+license = "MIT OR Apache-2.0 OR MulanPSL-2.0"
+
+[workspace.dependencies]
+sparrow-test-support = { path = "crates/sparrow-test-support" }
+sparrow-server = { path = "crates/sparrow-server" }
+sparrow-core = { path = "crates/sparrow-core" }
+sparrow-client = { path = "crates/sparrow-client" }
+sparrow-access = { path = "crates/sparrow-access" }
+sparrow-limits = { path = "crates/sparrow-limits", version = "0.1.1" }
+rocksdb = { version = "0.25", default-features = false, features = ["lz4", "zstd", "bindgen-runtime"] }
+purrdf = "=5"
+purrdf-hash = "=5"
+purrdf-lex = "=5"
+purrdf-ed25519 = "=5"
+purrdf-core = "=5"
+getrandom = "0.3"
+tempfile = "3"
+rustix = { version = "1.1.6", features = ["fs"] }
+tracing = "0.1.44"
+log = { version = "0.4", features = ["std", "kv"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std", "fmt"] }
+capnp = "0.28.1"
+capnp-rpc = "0.28.0"
+capnpc = "0.28.1"
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["compat"] }
+tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "io-std", "io-util", "process"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+
+[workspace.lints.rust]
+unreachable_pub = "deny"
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"

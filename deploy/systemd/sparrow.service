@@ -1,0 +1,140 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+#
+# The Sparrow evidence server, installed verbatim as /etc/systemd/system/sparrow.service by
+# deploy/install.sh. It is complete: no drop-in is expected. deploy/README.md lays out the host it
+# needs (the sparrow user and group, /var/lib/sparrow, /etc/sparrow, the images under
+# /usr/local/libexec/sparrow) and deploy/RECOVERY.md justifies every item systemd-analyze security
+# still reports.
+#
+# Permissions (deploy/README.md, "Permissions"): the store /var/lib/sparrow/store is the daemon's, mode
+# 0710, and its socket rpc.sock is 0660; the daemon sets both itself every time it starts, so
+# members of the sparrow group can reach the socket and nothing else in the store. No ACL is set
+# on the store, because the daemon's own chmod would mask it away. /var/lib/sparrow/intake carries a
+# default ACL with a named entry for the sparrow group, so a new root is writable by the daemon
+# whatever the umask of the member who made it.
+
+[Unit]
+Description=Sparrow typed diagnostic evidence server
+Documentation=file:///usr/local/share/doc/sparrow/deploy/README.md
+RequiresMountsFor=/var/lib/sparrow
+# Bound restarts so a failed run stops for diagnosis instead of looping (deploy/RECOVERY.md, "Unit
+# start-limit hit"). A start condition that will pass does not spend them: the daemon waits, and does
+# not exit, for free space for the open and the WAL replay, for a pending upgrade's write allowance,
+# and for a port or socket name a departing owner holds (deploy/RECOVERY.md, "Start waiting"). A start
+# condition that cannot pass without a change of configuration, image or store ends with
+# exit status 78 (RestartPreventExitStatus below), which the unit does not restart, and the journal
+# names it.
+#
+# The unit stays Type=exec: it is active (running) through a wait, so a readiness gate would hold it
+# in activating and the start timeout would kill a wait that lasts as long as its condition. The wait
+# is reported instead as StatusText, which the daemon sets through NotifyAccess=main
+# (systemctl show -p StatusText sparrow.service), and as journal lines.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=sparrow
+Group=sparrow
+SyslogIdentifier=sparrowd
+ExecStart=/usr/local/libexec/sparrow/sparrowd --config /etc/sparrow/server.toml
+WorkingDirectory=/var/lib/sparrow/store
+# The CHAP secret is root's (/etc/sparrow/tcp.secret, mode 0600) and reaches the daemon only as a
+# credential: /run/credentials/sparrow.service/tcp.secret, mode 0400, owned by sparrow, which is
+# what rpc_tcp_secret_file names. The daemon refuses a secret with any group or other bit.
+LoadCredential=tcp.secret:/etc/sparrow/tcp.secret
+# Store files stay owner-only. The two group-reachable names (the store directory and the socket)
+# are set explicitly by the daemon, so this umask cannot defeat them.
+UMask=0077
+
+# The daemon drains workers, synchronizes the WAL and removes its Unix socket through its SIGINT
+# path; SIGTERM has no drain handler. Only the main process drains; anything left is killed at the
+# timeout.
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=120
+# Recover from crashes and host OOM kills. Startup removes a stale Unix socket only after it holds
+# the store's exclusive lock, so a restart cannot open a second writer.
+Restart=on-failure
+RestartSec=10
+# A refused start (exit status 78, sysexits EX_CONFIG) repeats on every restart: it is not restarted.
+RestartPreventExitStatus=78
+# The daemon reports its start wait and then readiness as STATUS=/READY=1 (start_wait.rs).
+NotifyAccess=main
+
+# Resources. A busy daemon's cgroup peaks near 1.4 GB and a sustained deep-JSON backlog reaches
+# the 2 GiB throttle (docs/deployment.md), so memory is protected up to 1 GiB, throttled above
+# 2 GiB and stopped at 4 GiB. One core bounds Sparrow against the host's other services.
+MemoryLow=1G
+MemoryHigh=2G
+MemoryMax=4G
+CPUQuota=100%
+# Sparrow yields disk to the host's other services (default weight 100).
+IOWeight=20
+# The store keeps 1024 descriptors for RPC, intake, logs and the WAL and bounds RocksDB's table
+# cache (max_open_files) to the rest; below a soft limit of 2048 it refuses to open. A store
+# holds about 900 table files at 32 GB, which the default soft limit of 1024 runs out on.
+LimitNOFILE=65536
+# Six threads in normal running; tokio's blocking pool may grow to 512 threads under load.
+TasksMax=1024
+
+# Priority: first on the host, not real time. The highest nice and best-effort IO priority, and
+# the OOM killer's last choice short of never.
+Nice=-20
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+OOMScoreAdjust=-900
+ManagedOOMPreference=avoid
+RestrictRealtime=yes
+
+# The AppArmor profile sparrow (deploy/apparmor/sparrow, installed as /etc/apparmor.d/sparrow)
+# denies exec of every file. systemd puts the daemon under it at its own execve and refuses to
+# start the unit while it is not loaded (no "-" prefix).
+AppArmorProfile=sparrow
+NoNewPrivileges=yes
+# Not RestrictSUIDSGID=: seccomp cannot read openat2's mode, so systemd refuses openat2 outright
+# (ENOSYS), and the daemon needs openat2 to resolve paths beneath a consume root without symlinks;
+# it has no weaker fallback (measured on the test instance). A setuid
+# or setgid file it made would be inert anyway: NoNewPrivileges=yes, and it creates every file with
+# a fixed mode (0600, 0700, 0710, 0660).
+
+# The public Cap'n Proto listener defaults to 0.0.0.0:518, below 1024: binding it is the only
+# privilege this service holds. No file capability is set on the image.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+ProtectSystem=strict
+ProtectHome=yes
+# The store and socket and the consume roots.
+ReadWritePaths=/var/lib/sparrow/store /var/lib/sparrow/intake
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+# Unix sockets (its own and the journal's) and IPv4/IPv6 for the public listener and any syslog
+# listener the configuration declares.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# The storage engine lowers its low-priority (compaction) pool's CPU priority (table_options.rs,
+# lower_thread_pool_cpu_priority) with sched_setscheduler(SCHED_OTHER) and setpriority(PRIO_PROCESS, 19), both
+# in @resources, so the denial above kills the daemon with SIGSYS at its first low-pool job. Later
+# entries edit the set the first one started, so these two are added back and the rest of @resources stays
+# denied. RestrictRealtime=yes already refuses real-time policies, and SCHED_OTHER is not one.
+SystemCallFilter=sched_setscheduler setpriority
+
+[Install]
+WantedBy=multi-user.target

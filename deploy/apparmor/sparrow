@@ -1,0 +1,77 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+#
+# The Sparrow daemon's AppArmor profile, enforce mode. Installed verbatim as /etc/apparmor.d/sparrow
+# by deploy/install.sh, which loads it (apparmor_parser -r -W); apparmor.service loads it at boot.
+# sparrow.service names it (AppArmorProfile=sparrow) and systemd refuses to start the unit while it
+# is not loaded. It attaches to nothing by path: the unit alone puts the daemon under it, at the
+# daemon's own execve. deploy/MANUAL.md shows the same confinement by hand (aa-exec -p sparrow).
+#
+# The daemon runs nothing, so exec of every file is refused at the kernel, whatever another rule
+# grants (a deny wins over every allow). Its reads and writes are the ones a traced test instance
+# made: its image and libraries, its configuration and credential,
+# the lexicon bundle, the store, the consume roots, its own /proc entries, the CPU list and
+# RocksDB's identity source.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile sparrow flags=(attach_disconnected) {
+  include <abstractions/base>
+
+  # It runs nothing.
+  audit deny /** x,
+
+  # Its images (mapped, never executed by it) and the lexicons.
+  /usr/local/libexec/sparrow/ r,
+  /usr/local/libexec/sparrow/* mr,
+  /usr/local/share/sparrow/ r,
+  /usr/local/share/sparrow/** r,
+
+  # Its configuration (only: not the secret, the shipper's sources or the watch definitions beside
+  # it) and the CHAP secret systemd hands it as a credential.
+  /etc/sparrow/server.toml r,
+  /run/credentials/sparrow.service/ r,
+  /run/credentials/sparrow.service/* r,
+  # The same, for a run by hand (MANUAL.md): root's private copy of the configuration and secret.
+  /run/sparrow-manual/ r,
+  /run/sparrow-manual/* r,
+
+  # The store and its socket: RocksDB files, the exclusive LOCK, the WAL and manifests.
+  /var/lib/sparrow/ r,
+  /var/lib/sparrow/store/ rw,
+  /var/lib/sparrow/store/** rwk,
+
+  # Consume roots: discovery, the claim (a rename into .sparrow-inflight), its lock and deletion.
+  /var/lib/sparrow/intake/ r,
+  /var/lib/sparrow/intake/** rwk,
+  # Its own descriptors (consume observation through /proc/self/fd/N), thread names, the CPUs the
+  # runtime sizes itself from, and RocksDB's identity source. Its maps and status are in
+  # abstractions/base.
+  @{PROC}/@{pid}/fd/ r,
+  @{PROC}/@{pid}/task/@{tid}/comm rw,
+  @{PROC}/sys/kernel/random/uuid r,
+  @{sys}/devices/system/cpu/{online,possible,present} r,
+
+  # Time zones for timestamps.
+  /etc/localtime r,
+  /usr/share/zoneinfo/** r,
+
+  # The private socket: created, bound, listened on and accepted from any client its file modes
+  # admit; the inherited journal stream on standard output and error is sent on.
+  unix (create, bind, listen, accept, send, receive, getattr, setattr, getopt, setopt, shutdown) type=stream,
+  # It connects to no stream socket but its own (the stale-socket probe at startup).
+  unix (connect) type=stream peer=(label=sparrow),
+  # The journal.
+  unix (create, connect, send) type=dgram,
+  /run/systemd/journal/socket w,
+  # The service manager's notification socket: the start wait is reported as StatusText.
+  /run/systemd/notify w,
+
+  # The public Cap'n Proto listener and the syslog listeners the configuration declares.
+  network inet stream,
+  network inet6 stream,
+  network inet dgram,
+  network inet6 dgram,
+  capability net_bind_service,
+}
