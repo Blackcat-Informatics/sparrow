@@ -1,0 +1,24 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 31ff7327ee2d2445bd0a4ad8057eb5dd3dd7114e
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 472
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/472
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 89740d13c245cdff1fc8a7c546d05c649854f12d
+GhpRsq-Head-Ref: paudley/8-make-lossy-aspirational-delivery-an
+GhpRsq-Head-OID: 31ff7327ee2d2445bd0a4ad8057eb5dd3dd7114e
+GhpRsq-Result-Tree: 9c0a1fc65d84d9b1fb2728bf4f8b305249d47859
+GhpRsq-Result-Commit: f6622e362a2996b0d4bb84f7d32b52d8af5efb94
+GhpRsq-Parent-Hashes: 31ff7327ee2d2445bd0a4ad8057eb5dd3dd7114e
+GhpRsq-Squash-Notes-SHA256: 13ef83de1c438d495942a782a9a1c7eaad7b20bfe9be648ce56db0561c32a89b
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Tree: 7858c0ca81e37680d1b5333f00be46a2f67c63b4
+GhpRsq-Stage-Commit: de05151abd8f58ad795303e3e114a4e2be8d7d71
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/de05151abd8f58ad795303e3e114a4e2be8d7d71
+GhpRsq-Stage-Ref: refs/ghprsq/pr/472/stage
+GhpRsq-Stage-Files: 15
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/de05151abd8f58ad795303e3e114a4e2be8d7d71
