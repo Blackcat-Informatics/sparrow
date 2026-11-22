@@ -1148,7 +1148,9 @@ its own publication time. Window sizing obeys the discovered manifest bounds.
 
 The local journal keeps at most eight current range receipts. After a window
 is certified, `last_window` points to its artifact and `first_local_range`
-marks the start of the remaining local receipts. The input's completion
+marks the start of the remaining local receipts. Each range receipt and its
+confirmed offset commit in one local transaction. When EOF follows a single
+certified range, the job can finish offline. The input's completion
 record and the final window's local receipts survive reopening. `close` stops
 a worker and waits for it to release the input for another process.
 

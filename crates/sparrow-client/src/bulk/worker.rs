@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 use super::{
-    RangeReceipt, Shared,
-    disk::{self, Blocks, Pending, State},
+    RECEIPT_WINDOW, RangeReceipt, Shared,
+    disk::{Blocks, Pending, State},
 };
 use crate::{
     Client, Durability, Error, Expect, Format, IMPORT_CHUNK_BYTES, format_label,
@@ -12,10 +12,7 @@ use crate::{
     parts::{self, CutSource, PartLimits, PartSpan},
     receipt::ExpectedArtifact,
 };
-use std::{io, path::Path, time::Duration};
-
-/// Bounds local receipt files, manifest working memory and one window's retry work.
-const WINDOW: u32 = 8;
+use std::{io, time::Duration};
 
 enum Body {
     Data(Blocks, u64),
@@ -74,7 +71,6 @@ struct Page {
 }
 
 fn manifest(
-    dir: &Path,
     s: &State,
     limits: &PartLimits,
     mut end: u32,
@@ -82,32 +78,22 @@ fn manifest(
     sealed: bool,
 ) -> Result<Page, Error> {
     use purrdf_lex::json::{self, Object, Value};
-    if end < s.page_start || end > s.count || end - s.page_start > WINDOW {
+    if end < s.page_start || end > s.count || end - s.page_start > RECEIPT_WINDOW {
         return Err(Error::Protocol(
             "bulk manifest window outside receipt ledger",
         ));
     }
     let mut offset = s.page_offset;
     let mut rows = Vec::new();
-    for index in s.page_start..end {
-        let r: RangeReceipt = disk::read_meta(&dir.join(disk::receipt_name(index)))?;
-        if r.index != index
-            || r.start != offset
-            || r.end < r.start
-            || s.store.as_ref() != Some(&r.store_id)
-        {
-            return Err(Error::Protocol(
-                "bulk range ledger is not contiguous on its bound store",
-            ));
-        }
+    for r in s.receipts.iter().take((end - s.page_start) as usize) {
         rows.push((
             PartSpan {
-                index,
+                index: r.index,
                 start: r.start,
                 length: r.end - r.start,
                 format: parse_format(&r.format)?,
             },
-            r.artifact_id,
+            r.artifact_id.clone(),
         ));
         offset = r.end;
     }
@@ -208,18 +194,14 @@ fn part(
 }
 
 async fn advance(shared: &Shared, client: &Client) -> Result<bool, Error> {
-    let (s, blocks, dir) = {
+    let (s, blocks) = {
         let j = shared.lock()?;
-        (j.state.clone(), j.blocks(), j.dir.clone())
+        (j.state.clone(), j.blocks())
     };
-    let finishing = s.eof && s.confirmed == s.staged && s.count > 0;
-    if finishing && s.count == 1 {
-        let r: RangeReceipt = disk::read_meta(&dir.join(disk::receipt_name(0)))?;
-        let mut j = shared.lock()?;
-        j.complete(r.artifact_id)?;
-        shared.changed(&j.state);
+    if s.completed.is_some() {
         return Ok(true);
     }
+    let finishing = s.eof && s.confirmed == s.staged && s.count > 0;
     let set = set_id(&s);
     let limits = PartLimits::from_discovery(
         client.discovery(),
@@ -231,10 +213,10 @@ async fn advance(shared: &Shared, client: &Client) -> Result<bool, Error> {
     let page = match &s.pending {
         Some(p) => p
             .page_end
-            .map(|end| manifest(&dir, &s, &limits, end, p.final_page, true))
+            .map(|end| manifest(&s, &limits, end, p.final_page, true))
             .transpose()?,
-        None if finishing || s.count - s.page_start >= WINDOW => {
-            Some(manifest(&dir, &s, &limits, s.count, finishing, false)?)
+        None if finishing || s.count - s.page_start >= RECEIPT_WINDOW => {
+            Some(manifest(&s, &limits, s.count, finishing, false)?)
         }
         None => None,
     };
@@ -348,7 +330,7 @@ async fn advance(shared: &Shared, client: &Client) -> Result<bool, Error> {
             artifact_id: receipt.id,
             payload_id: receipt.payload_id,
         };
-        j.certify(&range)?;
+        j.certify(range)?;
     }
     shared.status.send_modify(|p| p.diagnostic = None);
     shared.changed(&j.state);
@@ -378,7 +360,7 @@ pub(super) async fn run(shared: &Shared) -> Result<(), Error> {
             return Ok(());
         }
         if !state.eof
-            && state.count - state.page_start < WINDOW
+            && state.count - state.page_start < RECEIPT_WINDOW
             && (state.staged == state.confirmed
                 || state
                     .file

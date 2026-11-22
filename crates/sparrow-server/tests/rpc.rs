@@ -8607,6 +8607,32 @@ async fn bulk_reopens_an_unacknowledged_range_and_publishes_while_input_is_open(
             client.bytes(&proof.artifact_id, 0, 13).await.unwrap(),
             b"offline input"
         );
+        // A certified single range also finishes if EOF arrives after restart, offline.
+        let mut job = offline.open("sealed", "pipe", Format::Log).await.unwrap();
+        let mut progress = job.progress();
+        let (mut write, mut read) = tokio::io::duplex(16);
+        write.write_all(b"sole\n").await.unwrap();
+        {
+            let staging = job.stage_stream(0, &mut read);
+            tokio::pin!(staging);
+            tokio::select! {
+                result = &mut staging => panic!("input ended before durable receipt: {result:?}"),
+                confirmed = progress.wait_for(|p| p.confirmed == 5) => drop(confirmed.unwrap()),
+            }
+        }
+        let receipt = job.receipt(0).await.unwrap();
+        job.close().await.unwrap();
+        let unavailable = BulkImporter::new(BulkConfig::new(
+            Endpoint::Unix(dir.path().join("absent.sock")),
+            dir.path().join("disconnected"),
+        ))
+        .unwrap();
+        let mut job = unavailable
+            .open("sealed", "pipe", Format::Log)
+            .await
+            .unwrap();
+        job.stage_stream(5, tokio::io::empty()).await.unwrap();
+        assert_eq!(job.finish().await.unwrap().artifact_id, receipt.artifact_id);
         late.abort();
         proxy.abort();
     };

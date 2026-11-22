@@ -22,6 +22,9 @@ use tokio::{
     sync::{Notify, Semaphore, oneshot, watch},
 };
 
+/// Maximum number of recent range receipts carried in a single journal transaction.
+const RECEIPT_WINDOW: u32 = 8;
+
 /// Per-job disk and prefetch bounds. Jobs use separate connections and admission from log delivery.
 #[derive(Debug, Clone)]
 pub struct BulkConfig {
@@ -117,6 +120,7 @@ impl BulkImporter {
             boundary: 0,
             confirmed: 0,
             count: 0,
+            receipts: Vec::new(),
             page_start: 0,
             page_offset: 0,
             previous: None,
@@ -338,7 +342,11 @@ impl BulkJob {
             if index >= j.state.count {
                 return Err(Error::InvalidArgument("range has not been confirmed"));
             }
-            Ok(disk::read_meta(&j.dir.join(disk::receipt_name(index)))?)
+            j.state
+                .receipts
+                .get((index - j.state.page_start) as usize)
+                .cloned()
+                .ok_or(Error::Protocol("bulk journal lost a confirmed range"))
         })
         .await
         .map_err(io::Error::other)?

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
-use super::RangeReceipt;
+use super::{RECEIPT_WINDOW, RangeReceipt};
 use crate::{Error, IMPORT_CHUNK_BYTES, parts::CutSource};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -23,6 +23,7 @@ pub(super) struct State {
     pub(super) boundary: u64,
     pub(super) confirmed: u64,
     pub(super) count: u32,
+    pub(super) receipts: Vec<RangeReceipt>,
     pub(super) page_start: u32,
     pub(super) page_offset: u64,
     pub(super) previous: Option<String>,
@@ -44,7 +45,7 @@ pub(super) struct Pending {
     pub(super) import: Option<String>,
 }
 
-pub(super) fn read_meta<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
+fn read_meta<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
     let mut bytes = String::new();
     File::open(path)?
         .take(64 * 1024 + 1)
@@ -75,7 +76,7 @@ fn write_meta<T: Serialize>(dir: &Path, name: &str, value: &T) -> io::Result<()>
 }
 
 pub(super) struct Journal {
-    pub(super) dir: PathBuf,
+    dir: PathBuf,
     pub(super) state: State,
     _lock: File,
     pub(super) faulted: bool,
@@ -103,6 +104,7 @@ impl Journal {
                     || state.boundary > state.staged
                     || state.page_start > state.count
                     || state.page_offset > state.confirmed
+                    || !state.valid_receipts()
                     || (state.page_start != 0) != state.previous.is_some()
                     || state.completed.is_some()
                         && (!state.eof
@@ -153,13 +155,7 @@ impl Journal {
                 .to_str()
                 .and_then(|n| n.strip_prefix("data-"))
                 .and_then(|n| n.parse::<u64>().ok());
-            let obsolete = name
-                .to_str()
-                .and_then(|n| n.strip_prefix("receipt-"))
-                .and_then(|n| n.strip_suffix(".toml"))
-                .and_then(|n| n.parse::<u32>().ok())
-                .is_some_and(|ordinal| ordinal < self.state.page_start);
-            if block.is_some_and(|n| self.reclaimable(n)) || obsolete {
+            if block.is_some_and(|n| self.reclaimable(n)) {
                 fs::remove_file(item.path())?;
             }
         }
@@ -170,27 +166,38 @@ impl Journal {
         self.change(|s| {
             s.completed = Some(artifact);
             s.pending = None;
-        })?;
-        self.recover_space()
+        })
     }
 
     pub(super) fn window(&mut self, artifact: String, end: u32, offset: u64) -> io::Result<()> {
-        let first = self.state.page_start;
         self.change(|s| {
             s.previous = Some(artifact);
             s.page_start = end;
             s.page_offset = offset;
+            s.receipts.retain(|r| r.index >= end);
             s.pending = None;
-        })?;
-        for index in first..end {
-            fs::remove_file(self.dir.join(receipt_name(index)))?;
-        }
-        Ok(())
+        })
     }
 
     pub(super) fn change(&mut self, edit: impl FnOnce(&mut State)) -> io::Result<()> {
         let mut state = self.state.clone();
         edit(&mut state);
+        // EOF and the first range's acknowledgment can arrive in either order. The later
+        // transaction already has the complete certificate and can finish without discovery.
+        if state.completed.is_none()
+            && state.eof
+            && state.confirmed == state.staged
+            && state.count == 1
+        {
+            let range = state.receipts.first().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing sole bulk range receipt",
+                )
+            })?;
+            state.completed = Some(range.artifact_id.clone());
+        }
+        let completed = self.state.completed.is_none() && state.completed.is_some();
         if let Err(error) = write_meta(&self.dir, "state.toml", &state) {
             // A failed directory sync can follow a successful rename. Reopen to establish
             // which transaction is present before permitting another append or RPC.
@@ -198,6 +205,9 @@ impl Journal {
             return Err(error);
         }
         self.state = state;
+        if completed {
+            self.recover_space()?;
+        }
         Ok(())
     }
 
@@ -229,21 +239,25 @@ impl Journal {
         self.state.completed.is_some() || block < self.state.confirmed.saturating_sub(1) / BLOCK
     }
 
-    pub(super) fn certify(&mut self, receipt: &RangeReceipt) -> Result<(), Error> {
-        write_meta(&self.dir, &receipt_name(receipt.index), receipt)?;
+    pub(super) fn certify(&mut self, receipt: RangeReceipt) -> Result<(), Error> {
         let old = self.state.confirmed;
+        let end = receipt.end;
         let next = self
             .state
             .count
             .checked_add(1)
             .ok_or(Error::InvalidArgument("bulk range ordinals exhausted"))?;
         self.change(|s| {
-            s.confirmed = receipt.end;
+            s.confirmed = end;
+            s.receipts.push(receipt);
             s.count = next;
             s.pending = None;
         })?;
+        if self.state.completed.is_some() {
+            return Ok(());
+        }
         // Start one block earlier because the previous range retained its boundary byte.
-        for n in old.saturating_sub(1) / BLOCK..=receipt.end / BLOCK {
+        for n in old.saturating_sub(1) / BLOCK..=end / BLOCK {
             if self.reclaimable(n) {
                 match fs::remove_file(self.blocks().path(n)) {
                     Ok(()) => {}
@@ -256,8 +270,27 @@ impl Journal {
     }
 }
 
-pub(super) fn receipt_name(index: u32) -> String {
-    format!("receipt-{index:010}.toml")
+impl State {
+    fn valid_receipts(&self) -> bool {
+        let Some(count) = self.count.checked_sub(self.page_start) else {
+            return false;
+        };
+        if count > RECEIPT_WINDOW || self.receipts.len() != count as usize {
+            return false;
+        }
+        let mut offset = self.page_offset;
+        for (index, receipt) in (self.page_start..self.count).zip(&self.receipts) {
+            if receipt.index != index
+                || receipt.start != offset
+                || receipt.end < offset
+                || self.store.as_ref() != Some(&receipt.store_id)
+            {
+                return false;
+            }
+            offset = receipt.end;
+        }
+        offset == self.confirmed
+    }
 }
 
 #[derive(Clone)]
