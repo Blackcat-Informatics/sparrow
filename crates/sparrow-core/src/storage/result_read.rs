@@ -34,14 +34,15 @@ pub enum ResultPage {
 impl Store {
     /// Retire an ephemeral result capture, never its underlying evidence or pins.
     /// Unknown, expired and already released captures return false. Existing
-    /// cursor replay remains valid until this operation or the original expiry.
+    /// cursor replay remains valid until this operation or the original expiry. The
+    /// identity check and release need only the immutable store ID and in-memory registries.
     pub fn result_release(
         &self,
         store_id: &str,
         snapshot_id: &str,
         now: u64,
     ) -> Result<bool, Error> {
-        if self.lock()?.id != store_id {
+        if self.id.as_ref() != store_id {
             return Err(Error::new(
                 "STORE_MISMATCH",
                 "result release requires its original store identity",

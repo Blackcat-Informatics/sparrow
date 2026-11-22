@@ -5,8 +5,6 @@
 
 use sparrow_server::admission::Admission;
 use sparrow_server::local_endpoint::LocalEndpoint;
-use std::sync::Arc;
-use tokio::sync::OwnedSemaphorePermit;
 
 #[derive(Default)]
 pub(super) struct Workers {
@@ -16,29 +14,12 @@ pub(super) struct Workers {
     pub archive: Option<sparrow_server::archive::Worker>,
 }
 
-/// Reserve the complete native admission budget, waiting for every owned worker.
-/// Tokio's fair queue blocks fresh try-acquires while the full reservation waits.
-async fn drain(admission: &Admission, slots: u32) -> Result<OwnedSemaphorePermit, String> {
-    // Writers waiting for a permit stop waiting now (SHUTTING_DOWN); the drain below takes the
-    // permits they would have used.
-    admission.begin_shutdown();
-    let operations = admission.operations().clone();
-    let guard = operations
-        .clone()
-        .acquire_many_owned(slots)
-        .await
-        .map_err(|error| format!("RPC admission drain failed: {error}"))?;
-    operations.close();
-    Ok(guard)
-}
-
 pub(super) async fn finish(
     initial: Result<(), Box<dyn std::error::Error>>,
     workers: Workers,
     store: &sparrow_core::Store,
     endpoints: &[&LocalEndpoint],
-    admission: &Arc<Admission>,
-    slots: u32,
+    admission: &Admission,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut errors = Vec::with_capacity(6);
     // The teardown reports its errors as one text; the class of the start refusal survives it.
@@ -60,8 +41,8 @@ pub(super) async fn finish(
         record_failure(&mut errors, "maintenance shutdown", worker.shutdown().await);
     }
     // Intake workers may need their owned RPC transport to finish an admitted import.
-    // Once joined, reserve all slots and retain them through the final WAL fence.
-    let drained = drain(admission, slots).await;
+    // Once joined, drain and close both native budgets before the final WAL fence.
+    let drained = admission.drain().await;
     if drained.is_ok() {
         let flushed = store.flush();
         let closed = flushed.is_ok();
@@ -85,8 +66,8 @@ pub(super) async fn finish(
                 }
             }
         }
-    } else if let Err(error) = &drained {
-        errors.push(error.clone());
+    } else if let Err(error) = drained {
+        errors.push(error.to_string());
         errors.push("store flush withheld because RPC admission could not be drained".into());
     }
     for endpoint in endpoints {
@@ -121,13 +102,16 @@ fn record_failure<T, E: std::fmt::Display>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
+    /// Ordinary work remains owned until its permit drops, and a completed drain
+    /// permanently closes the shared operation budget.
     #[tokio::test]
     async fn final_drain_waits_for_all_workers_and_closes_fresh_admission() {
         let operations = Arc::new(tokio::sync::Semaphore::new(2));
         let admission = Admission::new(operations.clone());
         let worker = operations.clone().acquire_owned().await.unwrap();
-        let barrier = drain(&admission, 2);
+        let barrier = admission.drain();
         tokio::pin!(barrier);
         tokio::select! {
             biased;
@@ -136,16 +120,16 @@ mod tests {
         }
         assert!(operations.clone().try_acquire_owned().is_err());
         drop(worker);
-        let guard = barrier.await.unwrap();
+        barrier.await.unwrap();
         assert!(operations.is_closed());
-        assert_eq!(guard.num_permits(), 2);
-        drop(guard);
         assert!(matches!(
             operations.try_acquire_owned(),
             Err(tokio::sync::TryAcquireError::Closed)
         ));
     }
 
+    /// The final fence covers a buffered writer whose caller disappeared and still waits
+    /// for an admitted diagnostic after that writer releases admission.
     #[tokio::test]
     async fn final_flush_covers_buffered_worker_after_its_caller_disappears() {
         let dir = tempfile::tempdir().unwrap();
@@ -157,7 +141,8 @@ mod tests {
         let identity = store.store_id().unwrap();
         let operations = Arc::new(tokio::sync::Semaphore::new(2));
         let admission = Admission::new(operations.clone());
-        let permit = operations.clone().acquire_owned().await.unwrap();
+        let permit = admission.writer().await.unwrap();
+        let diagnostic = admission.diagnostic().unwrap();
         let owner = store.clone();
         let (entered, running) = tokio::sync::oneshot::channel();
         let (release, paused) = std::sync::mpsc::channel();
@@ -186,18 +171,33 @@ mod tests {
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
         {
-            let teardown = finish(Ok(()), Workers::default(), &store, &[], &admission, 2);
+            let teardown = finish(Ok(()), Workers::default(), &store, &[], &admission);
             tokio::pin!(teardown);
             tokio::select! {
                 biased;
                 _ = &mut teardown => panic!("final flush overtook an admitted worker"),
                 _ = tokio::task::yield_now() => {}
             }
-            assert!(operations.clone().try_acquire_owned().is_err());
+            assert_eq!(
+                admission.writer().await.err().unwrap().code,
+                "SHUTTING_DOWN"
+            );
+            assert_eq!(admission.reader().err().unwrap().code, "SHUTTING_DOWN");
+            assert_eq!(admission.diagnostic().err().unwrap().code, "SHUTTING_DOWN");
             release.send(()).unwrap();
+            worker.await.unwrap();
+            let buffered = store.durability_status().unwrap();
+            assert_eq!(buffered.pending_writes, 1);
+            assert!(buffered.accepted_through > buffered.durable_through);
+            tokio::select! {
+                biased;
+                _ = &mut teardown => panic!("final flush overtook an admitted diagnostic"),
+                () = std::future::ready(()) => {}
+            }
+            assert_eq!(store.durability_status().unwrap().pending_writes, 1);
+            drop(diagnostic);
             teardown.await.unwrap();
         }
-        worker.await.unwrap();
         let artifact = receipt.await.unwrap().unwrap();
         let status = store.durability_status().unwrap();
         assert_eq!(status.pending_writes, 0);

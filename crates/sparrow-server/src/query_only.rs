@@ -3,9 +3,8 @@
 
 //! The one write gate every connection's typed service passes through.
 //!
-//! Every operation is classified here, once. A read is forwarded to the typed service
-//! unchanged. A write is forwarded too, unless the daemon is query-only; then it returns a
-//! typed `READ_ONLY` failure before its request is decoded. Unix connections, CHAP sessions
+//! Every operation is classified here once. Storage dispatch checks for shutdown, and a
+//! query-only daemon first refuses writes with `READ_ONLY`. Unix connections, CHAP sessions
 //! and the anonymous TCP gate all forward through this type. An operation added to the schema
 //! without a decision here falls back to the generated `unimplemented` error, so no new
 //! operation can write by omission.
@@ -32,6 +31,14 @@ impl WriteGate {
     pub(crate) fn rpc(&self) -> &crate::Rpc {
         &self.rpc
     }
+
+    fn require_writable(&self) -> Result<(), Error> {
+        if self.query_only {
+            Err(read_only())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn read_only() -> Error {
@@ -45,14 +52,19 @@ macro_rules! classify {
     (
         reads { $($read:ident: $read_params:ident, $read_results:ident;)* }
         writes { $($write:ident: $write_params:ident, $write_results:ident;)* }
+        unsupported { $($unsupported:ident: $unsupported_params:ident, $unsupported_results:ident;)* }
     ) => {
         impl sparrow::Server for WriteGate {
             $(
                 async fn $read(
                     self: Rc<Self>,
                     params: sparrow::$read_params,
-                    results: sparrow::$read_results,
+                    mut results: sparrow::$read_results,
                 ) -> capnp::Result<()> {
+                    if let Err(error) = self.rpc.require_admission() {
+                        failure(results.get().init_result(), error);
+                        return Ok(());
+                    }
                     <crate::Rpc as sparrow::Server>::$read(self.rpc.clone(), params, results).await
                 }
             )*
@@ -62,13 +74,35 @@ macro_rules! classify {
                     params: sparrow::$write_params,
                     mut results: sparrow::$write_results,
                 ) -> capnp::Result<()> {
-                    if self.query_only {
-                        failure(results.get().init_result(), read_only());
+                    if let Err(error) = self.require_writable().and_then(|()| self.rpc.require_admission()) {
+                        failure(results.get().init_result(), error);
                         return Ok(());
                     }
                     <crate::Rpc as sparrow::Server>::$write(self.rpc.clone(), params, results).await
                 }
             )*
+            $(
+                async fn $unsupported(
+                    self: Rc<Self>,
+                    params: sparrow::$unsupported_params,
+                    results: sparrow::$unsupported_results,
+                ) -> capnp::Result<()> {
+                    <crate::Rpc as sparrow::Server>::$unsupported(self.rpc.clone(), params, results).await
+                }
+            )*
+
+            // The removed backup ordinal retains its query-only and unsupported refusals.
+            async fn backup(
+                self: Rc<Self>,
+                params: sparrow::BackupParams,
+                mut results: sparrow::BackupResults,
+            ) -> capnp::Result<()> {
+                if let Err(error) = self.require_writable() {
+                    failure(results.get().init_result(), error);
+                    return Ok(());
+                }
+                <crate::Rpc as sparrow::Server>::backup(self.rpc.clone(), params, results).await
+            }
         }
     };
 }
@@ -77,8 +111,6 @@ classify! {
     reads {
         status: StatusParams, StatusResults;
         discover: DiscoverParams, DiscoverResults;
-        auth_challenge: AuthChallengeParams, AuthChallengeResults;
-        authenticate: AuthenticateParams, AuthenticateResults;
         artifact_get: ArtifactGetParams, ArtifactGetResults;
         record_get: RecordGetParams, RecordGetResults;
         bytes_read: BytesReadParams, BytesReadResults;
@@ -135,7 +167,9 @@ classify! {
         source_time_define: SourceTimeDefineParams, SourceTimeDefineResults;
         diagnostic_define: DiagnosticDefineParams, DiagnosticDefineResults;
         watch_claim_retire: WatchClaimRetireParams, WatchClaimRetireResults;
-        // The removed backup method: a query-only daemon refuses it like a write.
-        backup: BackupParams, BackupResults;
+    }
+    unsupported {
+        auth_challenge: AuthChallengeParams, AuthChallengeResults;
+        authenticate: AuthenticateParams, AuthenticateResults;
     }
 }

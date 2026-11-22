@@ -77,7 +77,7 @@ pub(crate) enum Action {
 pub(crate) enum Command {
     Mutation {
         action: Action,
-        reply: oneshot::Sender<Result<ManagedWatch, sparrow_core::Error>>,
+        reply: oneshot::Sender<Result<MutationReceipt, sparrow_core::Error>>,
     },
     Handoff {
         intent: sparrow_core::ConsumptionHandoff,
@@ -91,6 +91,13 @@ pub(crate) enum Command {
         retirement: ClaimRetirement,
         reply: oneshot::Sender<Result<sparrow_core::RetiredConsumption, sparrow_core::Error>>,
     },
+}
+
+/// Completed watch state and its bounded retired-claim snapshot, read by the
+/// mutation owner before it sends the receipt.
+pub(crate) struct MutationReceipt {
+    pub(crate) watch: ManagedWatch,
+    pub(crate) retired: Result<Vec<sparrow_core::RetiredConsumption>, sparrow_core::Error>,
 }
 
 /// An administrator's request to retire one unrecoverable claim of one watch.
@@ -253,7 +260,10 @@ impl WatchController {
         self.enqueue(|reply| Command::TailFinish { intent, reply })
             .await
     }
-    pub(crate) async fn submit(&self, action: Action) -> Result<ManagedWatch, sparrow_core::Error> {
+    pub(crate) async fn submit(
+        &self,
+        action: Action,
+    ) -> Result<MutationReceipt, sparrow_core::Error> {
         self.enqueue(|reply| Command::Mutation { action, reply })
             .await
     }

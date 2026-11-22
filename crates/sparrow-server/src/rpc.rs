@@ -319,6 +319,10 @@ impl Rpc {
         capnp_rpc::new_client(self.into_gate())
     }
 
+    pub(crate) fn require_admission(&self) -> Result<(), Error> {
+        self.admission.require_open().map_err(refusal)
+    }
+
     /// Persistent store identity bound into CHAP responses.
     pub(crate) fn store_id(&self) -> Result<String, Error> {
         self.store.store_id()
@@ -386,7 +390,7 @@ impl Rpc {
         &self,
         store: &str,
         action: crate::watch_admin::Action,
-    ) -> Result<crate::watch_admin::ManagedWatch, Error> {
+    ) -> Result<crate::watch_admin::MutationReceipt, Error> {
         self.check_store(store)?;
         let controller = self.controller()?;
         // The finite command channel owns admission. Holding a storage work permit
@@ -1912,12 +1916,11 @@ fn text_results(
 
 fn watch_mutation_result(
     mut out: wire::result::Builder<'_, wire::watch_mutation::Owned>,
-    owner: &Store,
     store: &str,
     request: &str,
-    result: Result<crate::watch_admin::ManagedWatch, Error>,
+    result: Result<crate::watch_admin::MutationReceipt, Error>,
 ) -> capnp::Result<()> {
-    match result.and_then(|watch| Ok((watch, owner.consumption_retired()?))) {
+    match result.and_then(|receipt| Ok((receipt.watch, receipt.retired?))) {
         Ok((watch, retired)) => {
             let mut receipt = out.reborrow().init_ok();
             receipt.set_request_id(request);
@@ -2163,13 +2166,7 @@ impl wire::sparrow::Server for Rpc {
                 },
             )
             .await;
-        watch_mutation_result(
-            results.get().init_result(),
-            &self.store,
-            store,
-            request_id,
-            result,
-        )
+        watch_mutation_result(results.get().init_result(), store, request_id, result)
     }
 
     async fn watch_remove(
@@ -2198,13 +2195,7 @@ impl wire::sparrow::Server for Rpc {
                 },
             )
             .await;
-        watch_mutation_result(
-            results.get().init_result(),
-            &self.store,
-            store,
-            request_id,
-            result,
-        )
+        watch_mutation_result(results.get().init_result(), store, request_id, result)
     }
 
     async fn events_ingest(
@@ -4948,18 +4939,25 @@ mod tests {
         assert!(waits.longest_ms >= 3000);
     }
 
-    /// INVARIANT (#246): shutdown interrupts a waiting writer at once with `SHUTTING_DOWN`
-    /// (not after its bound as `RESOURCE_LIMIT`), whether shutdown begins or the budget closes.
+    /// INVARIANT (#246, #495): shutdown interrupts a waiting writer at once with
+    /// `SHUTTING_DOWN`, including when its queued grant is ready on the same poll.
     #[tokio::test(start_paused = true)]
     async fn shutdown_interrupts_waiting_writers() {
         let started = tokio::time::Instant::now();
-        // Shutdown beginning interrupts a writer queued behind the drain.
+        // Queue with one pending poll, then make the grant and shutdown ready together.
         let (_dir, rpc, operations) = admission_fixture(1);
-        let _held = operations.clone().acquire_owned().await.unwrap();
-        let waiting = spawn_write(&rpc).await;
-        assert!(!waiting.is_finished());
+        let held = operations.clone().acquire_owned().await.unwrap();
+        let waiting = rpc.work(|_, _| Ok(7u8));
+        tokio::pin!(waiting);
+        tokio::select! {
+            biased;
+            _ = &mut waiting => panic!("writer answered with the budget held"),
+            () = std::future::ready(()) => {}
+        }
+        assert_eq!(rpc.admission.writer_waits().waiting, 1);
         rpc.admission.begin_shutdown();
-        assert_eq!(waiting.await.unwrap().unwrap_err().code, "SHUTTING_DOWN");
+        drop(held);
+        assert_eq!(waiting.await.unwrap_err().code, "SHUTTING_DOWN");
         assert_eq!(rpc.admission.writer_waits().waiting, 0);
         // So does the budget closing, and a writer that arrives after is told the same.
         let (_dir, rpc, operations) = admission_fixture(1);
@@ -5007,6 +5005,59 @@ mod tests {
         assert!(
             matches!(result.which().unwrap(), wire::result::Ok(_)),
             "status was refused while writers held the budget"
+        );
+    }
+
+    /// Watch list remains available under saturation and refuses fresh private requests
+    /// once admission closes. The ingest-only and query-only policy refusals still apply.
+    #[tokio::test]
+    async fn shutdown_refuses_fresh_watch_lists_after_endpoint_policy_checks() {
+        let (_dir, rpc, operations) = admission_fixture(1);
+        let _held = operations.try_acquire_owned().unwrap();
+        let private = Rpc::clone(&rpc).into_client();
+        let read_only = Rpc::clone(&rpc).query_only().into_client();
+        let ingest: wire::sparrow::Client =
+            capnp_rpc::new_client(crate::ingest_gate::IngestGate::new(
+                Rpc::clone(&rpc),
+                crate::ingest_gate::IngestSocketPolicy,
+            ));
+        let served = private.watch_list_request().send().promise.await.unwrap();
+        assert!(matches!(
+            served.get().unwrap().get_result().unwrap().which().unwrap(),
+            wire::result::Ok(_)
+        ));
+
+        rpc.admission.begin_shutdown();
+        for (client, expected) in [(private, "SHUTTING_DOWN"), (ingest, "PERMISSION_DENIED")] {
+            let response = client.watch_list_request().send().promise.await.unwrap();
+            let result = response
+                .get()
+                .unwrap()
+                .get_result()
+                .unwrap()
+                .which()
+                .unwrap();
+            let wire::result::Error(error) = result else {
+                panic!("watch list was served after closing");
+            };
+            let error = error.unwrap();
+            assert_eq!(error.get_code().unwrap().to_str().unwrap(), expected);
+            assert_eq!(error.get_retryable(), expected == "SHUTTING_DOWN");
+        }
+        let response = read_only.watch_put_request().send().promise.await.unwrap();
+        let result = response
+            .get()
+            .unwrap()
+            .get_result()
+            .unwrap()
+            .which()
+            .unwrap();
+        let wire::result::Error(error) = result else {
+            panic!("query-only watch mutation was served");
+        };
+        assert_eq!(
+            error.unwrap().get_code().unwrap().to_str().unwrap(),
+            "READ_ONLY"
         );
     }
 }

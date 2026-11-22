@@ -240,10 +240,13 @@ pub struct Admitted {
 /// come in two classes:
 /// - a **writer** (the intake path: ingest, events, imports, flush, discovery, pins) waits for
 ///   a permit, FIFO, for at most [`WRITER_PERMIT_WAIT`];
-/// - a **reader** (queries, status, gets) takes a permit only if one is free, and is first
+/// - a **reader** (queries and gets) takes a permit only if one is free, and is first
 ///   limited to `max - writer_reserve` slots, so readers can never hold the last
 ///   `writer_reserve` permits. A query storm therefore cannot starve ingest (#91). A reader
 ///   never waits: it would sit in the writers' FIFO and be served ahead of a later writer.
+///
+/// Status has a separate budget so it can report either kind of saturation. Teardown drains
+/// both budgets after intake workers stop.
 pub struct Admission {
     operations: Arc<Semaphore>,
     readers: Arc<Semaphore>,
@@ -299,15 +302,52 @@ impl Admission {
         })
     }
 
-    /// The shared budget, which workers and shutdown draw on.
-    #[must_use]
-    pub fn operations(&self) -> &Arc<Semaphore> {
-        &self.operations
-    }
-
-    /// Tell every waiting writer, and every later one, that admission is closing.
+    /// Refuse fresh storage dispatch and interrupt waiting writers.
     pub fn begin_shutdown(&self) {
         self.closing.send_replace(true);
+    }
+
+    /// Stop storage dispatch, wait for all native holders and permanently close both budgets.
+    /// The caller joins owned intake before this barrier so it can still complete its work.
+    ///
+    /// # Errors
+    /// A budget closed before its full reservation could be acquired.
+    pub async fn drain(&self) -> Result<(), sparrow_core::Error> {
+        self.begin_shutdown();
+        // Keep a fixed reservation order even if another caller starts a drain.
+        let _operations = self
+            .operations
+            .acquire_many(self.reader_slots + self.reserve)
+            .await
+            .map_err(|error| {
+                sparrow_core::Error::new(
+                    "STORAGE_FAILURE",
+                    format!("RPC operation admission drain failed: {error}"),
+                )
+            })?;
+        let _diagnostics = self
+            .diagnostics
+            .acquire_many(self.reader_slots)
+            .await
+            .map_err(|error| {
+                sparrow_core::Error::new(
+                    "STORAGE_FAILURE",
+                    format!("RPC diagnostic admission drain failed: {error}"),
+                )
+            })?;
+        self.operations.close();
+        self.diagnostics.close();
+        Ok(())
+    }
+
+    /// Check the closing signal before dispatch and again after taking a permit. The watch
+    /// borrow ends here, before the caller can await or run storage work.
+    pub(crate) fn require_open(&self) -> Result<(), Refusal> {
+        if *self.closing.borrow() {
+            Err(SHUTTING_DOWN)
+        } else {
+            Ok(())
+        }
     }
 
     /// Permits no reader may hold.
@@ -373,6 +413,7 @@ impl Admission {
             let waiter = waiter.get_or_insert_with(|| self.import_waits.enter());
             tokio::select! {
                 biased;
+                _ = closing.wait_for(|closing| *closing) => return Err(refused),
                 () = &mut freed => {
                     // A slot freed with the bound spent is answered, not retried.
                     if Instant::now() >= deadline {
@@ -380,7 +421,6 @@ impl Admission {
                         return Err(refused);
                     }
                 }
-                _ = closing.wait_for(|closing| *closing) => return Err(refused),
                 () = tokio::time::sleep_until(deadline) => {
                     waiter.timed_out();
                     return Err(refused);
@@ -417,29 +457,31 @@ impl Admission {
     /// # Errors
     /// The refusal to answer the caller with.
     pub async fn writer_until(&self, deadline: Instant) -> Result<Admitted, Refusal> {
-        match self.operations.clone().try_acquire_owned() {
-            Ok(permit) => return Ok(Admitted::writer(permit)),
+        self.require_open()?;
+        let permit = match self.operations.clone().try_acquire_owned() {
+            Ok(permit) => permit,
             Err(TryAcquireError::Closed) => return Err(SHUTTING_DOWN),
-            Err(TryAcquireError::NoPermits) => {}
-        }
-        let mut waiter = self.writer_waits.enter();
-        let mut closing = self.closing.subscribe();
-        let served = tokio::select! {
-            biased;
-            permit = self.operations.clone().acquire_owned() => {
-                permit.map(Admitted::writer).map_err(|_| SHUTTING_DOWN)
-            }
-            _ = closing.wait_for(|closing| *closing) => Err(SHUTTING_DOWN),
-            () = tokio::time::sleep_until(deadline) => {
-                waiter.timed_out();
-                Err(Refusal {
-                    code: "RESOURCE_LIMIT",
-                    message: "RPC operation concurrency is at its configured limit; the wait for a permit ended, retry",
-                })
+            Err(TryAcquireError::NoPermits) => {
+                self.require_open()?;
+                let mut waiter = self.writer_waits.enter();
+                let mut closing = self.closing.subscribe();
+                tokio::select! {
+                    biased;
+                    _ = closing.wait_for(|closing| *closing) => return Err(SHUTTING_DOWN),
+                    permit = self.operations.clone().acquire_owned() => permit.map_err(|_| SHUTTING_DOWN)?,
+                    () = tokio::time::sleep_until(deadline) => {
+                        self.require_open()?;
+                        waiter.timed_out();
+                        return Err(Refusal {
+                            code: "RESOURCE_LIMIT",
+                            message: "RPC operation concurrency is at its configured limit; the wait for a permit ended, retry",
+                        });
+                    }
+                }
             }
         };
-        drop(waiter);
-        served
+        self.require_open()?;
+        Ok(Admitted::writer(permit))
     }
 
     /// A permit for a reader, only if a reader slot and an operation permit are free now.
@@ -447,25 +489,33 @@ impl Admission {
     /// # Errors
     /// The refusal to answer the caller with.
     pub fn reader(&self) -> Result<Admitted, Refusal> {
-        let busy = || {
-            self.reader_refusals.fetch_add(1, Ordering::Relaxed);
-            Refusal {
-                code: "RESOURCE_LIMIT",
-                message: "RPC operation concurrency is at its configured limit",
-            }
-        };
+        self.require_open()?;
+        let busy = || self.read_busy("RPC operation concurrency is at its configured limit");
         let slot = match self.readers.clone().try_acquire_owned() {
             Ok(slot) => slot,
             Err(TryAcquireError::NoPermits) => return Err(busy()),
             Err(TryAcquireError::Closed) => return Err(SHUTTING_DOWN),
         };
-        match self.operations.clone().try_acquire_owned() {
-            Ok(operation) => Ok(Admitted {
-                _operation: Some(operation),
-                _reader: Some(slot),
-            }),
-            Err(TryAcquireError::NoPermits) => Err(busy()),
-            Err(TryAcquireError::Closed) => Err(SHUTTING_DOWN),
+        let operation = match self.operations.clone().try_acquire_owned() {
+            Ok(operation) => operation,
+            Err(TryAcquireError::NoPermits) => return Err(busy()),
+            Err(TryAcquireError::Closed) => return Err(SHUTTING_DOWN),
+        };
+        self.require_open()?;
+        Ok(Admitted {
+            _operation: Some(operation),
+            _reader: Some(slot),
+        })
+    }
+
+    fn read_busy(&self, message: &'static str) -> Refusal {
+        if let Err(refusal) = self.require_open() {
+            return refusal;
+        }
+        self.reader_refusals.fetch_add(1, Ordering::Relaxed);
+        Refusal {
+            code: "RESOURCE_LIMIT",
+            message,
         }
     }
 }
@@ -476,29 +526,25 @@ impl Admission {
     /// refuse it. As many status reads run at once as readers may (`reader_slots`), so a
     /// health check overlapping a CLI or MCP read is served; one more is refused and counted.
     ///
-    /// Once shutdown has begun it answers `SHUTTING_DOWN` like every other operation. A read
-    /// already running is not drained: it only reads a snapshot and writes nothing, so the
-    /// final flush does not depend on it, and the process outlives it.
+    /// Once shutdown begins it answers `SHUTTING_DOWN`. An admitted read retains its slot
+    /// through completion, including any writer revalidation it performs.
     ///
     /// # Errors
     /// The refusal to answer the caller with.
     pub fn diagnostic(&self) -> Result<Admitted, Refusal> {
-        if *self.closing.borrow() {
-            return Err(SHUTTING_DOWN);
-        }
-        match self.diagnostics.clone().try_acquire_owned() {
-            Ok(slot) => Ok(Admitted {
-                _operation: None,
-                _reader: Some(slot),
-            }),
-            Err(_) => {
-                self.reader_refusals.fetch_add(1, Ordering::Relaxed);
-                Err(Refusal {
-                    code: "RESOURCE_LIMIT",
-                    message: "status reads are at their configured limit",
-                })
+        self.require_open()?;
+        let slot = match self.diagnostics.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(TryAcquireError::Closed) => return Err(SHUTTING_DOWN),
+            Err(TryAcquireError::NoPermits) => {
+                return Err(self.read_busy("status reads are at their configured limit"));
             }
-        }
+        };
+        self.require_open()?;
+        Ok(Admitted {
+            _operation: None,
+            _reader: Some(slot),
+        })
     }
 }
 
