@@ -2352,6 +2352,21 @@ fingerprints = []
 names = ['^(append_offline_event|replay_offline_segment)$']
 
 [[job]]
+id = "durable-producer-directory-creation"
+summary = "Create private producer directories and synchronize newly created directory entries through their first existing parent."
+home = "sparrow_client::quarantine::create_dir"
+entry_points = ["sparrow_client::quarantine::save", "sparrow_client::spool::Log::open"]
+spec = "docs/interfaces.md: Configured spool."
+vectors = ["crates/sparrow-client/src/quarantine.rs", "crates/sparrow-client/src/spool.rs"]
+bench = []
+enforced = true
+
+[job.forbidden]
+constants = []
+fingerprints = []
+names = ['^(create_spool_dirs|create_quarantine_dirs)$']
+
+[[job]]
 id = "sealed-producer-publication"
 summary = "Compare the exact retained receipt and fence a missing receipt against the server deadline and persistent retirement watermark before first publication."
 home = "sparrow_core::storage::Store::ingest_events_before"

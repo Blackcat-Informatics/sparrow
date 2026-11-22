@@ -7908,6 +7908,7 @@ struct EventRelayState {
     mutate_file: std::cell::RefCell<Option<std::path::PathBuf>>,
     mutate_published_file: std::cell::RefCell<Option<std::path::PathBuf>>,
     first_accepted: tokio::sync::Notify,
+    obstruct_checkpoint: std::cell::RefCell<Option<std::path::PathBuf>>,
     discovered: tokio::sync::Notify,
 }
 struct EventRelay(std::rc::Rc<EventRelayState>);
@@ -7946,6 +7947,10 @@ impl EventRelayState {
                 self.first_accepted.notify_one();
                 // The real daemon committed. Only the reply is lost.
                 std::future::pending::<()>().await;
+            }
+            if let Some(path) = self.obstruct_checkpoint.borrow_mut().take() {
+                std::fs::create_dir(path)?;
+                self.first_accepted.notify_one();
             }
         }
         Ok(())
@@ -8562,6 +8567,7 @@ fn relay(
         mutate_file: std::cell::RefCell::new(None),
         mutate_published_file: std::cell::RefCell::new(None),
         first_accepted: tokio::sync::Notify::new(),
+        obstruct_checkpoint: std::cell::RefCell::new(None),
         discovered: tokio::sync::Notify::new(),
     });
     let capability: wire::sparrow::Client = capnp_rpc::new_client(EventRelay(state.clone()));
@@ -8649,7 +8655,31 @@ async fn sealed_spool_holds_across_fences_and_retries_the_original_receipt_after
             Err(FlushError::TimedOut(_))
         ));
         assert_eq!(state.calls.borrow().len(), 2);
+        let checkpoint = dir.path().join("private/HEADER.new");
+        *state.obstruct_checkpoint.borrow_mut() = Some(checkpoint.clone());
         delivery.retry_held();
+        tokio::time::timeout(deadline, state.first_accepted.notified())
+            .await
+            .unwrap();
+        state.refuse_discovery.set(true);
+        assert!(matches!(
+            delivery.flush_async(short).await,
+            Err(FlushError::TimedOut(_))
+        ));
+        assert!(matches!(
+            delivery.stats().unwrap().last_transient_failure.as_deref(),
+            Some(Error::Io(_))
+        ));
+        std::fs::remove_dir(checkpoint).unwrap();
+        // Only the second batch still needs the daemon. The first checkpoints offline
+        // using its already certified receipt, even when a new discovery is refused.
+        assert!(matches!(
+            delivery.flush_async(short).await,
+            Err(FlushError::TimedOut(_))
+        ));
+        assert_eq!(delivery.confirmed_token().unwrap(), b"one");
+        assert_eq!(state.calls.borrow().len(), 3);
+        state.refuse_discovery.set(false);
         assert_eq!(
             delivery
                 .shutdown_async(deadline)

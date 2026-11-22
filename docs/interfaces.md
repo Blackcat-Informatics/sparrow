@@ -4780,6 +4780,8 @@ The sender groups entries within the configured and discovered ceilings and
 syncs the exact batch identity, range, store and deadline before its first
 transmission. Reconnect and process restart preserve them. Receipt
 certification and a synchronized local checkpoint precede segment removal.
+After a certified reply, the sender retains the receipt in memory and retries
+a failed local checkpoint even if the daemon goes offline.
 An incomplete final append is truncated on recovery. Interior corruption
 stops startup. A missing compatible daemon, a replaced store, a permanent
 input refusal or an uncertain receipt retains the prefix on disk.

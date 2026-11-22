@@ -793,17 +793,19 @@ impl Log {
             };
         }
         next.seal = None;
+        // A failed directory sync can leave the new HEADER visible after rename.
+        // Never append behind either recoverable cursor, even when checkpoint returns an error.
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|(index, _)| *index < next.cursor.segment)
+        {
+            self.active = None;
+        }
         self.checkpoint(&next)?;
         self.head = next;
         self.stats.confirmed_token = prepared.token.clone();
         self.stats.next_batch = self.head.batch;
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|(index, _)| *index < self.head.cursor.segment)
-        {
-            self.active = None;
-        }
         self.stats.sealed_batch = None;
         self.stats.cleanup_pending = true;
         Ok(())
@@ -871,6 +873,13 @@ mod tests {
         let replay = log.prepare(store, 30, limits).unwrap().unwrap();
         assert_eq!(replay.deadline, prepared.deadline);
         assert_eq!(replay.batch, prepared.batch);
+        let checkpoint = config.dir.join("HEADER.new");
+        fs::create_dir(&checkpoint).unwrap();
+        assert!(log.confirm(&prepared, "artifact:first").is_err());
+        event.sequence = 2;
+        log.append(&event, b"second", 2).unwrap();
+        let second = event.clone();
+        fs::remove_dir(checkpoint).unwrap();
         log.confirm(&prepared, "artifact:first").unwrap();
         let retired = segment(&config.dir, 0);
         let saved = dir.path().join("saved");
@@ -878,8 +887,8 @@ mod tests {
         fs::create_dir(&retired).unwrap();
         assert!(log.finish_confirmation().is_err());
         assert!(log.stats.cleanup_pending);
-        event.sequence = 2;
-        log.append(&event, b"second", 2).unwrap();
+        event.sequence = 3;
+        log.append(&event, b"third", 3).unwrap();
         fs::remove_dir(&retired).unwrap();
         fs::rename(&saved, &retired).unwrap();
         log.finish_confirmation().unwrap();
@@ -888,9 +897,9 @@ mod tests {
         drop(log);
         let mut log = Log::open(&config, "app", [2; 16]).unwrap();
         assert_eq!(log.stats.confirmed_token, b"first");
-        assert_eq!(log.stats.accepted_token, b"second");
+        assert_eq!(log.stats.accepted_token, b"third");
         let next = log.prepare(store, 30, limits).unwrap().unwrap();
-        assert_eq!(next.batch.events.as_slice(), [event]);
+        assert_eq!(next.batch.events.as_slice(), [second, event]);
         assert_ne!(next.batch.request_id, prepared.batch.request_id);
     }
 

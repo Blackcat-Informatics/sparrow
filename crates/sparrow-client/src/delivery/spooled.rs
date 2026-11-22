@@ -443,6 +443,7 @@ fn intake(shared: &Shared) -> Result<(), Error> {
 
 pub(super) async fn deliver(shared: &Shared) -> Result<(), Error> {
     let mut connection: Option<Client> = None;
+    let mut certified: Option<(crate::spool::Prepared, ArtifactReceipt)> = None;
     let mut discovered_at = Instant::now();
     let mut ready_since = None;
     let mut backoff = Backoff::new(&shared.config);
@@ -498,6 +499,22 @@ pub(super) async fn deliver(shared: &Shared) -> Result<(), Error> {
                 state.transient = None;
                 return Ok(());
             }
+            // Once the server certified this batch, only the disk checkpoint remains.
+            // Keep that evidence across ENOSPC or sync failures, including after the
+            // server's retry window closes or its socket becomes unavailable.
+            if let Some((prepared, receipt)) = &certified {
+                let mut log = disk(shared)?;
+                log.confirm(prepared, &receipt.id)?;
+                let mut state = state(shared)?;
+                state.spool = Some(log.stats.clone());
+                state.durable_sequence = log.head.confirmed;
+                state.durable = log.head.confirmed;
+                state.receipt = certified.take().map(|(_, receipt)| receipt);
+                state.pending = None;
+                state.transient = None;
+                state.held = None;
+                return Ok(());
+            }
             // Discovery samples the server clock. Renew a long-idle connection before
             // preparing new seals. A recovered seal always keeps its original deadline.
             if connection.is_none() || discovered_at.elapsed() >= Duration::from_secs(60) {
@@ -541,16 +558,7 @@ pub(super) async fn deliver(shared: &Shared) -> Result<(), Error> {
                     Some(prepared.deadline),
                 )
                 .await?;
-            let mut log = disk(shared)?;
-            log.confirm(&prepared, &receipt.id)?;
-            let mut state = state(shared)?;
-            state.spool = Some(log.stats.clone());
-            state.durable_sequence = log.head.confirmed;
-            state.durable = log.head.confirmed;
-            state.receipt = Some(receipt);
-            state.pending = None;
-            state.transient = None;
-            state.held = None;
+            certified = Some((prepared, receipt));
             Ok::<_, Error>(())
         };
         let result = tokio::select! { _=shared.abort_wake.notified()=>return Ok(()), result=tokio::time::timeout(shared.config.rpc_timeout,attempt)=> result.unwrap_or_else(|_| Err(Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut,"sealed event RPC timed out")))) };
@@ -564,6 +572,7 @@ pub(super) async fn deliver(shared: &Shared) -> Result<(), Error> {
             Err(error) => {
                 let manual = connection.is_some()
                     && !cleanup
+                    && certified.is_none()
                     && (disposition(&error) == Disposition::SetAside
                         || matches!(&error,Error::Domain{code,..} if code == STORE_MISMATCH));
                 connection = None;
