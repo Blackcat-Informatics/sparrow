@@ -9,17 +9,17 @@ vulnerabilities privately so they can be investigated and fixed responsibly.
 
 ## Supported versions
 
-Sparrow has no tagged releases yet. Only the current `main` branch is
-supported. Fixes land on `main`; there are no maintained back-port branches.
+Security fixes are available on `main`. Tagged releases are source
+snapshots. To apply a fix, update to the `main` revision that contains it.
 
 ## Reporting a vulnerability
 
-Do not open a public GitHub issue for a security vulnerability.
+Use [GitHub private vulnerability reporting](https://github.com/Blackcat-Informatics/sparrow/security/advisories/new)
+or email <security@blackcatinformatics.ca> with `SECURITY` and `Sparrow` in the
+subject line.
 
-Instead:
+Include the following in your report.
 
-- email <security@blackcatinformatics.ca>
-- include `SECURITY` and `Sparrow` in the subject line
 - name the affected component (server, client library, CLI, MCP adapter or
   packaging) and the commit you tested
 - describe the vulnerability, its impact and the configuration it needs
@@ -27,14 +27,17 @@ Instead:
 
 ## Threat surface
 
-Sparrow runs as one unprivileged Linux user service with local storage. The
+Sparrow runs as an unprivileged Linux service with local storage. The
 surfaces most relevant to a report are:
 
-- **The private Unix socket.** It serves the complete typed capability,
-  including pins, deletion-capable watch administration and every query. Its
-  directory is mode 0700 and the socket mode 0600, so access is limited to the
-  service's own user. Anything that weakens that boundary (permission races,
-  symlink substitution, a socket left reachable by another user) is in scope.
+- **The group-accessible Unix socket.** The store directory uses mode
+  `0710` and the socket uses mode `0660`. The service group can traverse
+  the directory and connect to the socket. The example service keeps store
+  files owner-only through its umask. On a writable daemon, socket access
+  includes administrative RPCs for pins and deletion-capable watches.
+  Treat service group membership as administrative access. Report permission
+  races, symlink substitution and socket access outside the owner and
+  service group.
 - **Public Cap'n Proto TCP.** When configured, the TCP listener admits
   anonymous peers for discovery, ingestion, flush and imports only. Every
   other operation requires a shared-secret CHAP session. **CHAP
