@@ -29,7 +29,7 @@ rank text searches, and evaluate governed SPARQL queries. Keep an independent
 copy of anything irreplaceable. [Architecture](docs/architecture.md)
 
 `sparrowd` serves typed Cap'n Proto RPC. The `sparrow-access` package supplies
-the `sparrow` CLI and stdio MCP adapter. Rust producers can use
+the `sparrow` CLI and MCP adapter. Rust producers can use
 [`sparrow-client`](https://crates.io/crates/sparrow-client) and negotiate
 `sparrow-producer/1` across compatible wire versions. The current wire schema
 is 73. [Interfaces](docs/interfaces.md)
@@ -157,7 +157,7 @@ independently. Reads do not extend a pin's deadline.
   semantic indexes.
 - **Temporal retention:** time-based expiry, explicit disk-pressure eviction,
   named pins, and reference-aware reclamation.
-- **Agent access:** typed Cap'n Proto RPC and a stdio MCP adapter, a CLI, bounded evidence
+- **Agent access:** typed Cap'n Proto RPC, a CLI, stdio and [localhost Streamable HTTP MCP](docs/interfaces.md#local-streamable-http), bounded evidence
   reads, typed query results, and explicit completeness information.
 - **Rust logging integration:** a composable `tracing` layer with
   structured events and spans, bounded buffering, drop counters, and explicit

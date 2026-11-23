@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
-//! Bounded stdio MCP lifecycle and tool dispatch over the typed daemon client.
+//! Bounded MCP tool dispatch and stdio lifecycle over the typed daemon client.
 
 use crate::{AgentError, agent::tool};
 use futures::{
@@ -16,6 +16,10 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 const VERSION: &str = "2025-11-25";
 const FRAME_LIMIT: usize = 128 * 1024;
+const CALL_LIMIT: usize = 4;
+
+mod http;
+pub use http::McpHttp;
 
 /// Serve newline-delimited MCP on stdin/stdout without opening a database writer.
 /// Call within a Tokio `LocalSet`; each tool uses the SDK's selected RPC endpoint.
@@ -104,17 +108,232 @@ fn id_key(id: &Value) -> Option<String> {
     }
 }
 
-async fn send<W: AsyncWrite + Unpin>(writer: &mut W, value: &Value) -> io::Result<()> {
-    let mut message = json::write_compact(value);
+fn encode(value: &Value) -> io::Result<String> {
+    let message = json::write_compact(value);
     if message.len() > 8 * 1024 * 1024 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "MCP response exceeds 8 MiB",
         ));
     }
+    Ok(message)
+}
+
+async fn send<W: AsyncWrite + Unpin>(writer: &mut W, value: &Value) -> io::Result<()> {
+    let mut message = encode(value)?;
     message.push('\n');
     writer.write_all(message.as_bytes()).await?;
     writer.flush().await
+}
+
+struct Message {
+    method: String,
+    id: Option<Value>,
+    params: Value,
+}
+
+impl Message {
+    fn decode(bytes: &[u8]) -> Result<Self, Value> {
+        let value = json::read_slice(
+            bytes,
+            json::Limits {
+                max_depth: 64,
+                max_values: 16384,
+                max_string_bytes: FRAME_LIMIT,
+                unique_members: true,
+            },
+        )
+        .map_err(|error| protocol_error(Value::Null, -32700, error.to_string()))?;
+        let decode = || {
+            let mut fields = Record::new(&value, "MCP request")?;
+            let version: String = fields.required("jsonrpc")?;
+            if version != "2.0" {
+                return Err(json::record::DecodeError::custom("jsonrpc requires 2.0"));
+            }
+            let method = fields.required("method")?;
+            let id = fields.raw("id")?.cloned();
+            let params = fields
+                .raw("params")?
+                .cloned()
+                .unwrap_or_else(|| Object::new().into());
+            fields.deny_unknown()?;
+            Ok(Self { method, id, params })
+        };
+        decode().map_err(|error| protocol_error(Value::Null, -32600, error.to_string()))
+    }
+}
+
+/// Transport-specific admission for the shared tool dispatcher.
+#[derive(Clone, Copy)]
+enum ToolAccess {
+    Stdio,
+    HttpRead,
+}
+
+impl ToolAccess {
+    fn allows(self, name: &str) -> bool {
+        match self {
+            Self::Stdio => tool::known(name),
+            Self::HttpRead => tool::http_read(name),
+        }
+    }
+
+    fn instructions(self) -> &'static str {
+        match self {
+            Self::Stdio => {
+                "Queries expose coverage and work limits. Times select server acceptance. Read original bytes to verify evidence. Pin mutations need stable request IDs; cancellation does not prove non-delivery."
+            }
+            Self::HttpRead => {
+                "Use status to find the store ID. Queries expose coverage and work limits. Times select server acceptance. Read original bytes to verify evidence."
+            }
+        }
+    }
+}
+
+enum RequestAction {
+    Reply(Value),
+    Call(Box<tool::Operation>),
+}
+
+fn initialize(params: &Value, access: ToolAccess) -> Result<Value, json::record::DecodeError> {
+    let mut fields = Record::new(params, "initialize params")?;
+    let _: String = fields.required("protocolVersion")?;
+    let capabilities = fields
+        .raw("capabilities")?
+        .ok_or_else(|| json::record::DecodeError::missing_field("capabilities"))?;
+    let _ = Record::new(capabilities, "client capabilities")?;
+    let info = fields
+        .raw("clientInfo")?
+        .ok_or_else(|| json::record::DecodeError::missing_field("clientInfo"))?;
+    let mut info = Record::new(info, "clientInfo")?;
+    let _: String = info.required("name")?;
+    let _: String = info.required("version")?;
+    Ok(Object::new()
+        .with("protocolVersion", VERSION)
+        .with(
+            "capabilities",
+            Object::new().with("tools", Object::new().with("listChanged", false)),
+        )
+        .with(
+            "serverInfo",
+            Object::new()
+                .with("name", "sparrow")
+                .with("version", env!("CARGO_PKG_VERSION")),
+        )
+        .with("instructions", access.instructions())
+        .into())
+}
+
+fn list_tools(params: &Value, access: ToolAccess) -> Result<Value, json::record::DecodeError> {
+    let mut fields = Record::new(params, "tools/list params")?;
+    let _ = fields.raw("_meta")?;
+    fields.deny_unknown()?;
+    Ok(Object::new()
+        .with("tools", tool::definitions_for(|name| access.allows(name)))
+        .into())
+}
+
+fn dispatch(method: &str, params: &Value, id: &Value, access: ToolAccess) -> RequestAction {
+    let invalid = |error: json::record::DecodeError| {
+        RequestAction::Reply(protocol_error(id.clone(), -32602, error.to_string()))
+    };
+    let reply = |value| RequestAction::Reply(response(id.clone(), value));
+    if params.as_object().is_none() {
+        return RequestAction::Reply(protocol_error(
+            id.clone(),
+            -32602,
+            "params requires an object",
+        ));
+    }
+    match method {
+        "ping" => reply(Object::new().into()),
+        "initialize" => initialize(params, access).map_or_else(invalid, reply),
+        "tools/list" => list_tools(params, access).map_or_else(invalid, reply),
+        "tools/call" => {
+            let decode = || {
+                let mut fields = Record::new(params, "tools/call params")?;
+                let name: String = fields.required("name")?;
+                let arguments = fields
+                    .raw("arguments")?
+                    .cloned()
+                    .unwrap_or_else(|| Object::new().into());
+                let _ = fields.raw("_meta")?;
+                fields.deny_unknown()?;
+                Ok((name, arguments))
+            };
+            let (name, arguments) = match decode() {
+                Ok(value) => value,
+                Err(error) => return invalid(error),
+            };
+            if !access.allows(&name) {
+                return RequestAction::Reply(protocol_error(
+                    id.clone(),
+                    -32602,
+                    format!("unknown tool: {name}"),
+                ));
+            }
+            match tool::Operation::parse(&name, &arguments) {
+                Ok(operation) => RequestAction::Call(Box::new(operation)),
+                Err(error) => reply(tool_result(
+                    Object::new().with("error", error.json()).into(),
+                    true,
+                )),
+            }
+        }
+        _ => RequestAction::Reply(protocol_error(
+            id.clone(),
+            -32601,
+            format!("unknown method: {method}"),
+        )),
+    }
+}
+
+fn call_limit(id: Value) -> Value {
+    response(
+        id,
+        tool_result(
+            Object::new()
+                .with(
+                    "error",
+                    Object::new()
+                        .with("code", "RESOURCE_LIMIT")
+                        .with("message", "four MCP calls are already in progress")
+                        .with("retryable", true),
+                )
+                .into(),
+            true,
+        ),
+    )
+}
+
+async fn execute(
+    endpoint: &Endpoint,
+    operation: tool::Operation,
+    id: Value,
+    access: ToolAccess,
+) -> Value {
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let client = Client::connect_endpoint(endpoint).await.map_err(|error| match error {
+            sparrow_client::Error::Io(error) => AgentError::from(capnp::Error::from(error)),
+            error => AgentError::from(error),
+        })?;
+        operation.execute(&client).await
+    }).await.unwrap_or_else(|_| Err(AgentError {
+        code: "RPC_TIMEOUT".into(),
+        message: match access {
+            ToolAccess::Stdio => "tool exceeded 30 seconds; mutation delivery may be unknown; retry its stable request ID",
+            ToolAccess::HttpRead => "tool exceeded 30 seconds",
+        }.into(),
+        retryable: true,
+    }));
+    let output = match result {
+        Ok(value) => {
+            let failed = value.get("execution_status").and_then(Value::as_str) == Some("failed");
+            tool_result(value, failed)
+        }
+        Err(error) => tool_result(Object::new().with("error", error.json()).into(), true),
+    };
+    response(id, output)
 }
 
 async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
@@ -147,24 +366,10 @@ async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                     Err(error) => { send(&mut writer, &protocol_error(Value::Null, -32700, error.to_string())).await?; return Err(error.into()); }
                 };
                 drop(incoming); incoming = Box::pin(frame(&mut reader));
-                let value = match json::read_slice(&bytes, json::Limits { max_depth: 64, max_values: 16384, max_string_bytes: FRAME_LIMIT, unique_members: true }) {
-                    Ok(value) => value,
-                    Err(error) => { send(&mut writer, &protocol_error(Value::Null, -32700, error.to_string())).await?; continue; }
+                let Message { method, id, params } = match Message::decode(&bytes) {
+                    Ok(message) => message,
+                    Err(reply) => { send(&mut writer, &reply).await?; continue; }
                 };
-                let decode = || {
-                    let mut record = Record::new(&value, "MCP request")?;
-                    let version: String = record.required("jsonrpc")?;
-                    let method: String = record.required("method")?;
-                    let id = record.raw("id")?.cloned();
-                    let params = record.raw("params")?.cloned().unwrap_or_else(|| Object::new().into());
-                    record.deny_unknown()?;
-                    Ok::<_, purrdf_lex::json::record::DecodeError>((version, method, id, params))
-                };
-                let (version, method, id, params) = match decode() {
-                    Ok(request) => request,
-                    Err(error) => { send(&mut writer, &protocol_error(Value::Null, -32600, error.to_string())).await?; continue; }
-                };
-                if version != "2.0" { send(&mut writer, &protocol_error(Value::Null, -32600, "jsonrpc requires 2.0")).await?; continue; }
                 let Some(id) = id else {
                     if params.as_object().is_none() { continue; }
                     match method.as_str() {
@@ -179,67 +384,35 @@ async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 let Some(key) = id_key(&id) else { send(&mut writer, &protocol_error(Value::Null, -32600, "request ID requires a bounded string or integer")).await?; continue; };
                 if pending.contains_key(&key) { send(&mut writer, &protocol_error(id, -32600, "request ID is already in progress")).await?; continue; }
                 if params.as_object().is_none() { send(&mut writer, &protocol_error(id, -32602, "params requires an object")).await?; continue; }
-                match method.as_str() {
-                    "ping" => send(&mut writer, &response(id, Object::new().into())).await?,
-                    "initialize" => {
-                        if initialized { send(&mut writer, &protocol_error(id, -32600, "session already initialized")).await?; continue; }
-                        let valid = || {
-                            let mut fields = Record::new(&params, "initialize params")?;
-                            let _: String = fields.required("protocolVersion")?;
-                            let capabilities = fields.raw("capabilities")?.ok_or_else(|| purrdf_lex::json::record::DecodeError::missing_field("capabilities"))?;
-                            let _ = Record::new(capabilities, "client capabilities")?;
-                            let info = fields.raw("clientInfo")?.ok_or_else(|| purrdf_lex::json::record::DecodeError::missing_field("clientInfo"))?;
-                            let mut info = Record::new(info, "clientInfo")?;
-                            let _: String = info.required("name")?; let _: String = info.required("version")?;
-                            Ok::<_, purrdf_lex::json::record::DecodeError>(())
-                        };
-                        if let Err(error) = valid() { send(&mut writer, &protocol_error(id, -32602, error.to_string())).await?; continue; }
-                        initialized = true;
-                        send(&mut writer, &response(id, Object::new().with("protocolVersion", VERSION)
-                            .with("capabilities", Object::new().with("tools", Object::new().with("listChanged", false)))
-                            .with("serverInfo", Object::new().with("name", "sparrow").with("version", env!("CARGO_PKG_VERSION")))
-                            .with("instructions", "Queries expose coverage and work limits. Times select server acceptance. Read original bytes to verify evidence. Pin mutations need stable request IDs; cancellation does not prove non-delivery.")
-                            .into())).await?;
+                if method == "initialize" && initialized {
+                    send(&mut writer, &protocol_error(id, -32600, "session already initialized")).await?;
+                    continue;
+                }
+                if !ready && !matches!(method.as_str(), "ping" | "initialize") {
+                    send(&mut writer, &protocol_error(id, -32000, "initialize and send notifications/initialized first")).await?;
+                    continue;
+                }
+                let access = ToolAccess::Stdio;
+                match dispatch(&method, &params, &id, access) {
+                    RequestAction::Reply(reply) => {
+                        if method == "initialize" && reply.get("result").is_some() {
+                            initialized = true;
+                        }
+                        send(&mut writer, &reply).await?;
                     }
-                    _ if !ready => send(&mut writer, &protocol_error(id, -32000, "initialize and send notifications/initialized first")).await?,
-                    "tools/list" => {
-                        let mut fields = Record::new(&params, "tools/list params")?;
-                        let _ = fields.raw("_meta")?;
-                        if let Err(error) = fields.deny_unknown() { send(&mut writer, &protocol_error(id, -32602, error.to_string())).await?; continue; }
-                        send(&mut writer, &response(id, Object::new().with("tools", tool::definitions()).into())).await?;
+                    RequestAction::Call(_) if pending.len() == CALL_LIMIT => {
+                        send(&mut writer, &call_limit(id)).await?;
                     }
-                    "tools/call" => {
-                        let decode = || {
-                            let mut fields = Record::new(&params, "tools/call params")?;
-                            let name: String = fields.required("name")?;
-                            let arguments = fields.raw("arguments")?.cloned().unwrap_or_else(|| Object::new().into());
-                            let _ = fields.raw("_meta")?; fields.deny_unknown()?;
-                            Ok::<_, purrdf_lex::json::record::DecodeError>((name, arguments))
-                        };
-                        let (name, arguments) = match decode() { Ok(value) => value, Err(error) => { send(&mut writer, &protocol_error(id, -32602, error.to_string())).await?; continue; } };
-                        if !tool::known(&name) { send(&mut writer, &protocol_error(id, -32602, format!("unknown tool: {name}"))).await?; continue; }
-                        let operation = match tool::Operation::parse(&name, &arguments) {
-                            Ok(operation) => operation,
-                            Err(error) => { send(&mut writer, &response(id, tool_result(Object::new().with("error", error.json()).into(), true))).await?; continue; }
-                        };
-                        if pending.len() == 4 { send(&mut writer, &response(id, tool_result(Object::new().with("error", Object::new().with("code", "RESOURCE_LIMIT").with("message", "four MCP calls are already in progress").with("retryable", true)).into(), true))).await?; continue; }
-                        let endpoint = endpoint.clone(); let result_key = key.clone(); let (handle, registration) = AbortHandle::new_pair(); pending.insert(key, handle);
+                    RequestAction::Call(operation) => {
+                        let endpoint = endpoint.clone();
+                        let result_key = key.clone();
+                        let (handle, registration) = AbortHandle::new_pair();
+                        pending.insert(key, handle);
                         jobs.push(async move {
-                            let reply = Abortable::new(async move {
-                            let result = tokio::time::timeout(Duration::from_secs(30), async {
-                                let client = Client::connect_endpoint(&endpoint).await.map_err(|error| match error {
-                                    sparrow_client::Error::Io(error) => AgentError::from(capnp::Error::from(error)),
-                                    error => AgentError::from(error),
-                                })?;
-                                operation.execute(&client).await
-                            }).await.unwrap_or_else(|_| Err(AgentError { code: "RPC_TIMEOUT".into(), message: "tool exceeded 30 seconds; mutation delivery may be unknown; retry its stable request ID".into(), retryable: true }));
-                            let output = match result { Ok(value) => { let failed = value.get("execution_status").and_then(Value::as_str) == Some("failed"); tool_result(value, failed) }, Err(error) => tool_result(Object::new().with("error", error.json()).into(), true) };
-                            response(id, output)
-                            }, registration).await;
+                            let reply = Abortable::new(execute(&endpoint, *operation, id, access), registration).await;
                             (result_key, reply)
                         }.boxed_local());
                     }
-                    _ => send(&mut writer, &protocol_error(id, -32601, format!("unknown method: {method}"))).await?,
                 }
             }
         }

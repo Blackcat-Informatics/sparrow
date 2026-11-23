@@ -148,6 +148,7 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/9c46d8cc8ed19b
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/markdown-rdf-projection> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/matched-record-summary> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/mcp-job-lifetime> .
+<> <https://blackcatinformatics.ca/raf/report/1#job> <#job/mcp-request-dispatch> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/merged-eviction-traversal> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/native-correlation-control-codec> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/native-correlation-recipes> .
@@ -1903,6 +1904,15 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/9c46d8cc8ed19b
 <#job/mcp-job-lifetime> <https://blackcatinformatics.ca/raf/report/1#specRef> "docs/query-streaming.md: real transport cancellation qualification." .
 <#job/mcp-job-lifetime> <https://blackcatinformatics.ca/raf/report/1#summary> "One bounded MCP dispatcher retains each admission/ID slot through cancelled job retirement; abort drops the tool's owned SDK connection without emitting a cancelled reply or cancelling sibling tools." .
 <#job/mcp-job-lifetime> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/tests/rpc.rs" .
+<#job/mcp-request-dispatch> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
+<#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+<#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_access::run_mcp" .
+<#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_access::mcp::http::McpHttp::serve" .
+<#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#homeSymbol> "sparrow_access::mcp::dispatch" .
+<#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#jobId> "mcp-request-dispatch" .
+<#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#specRef> "docs/interfaces.md: MCP operations." .
+<#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#summary> "Stdio and Streamable HTTP share JSON-RPC tool dispatch. HTTP admits only the configured log read catalog." .
+<#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/tests/rpc/mcp_http.rs" .
 <#job/merged-eviction-traversal> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
 <#job/merged-eviction-traversal> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
 <#job/merged-eviction-traversal> <https://blackcatinformatics.ca/raf/report/1#forbiddenName> "^(collect_eviction_candidates|sort_recordless_artifacts)$" .
