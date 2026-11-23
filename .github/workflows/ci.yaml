@@ -21,11 +21,15 @@ on:
         description: Compare serial and parallel test-suite execution
         type: boolean
         default: false
+      benchmark_lanes:
+        description: Compare the full gate with independent compile and test jobs
+        type: boolean
+        default: false
 
 # A newer push to a pull request cancels the run the previous push started.
 # Runs on main are never cancelled.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.benchmark_suites && '-suite-benchmark' || '' }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.benchmark_suites && '-suite-benchmark' || '' }}${{ inputs.benchmark_lanes && '-lane-benchmark' || '' }}${{ inputs.benchmark_cache && inputs.benchmark_source_change && '-edited-cache-benchmark' || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
@@ -33,11 +37,12 @@ permissions:
 
 jobs:
   check:
-    name: ${{ inputs.benchmark_cache && format('Cache benchmark ({0})', matrix.cache) || inputs.benchmark_suites && 'Suite timing benchmark' || 'make check' }}
+    name: ${{ inputs.benchmark_cache && format('Cache benchmark ({0})', matrix.cache) || inputs.benchmark_suites && 'Suite timing benchmark' || inputs.benchmark_lanes && format('Lane benchmark ({0})', matrix.lane) || 'make check' }}
     strategy:
       fail-fast: false
       matrix:
         cache: ${{ fromJSON(inputs.benchmark_cache && '["dependencies", "workspace"]' || '["dependencies"]') }}
+        lane: ${{ fromJSON(inputs.benchmark_lanes && '["full", "compile", "test"]' || '["full"]') }}
     # Inert anywhere but github.com, so a Forgejo mirror that reads
     # .github/workflows never runs it.
     if: github.server_url == 'https://github.com'
@@ -90,25 +95,45 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache Cargo and target
+        id: cargo-cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: sparrow
           key: ${{ inputs.benchmark_cache && format('workspace-benchmark-v1-{0}', matrix.cache) || '' }}
           cache-workspace-crates: ${{ matrix.cache == 'workspace' }}
+          save-if: ${{ !inputs.benchmark_lanes }}
+
+      - name: Require the same warm cache for the lane comparison
+        if: inputs.benchmark_lanes
+        env:
+          CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
+        run: test "$CACHE_HIT" = true
 
       - name: Install the commit hook
         working-directory: sparrow
         run: make install-hooks
 
       - name: Install the helper census
+        if: matrix.lane != 'test'
         working-directory: sparrow
         run: make install-census
 
       - name: make check
+        if: matrix.lane == 'full'
         working-directory: sparrow
         env:
           CARGO_TERM_VERBOSE: ${{ inputs.benchmark_cache && 'true' || 'false' }}
         run: make check
+
+      - name: Run compile and census checks
+        if: matrix.lane == 'compile'
+        working-directory: sparrow
+        run: make check-compile census-check
+
+      - name: Run release tests
+        if: matrix.lane == 'test'
+        working-directory: sparrow
+        run: make tools-check test
 
       - name: Compare serial and parallel release suites
         if: inputs.benchmark_suites
