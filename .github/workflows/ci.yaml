@@ -8,6 +8,15 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      benchmark_cache:
+        description: Compare dependency and workspace build caches
+        type: boolean
+        default: false
+      benchmark_source_change:
+        description: Change a Rust source file during the cache comparison
+        type: boolean
+        default: false
 
 # A newer push to a pull request cancels the run the previous push started.
 # Runs on main are never cancelled.
@@ -20,7 +29,11 @@ permissions:
 
 jobs:
   check:
-    name: make check
+    name: ${{ inputs.benchmark_cache && format('Cache benchmark ({0})', matrix.cache) || 'make check' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        cache: ${{ fromJSON(inputs.benchmark_cache && '["dependencies", "workspace"]' || '["dependencies"]') }}
     # Inert anywhere but github.com, so a Forgejo mirror that reads
     # .github/workflows never runs it.
     if: github.server_url == 'https://github.com'
@@ -36,6 +49,11 @@ jobs:
         with:
           path: sparrow
           persist-credentials: false
+
+      - name: Change a Rust compile input for the cache comparison
+        if: inputs.benchmark_cache && inputs.benchmark_source_change
+        working-directory: sparrow
+        run: printf '\n// Workspace cache benchmark source change.\n' >> crates/sparrow-limits/src/lib.rs
 
       - name: Read the pinned PurRDF revision
         id: purrdf
@@ -71,6 +89,8 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: sparrow
+          key: ${{ inputs.benchmark_cache && format('workspace-benchmark-v1-{0}', matrix.cache) || '' }}
+          cache-workspace-crates: ${{ matrix.cache == 'workspace' }}
 
       - name: Install the commit hook
         working-directory: sparrow
@@ -82,4 +102,6 @@ jobs:
 
       - name: make check
         working-directory: sparrow
+        env:
+          CARGO_TERM_VERBOSE: ${{ inputs.benchmark_cache && 'true' || 'false' }}
         run: make check
