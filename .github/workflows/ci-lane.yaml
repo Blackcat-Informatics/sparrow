@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+name: CI lane
+
+on:
+  workflow_call:
+    inputs:
+      lane:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: ${{ inputs.lane == 'compile' && 'Compile and census checks' || 'Release tests' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      # The gate expects PurRDF beside the Sparrow checkout at ../purrdf: the
+      # tests archive its text lexicons and the census archives its source.
+      - name: Checkout Sparrow
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: sparrow
+          persist-credentials: false
+
+      - name: Read the pinned PurRDF revision
+        id: purrdf
+        working-directory: sparrow
+        run: |
+          revision="$(sed -n 's/^git_revision = "\([0-9a-f]\{40\}\)"$/\1/p' registry/compatibility.toml)"
+          if [ "$(printf '%s\n' "$revision" | grep -c .)" != 1 ]; then
+            echo "error: registry/compatibility.toml must name exactly one 40-hex git_revision" >&2
+            exit 1
+          fi
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PurRDF at the pinned revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: Blackcat-Informatics/purrdf
+          ref: ${{ steps.purrdf.outputs.revision }}
+          path: purrdf
+          persist-credentials: false
+
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends b3sum capnproto libclang-dev clang libcap2-bin
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cache Cargo and target
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: sparrow
+          shared-key: ${{ inputs.lane == 'compile' && 'check' || 'release-tests' }}
+
+      - name: Run the selected checks
+        working-directory: sparrow
+        env:
+          CI_LANE: ${{ inputs.lane }}
+        run: |
+          case "$CI_LANE" in
+            compile)
+              make install-hooks install-census
+              make check-compile census-check
+              ;;
+            test)
+              make tools-check test
+              ;;
+            *)
+              printf 'Unknown verification lane %s\n' "$CI_LANE" >&2
+              exit 2
+              ;;
+          esac

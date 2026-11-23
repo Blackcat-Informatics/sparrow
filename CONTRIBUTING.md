@@ -79,10 +79,13 @@ make build-runtime  # release build of the server and client binaries
 ```
 
 `make check` is the whole gate. It checks formatting, runs release-profile
-Clippy over every target with warnings denied, runs the release test suite,
-runs the census self-tests, and runs the pinned cross-workspace census check.
-`make all` is the same gate. Release builds of RocksDB are slow the first
-time; later runs reuse the target directory.
+Clippy over every target and each shipped crate with warnings denied, runs
+the release test suite, and runs the census self-tests and pinned cross-workspace
+check. `make all` runs the same gate. Release builds of RocksDB are slow the
+first time. Later runs reuse the target directory.
+
+GitHub CI runs the compile and census checks alongside the release tests on
+separate runners. The `make check` status passes only when both jobs succeed.
 
 The helper ledger uses canonical RDF 1.2 Turtle. Use RAF's RDF builder to
 edit the graph and render it as Turtle. Verify the result with
