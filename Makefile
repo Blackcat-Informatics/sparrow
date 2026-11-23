@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 .DEFAULT_GOAL := check
-.PHONY: all check precommit hook-check tools-check fmt fmt-check lint test check-shipped census census-cross census-check census-tool-check install-census install-hooks build-runtime install-bin
+.PHONY: all check check-compile precommit hook-check tools-check fmt fmt-check lint test check-shipped census census-cross census-check census-tool-check install-census install-hooks build-runtime install-bin
 
 all: check
 
@@ -11,7 +11,8 @@ all: check
 # lock. `check` is the full gate (hook-check first, so a checkout without the
 # hook cannot pass silently); it must pass on a change's head before merge.
 precommit: tools-check fmt-check lint
-check: hook-check tools-check fmt-check lint check-shipped test census-check
+check: check-compile test census-check
+check-compile: hook-check tools-check fmt-check lint check-shipped
 
 hook-check:
 	@cmd="$$(git config --local --get hook.sparrow-verify.command)"; \

@@ -9,8 +9,7 @@ on:
       - main
   workflow_dispatch:
 
-# A newer push to a pull request cancels the run the previous push started.
-# Runs on main are never cancelled.
+# Cancel obsolete pull request runs. Runs on main are never cancelled.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -19,67 +18,28 @@ permissions:
   contents: read
 
 jobs:
+  compile:
+    if: github.server_url == 'https://github.com'
+    uses: ./.github/workflows/ci-lane.yaml
+    with:
+      lane: compile
+
+  test:
+    if: github.server_url == 'https://github.com'
+    uses: ./.github/workflows/ci-lane.yaml
+    with:
+      lane: test
+
   check:
     name: make check
-    # Inert anywhere but github.com, so a Forgejo mirror that reads
-    # .github/workflows never runs it.
-    if: github.server_url == 'https://github.com'
+    if: always() && github.server_url == 'https://github.com'
+    needs: [compile, test]
     runs-on: ubuntu-latest
-    # Cold release builds of RocksDB and the workspace are slow; the cache
-    # shortens later runs.
-    timeout-minutes: 120
     steps:
-      # The gate expects PurRDF beside the Sparrow checkout at ../purrdf: the
-      # tests archive its text lexicons and the census archives its source.
-      - name: Checkout Sparrow
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          path: sparrow
-          persist-credentials: false
-
-      - name: Read the pinned PurRDF revision
-        id: purrdf
-        working-directory: sparrow
+      - name: Require both jobs to pass
+        env:
+          COMPILE_RESULT: ${{ needs.compile.result }}
+          TEST_RESULT: ${{ needs.test.result }}
         run: |
-          revision="$(sed -n 's/^git_revision = "\([0-9a-f]\{40\}\)"$/\1/p' registry/compatibility.toml)"
-          if [ "$(printf '%s\n' "$revision" | grep -c .)" != 1 ]; then
-            echo "error: registry/compatibility.toml must name exactly one 40-hex git_revision" >&2
-            exit 1
-          fi
-          echo "revision=$revision" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout PurRDF at the pinned revision
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          repository: Blackcat-Informatics/purrdf
-          ref: ${{ steps.purrdf.outputs.revision }}
-          path: purrdf
-          persist-credentials: false
-
-      - name: Install build and test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends b3sum capnproto libclang-dev clang libcap2-bin
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
-
-      - name: Cache Cargo and target
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          workspaces: sparrow
-
-      - name: Install the commit hook
-        working-directory: sparrow
-        run: make install-hooks
-
-      - name: Install the helper census
-        working-directory: sparrow
-        run: make install-census
-
-      - name: make check
-        working-directory: sparrow
-        run: make check
+          printf 'Compile and census checks %s\nRelease tests %s\n' "$COMPILE_RESULT" "$TEST_RESULT"
+          test "$COMPILE_RESULT" = success && test "$TEST_RESULT" = success
