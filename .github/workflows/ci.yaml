@@ -17,11 +17,15 @@ on:
         description: Change a Rust source file during the cache comparison
         type: boolean
         default: false
+      benchmark_suites:
+        description: Compare serial and parallel test-suite execution
+        type: boolean
+        default: false
 
 # A newer push to a pull request cancels the run the previous push started.
 # Runs on main are never cancelled.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.benchmark_suites && '-suite-benchmark' || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
@@ -29,7 +33,7 @@ permissions:
 
 jobs:
   check:
-    name: ${{ inputs.benchmark_cache && format('Cache benchmark ({0})', matrix.cache) || 'make check' }}
+    name: ${{ inputs.benchmark_cache && format('Cache benchmark ({0})', matrix.cache) || inputs.benchmark_suites && 'Suite timing benchmark' || 'make check' }}
     strategy:
       fail-fast: false
       matrix:
@@ -105,3 +109,10 @@ jobs:
         env:
           CARGO_TERM_VERBOSE: ${{ inputs.benchmark_cache && 'true' || 'false' }}
         run: make check
+
+      - name: Compare serial and parallel release suites
+        if: inputs.benchmark_suites
+        working-directory: sparrow
+        run: |
+          cargo test --locked --release --workspace --no-run --message-format=json > "$RUNNER_TEMP/sparrow-test-binaries.json"
+          python3 tools/benchmark-test-suites.py "$RUNNER_TEMP/sparrow-test-binaries.json" "$RUNNER_TEMP/sparrow-test-benchmark"
