@@ -3101,7 +3101,9 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/9c46d8cc8ed19b
 <#job/source-summary-counters> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::source_summary::counts" .
 <#job/source-summary-counters> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::source_summary::fence" .
 <#job/source-summary-counters> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::source_summary::page" .
+<#job/source-summary-counters> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::source_summary::reset" .
 <#job/source-summary-counters> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::source_summary::source_hash" .
+<#job/source-summary-counters> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::writer_format::enable_source_bytes" .
 <#job/source-summary-counters> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::writer_format::enable_source_summary" .
 <#job/source-summary-counters> <https://blackcatinformatics.ca/raf/report/1#forbiddenName> "^(source_counter_delta|update_source_summary|clamp_source_count|copy_source_summary_pager|source_sha256|fold_catalog_batch)$" .
 <#job/source-summary-counters> <https://blackcatinformatics.ca/raf/report/1#homeSymbol> "sparrow_core::storage::source_summary::apply" .

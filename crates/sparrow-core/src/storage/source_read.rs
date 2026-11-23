@@ -91,6 +91,8 @@ pub struct SourceSummary {
     pub fragment_parents: usize,
     /// Exact number of record entries present and not evicted.
     pub retained_records: usize,
+    /// Logical payload bytes of complete artifacts and readable retained fragments.
+    pub retained_payload_bytes: u64,
     /// Declared immutable time mapping, or explicit absence.
     pub time_profile_id: Option<String>,
     /// Declared immutable diagnostic mapping, or explicit absence.
@@ -124,6 +126,7 @@ impl SourceSummary {
             complete_artifacts: 0,
             fragment_parents: 0,
             retained_records: 0,
+            retained_payload_bytes: 0,
             time_profile_id: None,
             diagnostic_profile_id: None,
             continuity_unknown: true,
@@ -625,6 +628,7 @@ impl Store {
             row.complete_artifacts = wide(counts.complete_artifacts)?;
             row.fragment_parents = wide(counts.fragment_parents)?;
             row.retained_records = wide(counts.retained_records)?;
+            row.retained_payload_bytes = counts.retained_payload_bytes;
             counted.insert(counts.source);
             Ok(())
         };

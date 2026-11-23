@@ -83,6 +83,7 @@ struct SourceSummary {
   tailGenerationIds @10 :List(Text);
   syslogListenerIds @11 :List(Text);
   receiverWindowIds @12 :List(Text);
+  retainedPayloadBytes @13 :Count;
 }
 struct SourceListQuery {
   storeId @0 :Text; schemaVersion @1 :UInt32; source @2 :OptionalText;

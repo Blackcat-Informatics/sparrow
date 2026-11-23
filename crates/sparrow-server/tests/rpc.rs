@@ -375,7 +375,7 @@ async fn log_timestamp_profiles_share_tcp_cli_unix_mcp_and_chronological_capture
             assert_eq!(artifact["record_ids"].as_array().unwrap().len(), 3);
             assert_eq!(
                 cli(&endpoint, &["status"])["store_format"].as_str(),
-                Some("sparrow.store/365")
+                Some("sparrow.store/475")
             );
             let first = cli(
                 &endpoint,
@@ -822,7 +822,7 @@ async fn typed_tail_handoff_retires_original_checkpoint_over_tcp_and_replays_thr
         assert_eq!(client.bytes(&generation, 0, 10).await.unwrap(), b"first\nlast");
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement stays independent");
         let status = cli(&socket, &["status"]);
-        assert_eq!(status["store_format"].as_str(), Some("sparrow.store/356"));
+        assert_eq!(status["store_format"].as_str(), Some("sparrow.store/466"));
         assert_eq!(status["live_records"].as_str(), Some("2"));
         assert_eq!(cli(&socket, &["records", "--source", "consume-acceptance"])["rows"], original_records);
     }).await;
@@ -3345,6 +3345,7 @@ async fn source_listing_exposes_declared_idle_and_occurrence_sources_through_sha
             assert_eq!(source["complete_artifacts"].as_str(), Some("2"));
             assert_eq!(source["fragment_parents"].as_str(), Some("0"));
             assert_eq!(source["retained_records"].as_str(), Some("4"));
+            assert_eq!(source["retained_payload_bytes"].as_str(), Some("12"));
             assert_eq!(
                 source["diagnostic_profile_id"].as_str(),
                 Some(diagnostic.id.as_str())
@@ -3407,6 +3408,7 @@ async fn source_listing_exposes_declared_idle_and_occurrence_sources_through_sha
                 Some("consume-acceptance")
             );
             assert_eq!(captured[0]["retained_records"].as_str(), Some("0"));
+            assert_eq!(captured[0]["retained_payload_bytes"].as_str(), Some("0"));
             assert_eq!(
                 captured[0]["watches"][0]["watch_id"].as_str(),
                 Some("completed")
@@ -4688,7 +4690,7 @@ async fn explicit_handoff_consumes_exact_generations_and_replays_after_removal_a
         assert_eq!(std::fs::read(&input).unwrap(), b"replacement must remain\n");
         let response = client.capability().status_request().send().promise.await.unwrap();
         let status = rpc_ok(response.get().unwrap().get_result().unwrap());
-        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/355");
+        assert_eq!(status.get_store_format().unwrap().to_str().unwrap(), "sparrow.store/465");
         assert_eq!(status.get_live_records(), 2);
         assert!(status.get_consume_watches().unwrap().is_empty());
         drop(client); drop(daemon);
@@ -4950,7 +4952,7 @@ async fn typed_watch_administration_is_durable_revisioned_and_does_not_resurrect
             );
             assert_eq!(
                 cli(&socket, &["status"])["store_format"].as_str(),
-                Some("sparrow.store/354")
+                Some("sparrow.store/464")
             );
         })
         .await;
@@ -5969,7 +5971,7 @@ async fn configured_inotify_consumption_preserves_exact_bytes_and_defers_reopene
                 Some("5")
             );
             assert_eq!(status["live_records"].as_str(), Some("5"));
-            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/354"));
+            assert_eq!(status["store_format"].as_str(), Some("sparrow.store/464"));
             rustix::process::kill_process(
                 rustix::process::Pid::from_raw(daemon.0.id() as i32).unwrap(),
                 rustix::process::Signal::INT,
