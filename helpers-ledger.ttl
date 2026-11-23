@@ -1,5 +1,5 @@
 VERSION "1.2"
-BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/9c46d8cc8ed19bb70b07aad9bcb6467fcb1a3c47a8cd522ea3ba55c5aa495813>
+BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/529d5b8816f76bcdc7a066821d02dffec16b14f71faef3fc2d1a111f13d0fd89>
 <> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#Ledger> .
 <> <https://blackcatinformatics.ca/raf/report/1#distinct> <#distinct/0> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/active-file-checkpoint-attachment> .
@@ -1906,8 +1906,8 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/9c46d8cc8ed19b
 <#job/mcp-job-lifetime> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/tests/rpc.rs" .
 <#job/mcp-request-dispatch> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
 <#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
-<#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_access::run_mcp" .
 <#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_access::mcp::http::McpHttp::serve" .
+<#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_access::run_mcp" .
 <#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#homeSymbol> "sparrow_access::mcp::dispatch" .
 <#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#jobId> "mcp-request-dispatch" .
 <#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#specRef> "docs/interfaces.md: MCP operations." .
