@@ -168,10 +168,45 @@ fn bind_name(path: &Path, kind: Kind) -> io::Result<(tokio::net::UnixListener, (
         .and_then(|()| crate::ingest_socket::check_socket(path, gid)),
     };
     if let Err(error) = checked {
-        remove_socket(path, identity)?;
-        return Err(error);
+        return Err(cleanup_rejected_socket(path, identity, error));
     }
     Ok((listener, identity))
+}
+
+/// Keep the validation error primary, including when the rejected socket cannot be removed.
+fn cleanup_rejected_socket(path: &Path, identity: (u64, u64), validation: io::Error) -> io::Error {
+    match remove_socket(path, identity) {
+        Ok(()) => validation,
+        Err(cleanup) => io::Error::new(
+            validation.kind(),
+            BindCleanupError {
+                validation,
+                cleanup,
+            },
+        ),
+    }
+}
+
+#[derive(Debug)]
+struct BindCleanupError {
+    validation: io::Error,
+    cleanup: io::Error,
+}
+
+impl std::fmt::Display for BindCleanupError {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            output,
+            "{} (socket cleanup also failed with {})",
+            self.validation, self.cleanup
+        )
+    }
+}
+
+impl std::error::Error for BindCleanupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.validation)
+    }
 }
 
 /// Remove a socket left on `path` once a refused connection proves no listener is behind it;
@@ -290,12 +325,18 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         let _replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let replacement_identity = socket_identity(&path).unwrap();
-        assert!(
-            remove_socket(&path, identity)
-                .unwrap_err()
-                .to_string()
-                .contains("identity changed")
-        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
+        let gid = std::fs::symlink_metadata(&path).unwrap().gid();
+        let validation =
+            crate::ingest_socket::check_socket(&path, gid.wrapping_add(1)).unwrap_err();
+        let original = validation.to_string();
+        let error = cleanup_rejected_socket(&path, identity, validation);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let source = std::error::Error::source(&error).unwrap();
+        assert_eq!(source.to_string(), original);
+        let message = error.to_string();
+        assert!(message.contains(&original), "{message}");
+        assert!(message.contains("identity changed"), "{message}");
         assert_eq!(socket_identity(&path).unwrap(), replacement_identity);
         assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
     }
