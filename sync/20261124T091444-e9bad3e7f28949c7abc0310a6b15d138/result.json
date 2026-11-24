@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/39-check-scoped-sparql-parity-on-a-strict",
+  "branch": "paudley/39-check-scoped-sparql-parity-on-a-strict",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "590bd3055fcea7fd7085103d4f8a8b8608cd5f17",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/39-check-scoped-sparql-parity-on-a-strict/.stage/check-scoped-sparql-parity-on-a-strict/sync/20261124T091444-e9bad3e7f28949c7abc0310a6b15d138",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "59d7e2785545eaccb01a80dca13480874ff10218",
+  "merge_bases": [
+    "590bd3055fcea7fd7085103d4f8a8b8608cd5f17"
+  ],
+  "commit": "59d7e2785545eaccb01a80dca13480874ff10218"
+}
