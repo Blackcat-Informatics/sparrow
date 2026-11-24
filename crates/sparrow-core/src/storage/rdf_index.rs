@@ -760,24 +760,61 @@ impl<'a> RdfWrite<'a> {
             .ok_or_else(|| Error::new("STORAGE_FAILURE", "RDF graph manifest missing"))?;
         let manifest = parse(&value)?;
         let owner = integer(&manifest, "owner")?;
-        for (stream, row) in manifest_rows(&manifest)? {
+        let rows = manifest_rows(&manifest)?;
+        let terms = read_field::<Vec<String>>(&manifest, "terms")?
+            .iter()
+            .map(|term| {
+                term.parse::<u64>()
+                    .map_err(|_| Error::new("STORAGE_FAILURE", "invalid RDF term reference"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let graphs = read_field::<Vec<String>>(&manifest, "graphs")?
+            .iter()
+            .map(|graph| {
+                graph
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|id| *id > 0)
+                    .ok_or_else(|| Error::new("STORAGE_FAILURE", "invalid named graph ID"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // A record owner contains only plain metadata quads. Diagnostic and content owners
+        // can carry other named graphs and native RDF streams.
+        if id.starts_with("record:") {
+            let expected = encoded(&TermValue::iri(graph_iri(id)))?;
+            if graphs != [owner]
+                || self.db.get_pinned(term_key(owner))?.as_deref() != Some(expected.as_slice())
+                || rows
+                    .iter()
+                    .any(|(stream, row)| *stream != 0 || row[3] != owner)
+            {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    format!("record RDF manifest {id} contradicts its graph owner"),
+                ));
+            }
+            if terms.windows(2).any(|pair| pair[0] >= pair[1])
+                || terms.binary_search(&owner).is_err()
+                || rows
+                    .iter()
+                    .flat_map(|(_, row)| row)
+                    .any(|term| terms.binary_search(term).is_err())
+            {
+                return Err(Error::new(
+                    "STORAGE_FAILURE",
+                    format!("record RDF manifest {id} contradicts its declared terms"),
+                ));
+            }
+        }
+        for (stream, row) in rows {
             for (name, order) in ORDERS {
                 batch.delete(index_key(owner, stream, name, order, &row));
             }
         }
-        for term in read_field::<Vec<String>>(&manifest, "terms")? {
-            self.adjust(
-                term.parse()
-                    .map_err(|_| Error::new("STORAGE_FAILURE", "invalid RDF term reference"))?,
-                false,
-            )?;
+        for term in terms {
+            self.adjust(term, false)?;
         }
-        for graph in read_field::<Vec<String>>(&manifest, "graphs")? {
-            let graph = graph
-                .parse::<u64>()
-                .ok()
-                .filter(|id| *id > 0)
-                .ok_or_else(|| Error::new("STORAGE_FAILURE", "invalid named graph ID"))?;
+        for graph in graphs {
             batch.delete(graph_key(graph, owner));
             batch.delete(owner_graph_key(owner, graph));
         }

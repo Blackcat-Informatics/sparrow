@@ -27000,3 +27000,104 @@ fn cancelling_background_work_after_the_final_flush_loses_no_acknowledged_record
         );
     }
 }
+
+#[test]
+fn expiry_refuses_malformed_timed_record_metadata_without_retiring_evidence() {
+    use purrdf_lex::json::{self, Value};
+    use sparrow_core::{EventTime, QuerySelection, RdfGraphLayers, TimeRepresentation};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .define_time_profile("timed", "/timestamp", TimeRepresentation::Rfc3339)
+        .unwrap();
+    let bytes = br#"{"timestamp":"2026-10-07T05:00:00Z","message":"timed event"}"#;
+    let old = store.ingest("old", "timed", "json", bytes, 100).unwrap();
+    let kept = store.ingest("kept", "timed", "json", bytes, 200).unwrap();
+    let record = store.record(&old.record_ids[0]).unwrap();
+    assert!(matches!(record.event_time, EventTime::Known { .. }));
+    let mut scope = record_page_scope("timed", 1000);
+    scope.selection = QuerySelection::Evidence(old.record_ids.clone());
+    let event = "PREFIX sp: <urn:sparrow:vocab:> SELECT ?t WHERE { ?r sp:eventTime ?t }";
+    let before = scoped_rows(&store, &scope, RdfGraphLayers::ALL, event, 300).0;
+    assert_eq!(before.len(), 1);
+    drop(store);
+
+    let db = catalog_db(dir.path()).unwrap();
+    let key = format!("rdf:graph:{}", old.record_ids[0]);
+    let kept_key = format!("rdf:graph:{}", kept.record_ids[0]);
+    let intact = db.get(&key).unwrap().unwrap();
+    let graph = json::read_slice(&intact, json::Limits::default()).unwrap();
+    let neighbor =
+        json::read_slice(&db.get(kept_key).unwrap().unwrap(), json::Limits::default()).unwrap();
+    let owner = graph["owner"].as_str().unwrap().parse::<u64>().unwrap();
+    assert_ne!(graph["owner"], neighbor["owner"]);
+    let index_rows = |db: &rocksdb::DB| {
+        db.prefix_iterator(b"rdf:q:")
+            .map(Result::unwrap)
+            .take_while(|(key, _)| key.starts_with(b"rdf:q:"))
+            .filter(|(key, _)| key.ends_with(&owner.to_be_bytes()))
+            .collect::<Vec<_>>()
+    };
+    let original_rows = index_rows(&db);
+    assert!(!original_rows.is_empty());
+    drop(db);
+
+    let mut wrong_owner = graph.clone();
+    let Value::Array(rows) = wrong_owner.get_mut("rows").unwrap() else {
+        panic!("metadata rows");
+    };
+    let Value::Array(row) = &mut rows[0] else {
+        panic!("metadata row");
+    };
+    assert_eq!(row[4], graph["owner"]);
+    let term = row[2].clone();
+    row[4] = neighbor["owner"].clone();
+
+    let mut missing_term = graph;
+    let Value::Array(terms) = missing_term.get_mut("terms").unwrap() else {
+        panic!("metadata terms");
+    };
+    let count = terms.len();
+    terms.retain(|value| *value != term);
+    assert_eq!(terms.len() + 1, count);
+
+    for (corrupt, diagnostic) in [
+        (wrong_owner, "graph owner"),
+        (missing_term, "declared terms"),
+    ] {
+        let corrupt = json::write_compact(&corrupt);
+        let db = catalog_db(dir.path()).unwrap();
+        db.put(&key, &corrupt).unwrap();
+        drop(db);
+        let store = Store::open(dir.path(), config()).unwrap();
+        let error = store.expire(record.expires_at + 1).unwrap_err();
+        assert_eq!(error.code, "STORAGE_FAILURE");
+        assert!(error.message.contains(diagnostic), "{error}");
+        assert_eq!(store.bytes(&old.id, 0, bytes.len(), 300).unwrap(), bytes);
+        assert_eq!(
+            scoped_rows(&store, &scope, RdfGraphLayers::ALL, event, 300).0,
+            before
+        );
+        drop(store);
+        let db = catalog_db(dir.path()).unwrap();
+        assert_eq!(db.get(&key).unwrap().unwrap(), corrupt.as_bytes());
+        assert_eq!(index_rows(&db), original_rows);
+    }
+
+    let db = catalog_db(dir.path()).unwrap();
+    db.put(&key, intact).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(store.expire(record.expires_at + 1).unwrap(), 2);
+    assert_eq!(
+        store
+            .bytes(&kept.id, 0, bytes.len(), record.expires_at + 1)
+            .unwrap(),
+        bytes
+    );
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    assert!(db.get(&key).unwrap().is_none());
+    assert!(index_rows(&db).is_empty());
+}
