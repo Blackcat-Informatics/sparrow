@@ -259,11 +259,40 @@ fn decode_intent(bytes: &[u8]) -> Result<ArchiveIntent, Error> {
     Ok(intent)
 }
 
-/// Load archive progress at open, fencing a newly configured store first.
-///
-/// A store fenced for archiving cannot be opened without a policy: retiring
-/// unarchived evidence would silently break the archive's completeness.
-pub(super) fn open(db: &DB, policy: Option<&ArchivePolicy>) -> Result<Option<ArchiveState>, Error> {
+pub(super) enum OpenArchive {
+    Disabled,
+    Existing(ArchiveState),
+    Enable,
+}
+
+impl OpenArchive {
+    /// Enable a newly configured archive using the writer format after startup upgrades.
+    pub(super) fn finish(self, db: &DB) -> Result<Option<ArchiveState>, Error> {
+        match self {
+            Self::Disabled => Ok(None),
+            Self::Existing(state) => Ok(Some(state)),
+            Self::Enable => {
+                let format = db
+                    .get("store_format")?
+                    .ok_or_else(|| corrupt("writer format missing"))?;
+                let mut batch = WriteBatch::default();
+                batch.put("store_format", writer_format::enable_archive(&format)?);
+                // The archive family includes the log time law; keep that fence coherent.
+                if db.get(super::source_time::LOG_FENCE)?.is_none() {
+                    batch.put(super::source_time::LOG_FENCE, super::log_time::LAW);
+                }
+                // The whole retained backlog waits for its first segment.
+                batch.put(THROUGH_KEY, encode_through(None));
+                catalog_upgrade::commit(db, batch)?;
+                Ok(Some(ArchiveState::default()))
+            }
+        }
+    }
+}
+
+/// Validate the archive policy and persisted state before startup upgrades.
+/// An archive-fenced store requires its policy to protect unarchived evidence.
+pub(super) fn prepare_open(db: &DB, policy: Option<&ArchivePolicy>) -> Result<OpenArchive, Error> {
     let format = db
         .get("store_format")?
         .ok_or_else(|| corrupt("writer format missing"))?;
@@ -276,35 +305,21 @@ pub(super) fn open(db: &DB, policy: Option<&ArchivePolicy>) -> Result<Option<Arc
         ));
     }
     match (policy, fenced) {
-        (None, false) => return Ok(None),
-        (None, true) => {
-            return Err(Error::new(
-                "INVALID_ARGUMENT",
-                "this store archives evidence before deleting it; configure the [archive] table to open it",
-            ));
-        }
-        (Some(_), false) => {
-            let mut batch = WriteBatch::default();
-            batch.put("store_format", writer_format::enable_archive(&format)?);
-            // The archive family includes the log time law; keep that fence coherent.
-            if db.get(super::source_time::LOG_FENCE)?.is_none() {
-                batch.put(super::source_time::LOG_FENCE, super::log_time::LAW);
-            }
-            // Nothing is archived yet: the whole retained backlog waits for its first segment.
-            batch.put(THROUGH_KEY, encode_through(None));
-            catalog_upgrade::commit(db, batch)?;
-            return Ok(Some(ArchiveState::default()));
-        }
-        (Some(_), true) => {}
+        (None, false) => Ok(OpenArchive::Disabled),
+        (None, true) => Err(Error::new(
+            "INVALID_ARGUMENT",
+            "this store archives evidence before deleting it; configure the [archive] table to open it",
+        )),
+        (Some(_), false) => Ok(OpenArchive::Enable),
+        (Some(_), true) => Ok(OpenArchive::Existing(ArchiveState {
+            through: through
+                .as_deref()
+                .map(decode_through)
+                .transpose()?
+                .flatten(),
+            intent: intent.as_deref().map(decode_intent).transpose()?,
+        })),
     }
-    Ok(Some(ArchiveState {
-        through: through
-            .as_deref()
-            .map(decode_through)
-            .transpose()?
-            .flatten(),
-        intent: intent.as_deref().map(decode_intent).transpose()?,
-    }))
 }
 
 impl Writer {
