@@ -2263,11 +2263,12 @@ and diagnostic/failure outcomes retain native ownership and certainty. UPDATE is
 refused by native read preparation; federation is disabled. These are core
 integration surfaces. Schema 51 exposes the same native read through typed
 `Sparrow.sparqlQuery`, CLI `sparrow ENDPOINT sparql REQUEST.json`, and MCP
-`sparql_query`. Deployed schema 61 also provides the measured explanation surface
-below. Native stored-text relations remain unfinished.
-Native correlation is implemented in source schema 58, as specified below.
-Recordless artifact metadata is implemented and deployed in
-schema 52, as qualified below.
+`sparql_query`. [Measured explanations](#measured-native-explanation-schema-61)
+and [stored-text relations](#stored-text-graph-relations-source-schema-62)
+share this query scope and continuation. Graph queries include
+[recordless artifact metadata](#recordless-artifact-rdf-writer-authority).
+[Native correlation](#native-correlation-schema-58) exposes fixed governed
+SELECT recipes through a separate typed operation.
 
 The core `sparql_read`/`sparql_read_next` pair publishes immutable native captures
 through the existing finite catalog lease owner. Pages share the native outcome
@@ -2608,8 +2609,9 @@ explicitly absent. Existing incomplete index/scope certainty is preserved;
 it is not relabeled as a native certified partial answer. Native graph queries
 separately preserve PurRDF governor certificates through the schema-51 graph
 surface. Frozen scope receipts extend these host captures in schema 56 and
-graph/context in schema 57. Public measured explanations and stored-text SPARQL
-relations remain unfinished, as recorded in [native integration gaps](purrdf-integration-gaps.md).
+graph and context captures in schema 57. [Measured explanations](#measured-native-explanation-schema-61)
+and [stored-text relations](#stored-text-graph-relations-source-schema-62)
+are available through the native graph surface.
 
 
 ### Single context capture admission
@@ -2965,8 +2967,8 @@ arities, volatility and access modes) alongside node work. Custom aggregate and
 native ranked-retrieval declarations are not registered by this input.
 PurRDF's selected fallible-query return type does not expose its internal
 relation-witness ledger; Sparrow does not invent a returned generation or
-service-level attestation. Schema 62 is installed and qualified through both
-typed transports and CLI/MCP.
+service-level attestation. The schema 62 qualification covered both typed
+transports, the CLI and MCP.
 
 ### Recordless artifact RDF writer authority
 
