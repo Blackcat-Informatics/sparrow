@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 124,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/124-report-exact-retained-bytes-per-source",
+  "branch": "paudley/124-report-exact-retained-bytes-per-source",
+  "slug": "report-exact-retained-bytes-per-source",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/124-report-exact-retained-bytes-per-source/.stage/report-exact-retained-bytes-per-source",
+  "stage_tracked": true,
+  "base": "refs/remotes/origin/main",
+  "base_oid": "b7ab4818a0a16bef787dc4acbf00a4d6573d937b",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/124-report-exact-retained-bytes-per-source",
+    "branch:paudley/124-report-exact-retained-bytes-per-source",
+    "ignored:168 files (168 reflinked, 0 written)",
+    "rust-caches:skipping busy source /opt/.cargo/10/07f7be82c751a2: /opt/.cargo/10/07f7be82c751a2/release/.cargo-build-lock; skipping busy source /opt/.cargo/10/07f7be82c751a2: /opt/.cargo/10/07f7be82c751a2/release/.cargo-build-lock; reflinked /home/paudley/Active/sparrow/.worktrees/declare-merge-gate caches into /home/paudley/Active/sparrow/.worktrees/124-report-exact-retained-bytes-per-source plus 0 dependency units from 0 other checkouts in 1.5s; 327 unchanged files keep their built mtimes; 2 other files take the seed time and rebuild; 6 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/124-report-exact-retained-bytes-per-source/.stage/report-exact-retained-bytes-per-source",
+    "issue:/home/paudley/Active/sparrow/.worktrees/124-report-exact-retained-bytes-per-source/.stage/report-exact-retained-bytes-per-source/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-23T23:20:46-0600",
+  "seed_error": ""
+}

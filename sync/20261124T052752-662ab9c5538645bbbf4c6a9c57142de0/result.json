@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/124-report-exact-retained-bytes-per-source",
+  "branch": "paudley/124-report-exact-retained-bytes-per-source",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "b7ab4818a0a16bef787dc4acbf00a4d6573d937b",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/124-report-exact-retained-bytes-per-source/.stage/report-exact-retained-bytes-per-source/sync/20261124T052752-662ab9c5538645bbbf4c6a9c57142de0",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "33bb02bedee96a77013a018c141593bea77a9e07",
+  "merge_bases": [
+    "b7ab4818a0a16bef787dc4acbf00a4d6573d937b"
+  ],
+  "commit": "33bb02bedee96a77013a018c141593bea77a9e07"
+}
