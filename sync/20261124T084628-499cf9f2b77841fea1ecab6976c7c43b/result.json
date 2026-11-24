@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/83-test-splitting-a-single-line-longer",
+  "branch": "paudley/83-test-splitting-a-single-line-longer",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "ae6f8c4406f4cd71617b533be5a130838a6884b9",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/83-test-splitting-a-single-line-longer/.stage/test-splitting-a-single-line-longer/sync/20261124T084628-499cf9f2b77841fea1ecab6976c7c43b",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "0f355b67ff9e9cfdba5914d651bd63b684038a6e",
+  "merge_bases": [
+    "ae6f8c4406f4cd71617b533be5a130838a6884b9"
+  ],
+  "commit": "0f355b67ff9e9cfdba5914d651bd63b684038a6e"
+}

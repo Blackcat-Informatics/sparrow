@@ -1,0 +1,80 @@
+{
+  "issue": 83,
+  "pr_number": 520,
+  "branch": "paudley/83-test-splitting-a-single-line-longer",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/83-test-splitting-a-single-line-longer/.stage/test-splitting-a-single-line-longer",
+  "observed_at": "2026-11-24T08:53:41.188624+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/83-test-splitting-a-single-line-longer/.stage/test-splitting-a-single-line-longer/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/83-test-splitting-a-single-line-longer/.stage/test-splitting-a-single-line-longer/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/83-test-splitting-a-single-line-longer/.stage/test-splitting-a-single-line-longer/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/83-test-splitting-a-single-line-longer/.stage/test-splitting-a-single-line-longer/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/83-test-splitting-a-single-line-longer/.stage/test-splitting-a-single-line-longer/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 520,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Verify an oversized log line splits between short records",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/520",
+    "baseRefName": "main",
+    "baseRefOid": "0f355b67ff9e9cfdba5914d651bd63b684038a6e",
+    "headRefName": "paudley/83-test-splitting-a-single-line-longer",
+    "isCrossRepository": false,
+    "headRefOid": "1e1b3e4df9e63a7cd25fe5b66d241c7ad878c54a",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/536/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "1e1b3e4df9e63a7cd25fe5b66d241c7ad878c54a",
+    "branch": "paudley/83-test-splitting-a-single-line-longer",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 520,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #520 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}

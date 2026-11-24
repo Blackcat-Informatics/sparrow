@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 83,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/83-test-splitting-a-single-line-longer",
+  "branch": "paudley/83-test-splitting-a-single-line-longer",
+  "slug": "test-splitting-a-single-line-longer",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/83-test-splitting-a-single-line-longer/.stage/test-splitting-a-single-line-longer",
+  "stage_tracked": true,
+  "base": "refs/remotes/origin/main",
+  "base_oid": "ae6f8c4406f4cd71617b533be5a130838a6884b9",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/83-test-splitting-a-single-line-longer",
+    "branch:paudley/83-test-splitting-a-single-line-longer",
+    "ignored:168 files (168 reflinked, 0 written)",
+    "rust-caches:skipping busy source /opt/.cargo/6c/ecf261df245fef: /opt/.cargo/6c/ecf261df245fef/release/.cargo-build-lock; skipping busy source /opt/.cargo/6c/ecf261df245fef: /opt/.cargo/6c/ecf261df245fef/release/.cargo-build-lock; reflinked /home/paudley/Active/sparrow/.worktrees/declare-merge-gate caches into /home/paudley/Active/sparrow/.worktrees/83-test-splitting-a-single-line-longer plus 0 dependency units from 0 other checkouts in 3.2s; 296 unchanged files keep their built mtimes; 37 other files take the seed time and rebuild; 6 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/83-test-splitting-a-single-line-longer/.stage/test-splitting-a-single-line-longer",
+    "issue:/home/paudley/Active/sparrow/.worktrees/83-test-splitting-a-single-line-longer/.stage/test-splitting-a-single-line-longer/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-24T02:38:36-0600",
+  "seed_error": ""
+}
