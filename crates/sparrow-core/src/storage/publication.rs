@@ -3,7 +3,9 @@
 
 //! Recoverable native preparation and atomic complete-artifact publication.
 
-use super::import::{IMPORT_CHUNK_BYTES, IMPORT_LAYOUT_PAGE_RECORDS, ImportManifest};
+use super::import::{
+    IMPORT_CHUNK_BYTES, IMPORT_LAYOUT_PAGE_RECORDS, ImportManifest, ImportOperation,
+};
 use super::{
     Artifact, Catalog, Error, RETENTION_MS, RETRY_WINDOW, Record, Store, Writer, blake3, field,
     hex, ingest, integer, json, parse, put, random_id, read_chunk_range, read_field, retire,
@@ -402,30 +404,12 @@ pub(super) fn published_admitted(
     Ok(Published::Saved(manifest, Box::new(artifact)))
 }
 
-impl Store {
-    /// Recover private preparation progress; explicit absence precedes preparation.
-    pub fn import_preparation_get(
-        &self,
-        id: &str,
-        now: u64,
-    ) -> Result<Option<ImportPreparation>, Error> {
-        let writer = self.lock()?;
-        let manifest: ImportManifest = writer.get(id)?;
-        manifest.require_live(now)?;
-        preparation(&writer, &manifest)
-    }
-
-    /// Prepare a bounded run of ordinary records starting at the expected ordinal
-    /// and checkpoint their native dependencies in one durable batch. An oversized
-    /// record advances alone through raw chunks. Retrying an older ordinal returns
-    /// progress without another occurrence.
-    pub fn import_prepare_record(
-        &self,
-        id: &str,
-        expected_index: u64,
-        now: u64,
-    ) -> Result<ImportPreparation, Error> {
-        let writer = self.lock()?;
+impl ImportOperation<'_> {
+    /// Prepare record under the admitted writer lock.
+    pub fn prepare_record(self, expected_index: u64) -> Result<ImportPreparation, Error> {
+        let Self {
+            writer, id, now, ..
+        } = self;
         let manifest: ImportManifest = writer.get(id)?;
         manifest.require_live(now)?;
         if !manifest.layout_complete || manifest.published_artifact.is_some() {
@@ -572,10 +556,14 @@ impl Store {
         Ok(progress)
     }
 
-    /// Atomically publish the complete artifact, ordered records and temporal
-    /// membership after all native dependencies have crossed synced checkpoints.
-    pub fn import_publish(&self, id: &str, now: u64) -> Result<Artifact, Error> {
-        let writer = self.lock()?;
+    /// Publish under the admitted writer lock.
+    pub fn publish(self) -> Result<Artifact, Error> {
+        let Self {
+            store,
+            writer,
+            id,
+            now,
+        } = self;
         if let Some((_, artifact)) = published(&writer, id, now)? {
             return Ok(artifact);
         }
@@ -754,8 +742,42 @@ impl Store {
         drop(writer);
         // The journal of a published import is reclaimable now, so tell the reclamation duty
         // instead of leaving its slot to the duty's interval.
-        self.wake_import_reclaim();
+        store.wake_import_reclaim();
         Ok(artifact)
+    }
+}
+
+impl Store {
+    /// Recover private preparation progress; explicit absence precedes preparation.
+    pub fn import_preparation_get(
+        &self,
+        id: &str,
+        now: u64,
+    ) -> Result<Option<ImportPreparation>, Error> {
+        let writer = self.lock()?;
+        let manifest: ImportManifest = writer.get(id)?;
+        manifest.require_live(now)?;
+        preparation(&writer, &manifest)
+    }
+
+    /// Prepare a bounded run of ordinary records starting at the expected ordinal
+    /// and checkpoint their native dependencies in one durable batch. An oversized
+    /// record advances alone through raw chunks. Retrying an older ordinal returns
+    /// progress without another occurrence.
+    pub fn import_prepare_record(
+        &self,
+        id: &str,
+        expected_index: u64,
+        now: u64,
+    ) -> Result<ImportPreparation, Error> {
+        self.import_operation(id, now)?
+            .prepare_record(expected_index)
+    }
+
+    /// Atomically publish the complete artifact, ordered records and temporal
+    /// membership after all native dependencies have crossed synced checkpoints.
+    pub fn import_publish(&self, id: &str, now: u64) -> Result<Artifact, Error> {
+        self.import_operation(id, now)?.publish()
     }
 }
 

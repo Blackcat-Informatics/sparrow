@@ -13,7 +13,9 @@ mod diagnostics;
 pub mod floor_pause;
 pub mod journal_log;
 pub mod local_endpoint;
+mod source_binding;
 mod source_file;
+pub use source_binding::SourceBindings;
 pub mod staging_refusal;
 pub mod start_wait;
 pub mod syslog_listener;
@@ -37,7 +39,7 @@ mod transport;
 mod udp_kernel;
 mod watch_admin;
 pub mod watches;
-pub use transport::{Access, admit_connection, local_caller, serve_connection};
+pub use transport::{Access, admit_connection, serve_connection};
 pub use watch_admin::WatchController;
 
 mod rdf_wire;

@@ -320,6 +320,33 @@ saved mutation retries over Unix and TCP after adoption. Stop the new unit
 before reverting an image/configuration; reverting a binary alone cannot undo a
 store-format upgrade.
 
+## Producer source bindings
+
+Use `[[source_bindings]]` in `server.toml` to restrict which RPC producers
+can write a source. Use `prefix = true` for a literal prefix. The daemon
+refuses overlapping selectors and empty permission lists at startup.
+A single rule can allow multiple caller classes.
+
+```toml
+[[source_bindings]]
+source = "worker."
+prefix = true
+allow = [
+    { class = "private-unix", uid = 1000 },
+    { class = "ingest-socket", uid = 1001 },
+]
+
+[[source_bindings]]
+source = "remote"
+allow = [{ class = "chap" }]
+```
+
+The Unix classes use the connecting account's kernel-reported UID.
+`chap` grants the source to authenticated TCP sessions and
+`anonymous-tcp` grants it to TCP peers using the anonymous capability.
+Unbound sources keep their endpoint's ordinary access. See
+[producer source admission](interfaces.md#producer-source-admission).
+
 ## Recovery qualification
 
 For isolated recovery qualification, work on a disposable copy of a store, made while its

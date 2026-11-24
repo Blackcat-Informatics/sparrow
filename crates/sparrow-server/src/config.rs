@@ -23,6 +23,9 @@ pub struct ServerConfig {
     /// Private shared-secret file, required exactly when `rpc_tcp_address` is set.
     #[serde(default)]
     pub rpc_tcp_secret_file: Option<PathBuf>,
+    /// Optional rules binding source labels to specific RPC producer callers.
+    #[serde(default)]
+    pub source_bindings: crate::SourceBindings,
     /// Explicit syslog intake listeners; none are opened by default.
     #[serde(default)]
     pub syslog: Vec<crate::syslog_listener::SyslogListener>,

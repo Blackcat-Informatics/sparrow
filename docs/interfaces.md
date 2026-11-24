@@ -3137,6 +3137,16 @@ days does not shorten a record that would ordinarily remain for another twenty.
 
 ## 5. Cap'n Proto ingestion, queries, and administration
 
+### Producer source admission
+
+The daemon applies [configured source bindings](deployment.md#producer-source-bindings)
+to inline ingest, ordinary and sealed events, and staged imports. It
+checks the source before starting an import and checks the stored source
+before resuming, publishing or cancelling it. Existing import ownership
+checks also apply. A refusal returns nonretryable `PERMISSION_DENIED`
+with the source label and producer class. No evidence is staged or
+published by the refused operation.
+
 ### Producer contract `sparrow-producer/1`
 
 `Discovery.producerProfiles` names the ingestion contracts the daemon serves.
@@ -5396,7 +5406,7 @@ refusal and every refusal of an older daemon.
 | `ARCHIVE_WATERMARK` | Publication at or behind the archive watermark. Not retryable as sent. |
 | `UNSUPPORTED` | Unsupported format operation, query capability, or mutation on the read surface. Raw artifact preservation can still succeed independently of projection support. |
 | `READ_ONLY` | A write sent to a query-only daemon (schema 67). Not retryable against that daemon. |
-| `PERMISSION_DENIED` | A non-producer operation on the ingest socket, or an import continued by an account other than the one that began it (schema 68). Not retryable on that connection. |
+| `PERMISSION_DENIED` | A source binding refuses the caller class or UID, an import belongs to another account, or the ingest socket refuses a non-producer operation. The failure is nonretryable on that connection. |
 
 `ARCHIVE_WATERMARK` is a publication at or behind the archive watermark: a clock
 regression, or a datagram stamped with its read instant that waited past the
