@@ -6,9 +6,8 @@
 //! The free-space floor never stops it from accepting (#257). Below the floor every write is
 //! refused by the store with the floor-labelled retryable `STORAGE_PRESSURE`, so a connection
 //! accepted then costs one answered request, where a connection left in the kernel backlog cost
-//! a silent client timeout. The connection ceiling, its slots taken before accept (#246), and
-//! the 60-second lease are unchanged: they, not the floor, bound how many connections the
-//! daemon serves at once.
+//! a silent client timeout. Unix connection slots are taken before accept. Public TCP accepts
+//! independently, and the transport enforces the connection deadlines on all listeners.
 
 use crate::{
     Access, Rpc, admission::Ceiling, floor_pause::PauseJournal, ingest_socket::IngestSocket,
@@ -35,23 +34,21 @@ struct AcceptFaults {
 }
 
 impl AcceptFaults {
-    async fn next(
+    async fn next<T>(
         &self,
-        sockets: &Sockets<'_>,
-        rpc: bool,
-        ingest: bool,
-    ) -> std::io::Result<Incoming> {
+        accept: impl Future<Output = std::io::Result<T>>,
+    ) -> std::io::Result<T> {
         if let Some(resume) = self.resume {
             tokio::time::sleep_until(resume).await;
         }
-        accepted(sockets.accept(rpc, ingest)).await
+        accepted(accept).await
     }
 
-    fn observe(
+    fn observe<T>(
         &mut self,
-        incoming: std::io::Result<Incoming>,
+        incoming: std::io::Result<T>,
         journal: &mut impl FnMut(&str),
-    ) -> Option<Incoming> {
+    ) -> Option<T> {
         match incoming {
             Ok(stream) => {
                 self.succeeded();
@@ -112,15 +109,10 @@ pub struct Sockets<'a> {
 enum Incoming {
     Private(tokio::net::UnixStream),
     Ingest(tokio::net::UnixStream),
-    Tcp(
-        tokio::net::TcpStream,
-        std::net::SocketAddr,
-        sparrow_client::TcpSecret,
-    ),
 }
 
 impl Sockets<'_> {
-    async fn accept(&self, rpc: bool, ingest: bool) -> std::io::Result<Incoming> {
+    async fn accept_unix(&self, rpc: bool, ingest: bool) -> std::io::Result<Incoming> {
         tokio::select! {
             ready = self.private.accept(), if rpc => {
                 ready.map(|(stream, _)| Incoming::Private(stream))
@@ -131,13 +123,22 @@ impl Sockets<'_> {
                     None => std::future::pending().await,
                 }
             }, if ingest => ready.map(|(stream, _)| Incoming::Ingest(stream)),
-            ready = async {
-                match &self.tcp {
-                    Some((listener, secret)) => listener.accept().await
-                        .map(|(stream, peer)| Incoming::Tcp(stream, peer, secret.clone())),
-                    None => std::future::pending().await,
-                }
-            }, if rpc => ready,
+        }
+    }
+
+    async fn accept_tcp(
+        &self,
+    ) -> std::io::Result<(
+        tokio::net::TcpStream,
+        std::net::SocketAddr,
+        sparrow_client::TcpSecret,
+    )> {
+        match &self.tcp {
+            Some((listener, secret)) => listener
+                .accept()
+                .await
+                .map(|(stream, peer)| (stream, peer, secret.clone())),
+            None => std::future::pending().await,
         }
     }
 
@@ -151,12 +152,16 @@ impl Sockets<'_> {
     ) -> T {
         tokio::pin!(work);
         let mut faults = AcceptFaults::default();
+        let mut tcp_faults = AcceptFaults::default();
         loop {
             tokio::select! {
                 biased;
                 completed = &mut work => return completed,
-                incoming = faults.next(self, true, self.ingest.is_some()) => {
+                incoming = faults.next(self.accept_unix(true, self.ingest.is_some())) => {
                     drop(faults.observe(incoming, &mut journal));
+                }
+                incoming = tcp_faults.next(self.accept_tcp()), if self.tcp.is_some() => {
+                    drop(tcp_faults.observe(incoming, &mut journal));
                 }
             }
         }
@@ -166,10 +171,9 @@ impl Sockets<'_> {
 /// Accept connections until `interrupt` resolves (an orderly stop, `Ok`) or `health` resolves
 /// (a worker ended; its failure is returned). `journal` receives each pause line.
 ///
-/// A connection slot is taken before its peer is accepted: at the ceiling the loop waits on a
-/// slot and the peer waits in the kernel listen backlog, served when a slot frees. One slot is
-/// held ahead for the private socket and public TCP together, which share a ceiling, and one
-/// for the ingest socket.
+/// Take a Unix connection slot before accepting, with a separate ceiling for each socket.
+/// Additional Unix peers wait in the kernel listen backlog. Public TCP has independent
+/// acceptance and accept-error backoff.
 ///
 /// An accept error, a failed floor measurement or a clock failure does not end the loop: it is
 /// counted, journaled and retried (`AcceptFaults`).
@@ -195,6 +199,7 @@ pub async fn serve<T>(
     let mut ingest_slot = None;
     let mut ingest_wait = None;
     let mut faults = AcceptFaults::default();
+    let mut tcp_faults = AcceptFaults::default();
     let mut measuring = None::<String>;
     loop {
         if rpc_slot.is_none() && rpc_wait.is_none() {
@@ -248,7 +253,7 @@ pub async fn serve<T>(
                     }
                 }
             }
-            incoming = faults.next(sockets, rpc_slot.is_some(), ingest_slot.is_some()),
+            incoming = faults.next(sockets.accept_unix(rpc_slot.is_some(), ingest_slot.is_some())),
                 if rpc_slot.is_some() || ingest_slot.is_some() => {
                 match faults.observe(incoming, &mut journal) {
                     Some(Incoming::Private(stream)) => {
@@ -265,18 +270,20 @@ pub async fn serve<T>(
                         rpc.floor_pause().connection_accepted();
                         let _ = socket.admit(stream, rpc.clone(), slot);
                     }
-                    Some(Incoming::Tcp(stream, peer, secret)) => {
-                        let Some(slot) = rpc_slot.take() else { continue };
-                        rpc.floor_pause().connection_accepted();
-                        // A peer that reset before this call is dropped without ending the daemon.
-                        if let Err(error) = stream.set_nodelay(true) {
-                            eprintln!("sparrowd: TCP peer {peer} dropped before it was served: {error}");
-                            continue;
-                        }
-                        crate::admit_connection(stream, rpc.clone(), slot, Access::PublicTcp(secret, peer.to_string()));
-                    }
                     None => {}
                 }
+            }
+            incoming = tcp_faults.next(sockets.accept_tcp()), if sockets.tcp.is_some() => {
+                let Some((stream, peer, secret)) = tcp_faults.observe(incoming, &mut journal) else {
+                    continue;
+                };
+                rpc.floor_pause().connection_accepted();
+                // A peer that reset before this call is dropped without ending the daemon.
+                if let Err(error) = stream.set_nodelay(true) {
+                    eprintln!("sparrowd: TCP peer {peer} dropped before it was served: {error}");
+                    continue;
+                }
+                crate::transport::admit_tcp_connection(stream, rpc.clone(), secret, peer.to_string());
             }
         }
     }

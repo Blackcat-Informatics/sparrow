@@ -1,5 +1,5 @@
 VERSION "1.2"
-BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/274194fce6b6bf119e6aabfca82aa3ec390b47646b9a9092d997c98a20ab8ec9>
+BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/a30f7f917d24673d3081e9d0fbc5a345b2cc979eef1aef99f916c1122e368086>
 <> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#Ledger> .
 <> <https://blackcatinformatics.ca/raf/report/1#distinct> <#distinct/0> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/active-file-checkpoint-attachment> .
@@ -1179,14 +1179,15 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/274194fce6b6bf
 <#job/daemon-configuration> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/tests/rpc.rs" .
 <#job/daemon-listener-accept> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
 <#job/daemon-listener-accept> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
-<#job/daemon-listener-accept> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_server::serving::AcceptFaults::next" .
 <#job/daemon-listener-accept> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_server::serving::AcceptFaults::observe" .
+<#job/daemon-listener-accept> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_server::serving::Sockets::accept_tcp" .
+<#job/daemon-listener-accept> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_server::serving::Sockets::accept_unix" .
 <#job/daemon-listener-accept> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_server::serving::Sockets::reject_while" .
 <#job/daemon-listener-accept> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_server::serving::serve" .
-<#job/daemon-listener-accept> <https://blackcatinformatics.ca/raf/report/1#homeSymbol> "sparrow_server::serving::Sockets::accept" .
+<#job/daemon-listener-accept> <https://blackcatinformatics.ca/raf/report/1#homeSymbol> "sparrow_server::serving::AcceptFaults::next" .
 <#job/daemon-listener-accept> <https://blackcatinformatics.ca/raf/report/1#jobId> "daemon-listener-accept" .
 <#job/daemon-listener-accept> <https://blackcatinformatics.ca/raf/report/1#specRef> "docs/interfaces.md: daemon teardown." .
-<#job/daemon-listener-accept> <https://blackcatinformatics.ca/raf/report/1#summary> "Active RPC serving and store recovery share the socket accept and failure backoff. During recovery each accepted stream is disconnected so a client can retry." .
+<#job/daemon-listener-accept> <https://blackcatinformatics.ca/raf/report/1#summary> "Active RPC serving and store recovery use the same Unix and public TCP acceptance paths, with independent backoff. During recovery each accepted stream is disconnected so a client can retry." .
 <#job/daemon-listener-accept> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/src/serving.rs" .
 <#job/daemon-listener-accept> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/src/session/tests.rs" .
 <#job/daemon-store-session> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .

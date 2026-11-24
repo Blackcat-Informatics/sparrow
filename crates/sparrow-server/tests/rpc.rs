@@ -3017,7 +3017,7 @@ async fn syslog_connection_failure_is_counted_keeps_siblings_and_reopens_exact_d
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn idle_rpc_connections_share_a_finite_transport_budget_independent_of_storage_work() {
+async fn unix_and_tcp_admission_isolate_each_other_and_expire_silent_peers() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let dir = tempfile::tempdir().unwrap();
@@ -3054,114 +3054,130 @@ async fn idle_rpc_connections_share_a_finite_transport_budget_independent_of_sto
             let (address, reservation, _port_lease) = configure_tcp_listener(&config);
             drop(reservation);
             let daemon = start(&config, &socket).await;
-            let mut idle = Vec::new();
-            for index in 0..5 {
-                let client = if index % 2 == 0 {
-                    tcp_client(address).await.unwrap()
-                } else {
-                    sparrow_client::Client::connect(&socket).await.unwrap()
-                };
-                let response = client
-                    .capability()
-                    .status_request()
-                    .send()
-                    .promise
+            let endpoint = sparrow_client::Endpoint::Tcp(address);
+            // A typed discovery proves each connection was accepted beyond the old shared limit.
+            let mut anonymous = Vec::new();
+            for _ in 0..7 {
+                anonymous.push(
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        sparrow_client::Client::connect_producer(&endpoint),
+                    )
                     .await
-                    .unwrap();
-                rpc_ok(response.get().unwrap().get_result().unwrap());
-                idle.push(client);
+                    .expect("anonymous TCP was held at the Unix ceiling")
+                    .unwrap(),
+                );
             }
-            // Five idle capabilities leave the single storage permit available to a sixth peer.
-            let sixth = tcp_client(address).await.unwrap();
-            let response = sixth
+            // Local diagnostics can still connect and answer with every former TCP slot held.
+            let observer = tokio::time::timeout(
+                Duration::from_secs(5),
+                sparrow_client::Client::connect(&socket),
+            )
+            .await
+            .expect("anonymous TCP prevented local admission")
+            .unwrap();
+            let response = observer
                 .capability()
                 .status_request()
                 .send()
                 .promise
                 .await
                 .unwrap();
-            rpc_ok(response.get().unwrap().get_result().unwrap());
-            // Unix and TCP share six transport leases. The sixth peer took the last slot: status
-            // shows six active connections and the accept loop held at the ceiling, and a TCP
-            // seventh peer waits in the backlog (#246) instead of being admitted or reset.
-            let status_client = idle[0].capability().clone();
-            let tcp_seventh = tokio::task::spawn_local(tcp_client(address));
-            status_until(&status_client, |admission| {
-                let ceiling = match admission.get_rpc_connections().unwrap().which().unwrap() {
-                    wire::optional_connection_ceiling_status::Value(ceiling) => ceiling.unwrap(),
-                    wire::optional_connection_ceiling_status::Absent(()) => {
-                        panic!("no ceiling reported")
-                    }
+            let status = rpc_ok(response.get().unwrap().get_result().unwrap());
+            let lease =
+                sparrow_client::ConnectionLeaseLimits::from(status.get_connection_lease().unwrap());
+            assert_eq!(anonymous[0].discovery().connection_lease, Some(lease));
+            assert!(lease.tcp_first_input_seconds < lease.idle_seconds);
+            assert!(lease.max_age_seconds > lease.idle_seconds);
+            assert_eq!(
+                status
+                    .get_admission()
+                    .unwrap()
+                    .get_public_tcp_connections()
+                    .unwrap()
+                    .get_active_connections(),
+                7,
+            );
+
+            let mut unix = Vec::new();
+            for _ in 0..5 {
+                unix.push(sparrow_client::Client::connect(&socket).await.unwrap());
+            }
+            let queued = tokio::net::UnixStream::connect(&socket).await.unwrap();
+            let unix_waiter = tokio::task::spawn_local({
+                let socket = socket.clone();
+                async move { sparrow_client::Client::connect(&socket).await }
+            });
+            status_until(observer.capability(), |admission| {
+                let wire::optional_connection_ceiling_status::Value(ceiling) =
+                    admission.get_rpc_connections().unwrap().which().unwrap()
+                else {
+                    panic!("no ceiling reported")
                 };
-                assert!(
-                    ceiling.get_active_connections() <= 6,
-                    "the ceiling was exceeded"
-                );
+                let ceiling = ceiling.unwrap();
+                assert!(ceiling.get_active_connections() <= 6);
                 ceiling.get_max_connections() == 6
                     && ceiling.get_active_connections() == 6
                     && ceiling.get_ceiling_wait().unwrap().get_waiting() == 1
             })
             .await;
             assert!(
-                !tcp_seventh.is_finished(),
-                "a seventh peer was over-admitted or reset"
+                !unix_waiter.is_finished(),
+                "an extra Unix connection bypassed its ceiling"
             );
-            drop(sixth);
-            let tcp_seventh = tcp_seventh
-                .await
-                .unwrap()
-                .expect("the waiting TCP peer was reset");
-            // The slot went to the TCP peer; a Unix peer now waits for the shared ceiling too.
-            // Witness that it reached the daemon's listen queue: a raw connect completes only
-            // once the kernel has queued the peer, with no accept, so it is deterministic. Status
-            // cannot witness it: every admission counter belongs to the accept loop, which waits
-            // for a slot whether or not a Unix peer exists. Then a typed client queues behind it.
-            let queued = tokio::net::UnixStream::connect(&socket)
-                .await
-                .expect("the Unix peer did not reach the listen queue");
-            let unix_seventh = tokio::task::spawn_local({
-                let socket = socket.clone();
-                async move { sparrow_client::Client::connect(&socket).await }
-            });
-            // The TCP peer took the freed slot; the Unix peers are held behind it, not admitted.
-            status_until(&status_client, |admission| {
-                let wire::optional_connection_ceiling_status::Value(ceiling) =
-                    admission.get_rpc_connections().unwrap().which().unwrap()
-                else {
-                    panic!("no ceiling reported");
-                };
-                let ceiling = ceiling.unwrap();
-                assert!(
-                    ceiling.get_active_connections() <= 6,
-                    "the ceiling was exceeded"
-                );
-                ceiling.get_active_connections() == 6
-                    && ceiling.get_ceiling_wait().unwrap().get_waiting() == 1
-            })
-            .await;
-            assert!(
-                !unix_seventh.is_finished(),
-                "a Unix peer was over-admitted or reset"
-            );
-            // The queued raw peer ends; the daemon serves or drops it and the slot passes on.
-            drop(queued);
-            drop(tcp_seventh);
-            let recovered = unix_seventh
-                .await
-                .unwrap()
-                .expect("the waiting Unix peer was reset");
-            let receipt = recovered
-                .ingest(
-                    "idle-budget",
-                    "idle-test",
-                    wire::Format::Log,
-                    b"one storage operation\n",
-                )
+
+            let producer = tokio::time::timeout(
+                Duration::from_secs(5),
+                sparrow_client::Client::connect_producer(&endpoint),
+            )
+            .await
+            .expect("private Unix peers prevented producer admission")
+            .unwrap();
+            let mut event = delivery_event("TCP admitted with the Unix ceiling full");
+            event.sequence = 1;
+            let receipt = producer
+                .events(&sparrow_client::EventBatch {
+                    request_id: "tcp-under-unix-saturation".into(),
+                    source: "admission.events".into(),
+                    client_instance: [9; 16],
+                    events: vec![event],
+                })
                 .await
                 .unwrap();
             assert_eq!(receipt.record_ids.len(), 1);
-            drop(recovered);
-            drop(idle);
+            drop(queued);
+            drop(unix.pop());
+            tokio::time::timeout(Duration::from_secs(5), unix_waiter)
+                .await
+                .expect("the queued Unix peer did not receive the freed slot")
+                .unwrap()
+                .expect("the queued Unix peer was reset");
+
+            let mut silent = tokio::net::TcpStream::connect(address).await.unwrap();
+            status_until(observer.capability(), |admission| {
+                admission
+                    .get_public_tcp_connections()
+                    .unwrap()
+                    .get_active_connections()
+                    == 9
+            })
+            .await;
+            let mut byte = [0];
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_secs(lease.tcp_first_input_seconds + 5),
+                    tokio::io::AsyncReadExt::read(&mut silent, &mut byte),
+                )
+                .await
+                .expect("a silent TCP peer outlived the first-input deadline")
+                .unwrap(),
+                0,
+            );
+            status_until(observer.capability(), |admission| {
+                let tcp = admission.get_public_tcp_connections().unwrap();
+                tcp.get_active_connections() == 8 && tcp.get_idle_expiries() == 1
+            })
+            .await;
             drop(daemon);
         })
         .await;
