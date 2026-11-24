@@ -125,14 +125,14 @@ refuses to start on it; `test-instance.sh setup` detects it and asks for
 "Test instance", gives the paths and teardown steps.
 
 `max_concurrent_requests` admits simultaneous storage work, including intake
-workers (1..64). `max_rpc_connections` independently admits Unix and TCP RPC
-streams from one shared ceiling (1..256, default 16). An idle agent capability
-holds a transport lease without consuming a storage permit. The existing
-60-second connection lease still applies. The daemon takes a connection slot
-before it accepts a peer, so a peer beyond the connection ceiling waits in the
-kernel's listen backlog and is served when a slot frees (a connection ends or
-its lease expires); it is no longer reset. A stalled peer therefore holds its
-slot until the lease expires. An intake operation (ingest, events, imports,
+workers (1..64). `max_rpc_connections` admits private Unix RPC streams
+(1..256, default 16). The group ingest socket has its own ceiling. An idle
+capability holds a transport lease without consuming a storage permit. The
+daemon takes a Unix connection slot before accepting a peer, so excess peers
+wait in the kernel backlog until a slot frees. Public TCP uses an independent
+acceptance path. It closes silent peers after 10 seconds. Positive reads renew
+the 60-second idle lease, and every connection closes by 10 minutes after
+admission. An intake operation (ingest, events, imports,
 flush, pins, discovery) that finds every storage permit taken waits for one, in
 arrival order, for at most 3 seconds, then receives the retryable
 `RESOURCE_LIMIT`. About a quarter of the permits (rounded up, none when there is
@@ -167,8 +167,8 @@ durability succeeds or the store is reopened. To avoid that, every write is chec
 retryable `STORAGE_PRESSURE`, and buffered writes that were already accepted
 are still synchronized. The daemon checks free space every second. Below the
 floor it keeps accepting Unix, ingest and TCP connections, including syslog TCP
-connections: the connection ceiling and the 60-second lease still bound
-them. It answers every write with the retryable `STORAGE_PRESSURE` carrying the
+connections. Unix connection ceilings and transport deadlines still apply.
+It answers every write with the retryable `STORAGE_PRESSURE` carrying the
 `freeSpaceFloor` class, so a producer knows the floor is the cause and holds
 (the Rust client keeps its batch and retries), and it serves reads, with the
 disk a query stages limited to 32 MiB in total, within the free space above half the floor.
@@ -414,9 +414,9 @@ its soft `RLIMIT_NOFILE`, keeps 1024 descriptors for sockets, connections,
 logs, the WAL, intake and archive files, and gives the rest to RocksDB's
 table cache (`max_open_files`), which closes the least recently used table
 file instead of exceeding it. Below a soft limit of 2048 the store refuses to
-open, naming `LimitNOFILE=65536`. The reserve covers the connection ceilings
-at their defaults and one descriptor per watched directory at the
-configured coverage; ceilings and watch coverage near 1024 need a higher limit. The
+open, naming `LimitNOFILE=65536`. Size the descriptor limit for the Unix
+ceilings, public TCP traffic and one descriptor per watched directory at the
+configured coverage. The
 startup line ends `nofile=N max_open_files=M`. Tests and `make check` open
 stores too, so they need a shell whose `ulimit -Sn` is at least 2048. A unit
 that sets no limit inherits the manager's soft 1024, which a store of about 900 table

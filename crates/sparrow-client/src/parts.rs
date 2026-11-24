@@ -1245,6 +1245,7 @@ mod tests {
             schema_version: crate::SCHEMA_VERSION,
             producer_profiles: vec![crate::PRODUCER_PROFILE.into()],
             sealed_event_deadline_ms: 0,
+            connection_lease: None,
             producer_limits: crate::ProducerLimits::default(),
             max_inline_artifact_bytes: 1,
             max_records_per_artifact: 1,

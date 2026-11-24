@@ -51,6 +51,8 @@ pub struct Discovery {
     pub producer_profiles: Vec<String>,
     /// Server-clock deadline for sealing a new durable request. Zero means unavailable.
     pub sealed_event_deadline_ms: u64,
+    /// Transport deadlines when the daemon advertises them.
+    pub connection_lease: Option<ConnectionLeaseLimits>,
     /// Server limits for tracking producer evidence. These describe the server's windows.
     pub producer_limits: ProducerLimits,
     /// Largest artifact carried in one inline ingest message. Larger artifacts
@@ -87,6 +89,27 @@ pub struct Discovery {
     /// The actual wire ordinal when this SDK does not recognize the advertised store role.
     /// Strict query discovery refuses such a role. A producer may still pin the store id.
     pub unknown_instance_role: Option<u16>,
+}
+
+/// Transport deadlines advertised by Discovery and status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionLeaseLimits {
+    /// Maximum established connection inactivity, in seconds.
+    pub idle_seconds: u64,
+    /// Maximum wait for first input on public TCP, in seconds.
+    pub tcp_first_input_seconds: u64,
+    /// Maximum connection age, in seconds.
+    pub max_age_seconds: u64,
+}
+
+impl From<wire::connection_lease_limits::Reader<'_>> for ConnectionLeaseLimits {
+    fn from(value: wire::connection_lease_limits::Reader<'_>) -> Self {
+        Self {
+            idle_seconds: value.get_idle_seconds(),
+            tcp_first_input_seconds: value.get_tcp_first_input_seconds(),
+            max_age_seconds: value.get_max_age_seconds(),
+        }
+    }
 }
 
 /// Limits on the server's producer-window registry, as advertised at discovery.
@@ -146,6 +169,14 @@ impl Discovery {
             schema_version: value.get_schema_version(),
             producer_profiles,
             sealed_event_deadline_ms: value.get_sealed_event_deadline_ms(),
+            connection_lease: value
+                .has_connection_lease()
+                .then(|| {
+                    value
+                        .get_connection_lease()
+                        .map(ConnectionLeaseLimits::from)
+                })
+                .transpose()?,
             producer_limits: ProducerLimits {
                 max_streams: limits.get_max_streams(),
                 max_gap_intervals: limits.get_max_gap_intervals(),

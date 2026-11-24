@@ -94,8 +94,9 @@ pub struct Rpc {
     syslog: crate::syslog_listener::SyslogRegistry,
     store: Store,
     admission: Arc<crate::admission::Admission>,
-    /// The shared RPC and TCP connection ceiling, reported by `status`.
+    /// The private Unix RPC connection ceiling, reported by `status`.
     connections: Option<Arc<crate::admission::Ceiling>>,
+    tcp_connections: Arc<crate::transport::TcpConnections>,
     max_pin_members: usize,
     watches: crate::watches::WatchRegistry,
     watch_controller: Option<crate::WatchController>,
@@ -264,6 +265,7 @@ impl Rpc {
             store,
             admission: crate::admission::Admission::new(requests),
             connections: None,
+            tcp_connections: Arc::default(),
             max_pin_members,
             watches: crate::watches::WatchRegistry::default(),
             watch_controller: None,
@@ -301,11 +303,15 @@ impl Rpc {
         self
     }
 
-    /// Report the shared RPC and TCP connection ceiling in `status`.
+    /// Report the private Unix RPC connection ceiling in `status`.
     #[must_use]
     pub fn with_connections(mut self, ceiling: Arc<crate::admission::Ceiling>) -> Self {
         self.connections = Some(ceiling);
         self
+    }
+
+    pub(crate) fn tcp_connections(&self) -> &Arc<crate::transport::TcpConnections> {
+        &self.tcp_connections
     }
 
     /// Serve reads only: every connection's service refuses writes with `READ_ONLY`.
@@ -3241,6 +3247,7 @@ impl wire::sparrow::Server for Rpc {
             Ok((value, durability, deadline)) => {
                 let mut out = results.get().init_result().init_ok();
                 out.set_sealed_event_deadline_ms(deadline);
+                crate::transport::encode_lease_limits(out.reborrow().init_connection_lease());
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
                 out.reborrow()
@@ -3387,8 +3394,12 @@ impl wire::sparrow::Server for Rpc {
                     backup.set_root("");
                     backup.init_failure().set_absent(());
                 }
+                let mut admission = out.reborrow().init_admission();
+                self.tcp_connections
+                    .encode(admission.reborrow().init_public_tcp_connections());
                 self.admission
-                    .encode(out.reborrow().init_admission(), self.connections.as_deref());
+                    .encode(admission, self.connections.as_deref());
+                crate::transport::encode_lease_limits(out.reborrow().init_connection_lease());
                 self.pause.encode(out.reborrow().init_floor_pause());
                 match &self.ingest_socket {
                     Some(socket) => socket.encode(out.reborrow().init_ingest_socket().init_value()),
