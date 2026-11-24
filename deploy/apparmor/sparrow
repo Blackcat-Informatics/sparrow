@@ -42,6 +42,10 @@ profile sparrow flags=(attach_disconnected) {
   /var/lib/sparrow/store/ rw,
   /var/lib/sparrow/store/** rwk,
 
+  # The producer socket in the optional setgid directory made by tmpfiles.
+  /run/sparrow-ingest/ r,
+  /run/sparrow-ingest/ingest.sock rw,
+
   # Consume roots: discovery, the claim (a rename into .sparrow-inflight), its lock and deletion.
   /var/lib/sparrow/intake/ r,
   /var/lib/sparrow/intake/** rwk,
@@ -57,8 +61,8 @@ profile sparrow flags=(attach_disconnected) {
   /etc/localtime r,
   /usr/share/zoneinfo/** r,
 
-  # The private socket: created, bound, listened on and accepted from any client its file modes
-  # admit; the inherited journal stream on standard output and error is sent on.
+  # The private and producer sockets admit connections through their file modes.
+  # getopt permits SO_PEERCRED on the producer socket. The inherited journal stream sends output.
   unix (create, bind, listen, accept, send, receive, getattr, setattr, getopt, setopt, shutdown) type=stream,
   # It connects to no stream socket but its own (the stale-socket probe at startup).
   unix (connect) type=stream peer=(label=sparrow),
