@@ -1,5 +1,5 @@
 VERSION "1.2"
-BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/bf9c94a9ca369c7330e0c6c8fbb7613a3b32fbdf23c8808bb53e29a2db7f587b>
+BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/05744f37291c9b98dd8a04a4e7b3d58cd430f85d7d76d6c150d93bc4b401154e>
 <> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#Ledger> .
 <> <https://blackcatinformatics.ca/raf/report/1#distinct> <#distinct/0> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/active-file-checkpoint-attachment> .
@@ -523,9 +523,10 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/bf9c94a9ca369c
 <#job/archive-filesystem-handoff> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/src/archive.rs" .
 <#job/archive-watermark-progress> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
 <#job/archive-watermark-progress> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+<#job/archive-watermark-progress> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::archive::OpenArchive::finish" .
 <#job/archive-watermark-progress> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::archive::Store::archive_intend" .
 <#job/archive-watermark-progress> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::archive::Store::archive_state" .
-<#job/archive-watermark-progress> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::archive::open" .
+<#job/archive-watermark-progress> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::archive::prepare_open" .
 <#job/archive-watermark-progress> <https://blackcatinformatics.ca/raf/report/1#forbiddenName> "^(mark_archived|set_archive_watermark|archive_for_tests)$" .
 <#job/archive-watermark-progress> <https://blackcatinformatics.ca/raf/report/1#homeSymbol> "sparrow_core::storage::archive::Store::archive_commit" .
 <#job/archive-watermark-progress> <https://blackcatinformatics.ca/raf/report/1#jobId> "archive-watermark-progress" .
