@@ -1,0 +1,16 @@
+{
+  "forgejo:comment:27294": {
+    "resolution": "acknowledged",
+    "reason": "This comment records the passing local qualification. It requests no change.",
+    "commit": null,
+    "reply_url": null,
+    "revision": {
+      "updated_at": "2026-11-24T17:24:19Z",
+      "state": null,
+      "commit": null,
+      "path": null,
+      "line": null,
+      "body_sha256": "12ad0a8fc13a6e45ebea673d89023be71e71beef5f9871b51bc3825eb4a49276"
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/50-limit-stopped-no-copy-on-write",
+  "branch": "paudley/50-limit-stopped-no-copy-on-write",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "a3e5638896d90598614a679d816356174ecb9410",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/50-limit-stopped-no-copy-on-write/.stage/limit-stopped-no-copy-on-write/sync/20261124T171503-1dd36aca9cfb407d83b77daa47f092b1",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "dd3c6021c3dc209f9af309a72069d7296b2560ff",
+  "merge_bases": [
+    "a3e5638896d90598614a679d816356174ecb9410"
+  ],
+  "commit": "dd3c6021c3dc209f9af309a72069d7296b2560ff"
+}

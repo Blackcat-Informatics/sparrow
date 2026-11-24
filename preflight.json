@@ -1,0 +1,113 @@
+{
+  "issue": 50,
+  "pr_number": 555,
+  "branch": "paudley/50-limit-stopped-no-copy-on-write",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/50-limit-stopped-no-copy-on-write/.stage/limit-stopped-no-copy-on-write",
+  "observed_at": "2026-11-24T17:24:35.417980+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews",
+    "merge_candidate"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/50-limit-stopped-no-copy-on-write/.stage/limit-stopped-no-copy-on-write/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/50-limit-stopped-no-copy-on-write/.stage/limit-stopped-no-copy-on-write/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/50-limit-stopped-no-copy-on-write/.stage/limit-stopped-no-copy-on-write/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/50-limit-stopped-no-copy-on-write/.stage/limit-stopped-no-copy-on-write/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/50-limit-stopped-no-copy-on-write/.stage/limit-stopped-no-copy-on-write/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict.",
+    "Preflight does not sign, fetch, push or mutate forge state. API permission and read access do not prove Git push authorization or protected-branch admission."
+  ],
+  "pr": {
+    "number": 555,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Pre-copy the store before a no-copy-on-write restart",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/555",
+    "baseRefName": "main",
+    "baseRefOid": "dd3c6021c3dc209f9af309a72069d7296b2560ff",
+    "headRefName": "paudley/50-limit-stopped-no-copy-on-write",
+    "isCrossRepository": false,
+    "headRefOid": "c7c3eabb67a81024de30533742f3d6d8fd4e7252",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/605/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 1,
+    "change_token": "75856944681fb98fadb9a05f3b1109c91f5819a4221c5890c887d785839c2691"
+  },
+  "local": {
+    "head": "c7c3eabb67a81024de30533742f3d6d8fd4e7252",
+    "branch": "paudley/50-limit-stopped-no-copy-on-write",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 555,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #555 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  },
+  "preflight": {
+    "git": "/usr/bin/git",
+    "python3": "/home/paudley/stage/root/bin/python3",
+    "stagectl": "/home/paudley/stage/root/bin/stagectl",
+    "bash": "/usr/bin/bash",
+    "readlink": "/home/paudley/stage/root/bin/readlink",
+    "sed": "/usr/bin/sed",
+    "awk": "/usr/bin/awk",
+    "ghprsq": "/home/paudley/stage/agents/bin/ghprsq",
+    "archive": {
+      "files": 14,
+      "bytes": 17828,
+      "errors": [],
+      "limits": "Read-only selected-evidence admission; full newly reachable Git object closure is checked by ghprsq before push."
+    },
+    "signing": {
+      "format": "openpgp",
+      "key_configured": true,
+      "limits": "Configuration inspected; no signing operation was performed."
+    },
+    "forge_permissions": {
+      "admin": true,
+      "push": true,
+      "pull": true
+    },
+    "merge_candidate": {
+      "base": "dd3c6021c3dc209f9af309a72069d7296b2560ff",
+      "head": "c7c3eabb67a81024de30533742f3d6d8fd4e7252",
+      "status": "clean"
+    }
+  }
+}
