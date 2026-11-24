@@ -333,23 +333,36 @@ no_copy_on_write() {
 }
 
 # The number of regular files under $1 that still have copy-on-write.
-copy_on_write_files() {
-    find "$1" -type f -exec lsattr -- {} + 2>/dev/null | awk '$1 !~ /C/' | wc -l
-}
+copy_on_write_files() (
+    set -o pipefail
+    cd -- "$1" || exit 1
+    # lsattr separates results with line breaks. Print only the flags for a path
+    # that contains a line break, including one in a parent directory.
+    find . -type f \( -path $'*\n*' -exec bash -c '
+        for file; do
+            flags=$(lsattr -d -- "$file") || exit 1
+            printf "%s\n" "${flags%% *}"
+        done
+    ' bash {} + -o -exec lsattr -d -- {} + \) | awk '$1 !~ /C/ { count++ } END { print count + 0 }'
+)
 
 # Switch copy-on-write off for DIR where its filesystem has the attribute. It is never a failure
 # for the caller. A directory that already holds copy-on-write files is left as it is, because new
 # files would inherit the attribute and the store would be mixed, so no reflink copy of it would
 # work. Such a directory is converted with convert_store_no_cow.
 switch_off_copy_on_write() {
-    local dir=$1 output
+    local dir=$1 output count
     if [[ -n ${DEST:-} ]]; then
         note "staged, not run: chattr +C $dir"
         return 0
     fi
     on_btrfs "$dir" || return 0
     no_copy_on_write "$dir" && return 0
-    if (($(copy_on_write_files "$dir"))); then
+    if ! count=$(copy_on_write_files "$dir"); then
+        note "could not check existing file attributes in $dir, so its attributes stay unchanged"
+        return 0
+    fi
+    if ((count > 0)); then
         note "$dir holds copy-on-write files; convert it while closed (deploy/copy-on-write.sh convert $dir)"
         return 0
     fi
@@ -387,14 +400,44 @@ refuse_open_store() {
 # The listing the store copy is compared by: every directory (name, type, mode) and every other
 # entry (name, type, size, mode, link target) under DIR, sockets left out, sorted. A directory's
 # size counts its entry names, so it is not listed.
-store_listing() {
-    (cd -- "$1" && find . ! -type s \( -type d -printf '%P %y %m\n' -o -printf '%P %y %s %m %l\n' \) | sort)
-}
+store_listing() (
+    set -o pipefail
+    cd -- "$1" || exit 1
+    find . ! -type s \( -type d -printf '%P\0%y %m\0\0' -o -printf '%P\0%y %s %m\0%l\0' \) |
+        while IFS= read -r -d '' path && IFS= read -r -d '' metadata && IFS= read -r -d '' target; do
+            printf '%q %s %q\0' "$path" "$metadata" "$target"
+        done | LC_ALL=C sort -z
+)
 
-# Whether a reflink copy of the store DIR can share its extents: DIR and every file in it have
-# copy-on-write off. A btrfs reflink needs the source and the destination file to agree on it.
+store_listings_match() (
+    local lists
+    lists=$(mktemp -d) || exit 1
+    trap 'rm -f -- "$lists/source" "$lists/copy"; rmdir -- "$lists"' EXIT
+    store_listing "$1" > "$lists/source" || exit 1
+    store_listing "$2" > "$lists/copy" || exit 1
+    cmp -s -- "$lists/source" "$lists/copy"
+)
+
+store_file_bytes_match() (
+    cd -- "$1" || exit 1
+    find . -type f -exec bash -c '
+        copy=$1
+        shift
+        for file; do
+            cmp -s -- "$file" "$copy/$file" || {
+                printf "the copy of %q differs from the source\n" "$file" >&2
+                exit 1
+            }
+        done
+    ' bash "$2" {} +
+)
+
+# Whether a reflink copy of the store DIR can share its extents.
 can_reflink_store() {
-    on_btrfs "$1" && no_copy_on_write "$1" && (($(copy_on_write_files "$1") == 0))
+    local count
+    on_btrfs "$1" && no_copy_on_write "$1" || return 1
+    count=$(copy_on_write_files "$1") || return 1
+    ((count == 0))
 }
 
 # The checks that precede a store copy, all before anything changes: DEST is a new name in an
@@ -431,7 +474,7 @@ check_store_copy() {
 # DEST that exists is a complete copy. Nothing in SOURCE changes. The Unix sockets a closed store
 # can leave are neither copied nor compared.
 keep_store_copy() {
-    local source dest method file files bytes
+    local source dest method files bytes
     source=$(realpath -e -- "$1") || die "$1 does not exist"
     dest=$2
     method=$(check_store_copy "$source" "$dest") || exit 1
@@ -447,15 +490,13 @@ keep_store_copy() {
             || die "copy of $source failed; $source is unchanged and $dest.partial is kept for inspection"
     fi
     find "$dest.partial" -type s -delete
-    diff -q <(store_listing "$source") <(store_listing "$dest.partial") >/dev/null \
-        || die "the copy's file list differs from $source; $source is unchanged and $dest.partial is kept"
+    store_listings_match "$source" "$dest.partial" \
+        || die "the copy's file list differs from $source or cannot be read; $source is unchanged and $dest.partial is kept"
     if [[ $method == full ]]; then
-        while IFS= read -r -d '' file; do
-            cmp -s -- "$source/$file" "$dest.partial/$file" \
-                || die "the copy of $file differs from $source; $source is unchanged and $dest.partial is kept"
-        done < <(cd -- "$source" && find . -type f -printf '%P\0')
+        store_file_bytes_match "$source" "$dest.partial" \
+            || die "file comparison failed; $source is unchanged and $dest.partial is kept"
     fi
-    files=$(find "$dest.partial" -type f | wc -l)
+    files=$(find "$dest.partial" -type f -printf . | wc -c)
     bytes=$(find "$dest.partial" -type f -printf '%s\n' | awk '{s += $1} END {print s + 0}')
     sync -f -- "$dest.partial"
     mv -T -- "$dest.partial" "$dest"
@@ -463,52 +504,89 @@ keep_store_copy() {
     note "kept a $method copy of $source at $dest: $files files, $bytes bytes"
 }
 
-# Rewrite the closed store DATA so that it and every file in it have copy-on-write off. The copy
-# is made in a no-copy-on-write sibling, its file list, sizes and bytes are compared with DATA, and
-# it then takes DATA's name. The original is kept, renamed DATA.cow-STAMP, for the operator to
-# remove once the converted store has been checked.
-convert_store_no_cow() {
-    local data partial kept need free files
-    data=$(realpath -e -- "$1") || die "$1 does not exist"
+# Check conversion prerequisites that do not require a closed store. Print the
+# mode for the converter. Restart checks it before stopping and conversion repeats it.
+check_store_conversion() {
+    local data=$1 partial parent filesystem flags count report need free status
     [[ -d $data ]] || die "$data is not a directory"
-    if ! on_btrfs "$data"; then
-        note "$data is not on btrfs; it has no copy-on-write to switch off"
+    filesystem=$(findmnt -no FSTYPE -T "$data") || die "cannot identify the filesystem of $data"
+    if [[ $filesystem != btrfs ]]; then
+        printf '%s\n' other-filesystem
         return 0
     fi
-    if no_copy_on_write "$data" && (($(copy_on_write_files "$data") == 0)); then
-        note "copy-on-write is already off for $data and every file in it"
-        return 0
-    fi
-    refuse_open_store "$data"
+
     partial=$data.no-cow.partial
-    kept=$data.cow-$(date -u +%Y%m%dT%H%M%SZ)
-    [[ ! -e $partial ]] || die "$partial is left from an earlier attempt; inspect and remove it"
-    need=$(du -s -B1 -- "$data" | cut -f1)
-    free=$(free_bytes "${data%/*}") || exit 1
+    [[ ! -e $partial && ! -L $partial ]] \
+        || die "$partial is left from an earlier conversion; preserve both directories until you identify the original (deploy/RECOVERY.md)"
+    flags=$(lsattr -d -- "$data") || die "cannot read copy-on-write attributes of $data"
+    if [[ ${flags%% *} == *C* ]]; then
+        count=$(copy_on_write_files "$data") || die "cannot check file attributes under $data"
+        if ((count == 0)); then
+            printf '%s\n' already-converted
+            return 0
+        fi
+    fi
+
+    parent=$(dirname -- "$data")
+    [[ -r $parent && -w $parent && -x $parent ]] || die "cannot create and synchronize a sibling of $data in $parent"
+    if mountpoint -q -- "$data"; then
+        die "$data is a mount point and cannot be exchanged with its sibling"
+    else
+        status=$?
+        ((status == 32)) || die "cannot determine whether $data is a mount point"
+    fi
+    mv --exchange --no-copy -T --help >/dev/null 2>&1 \
+        || die "put GNU mv with --exchange and --no-copy first in PATH before converting $data"
+    report=$(du -s -B1 -- "$data") || die "cannot measure the size of $data"
+    need=${report%%[[:space:]]*}
+    [[ $need =~ ^[0-9]+$ ]] || die "du reports no size for $data"
+    free=$(free_bytes "$parent") || exit 1
     ((free > need + 10 * 1024 ** 3)) \
         || die "only $free bytes free beside $data; converting it needs $need bytes plus 10 GiB"
-    mkdir -- "$partial"
+    printf '%s\n' convert
+}
+
+# Copy the closed store, verify it, and exchange the two sibling directories.
+# Between the exchange and retention, the partial name holds the original.
+convert_store_no_cow() {
+    local data partial kept mode count files parent
+    data=$(realpath -e -- "$1") || die "$1 does not exist"
+    mode=$(check_store_conversion "$data") || exit 1
+    case $mode in
+        other-filesystem) note "$data is not on btrfs; it has no copy-on-write to switch off"; return 0 ;;
+        already-converted) note "copy-on-write is already off for $data and every file in it"; return 0 ;;
+    esac
+    refuse_open_store "$data"
+    parent=$(dirname -- "$data")
+    partial=$data.no-cow.partial
+    kept=$data.cow-$(date -u +%Y%m%dT%H%M%SZ)
+    [[ ! -e $kept && ! -L $kept ]] || die "$kept already exists; retain it and retry with a new timestamp"
+
+    mkdir -- "$partial" || die "cannot create $partial; $data is unchanged"
     chattr +C -- "$partial" || die "cannot switch copy-on-write off for $partial; $data is unchanged"
-    # cp -a copies DATA's mode, owner and ACLs onto PARTIAL; the files inherit PARTIAL's attribute.
-    # A socket is not data: one is left only by an unclean exit, and the daemon creates its socket
-    # at start. So sockets are neither kept nor compared.
+    # cp -a copies the mode, owner and ACLs. Files inherit the sibling's attribute.
     cp -a --reflink=never -- "$data/." "$partial/" \
         || die "copying $data failed; $data is unchanged and $partial is kept for inspection"
-    find "$partial" -type s -delete
-    # A directory's size counts its entry names, so it is not compared.
-    diff -q <(store_listing "$data") <(store_listing "$partial") >/dev/null \
-        || die "the copy's file list differs from $data; $data is unchanged and $partial is kept"
-    while IFS= read -r -d '' file; do
-        cmp -s -- "$data/$file" "$partial/$file" \
-            || die "the copy of $file differs from $data; $data is unchanged and $partial is kept"
-    done < <(cd -- "$data" && find . -type f -printf '%P\0')
-    if (($(copy_on_write_files "$partial"))) || ! no_copy_on_write "$partial"; then
+    find "$partial" -type s -delete || die "cannot remove stale sockets from $partial; $data is unchanged"
+    store_listings_match "$data" "$partial" \
+        || die "the copy's file list differs from $data or cannot be read; $data is unchanged and $partial is kept"
+    store_file_bytes_match "$data" "$partial" \
+        || die "file comparison failed; $data is unchanged and $partial is kept"
+    count=$(copy_on_write_files "$partial") || die "cannot check file attributes in $partial; $data is unchanged"
+    if ((count > 0)) || ! no_copy_on_write "$partial"; then
         die "$partial or files in it still have copy-on-write; $data is unchanged"
     fi
-    files=$(find "$partial" -type f | wc -l)
-    sync -f -- "$partial"
-    mv -T -- "$data" "$kept"
-    mv -T -- "$partial" "$data"
-    sync -f -- "$data"
+    files=$(find "$partial" -type f -printf . | wc -c) || die "cannot count files in $partial; $data is unchanged"
+    sync -f -- "$partial" || die "cannot synchronize $partial; $data is unchanged"
+    mv --exchange --no-copy -T -- "$data" "$partial" \
+        || die "exchange of $data and $partial did not report success; preserve both and inspect them (deploy/RECOVERY.md)"
+    # Candidate bytes are already durable. Persist the sibling names without
+    # flushing unrelated writers on the same filesystem again.
+    sync -- "$parent" \
+        || die "cannot synchronize the exchange; preserve $data and the original at $partial"
+    mv --no-copy --no-clobber -T -- "$partial" "$kept" && [[ ! -e $partial && ! -L $partial ]] \
+        || die "converted store at $data; retaining the original did not report success; inspect $partial and $kept"
+    sync -f -- "$data" \
+        || die "cannot synchronize retention of the original; preserve $data and $kept"
     note "converted $data: $files files with copy-on-write off; the original is kept at $kept"
 }

@@ -240,6 +240,21 @@ operator diagnoses it and resets the unit.
   `--rollback` again to swap forward.
 - Reversible: yes; `--rollback` again swaps forward.
 
+## Interrupted copy-on-write conversion
+
+An atomic exchange keeps the canonical store directory present throughout
+conversion. Before the exchange, the canonical directory holds the original
+and its `.no-cow.partial` sibling holds the candidate. After the exchange,
+the canonical directory holds the verified conversion and the sibling holds
+the original until it moves to `.cow-STAMP`.
+
+If `.no-cow.partial` remains, preserve both directories. Use the conversion
+diagnostic and inspect the files' copy-on-write attributes to identify the
+original. If the canonical directory holds the verified conversion, keep
+the original at an unused retention path. If the canonical directory still
+holds the original, set the candidate aside. Restart refuses to proceed
+while the partial path remains.
+
 ## Watch root missing, replaced or unreadable
 
 - Symptom: the journal names `configured consume root changed`,
