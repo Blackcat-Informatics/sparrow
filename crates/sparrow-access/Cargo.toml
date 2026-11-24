@@ -4,7 +4,7 @@
 [package]
 name = "sparrow-access"
 version = "0.1.0"
-description = "Command-line and stdio MCP access to the Sparrow log store"
+description = "Command-line and MCP access to the Sparrow log store"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -22,6 +22,9 @@ path = "src/main.rs"
 [dependencies]
 capnp.workspace = true
 futures.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 purrdf.workspace = true
 purrdf-hash.workspace = true
 purrdf-lex.workspace = true
@@ -30,6 +33,7 @@ sparrow-core.workspace = true
 sparrow-server.workspace = true
 tokio.workspace = true
 toml.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

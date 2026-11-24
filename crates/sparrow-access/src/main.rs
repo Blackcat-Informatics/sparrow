@@ -1,17 +1,17 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
-//! CLI and stdio MCP entry point over the shared generated daemon client.
+//! CLI and MCP entry point over the shared generated daemon client.
 
 use purrdf_lex::json;
-use sparrow_access::{run_cli, run_mcp};
+use sparrow_access::{McpHttp, run_cli, run_mcp};
 use sparrow_client::{Client, Endpoint};
 mod drain;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let all: Vec<_> = std::env::args().skip(1).collect();
-    let usage = "usage: sparrow [--secret-file PATH] ENDPOINT COMMAND; ENDPOINT is a Unix socket path or tcp://IP:PORT; --secret-file authenticates TCP by CHAP; mcp --stdio starts the agent adapter";
+    let usage = "usage: sparrow [--secret-file PATH] ENDPOINT COMMAND; ENDPOINT is a Unix socket path or tcp://IP:PORT; --secret-file authenticates TCP by CHAP; mcp --stdio or mcp --http [LOOPBACK_IP:PORT] starts the agent adapter";
     let (endpoint, args) =
         Endpoint::from_args(&all).map_err(|error| format!("{error}; {usage}"))?;
     if args.is_empty() {
@@ -19,8 +19,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     tokio::task::LocalSet::new()
         .run_until(async {
-            if args == ["mcp", "--stdio"] {
-                run_mcp(&endpoint).await?;
+            if let [command, mode @ ..] = args
+                && command == "mcp"
+            {
+                match mode {
+                    [stdio] if stdio == "--stdio" => run_mcp(&endpoint).await?,
+                    [http, address @ ..] if http == "--http" && address.len() <= 1 => {
+                        let address = address.first().map_or("127.0.0.1:8765", String::as_str);
+                        let listener = McpHttp::bind(address.parse()?).await?;
+                        println!("http://{}/mcp", listener.local_addr());
+                        listener.serve(&endpoint).await?;
+                    }
+                    _ => return Err(usage.into()),
+                }
             } else {
                 let output = match args {
                     [command, rest @ ..] if command == "spool-drain" => {
