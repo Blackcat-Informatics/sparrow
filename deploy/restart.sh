@@ -44,6 +44,7 @@ else
     images=$(select_images "$REV") || exit 1
     read -r daemon cli <<<"$images"
 fi
+require_settled
 # The checks run on the kept images before anything is installed, so a refusal changes nothing.
 verify_image "$daemon" 'usage: sparrowd --config'
 verify_image "$cli" 'usage: sparrow'
