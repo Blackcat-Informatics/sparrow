@@ -1,0 +1,19 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 2353911bcd82668ded36e521b86e170b668ee4e6
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 553
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/553
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: edec49da210346ebfb1da8b780cfab7c8a7c8a0c
+GhpRsq-Head-Ref: paudley/47-swap-the-converted-no-cow-store-in-with
+GhpRsq-Head-OID: 2353911bcd82668ded36e521b86e170b668ee4e6
+GhpRsq-Result-Tree: bcacea436b3ef8f862f57f374c8a4029da590435
+GhpRsq-Result-Commit: a3e5638896d90598614a679d816356174ecb9410
+GhpRsq-Parent-Hashes: 2353911bcd82668ded36e521b86e170b668ee4e6
+GhpRsq-Squash-Notes-SHA256: 69f90fb10b12fbade3e668edc9f195e0cb431d0458974a0a24afadd2f95baea7
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
