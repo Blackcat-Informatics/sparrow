@@ -1,0 +1,24 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: de7f82c3b470e1075f98de919b1d0b7724c97d5a
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 544
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/544
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 2f37f0d6475e54f02b2ec59c8e8b5a10a52d3a9b
+GhpRsq-Head-Ref: paudley/99-prove-that-pipelined-calls-on-a-refused
+GhpRsq-Head-OID: de7f82c3b470e1075f98de919b1d0b7724c97d5a
+GhpRsq-Result-Tree: 85b9d28cf1ba371380e2d883f4cec2d8f4d52564
+GhpRsq-Result-Commit: 58302c81438302e2b97880ce52d3232da62cc46a
+GhpRsq-Parent-Hashes: de7f82c3b470e1075f98de919b1d0b7724c97d5a
+GhpRsq-Squash-Notes-SHA256: 519cc03a977851e718b09b011894aec870ecc961870e77599404475efa2e4dbd
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Tree: 47df9013ffbffd5780fd6ac648c1177b93c7ab33
+GhpRsq-Stage-Commit: b25b2adda305dc4093dfc3334dc8106877b37064
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/b25b2adda305dc4093dfc3334dc8106877b37064
+GhpRsq-Stage-Ref: refs/ghprsq/pr/544/stage
+GhpRsq-Stage-Files: 13
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/b25b2adda305dc4093dfc3334dc8106877b37064
