@@ -880,9 +880,10 @@ How a page reads:
   "Per-source counters and artifact index") from its position. With a source,
   it walks only that source's rows, seeking straight to the
   `--received-from` bound and stopping at `--received-before`, so it never reads
-  or charges another source's rows. Without a source it walks the index source
-  by source in the same way, so an unfiltered page costs what its selected rows
-  cost. Index rows are positions and are not charged.
+  or charges another source's rows, including recordless artifacts. Without a
+  source it walks the index source by source in the same way, so an unfiltered
+  page costs what its selected rows cost. Index rows are positions and are not
+  charged.
 - For each index row the page reads the artifact's entry and then its records
   through the entry's `record_ids`. For a parent whose entry was retired while
   pinned records survive, it reads those records through the source's record
