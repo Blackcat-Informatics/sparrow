@@ -1,0 +1,29 @@
+<!-- SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca> -->
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title description">
+  <title id="title">Sparrow</title>
+  <desc id="description">Temporal diagnostic evidence, carried gently: retained, pinned and queryable as a graph. A black cat carries a sparrow.</desc>
+  <style>
+    .paper { fill: #fffdf5; }
+    .ink { fill: #111214; }
+    .text { font-family: sans-serif; }
+    .title { font-size: 108px; font-weight: 700; }
+    .tagline { font-size: 36px; }
+  </style>
+
+  <rect class="ink" width="1280" height="640"/>
+  <rect class="paper" x="16" y="16" width="726" height="608" rx="16"/>
+
+  <g id="wordmark" class="ink text">
+    <text class="title" x="76" y="286">Sparrow</text>
+    <text class="tagline" x="82" y="366">
+      <tspan x="82">Temporal diagnostic evidence,</tspan>
+      <tspan x="82" dy="51">carried gently: retained, pinned</tspan>
+      <tspan x="82" dy="51">and queryable as a graph.</tspan>
+    </text>
+  </g>
+
+  <g id="mark">
+    <image x="758" y="67" width="500" height="500" xlink:href="sparrow-logo.svg"/>
+  </g>
+</svg>

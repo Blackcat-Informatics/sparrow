@@ -108,5 +108,11 @@ xmllint --noout docs/sparrow-logo.svg
 rsvg-convert -w 512 -h 512 docs/sparrow-logo.svg -o /tmp/sparrow-logo.png
 ```
 
-A social-preview card is not yet drawn. When one is added, keep its editable
-SVG source beside the rendered 1280×640 PNG, as PurRDF does.
+Edit `docs/sparrow-social.svg` to update the social-preview card. It uses the
+canonical logo by relative path. Render the 1280 × 640 PNG alongside it.
+
+```bash
+xmllint --noout docs/sparrow-social.svg
+rsvg-convert -w 1280 -h 640 docs/sparrow-social.svg -o docs/sparrow-social.png
+file docs/sparrow-social.png
+```
