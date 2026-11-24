@@ -2092,6 +2092,113 @@ async fn public_tcp_requires_chap_for_reads_and_administration_but_not_ingestion
         .await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn pipelined_calls_on_a_refused_session_reach_no_service() {
+    use capnp::capability::FromClientHook;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let (address, reservation) = configure_tcp_listener(&config);
+            drop(reservation);
+            let _daemon = start(&config, &socket).await;
+            let local = sparrow_client::Client::connect(&socket).await.unwrap();
+            let receipt = local
+                .ingest(
+                    "pipeline-evidence",
+                    "fixture",
+                    wire::Format::Log,
+                    b"evidence\n",
+                )
+                .await
+                .unwrap();
+            let secret =
+                sparrow_client::TcpSecret::read(&config.with_file_name("tcp.secret")).unwrap();
+
+            for accepted in [false, true] {
+                let client = sparrow_client::Client::connect_producer(
+                    &sparrow_client::Endpoint::Tcp(address),
+                )
+                .await
+                .unwrap();
+                let challenge = client
+                    .capability()
+                    .auth_challenge_request()
+                    .send()
+                    .promise
+                    .await
+                    .unwrap();
+                let nonce = rpc_ok(challenge.get().unwrap().get_result().unwrap())
+                    .get_nonce()
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                let mut response = secret.respond(&receipt.store_id, &nonce);
+                if !accepted {
+                    response[0] ^= 1;
+                }
+                let mut authenticate = client.capability().authenticate_request();
+                authenticate.get().set_response(&response);
+
+                // The generated pipeline omits union getters. Follow the pointer slots
+                // for AuthenticateResults.result, Result.ok and TcpSession.session.
+                let authenticate = authenticate.hook.send();
+                let promised = wire::sparrow::Client::new(
+                    authenticate
+                        .pipeline
+                        .get_pointer_field(0)
+                        .get_pointer_field(0)
+                        .get_pointer_field(0)
+                        .as_cap(),
+                );
+                let status = promised.status_request().send().promise;
+                let mut records = promised.records_search_request();
+                let mut scope = records.get().init_query().init_scope();
+                scope.set_schema_version(sparrow_client::SCHEMA_VERSION);
+                scope.init_received_before().set_unix_millis(u64::MAX);
+                let records = records.send().promise;
+
+                let auth = authenticate.promise.await.unwrap();
+                let auth = auth
+                    .get()
+                    .unwrap()
+                    .get_as::<wire::sparrow::authenticate_results::Reader<'_>>()
+                    .unwrap()
+                    .get_result()
+                    .unwrap();
+                if accepted {
+                    rpc_ok(auth).get_session().unwrap();
+                    let status = status.await.unwrap();
+                    let status = rpc_ok(status.get().unwrap().get_result().unwrap());
+                    assert_eq!(
+                        status.get_store_id().unwrap().to_str().unwrap(),
+                        receipt.store_id
+                    );
+                    let records = records.await.unwrap();
+                    let rows = rpc_ok(records.get().unwrap().get_result().unwrap())
+                        .get_rows()
+                        .unwrap();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(
+                        rows.get(0).get_artifact_id().unwrap().to_str().unwrap(),
+                        receipt.id
+                    );
+                } else {
+                    assert_eq!(rpc_error_code(auth), "UNAUTHENTICATED");
+                    assert!(status.await.is_err(), "refused session answered status");
+                    assert!(
+                        records.await.is_err(),
+                        "refused session answered a record query"
+                    );
+                }
+            }
+        })
+        .await;
+}
+
 /// Create a setgid 2750 ingest directory with the test user's own group and add the
 /// ingest socket keys to `config`. Returns the socket path and its group.
 fn configure_ingest_socket(
