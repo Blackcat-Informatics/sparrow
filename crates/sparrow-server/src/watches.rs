@@ -966,21 +966,24 @@ impl Detector {
         Ok(())
     }
 
-    fn scan_step(&mut self) -> Result<(), Error> {
+    fn scan_step(&mut self, space_ok: bool) -> Result<(), Error> {
         for _ in 0..SCAN_QUANTUM {
             if self.scan.is_none() {
                 let Some(relative) = self.todo.pop_front() else {
                     if !self.covered {
+                        if !self.deferred
+                            && let Owner::Tail(owner) = &mut self.owner
+                        {
+                            if !space_ok {
+                                return Ok(());
+                            }
+                            owner.reconcile_missing(&self.config.id)?;
+                        }
                         // Scan observations made without complete coverage cannot
                         // shorten the fresh quiet interval after reconciliation.
                         let now = Instant::now();
                         for candidate in self.candidates.values_mut() {
                             candidate.stable_since = now;
-                        }
-                        if !self.deferred
-                            && let Owner::Tail(owner) = &mut self.owner
-                        {
-                            owner.reconcile_missing(&self.config.id)?;
                         }
                         self.covered = true;
                         self.next_reconcile = now + self.rescan_interval();
@@ -1171,11 +1174,11 @@ impl Detector {
     }
 
     /// Whether this detector has work the worker must run again for at once, without
-    /// waiting for an event: a scan in progress or, with space to write, a tail backlog
-    /// that holds a permit.
+    /// waiting for an event. Scans keep reading the root; recording missing tails and
+    /// draining a tail backlog require space to write.
     fn busy(&self, space_ok: bool) -> bool {
         self.live()
-            && (!self.covered
+            && ((!self.covered && (space_ok || matches!(self.owner, Owner::Consume(_))))
                 || !self.todo.is_empty()
                 || self.scan.is_some()
                 || (space_ok
@@ -2231,11 +2234,19 @@ async fn pass(
             {
                 detector.rescan("periodic scan")?;
             }
-            detector.scan_step()?;
-            detector.drain()
+            let scan = detector.scan_step(space_ok);
+            if scan.as_ref().is_err_and(floor_class) {
+                return Ok(false);
+            }
+            scan?;
+            detector.drain()?;
+            Ok(true)
         });
-        if swept.is_none() || !space_ok {
-            continue;
+        match swept {
+            // Re-observe free space before doing more work with the stale admission.
+            Some(false) => return Ok(Flow::Next),
+            Some(true) if space_ok => {}
+            _ => continue,
         }
         let mut drained: Option<Error> = None;
         if let Owner::Tail(owner) = &mut detector.owner {

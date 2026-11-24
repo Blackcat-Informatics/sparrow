@@ -44,7 +44,7 @@ fn kernel_overflow_and_directory_exhaustion_require_fresh_coverage() {
         crate::consumption::RootBinding::Stored,
     )
     .unwrap();
-    detector.scan_step().unwrap();
+    detector.scan_step(true).unwrap();
     detector.drain().unwrap();
     assert!(detector.covered);
 
@@ -195,7 +195,7 @@ fn kernel_overflow_and_directory_exhaustion_require_fresh_coverage() {
     assert_eq!(status.coverage_losses, 1);
     assert_eq!(status.candidates, 0);
 
-    detector.scan_step().unwrap();
+    detector.scan_step(true).unwrap();
     detector.drain().unwrap();
     assert!(detector.covered);
     assert!(detector.candidates[Path::new("finished.bin")].stable_since >= loss);
@@ -216,7 +216,7 @@ fn kernel_overflow_and_directory_exhaustion_require_fresh_coverage() {
     detector
         .reconcile("bounded directory exhaustion fixture")
         .unwrap();
-    let error = detector.scan_step().unwrap_err();
+    let error = detector.scan_step(true).unwrap_err();
     assert!(
         error
             .to_string()
@@ -235,7 +235,7 @@ fn kernel_overflow_and_directory_exhaustion_require_fresh_coverage() {
     detector
         .reconcile("explicit directory budget repair")
         .unwrap();
-    detector.scan_step().unwrap();
+    detector.scan_step(true).unwrap();
     detector.drain().unwrap();
     assert!(detector.covered);
     assert_eq!(detector.directories.len(), 2);
@@ -369,7 +369,7 @@ fn periodic_rescan_keeps_quiet_clocks_and_finds_missed_files() {
         crate::consumption::RootBinding::Stored,
     )
     .unwrap();
-    detector.scan_step().unwrap();
+    detector.scan_step(true).unwrap();
     detector.drain().unwrap();
     assert!(detector.covered);
     let quiet_since = Instant::now() - Duration::from_secs(60);
@@ -387,7 +387,7 @@ fn periodic_rescan_keeps_quiet_clocks_and_finds_missed_files() {
     detector.rescan("periodic scan").unwrap();
     assert!(detector.covered);
     assert!(detector.ready().unwrap().is_some());
-    detector.scan_step().unwrap();
+    detector.scan_step(true).unwrap();
     detector.drain().unwrap();
     assert_eq!(detector.reconciliations, 1);
     assert_eq!(detector.directories.len(), 2);
@@ -881,7 +881,7 @@ fn refused_tail_attach_opens_the_file_once() {
         crate::consumption::RootBinding::Private,
     )
     .unwrap();
-    detector.scan_step().unwrap();
+    detector.scan_step(true).unwrap();
     detector.drain().unwrap();
     assert!(
         detector.failure.is_some(),
@@ -1061,6 +1061,100 @@ async fn a_paused_watch_wakes_on_the_floor_resume_edge_with_no_clock_passing() {
         .await;
 }
 
+/// A missing tail's recovered checkpoint stays active during a floor pause.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_missing_tail_waits_for_the_floor_to_resume_before_recording_a_gap() {
+    use std::os::unix::fs::MetadataExt;
+    let (worker, run) = worker(
+        crate::ProducerContract::ActiveFilesRetain,
+        &[("missing.log", b"n\n")],
+        Arc::new(tokio::sync::Semaphore::new(2)),
+    );
+    let root = worker._directory.path().join("producer");
+    let path = root.join("missing.log");
+    let (directory, file) = (root.metadata().unwrap(), path.metadata().unwrap());
+    let now = crate::now().unwrap();
+    // The previous worker accepted a prefix, then released its descriptor at shutdown.
+    let generation = worker
+        .store
+        .tail_start(
+            &sparrow_core::TailStart {
+                request_id: "before-floor-pause".into(),
+                watch: "wake".into(),
+                watch_revision: 1,
+                directories: sparrow_core::ConsumptionDirectories {
+                    root_device: directory.dev(),
+                    root_inode: directory.ino(),
+                    parent_device: directory.dev(),
+                    parent_inode: directory.ino(),
+                },
+                path: b"missing.log".to_vec(),
+                source: "wake".into(),
+                format: "log".into(),
+                device: file.dev(),
+                inode: file.ino(),
+            },
+            now,
+        )
+        .unwrap();
+    let accepted = worker
+        .store
+        .tail_append(&generation.id, 0, b"n\n", false, now)
+        .unwrap();
+    let floor = worker.store.space_floor().clone();
+    floor.set_free_for_tests(Some(0));
+    std::fs::remove_file(path).unwrap();
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let before = passes();
+            let task = tokio::task::spawn_local(run);
+            let began = Instant::now();
+            while passes() == before {
+                assert!(began.elapsed() < Duration::from_secs(30));
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            let state = worker.registry.snapshot().unwrap().pop().unwrap();
+            assert!(state.enabled && !state.covered);
+            assert_eq!(state.tail_descriptors, 0);
+            assert!(state.failure.is_none(), "{:?}", state.failure);
+            assert!(floor.paused());
+            assert_eq!(floor.status().refused_writes, 0);
+            assert!(
+                worker
+                    .store
+                    .tail_generation(&generation.id)
+                    .unwrap()
+                    .gap
+                    .is_none()
+            );
+            assert!(passes() <= before + 4, "paused reconciliation kept running");
+
+            floor.set_free_for_tests(None);
+            assert!(floor.observe(crate::now().unwrap()).unwrap().is_none());
+            let began = Instant::now();
+            loop {
+                let state = worker.registry.snapshot().unwrap().pop().unwrap();
+                assert!(state.failure.is_none(), "{:?}", state.failure);
+                if state.covered {
+                    break;
+                }
+                assert!(began.elapsed() < Duration::from_secs(30));
+                tokio::task::yield_now().await;
+            }
+            let settled = worker.store.tail_generation(&generation.id).unwrap();
+            assert_eq!(settled.gap.as_deref(), Some("read_gap"));
+            assert_eq!(settled.offset, accepted.source_end);
+            assert_eq!(settled.records, 1);
+            worker.stop.send_replace(true);
+            task.await.unwrap().unwrap();
+        })
+        .await;
+}
+
 /// INVARIANT (#184): a stop request wakes an idle worker at once; no clock has to pass, as
 /// the 50 ms stop poll needed.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1190,7 +1284,7 @@ async fn the_drain_before_a_wait_reports_and_wakes_for_what_it_found() {
         )
         .unwrap(),
     ];
-    detectors[0].scan_step().unwrap();
+    detectors[0].scan_step(true).unwrap();
     detectors[0].drain().unwrap();
     assert!(detectors[0].covered && detectors[0].candidates.len() == 1);
     // During a pass: a second input finds the capacity full, then the first one goes away.
@@ -1879,7 +1973,7 @@ fn a_held_watch_takes_only_its_share_and_other_watches_and_tails_still_claim() {
     assert_eq!(publishable, vec![id]);
 
     // A tail still begins its generation while the holds are set.
-    tail.scan_step().unwrap();
+    tail.scan_step(true).unwrap();
     tail.drain().unwrap();
     assert!(tail.failure.is_none(), "{:?}", tail.failure);
     assert_eq!(store.tail_generations("tail-fence").unwrap().len(), 1);
