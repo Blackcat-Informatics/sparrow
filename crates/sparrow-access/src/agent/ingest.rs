@@ -9,8 +9,13 @@ use std::path::PathBuf;
 pub(crate) struct Input {
     request: String,
     source: String,
-    format: wire::Format,
+    format: ImportFormat,
     path: PathBuf,
+}
+
+enum ImportFormat {
+    Native(wire::Format),
+    JournalExport,
 }
 
 impl Input {
@@ -21,15 +26,25 @@ impl Input {
         Ok(Self {
             request: args[0].clone(),
             source: args[1].clone(),
-            format: sparrow_client::parse_format(&args[2]).map_err(|e| invalid(e.to_string()))?,
+            format: if args[2] == "journal-export" {
+                ImportFormat::JournalExport
+            } else {
+                ImportFormat::Native(
+                    sparrow_client::parse_format(&args[2]).map_err(|e| invalid(e.to_string()))?,
+                )
+            },
             path: args[3].clone().into(),
         })
     }
 
     pub(super) async fn execute(&self, client: &sparrow_client::Client) -> Result<Value> {
-        match import_file_or_set(client, &self.request, &self.source, self.format, &self.path)
-            .await?
-        {
+        let ImportFormat::Native(format) = self.format else {
+            return render_receipt(
+                super::journal::import(client, &self.request, &self.source, self.path.clone())
+                    .await?,
+            );
+        };
+        match import_file_or_set(client, &self.request, &self.source, format, &self.path).await? {
             FileImport::Single(artifact) => render_receipt(artifact),
             FileImport::Set(manifest, members) => {
                 let parts = members.into_iter().map(|(span, artifact)| {

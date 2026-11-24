@@ -17,6 +17,7 @@ mod error;
 mod explanation;
 mod ingest;
 mod ingest_status;
+mod journal;
 mod json;
 mod parts;
 mod payload;
@@ -49,6 +50,7 @@ pub(crate) mod tool;
 pub(super) const USAGE: &str = concat!(
     "sparrow SOCKET_PATH sparql REQUEST.json | sparql-explain REQUEST.json | correlate REQUEST.json; ",
     "usage: sparrow SOCKET_PATH capabilities | discover | status | rdf STORE_ID RECORD_ID | ingest REQUEST_ID SOURCE FORMAT FILE | ingest-get STORE_ID IMPORT_ID | flush STORE_ID SESSION_ID SEQUENCE",
+    " | ingest REQUEST_ID SOURCE journal-export EXPORT_FILE",
     " | quarantine-replay FILE | parts verify SOURCE MANIFEST_ARTIFACT_ID [--match-stdin]",
     " | retention-metrics STORE_ID [--max-visits N] [--catalog-bytes N] [--payload-bytes N]",
     " | bytes STORE_ID EVIDENCE_ID OFFSET LENGTH OUTPUT_FILE | pin-renew REQUEST_ID STORE_ID PIN_ID DAYS [EXPECTED_REVISION]",

@@ -14,6 +14,8 @@ use std::{
 // A child can briefly inherit CLOEXEC sockets before exec closes them.
 use sparrow_test_support::crash::PROCESS_START;
 type TcpReservation = (std::net::TcpListener, std::sync::MutexGuard<'static, ()>);
+#[path = "rpc/journal.rs"]
+mod journal;
 
 #[tokio::test(flavor = "current_thread")]
 async fn capability_documents_share_cli_mcp_and_typed_transport_contracts() {
