@@ -85,9 +85,9 @@ same bounded pass as ordinary expiry, but its commits are admitted against the m
 reserve like the pass's own, it does not run import reclamation, and when free space is
 under the reserve it is refused before it reads anything. That refusal is not ageing out's
 turn: the episode does not count it, and ageing out is asked again by the floor's resume or
-by the pressure pass, which wakes it the first time it finds free space back above the
-reserve (and again if free space falls under it and clears it again), so a rise that stops
-short of the floor still runs ageing out, with no clock. It never deletes unarchived or
+by the pressure pass when it observes that free space has reached the reserve.
+A recovery that stops short of the floor can still wake expiry. The pressure
+pass wakes it again if free space falls below the reserve and recovers. It never deletes unarchived or
 pinned evidence (the archive gate and the pins are the same code as the pass's). It has no
 per-episode cap, unlike early retirement: early retirement of archived evidence is a policy
 choice that must be bounded, while evidence past retention is not, and a cap would leave
@@ -96,7 +96,7 @@ headroom the pass's own flush and compaction need is protected by the batch size
 ordinary 32 units) and by the reserve admission of every batch, which refuses when free
 space is under the reserve, so no further cap is needed. A backlog continues by the
 duty's continuation flag, an event, until nothing is due or the reserve refuses; a refusal
-parks it until the pass finds free space back above the reserve.
+parks it until the pass finds that free space has reached the reserve.
 Retired evidence returns its bytes only after native work, so when ageing out retires
 evidence for an episode that asked for reclamation it opens an in-memory wait, with no
 stored marker. Nothing was stored, so ending such a wait needs no commit; a commit would be
