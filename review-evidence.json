@@ -1,0 +1,25 @@
+{
+  "ok": true,
+  "head": null,
+  "items": [
+    {
+      "id": "forgejo:comment:27378",
+      "kind": "comment",
+      "url": "http://lillith:7555/fleet/sparrow/pulls/557#issuecomment-27378",
+      "author": "paudley",
+      "updated_at": "2026-11-24T18:39:52Z",
+      "state": null,
+      "commit": null,
+      "body_sha256": "6033e9fc6e37b082bc7b8ff5b2df20dd4cf7ec900309de1bdac2509648f376ff",
+      "body_bytes": 679,
+      "body_archived": false
+    }
+  ],
+  "coverage": {
+    "comments": "complete",
+    "reviews": "complete",
+    "inline_comments": "complete",
+    "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+  },
+  "bodies": "kept on the forge; each item carries body_sha256 of the original"
+}

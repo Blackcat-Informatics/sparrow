@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/106-raise-the-import-slot-count-and-let-a",
+  "branch": "paudley/106-raise-the-import-slot-count-and-let-a",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "8d9674f3f21a150c5035230825a8fa2a65f6b9e6",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/106-raise-the-import-slot-count-and-let-a/.stage/raise-the-import-slot-count-and-let-a/sync/20261124T180735-3dce9a4863c04eb9a724c1296338ac6f",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "b0a5552d04ddb69e72b75dcddcc38791f94445e7",
+  "merge_bases": [
+    "8d9674f3f21a150c5035230825a8fa2a65f6b9e6"
+  ],
+  "commit": "b0a5552d04ddb69e72b75dcddcc38791f94445e7"
+}

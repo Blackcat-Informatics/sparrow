@@ -1,0 +1,3 @@
+$ stagectl pr-checks 557
+skipped CI / make check (pull_request) /fleet/sparrow/actions/runs/610/jobs/0
+state: pass

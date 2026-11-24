@@ -1,0 +1,80 @@
+{
+  "issue": 106,
+  "pr_number": 557,
+  "branch": "paudley/106-raise-the-import-slot-count-and-let-a",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/106-raise-the-import-slot-count-and-let-a/.stage/raise-the-import-slot-count-and-let-a",
+  "observed_at": "2026-11-24T18:40:13.085064+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/106-raise-the-import-slot-count-and-let-a/.stage/raise-the-import-slot-count-and-let-a/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/106-raise-the-import-slot-count-and-let-a/.stage/raise-the-import-slot-count-and-let-a/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/106-raise-the-import-slot-count-and-let-a/.stage/raise-the-import-slot-count-and-let-a/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/106-raise-the-import-slot-count-and-let-a/.stage/raise-the-import-slot-count-and-let-a/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/106-raise-the-import-slot-count-and-let-a/.stage/raise-the-import-slot-count-and-let-a/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 557,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Reserve private admission in the expanded import journal registry",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/557",
+    "baseRefName": "main",
+    "baseRefOid": "b0a5552d04ddb69e72b75dcddcc38791f94445e7",
+    "headRefName": "paudley/106-raise-the-import-slot-count-and-let-a",
+    "isCrossRepository": false,
+    "headRefOid": "c37e1559d3a6503d408c83a3db1046da50adddc1",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/610/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 1,
+    "change_token": "d5c82d028d66cdda4d9dbb97052f4c802a56ca7cdfaf363290c2a245cb29e0fc"
+  },
+  "local": {
+    "head": "c37e1559d3a6503d408c83a3db1046da50adddc1",
+    "branch": "paudley/106-raise-the-import-slot-count-and-let-a",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 557,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #557 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}

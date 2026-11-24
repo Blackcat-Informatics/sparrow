@@ -1,0 +1,16 @@
+{
+  "forgejo:comment:27378": {
+    "resolution": "acknowledged",
+    "reason": "Records the passing required gate and focused acceptance. The comment requests no changes.",
+    "commit": "c37e1559d3a6503d408c83a3db1046da50adddc1",
+    "reply_url": null,
+    "revision": {
+      "updated_at": "2026-11-24T18:39:52Z",
+      "state": null,
+      "commit": null,
+      "path": null,
+      "line": null,
+      "body_sha256": "6033e9fc6e37b082bc7b8ff5b2df20dd4cf7ec900309de1bdac2509648f376ff"
+    }
+  }
+}
