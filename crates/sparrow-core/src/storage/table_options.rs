@@ -75,6 +75,8 @@ pub(super) fn database(max_open_files: i32, create: bool) -> Result<Options, Err
     options.set_max_open_files(max_open_files);
     options.create_if_missing(create);
     options.create_missing_column_families(create);
+    // A concurrent creator must go through the existing-store validation path.
+    options.set_error_if_exists(create);
     options.set_max_background_jobs(BACKGROUND_JOBS);
     options.set_max_subcompactions(SUBCOMPACTIONS);
     options.set_max_total_wal_size(MAX_TOTAL_WAL_BYTES);
