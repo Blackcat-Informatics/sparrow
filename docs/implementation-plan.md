@@ -93,13 +93,11 @@ For performance qualification, make bounded immutable local copies outside sourc
 record their digests and observation bounds, and measure whole-store costs.
 Reading a live file does not establish a stable corpus fingerprint.
 
-Native journal decoding is not yet designed. Preserve opaque journal bytes if
-imported, but report text coverage as not applicable until a qualified native
-adapter or explicitly identified journal export is available. Likewise, qualify
-compressed-input decoding separately from preserving its original compressed
-bytes. Do not present either representation as searched plain text without that
-adapter. Unknown `.bin` files remain opaque; the six JSON samples do not classify
-all files with that extension.
+[Journal export imports](interfaces.md#systemd-journal-export-import) produce
+searchable JSON Lines records that preserve journal field names and values.
+Export native systemd journal files with `journalctl --output=export` before
+importing them. Qualify compressed-input decoding separately from preserving
+the original compressed bytes. Unknown `.bin` files remain opaque.
 
 ## Query contracts to implement first
 
