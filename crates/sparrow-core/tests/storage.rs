@@ -8,6 +8,9 @@ use sparrow_core::{
 };
 use sparrow_test_support::{catalog_db, remove_artifact_rdf_upgrade, remove_tail_range_index};
 
+#[path = "storage/reverse_migration.rs"]
+mod reverse_migration;
+
 const DAY: u64 = 86_400_000;
 const HOUR: u64 = 60 * 60 * 1000;
 /// A syntactically valid future identity outside all allocated writer families.

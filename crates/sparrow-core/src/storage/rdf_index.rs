@@ -272,8 +272,17 @@ pub(super) fn reverse_family(db: &DB) -> Result<&ColumnFamily, Error> {
 
 /// Move reverse keys that predate their family. Each page moves atomically, so
 /// an interrupted open resumes with exactly the keys that remain.
-pub(super) fn upgrade_reverse(db: &DB) -> Result<(), Error> {
+pub(super) fn upgrade_reverse(db: &DB, disk_budget: u64, reserve: u64) -> Result<(), Error> {
     let family = reverse_family(db)?;
+    let admit = |batch: &WriteBatch| {
+        super::catalog_upgrade::admit_data_page(
+            db,
+            disk_budget,
+            reserve,
+            batch,
+            "reverse-family migration needs more data-write allowance. Increase the disk budget or free space before resuming.",
+        )
+    };
     let mut batch = WriteBatch::default();
     for row in db.prefix_iterator(REVERSE_PREFIX) {
         let (key, value) = row?;
@@ -289,11 +298,11 @@ pub(super) fn upgrade_reverse(db: &DB) -> Result<(), Error> {
         batch.put_cf(family, &key, &value);
         batch.delete(&key);
         if batch.len() >= REVERSE_PAGE * 2 {
-            super::catalog_upgrade::commit(db, std::mem::take(&mut batch))?;
+            super::catalog_upgrade::commit_page(db, std::mem::take(&mut batch), Some(&admit))?;
         }
     }
     if !batch.is_empty() {
-        super::catalog_upgrade::commit(db, batch)?;
+        super::catalog_upgrade::commit_page(db, batch, Some(&admit))?;
     }
     Ok(())
 }

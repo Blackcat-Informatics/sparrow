@@ -155,10 +155,35 @@ pub(super) fn step<P: Publication>(
     admit: PageAdmission<'_>,
 ) -> Result<(), Error> {
     let (batch, _) = page(db, job, progress, maximum)?;
+    commit_page(db, batch, admit)
+}
+
+/// Check a migration page's admission before committing its atomic batch.
+pub(super) fn commit_page(
+    db: &DB,
+    batch: WriteBatch,
+    admit: PageAdmission<'_>,
+) -> Result<(), Error> {
     if let Some(admit) = admit {
         admit(&batch)?;
     }
     commit(db, batch)
+}
+
+/// Charge a migration data page against the ordinary write allowance.
+pub(super) fn admit_data_page(
+    db: &DB,
+    disk_budget: u64,
+    reserve: u64,
+    batch: &WriteBatch,
+    pressure_message: &str,
+) -> Result<(), Error> {
+    let estimate = super::pressure::data_batch_estimate(batch);
+    let ceiling = super::pressure::data_write_ceiling(disk_budget, reserve, estimate)?;
+    if super::linked_physical_bytes(db)? > ceiling {
+        return Err(Error::new("STORAGE_PRESSURE", pressure_message));
+    }
+    Ok(())
 }
 
 /// Read a job's committed checkpoint.

@@ -645,9 +645,11 @@ live in their own `rdf_reverse` column family with a whole-key Bloom filter:
 they are the dictionary's only point reads that usually miss, and a filter over
 the much larger scanned index keys would cost far more memory. Opening an
 existing store validates its writer format, identity, interpretation profiles and
-archive compatibility before creating any missing column families. Startup upgrades then move legacy
-reverse lookups from the default family one atomic page at a time. Older
-writers cannot open a store with the reverse family. Preserve blank-node
+archive compatibility before creating any missing column families. Startup
+upgrades move legacy reverse lookups from the default family in atomic pages.
+Each page checks the data-write allowance before committing. A refused page's
+rows stay in the default family for a later retry. Older writers cannot open a
+store with the reverse family. Preserve blank-node
 scope, language and base direction, nested triple terms, graph declarations,
 reifiers, and annotations. Keep each native RDF stream distinguishable and
 advertise only capabilities the backend actually preserves.
