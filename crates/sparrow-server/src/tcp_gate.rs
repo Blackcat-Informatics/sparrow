@@ -75,6 +75,7 @@ impl crate::ingest_gate::Policy for AnonymousTcp {
         Ok(gate
             .rpc()
             .clone()
+            .with_producer(crate::source_binding::Caller::Chap {})
             .with_admin(format!("tcp-chap peer={}", self.peer)))
     }
 }

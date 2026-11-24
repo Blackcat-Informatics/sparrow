@@ -100,6 +100,8 @@ pub struct Rpc {
     watches: crate::watches::WatchRegistry,
     watch_controller: Option<crate::WatchController>,
     query_only: bool,
+    source_bindings: crate::SourceBindings,
+    producer: Option<crate::source_binding::Caller>,
     /// Present only on an ingest-socket connection: the caller its evidence records.
     intake: Option<sparrow_core::Intake>,
     /// The configured ingest socket's counters, reported by `status`.
@@ -196,6 +198,10 @@ impl Rpc {
                 return Ok(());
             }
         };
+        if let Err(error) = self.source_bindings.admit(&input.source, self.producer) {
+            failure(out, error);
+            return Ok(());
+        }
         // Batch validation bounds normalization by MAX_EVENT_BATCH_EVENTS and
         // MAX_EVENT_BATCH_BYTES, well inside the store's inline ingest bound.
         let bytes = match input.source_bytes().map_err(invalid) {
@@ -262,6 +268,8 @@ impl Rpc {
             watches: crate::watches::WatchRegistry::default(),
             watch_controller: None,
             query_only: false,
+            source_bindings: crate::SourceBindings::default(),
+            producer: None,
             intake: None,
             ingest_socket: None,
             admin: None,
@@ -357,6 +365,18 @@ impl Rpc {
         self
     }
 
+    /// Attach the validated producer source bindings from the daemon configuration.
+    #[must_use]
+    pub fn with_source_bindings(mut self, bindings: crate::SourceBindings) -> Self {
+        self.source_bindings = bindings;
+        self
+    }
+
+    pub(crate) fn with_producer(mut self, caller: crate::source_binding::Caller) -> Self {
+        self.producer = Some(caller);
+        self
+    }
+
     /// Identify this connection's administrator, recorded by admin operations that name
     /// their caller.
     pub(crate) fn with_admin(mut self, caller: String) -> Self {
@@ -366,6 +386,9 @@ impl Rpc {
 
     /// Record this ingest-socket caller on every artifact, record and import it creates.
     pub(crate) fn with_peer(mut self, credential: sparrow_core::PeerCredential) -> Self {
+        self.producer = Some(crate::source_binding::Caller::IngestSocket {
+            uid: credential.uid,
+        });
         self.intake = Some(sparrow_core::Intake::IngestSocket(credential));
         self
     }
@@ -374,12 +397,16 @@ impl Rpc {
     async fn import_work<T: Send + 'static>(
         &self,
         id: String,
-        operation: impl FnOnce(&Store, &str, u64) -> Result<T, Error> + Send + 'static,
-    ) -> Result<T, Error> {
-        let caller = self.intake;
+        operation: impl FnOnce(sparrow_core::ImportOperation<'_>) -> Result<T, Error> + Send + 'static,
+    ) -> Result<(T, String), Error> {
+        let intake = self.intake;
+        let producer = self.producer;
+        let bindings = self.source_bindings.clone();
         self.work(move |store, now| {
-            store.import_admit(&id, caller.as_ref(), now)?;
-            operation(&store, &id, now)
+            let admitted = store.authorize_import(&id, intake.as_ref(), now, |source| {
+                bindings.admit(source, producer)
+            })?;
+            Ok((operation(admitted)?, store.store_id()?))
         })
         .await
     }
@@ -2286,6 +2313,10 @@ impl wire::sparrow::Server for Rpc {
         }
         let request = request.to_owned();
         let source = source.to_owned();
+        if let Err(error) = self.source_bindings.admit(&source, self.producer) {
+            failure(results.get().init_result(), error);
+            return Ok(());
+        }
         let payload = payload.to_owned();
         let kind = format(input.get_format()?);
         let length = input.get_byte_length();
@@ -2351,12 +2382,7 @@ impl wire::sparrow::Server for Rpc {
         let bytes = bytes.to_vec();
         let offset = input.get_offset();
         match self
-            .import_work(id, move |store, id, now| {
-                Ok((
-                    store.import_append(id, offset, &bytes, now)?,
-                    store.store_id()?,
-                ))
-            })
+            .import_work(id, move |admitted| admitted.append(offset, &bytes))
             .await
         {
             Ok((value, store)) => {
@@ -2642,12 +2668,7 @@ impl wire::sparrow::Server for Rpc {
                 return Ok(());
             }
         };
-        match self
-            .import_work(id, |store, id, now| {
-                Ok((store.import_get(id, now)?, store.store_id()?))
-            })
-            .await
-        {
+        match self.import_work(id, |admitted| admitted.get()).await {
             Ok((value, store)) => {
                 import_progress(results.get().init_result().init_ok(), value, &store)?
             }
@@ -2668,12 +2689,7 @@ impl wire::sparrow::Server for Rpc {
                 return Ok(());
             }
         };
-        match self
-            .import_work(id, |store, id, now| {
-                Ok((store.import_seal(id, now)?, store.store_id()?))
-            })
-            .await
-        {
+        match self.import_work(id, |admitted| admitted.seal()).await {
             Ok((value, store)) => {
                 import_progress(results.get().init_result().init_ok(), value, &store)?
             }
@@ -2695,9 +2711,7 @@ impl wire::sparrow::Server for Rpc {
             }
         };
         match self
-            .import_work(id, |store, id, now| {
-                Ok((store.import_prepare_layout(id, now)?, store.store_id()?))
-            })
+            .import_work(id, |admitted| admitted.prepare_layout())
             .await
         {
             Ok((value, store)) => {
@@ -2723,12 +2737,7 @@ impl wire::sparrow::Server for Rpc {
         };
         let expected = input.get_expected_record();
         match self
-            .import_work(id, move |store, id, now| {
-                Ok((
-                    store.import_prepare_record(id, expected, now)?,
-                    store.store_id()?,
-                ))
-            })
+            .import_work(id, move |admitted| admitted.prepare_record(expected))
             .await
         {
             Ok((value, store)) => {
@@ -2751,12 +2760,7 @@ impl wire::sparrow::Server for Rpc {
                 return Ok(());
             }
         };
-        match self
-            .import_work(id, |store, id, now| {
-                Ok((store.import_publish(id, now)?, store.store_id()?))
-            })
-            .await
-        {
+        match self.import_work(id, |admitted| admitted.publish()).await {
             Ok((value, store)) => artifact(results.get().init_result().init_ok(), value, &store)?,
             Err(e) => failure(results.get().init_result(), e),
         }
@@ -2776,13 +2780,10 @@ impl wire::sparrow::Server for Rpc {
             }
         };
         match self
-            .work(move |store, now| {
-                store.import_cancel(&id, now)?;
-                Ok((id, store.store_id()?))
-            })
+            .import_work(id.clone(), |admitted| admitted.cancel())
             .await
         {
-            Ok((id, store)) => {
+            Ok(((), store)) => {
                 let mut out = results.get().init_result().init_ok().init_import();
                 out.set_store_id(store);
                 out.set_id(id);
@@ -3488,9 +3489,14 @@ impl wire::sparrow::Server for Rpc {
             );
             return Ok(());
         }
+        let source = request.get_source()?.to_str()?;
+        if let Err(error) = self.source_bindings.admit(source, self.producer) {
+            failure(results.get().init_result(), error);
+            return Ok(());
+        }
         let bytes = bytes.to_vec();
         let request_id = request.get_request_id()?.to_str()?.to_owned();
-        let source = request.get_source()?.to_str()?.to_owned();
+        let source = source.to_owned();
         let format = format(request.get_format()?);
         let mode = durability_mode(request.get_durability()?);
         let intake = self.intake;

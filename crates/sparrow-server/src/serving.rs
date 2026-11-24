@@ -255,8 +255,8 @@ pub async fn serve<T>(
                         let Some(slot) = rpc_slot.take() else { continue };
                         rpc.floor_pause().connection_accepted();
                         // A connection whose peer the kernel cannot name is dropped unanswered.
-                        match crate::local_caller(&stream) {
-                            Ok(caller) => crate::admit_connection(stream, rpc.clone(), slot, Access::Local(caller)),
+                        match stream.peer_cred() {
+                            Ok(credential) => crate::admit_connection(stream, rpc.clone(), slot, Access::Local(credential)),
                             Err(error) => eprintln!("sparrowd: private socket peer unreadable: {error}"),
                         }
                     }

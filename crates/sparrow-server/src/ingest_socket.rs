@@ -59,7 +59,7 @@ impl IngestSocket {
     /// A stream whose credentials cannot be read is dropped unanswered and counted. Run within
     /// a Tokio `LocalSet`.
     pub fn admit(&self, stream: tokio::net::UnixStream, rpc: crate::Rpc, slot: Slot) -> bool {
-        let credential = match peer_credential(&stream) {
+        let credential = match stream.peer_cred().and_then(evidence_peer) {
             Ok(credential) => credential,
             Err(error) => {
                 self.inner.refused.fetch_add(1, Ordering::Relaxed);
@@ -87,8 +87,7 @@ impl IngestSocket {
 }
 
 /// The caller's uid, gid and pid; a connection without all three is never admitted.
-fn peer_credential(stream: &tokio::net::UnixStream) -> io::Result<sparrow_core::PeerCredential> {
-    let credential = stream.peer_cred()?;
+fn evidence_peer(credential: tokio::net::unix::UCred) -> io::Result<sparrow_core::PeerCredential> {
     let pid = credential
         .pid()
         .and_then(|pid| u32::try_from(pid).ok())
