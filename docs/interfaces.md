@@ -574,12 +574,13 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
   bound. A syslog TCP frame refused for the floor is held unread past (#243) whether
   or not its connection was accepted before or during the pause. Syslog UDP is held by
   its own hold (below): datagrams queue in the daemon up to `hold_bytes`, then in the
-  kernel buffer. Three things stay paused, because they are the writes
-  themselves: configured consume and tail watches (their source files are the spool;
-  they observe and claim nothing), the daemon's maintenance that writes more than it
-  frees (import reclamation and online migration; ageing out, the lease purge and the
-  pressure pass run, under the maintenance reserve). A daemon that starts below the floor opens its store and serves
-  reads. Only free space below the maintenance reserve (capped at `min_free_bytes`) plus every byte of write-ahead log an
+  kernel buffer. Consume watches keep discovering candidates while claims and
+  publication wait. Tail watches keep tracking file events while capture and
+  checkpoint writes wait.
+  Import reclamation and online migration wait. Ageing out, the lease purge and
+  the pressure pass run under the maintenance reserve. A daemon that starts
+  below the floor opens its store and serves reads. Only free space below the
+  maintenance reserve (capped at `min_free_bytes`) plus every byte of write-ahead log an
   unclean stop left in `data_dir`, which an open writes its manifest, new WAL and replayed level-0 files into,
   keeps it waiting (`sparrowd: waiting to open the store`, nothing can answer then); the replay part is never capped.
   The running process waits for an open that fails for lack of space, an open
@@ -599,12 +600,11 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
   two minutes over six steps. The journal records failures and scheduled restarts.
   A wait is also reported as the unit's
   `StatusText` (`sd_notify` `STATUS=`), which reads `serving` once the daemon serves.
-  A write of the watch catalog that
-  pressure refuses (the first store of the configured catalog, and the retirement of a disabled watch) is retried on each worker pass. A paused
-  watch worker owns no timer: it observes the floor through the floor's ledger and
-  blocks on the floor's resume edge, which any number of duties subscribe to. The edge
-  is fired by whichever observation sees free space return, including the daemon's
-  one-second floor observation for space freed outside the daemon.
+  A watch catalog write refused under pressure is retried on each worker pass.
+  Watches wait for the floor's resume edge to resume writes. File detection and
+  periodic reconciliation continue. The next observation of restored free space
+  signals that edge, including the daemon's one-second floor check for space
+  freed outside the daemon.
 - Writes. A write is answered with `STORAGE_PRESSURE`, `retryable` true and, new,
   `Failure.class = freeSpaceFloor`. The field is added after `retryable` (no schema
   version change). An older client ignores it and handles the refusal as the retryable
