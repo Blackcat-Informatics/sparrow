@@ -292,6 +292,11 @@ directory, and the daemon sets mode 0660; a mismatch also stops startup. The
 daemon's own account does not need to be in the group: it owns the directory,
 and the setgid bit, not its membership, gives the socket the group.
 
+The shipped system unit grants write access to `/run/sparrow-ingest` when
+the tmpfiles entry creates it. The AppArmor profile allows only
+`/run/sparrow-ingest/ingest.sock` in that directory. Configure a corresponding
+unit drop-in and profile rule if using another socket path.
+
 `max_ingest_connections` is a ceiling separate from `max_rpc_connections`, so
 producers cannot use up the connections the CLI and MCP need. Over it, a
 producer connection waits in the kernel backlog until a slot frees and is not
