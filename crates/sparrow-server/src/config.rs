@@ -16,8 +16,8 @@ pub(crate) const MAX_CONSUME_ROOTS: usize = 8;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    /// Optional public Cap'n Proto TCP binding. Anonymous peers may only discover, ingest,
-    /// flush and import; other operations require a CHAP-authenticated session.
+    /// Optional public Cap'n Proto TCP binding. Anonymous peers use the shared producer
+    /// gate. Reads and administration require a CHAP-authenticated session.
     #[serde(default)]
     pub rpc_tcp_address: Option<std::net::SocketAddr>,
     /// Private shared-secret file, required exactly when `rpc_tcp_address` is set.

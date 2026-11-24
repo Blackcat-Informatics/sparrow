@@ -9,8 +9,8 @@
 socket_path = "/var/lib/sparrow/store/rpc.sock"
 data_dir = "/var/lib/sparrow/store"
 
-# The public Cap'n Proto listener. Anonymous peers may discover, ingest and import;
-# everything else needs a CHAP session with this secret.
+# The public Cap'n Proto listener admits the producer operations in docs/interfaces.md
+# under "Producer contract". Reads and administration require CHAP with this secret.
 rpc_tcp_address = "0.0.0.0:518"
 rpc_tcp_secret_file = "/run/credentials/sparrow.service/tcp.secret"
 
