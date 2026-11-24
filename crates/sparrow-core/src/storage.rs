@@ -1859,6 +1859,8 @@ impl Store {
         };
         let archive = archive::prepare_open(&db, config.archive.as_ref())?;
         timer.lap("identity");
+        rdf_index::validate_record_manifests(&db)?;
+        timer.lap("record_manifests");
         // The same open handle owns the store throughout validation and upgrades.
         for name in FAMILIES {
             if db.cf_handle(name).is_none() {
