@@ -448,6 +448,12 @@ undeleted until then. The count is per pass, and the worker journals it. A
 dangling time-index key or malformed record RDF manifest refuses retirement
 with `STORAGE_FAILURE`. Record RDF retirement checks the manifest's graph owner
 and declared terms before deleting index entries or changing term references.
+
+Store open and reopen check every record RDF manifest before catalog upgrades.
+An invalid graph owner slot or a row referencing a term missing from the
+manifest refuses open with `STORAGE_FAILURE`. The scan reads the manifests
+without decoding dictionary terms.
+
 Import journal reclamation runs on its own one-second tick, because a published
 journal holds one of the 16 import slots until it is reclaimed. Pressure keeps
 its one-second tick, and buffered synchronization keeps its configured interval.
