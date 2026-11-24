@@ -344,6 +344,8 @@ probe timeout, other error or changed identity refuses startup and preserves the
 name. Recovery coordinates with other Sparrow owners through the store lock;
 the private directory remains its pathname ownership boundary. Shutdown removes
 only the original bound socket identity and reports a replacement as a failure.
+If validation rejects a newly bound socket, the diagnostic keeps that error
+and reports any failure to remove the rejected name.
 Socket-bind refusal joins the already-started consume worker before returning.
 The public TCP bind still happens before opening or migrating the store.
 
