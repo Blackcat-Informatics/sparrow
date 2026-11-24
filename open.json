@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 55,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/55-let-the-system-unit-and-apparmor",
+  "branch": "paudley/55-let-the-system-unit-and-apparmor",
+  "slug": "let-the-system-unit-and-apparmor",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/55-let-the-system-unit-and-apparmor/.stage/let-the-system-unit-and-apparmor",
+  "stage_tracked": true,
+  "base": "refs/remotes/origin/main",
+  "base_oid": "78d9adcc32c9b4a1ab9dad665cd9b144ab5a8244",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/55-let-the-system-unit-and-apparmor",
+    "branch:paudley/55-let-the-system-unit-and-apparmor",
+    "ignored:168 files (168 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow/.worktrees/64-report-a-chap-nonce-randomness-failure caches into /home/paudley/Active/sparrow/.worktrees/55-let-the-system-unit-and-apparmor plus 0 dependency units from 0 other checkouts in 2.8s; 335 unchanged files keep their built mtimes; 2 other files take the seed time and rebuild; 4 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/55-let-the-system-unit-and-apparmor/.stage/let-the-system-unit-and-apparmor",
+    "issue:/home/paudley/Active/sparrow/.worktrees/55-let-the-system-unit-and-apparmor/.stage/let-the-system-unit-and-apparmor/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-24T08:05:07-0600",
+  "seed_error": ""
+}

@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/55-let-the-system-unit-and-apparmor",
+  "branch": "paudley/55-let-the-system-unit-and-apparmor",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "78d9adcc32c9b4a1ab9dad665cd9b144ab5a8244",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/55-let-the-system-unit-and-apparmor/.stage/let-the-system-unit-and-apparmor/sync/20261124T141510-8dd5b08edca8468a84d5698292caca1c",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "a5583506eeb0e7514dc42383f971be301286a6d1",
+  "merge_bases": [
+    "78d9adcc32c9b4a1ab9dad665cd9b144ab5a8244"
+  ],
+  "commit": "a5583506eeb0e7514dc42383f971be301286a6d1"
+}
