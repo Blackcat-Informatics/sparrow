@@ -1,0 +1,19 @@
+ghprsq source head backlink metadata
+
+parent_hashes: ecb90786d3201838b507828f1f2f6cda0724f9a7
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 533
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/533
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: a3fa2f98cca1da9ed33826e65abf9a1e2e852dea
+GhpRsq-Head-Ref: paudley/53-report-the-event-time-basis-on-records
+GhpRsq-Head-OID: ecb90786d3201838b507828f1f2f6cda0724f9a7
+GhpRsq-Result-Tree: 1fbb5e21746c4a4ac1d24822a96d6f3d62251e81
+GhpRsq-Result-Commit: cebebf63bbc554d9c8639eacd6f775c95bb5db45
+GhpRsq-Parent-Hashes: ecb90786d3201838b507828f1f2f6cda0724f9a7
+GhpRsq-Squash-Notes-SHA256: 4f50e203d95d2e2731a696fea18b95783fb491abd9ad84e37cac220e370f0245
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
