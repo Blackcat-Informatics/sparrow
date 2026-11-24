@@ -3403,9 +3403,11 @@ takes `read_gap`, and a changed root inode still refuses the start. The known
 weakness is inode reuse after a delete and create: a new file given the old inode
 and larger than the old offset is read on from the checkpoint; the device number
 never detected that either, and closing it needs a content digest in the stored
-checkpoint, which is a stored-format change. After a
-complete reconciliation, unavailable active identities receive durable read gaps;
-no missing prefix is invented. Status exposes finite `tail_generation_ids`,
+checkpoint, which is a stored-format change. After a complete reconciliation,
+unavailable active identities receive durable read gaps. A reconciliation ready
+to record gaps during a free-space pause stays incomplete and resumes on the
+floor's wake event. The gap preserves the last accepted checkpoint. Status
+exposes finite `tail_generation_ids`,
 `tail_read_bytes`, `tail_descriptors`, `tail_admission_waiting` and
 `tail_checkpoint_records`; the latter
 counts accepted occurrences across currently known checkpoints rather than live
