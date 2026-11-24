@@ -1,0 +1,19 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 5d7ff03039a248995a0b594fd44dcd03ab2f203d
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 542
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/542
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 25c461d92f18bf37b64d00a16fc6639e353c903b
+GhpRsq-Head-Ref: paudley/90-draw-the-social-preview-card-as-an
+GhpRsq-Head-OID: 5d7ff03039a248995a0b594fd44dcd03ab2f203d
+GhpRsq-Result-Tree: 26a11347b3e5467c1fc770100717baae901bdd88
+GhpRsq-Result-Commit: 2e66709d724fe4dc2c1f8989260b4c3a26d38291
+GhpRsq-Parent-Hashes: 5d7ff03039a248995a0b594fd44dcd03ab2f203d
+GhpRsq-Squash-Notes-SHA256: 288c34dd6f75c6d7ae18bb4d41e099aa49bb03306828e3b47222ef6d6e5bd03d
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
