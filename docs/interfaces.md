@@ -1963,7 +1963,7 @@ they do not specify their generated wire grammar.
 | Completed-file quiet interval | 30 seconds, configurable per watch; observed reopen/write activity postpones consumption. |
 | Pin duration | Required on every create/add/renew operation; no permanent or implicit pin. |
 | Disk capacity | An explicit deployment budget and maintenance reserve are required. |
-| RPC binding | Private Unix-domain socket for the daemon's group: store directory mode 0710, socket mode 0660, so a group member can connect but not list or read the store (2026-11-01); public Cap'n Proto TCP at `0.0.0.0:518`, explicitly authorized on 2026-10-08. Anonymous TCP peers may only discover, ingest and import; every other operation requires a shared-secret CHAP session (2026-10-27). An optional group-accessible ingest-only Unix socket (`ingest_socket_path`, schema 68, issue #10) admits members of `ingest_socket_gid` to the same producer operations and records each caller's `SO_PEERCRED` uid, gid and pid in provenance. |
+| RPC binding | The private Unix socket uses a store directory with mode 0710 and a socket with mode 0660, so daemon group members can connect without direct access to the store. The deployment template enables public Cap'n Proto TCP at `0.0.0.0:518`. Anonymous TCP peers use the [producer operations](#producer-contract-sparrow-producer1). TCP reads and administration require a CHAP session. The optional `ingest_socket_path` admits members of `ingest_socket_gid` to the same producer operations and records their `SO_PEERCRED` uid, gid and pid. |
 | Pagination | Default 200 items, maximum 1,000, additionally limited by serialized response bytes. |
 | Structured response budget | Default 256 KiB, configurable under a server maximum. |
 | Byte-read chunk | Default 64 KiB; maximum 1 MiB per call. |
@@ -3416,10 +3416,10 @@ requires `rpc_tcp_secret_file`, and either setting without the other refuses
 startup. Both listeners share connection and operation ceilings and the
 60-second connection lease.
 
-A TCP connection bootstraps an anonymous `Sparrow` capability. Anonymous peers
-may call `discover`, `ingest`, `eventsIngest`, `flush` and the import operations
-(`importBegin` through `importCancel`). Every other operation, including
-`status`, returns a typed `UNAUTHENTICATED` failure. An operation added to the
+A TCP connection bootstraps an anonymous `Sparrow` capability with the
+[producer operations](#producer-contract-sparrow-producer1) and the CHAP
+exchange. Read and administrative operations, including `status`, return a
+typed `UNAUTHENTICATED` failure until authentication. An operation added to the
 schema without an explicit admission decision returns Cap'n Proto `unimplemented`.
 The Unix socket serves the complete capability unchanged.
 
@@ -4659,10 +4659,11 @@ traversal. MCP marks this operation as an idempotent mutation that destroys the
 ephemeral replay result. It does not delete stored evidence. The schema changes
 to 42; storage format and helper-census/runtime dependency revisions are unchanged.
 
-The implemented client takes an optional `--secret-file PATH` and then an endpoint:
-a Unix socket path or `tcp://IP:PORT`. Without the secret, a TCP endpoint admits
-only discovery, ingestion, flush and imports. Numeric IPv4 and bracketed IPv6 addresses use the SDK's
-native endpoint parser. CLI operations and every stdio MCP tool call use the same
+The client takes an optional `--secret-file PATH` and then an endpoint, either a
+Unix socket path or `tcp://IP:PORT`. TCP clients can use the
+[producer operations](#producer-contract-sparrow-producer1) without a secret.
+Numeric IPv4 and bracketed IPv6 addresses use the SDK's native endpoint parser.
+CLI operations and every stdio MCP tool call use the same
 SDK client constructor and discovery certification over either transport. No
 HTTP envelope or alternate query implementation is involved.
 
@@ -4777,17 +4778,15 @@ any record is prepared.
 `cargo add sparrow-client@0.2.0`. The [SDK guide](../crates/sparrow-client/README.md)
 covers console output, local spooling and bulk imports. The package
 includes the Cap'n Proto schemas and builds with the host `capnp` compiler and
-Rust 1.98 on Linux, independently of Sparrow storage. The ingest socket carries
-`discover`, `ingest`, `import` (begin, append, seal,
-layout, prepare, publish, get and cancel), `eventsIngest` and `flush`
-(`crates/sparrow-server/src/ingest_gate.rs`). A producer that writes its own client speaks
+Rust 1.98 on Linux, independently of Sparrow storage. The ingest socket admits the
+[producer operations](#producer-contract-sparrow-producer1). A producer that writes its own client speaks
 the same schema and owns every rule the crate holds: resuming from the durable checkpoint,
 canceling on terminal failure and checking receipts.
 
 The binaries are `sparrowd` for the daemon and `sparrow` for its client.
 Every client invocation takes an optional `--secret-file PATH` and then an
-endpoint: a Unix socket path or `tcp://IP:PORT`. Operations other than discovery,
-ingestion, flush and imports need the secret over TCP. Commands emit JSON envelopes through the same owners as MCP.
+endpoint, either a Unix socket path or `tcp://IP:PORT`. TCP reads and
+administration require the secret. Commands emit JSON envelopes through the same owners as MCP.
 Byte reads save the exact range to an exclusively created output file and return
 its JSON receipt. Errors and diagnostics go to stderr.
 

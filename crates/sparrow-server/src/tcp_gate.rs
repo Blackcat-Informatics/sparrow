@@ -3,8 +3,8 @@
 
 //! Anonymous public TCP admission and its shared-secret CHAP upgrade.
 //!
-//! An anonymous peer may discover the store, ingest and import: the shared producer list in
-//! `ingest_gate`. Every other listed operation returns a typed `UNAUTHENTICATED` failure.
+//! Anonymous peers have the producer operations defined in `ingest_gate`. Read and
+//! administrative operations return a typed `UNAUTHENTICATED` failure.
 //! A successful CHAP exchange returns the connection's complete typed service. Every
 //! forward, and the session, passes through the one write gate in `query_only`.
 
@@ -44,9 +44,7 @@ impl AnonymousTcp {
 
 impl crate::ingest_gate::Policy for AnonymousTcp {
     fn refusal(&self) -> Error {
-        unauthenticated(
-            "public TCP peers may only discover, ingest and import before a CHAP-authenticated session",
-        )
+        unauthenticated("this operation requires a CHAP-authenticated TCP session")
     }
 
     fn challenge(&self, _: &WriteGate) -> Result<[u8; CHAP_BYTES], Error> {

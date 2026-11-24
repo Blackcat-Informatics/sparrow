@@ -111,8 +111,8 @@ btrfs device), filling them fills the store's device
 - Custody: the secret is generated on the host, never committed, never kept in
   this directory, and never passed on a command line. Rotating it means
   replacing the file, restarting the service and replacing every remote copy.
-  Anonymous peers may only discover, ingest and import; every other TCP
-  operation needs the secret.
+  Anonymous peers can use the [producer operations](../docs/interfaces.md#producer-contract-sparrow-producer1).
+  TCP reads and administrative operations require a CHAP session.
 
 No other credential exists. The Unix socket admits members of the `sparrow`
 group without a secret.
