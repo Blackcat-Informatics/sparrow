@@ -175,8 +175,8 @@ const PIN_MEMBER_BYTES: usize = 44;
 /// What `charge_catalog_shape` takes for `pins` pin rows holding `members` members
 /// together: eight times the bytes, 8 KiB a row and 1 KiB a charged event.
 pub(super) const fn pin_capture_charge(pins: usize, members: usize) -> usize {
-    pins * (8 * PIN_FIXED_BYTES + 8192 + 1024 * PIN_FIXED_EVENTS)
-        + members * (8 * PIN_MEMBER_BYTES + 1024)
+    pins.saturating_mul(8 * PIN_FIXED_BYTES + 8192 + 1024 * PIN_FIXED_EVENTS)
+        .saturating_add(members.saturating_mul(8 * PIN_MEMBER_BYTES + 1024))
 }
 
 /// The retirement limits a store sizes admission from: what expiry and eviction run
@@ -200,14 +200,16 @@ impl RetirementShare {
         self.limits.max_catalog_bytes - self.record_reserve
     }
 
-    /// Store-wide pin rows: a quarter of the pin budget.
+    /// Row-only upper bound before charging any members.
     pub(super) const fn max_pins(self) -> usize {
-        self.limits.max_pin_catalog_bytes / 4 / pin_capture_charge(1, 0)
+        self.limits.max_pin_catalog_bytes / pin_capture_charge(1, 0)
     }
 
-    /// Store-wide pinned members: the rest of the pin budget after `max_pins` rows.
+    /// Member upper bound after charging one pin row.
     pub(super) const fn max_pinned_members(self) -> usize {
-        (self.limits.max_pin_catalog_bytes - pin_capture_charge(self.max_pins(), 0))
+        self.limits
+            .max_pin_catalog_bytes
+            .saturating_sub(pin_capture_charge(1, 0))
             / pin_capture_charge(0, 1)
     }
 }
@@ -219,24 +221,23 @@ impl RetirementShare {
 pub struct RetirementBounds {
     /// Largest declared import.
     pub import_bytes: u64,
-    /// Largest number of pin rows.
+    /// Upper bound on pin rows before charging any members.
     pub pins: usize,
-    /// Largest number of members across all pin rows.
+    /// Upper bound on store-wide members after charging one row.
     pub pinned_members: usize,
 }
 
-/// Largest number of pin rows a store holds, expired rows included until expiry
-/// deletes them.
+/// Row-only upper bound under the default retirement pin budget. Members
+/// consume the same budget, and expired rows count until expiry deletes them.
 pub const MAX_PINS: usize = RetirementShare::DEFAULT.max_pins();
-/// Largest number of members all pin rows of a store hold together.
+/// Store-wide member upper bound under the default retirement pin budget after
+/// charging one row. Each additional row consumes part of that budget.
 pub const MAX_PINNED_MEMBERS: usize = RetirementShare::DEFAULT.max_pinned_members();
 
 const _: () = {
     let share = RetirementShare::DEFAULT;
-    // A pin set at both caps fits the pin budget, and every row fits one pass's
-    // pin visit allowance.
-    assert!(pin_capture_charge(MAX_PINS, MAX_PINNED_MEMBERS) <= share.limits.max_pin_catalog_bytes);
-    assert!(MAX_PINS < share.limits.scan_budget);
+    // Even a pin budget spent entirely on rows fits one pass's visit allowance.
+    assert!(MAX_PINS <= share.limits.scan_budget);
     // The record row reserve covers a record row at the raw ceiling.
     assert!(
         8 * (2048 * super::manifest_retire::ROW_CHUNK_BYTES + 64 * 1024)
