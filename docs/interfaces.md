@@ -1254,14 +1254,18 @@ Limits of the part path:
 
 Every expiry and eviction pass also reads every pin row, expired rows included,
 before any artifact. That capture has its own 64 MiB budget, apart from the
-artifact's share, so pins cannot crowd out an artifact row. To keep the capture
-inside that budget, a store holds at most `MAX_PINS` pin rows (606) and
-`MAX_PINNED_MEMBERS` members across all of them (36594), both derived from the
-budget with a compile-time assertion that a pin set at both caps fits. Creating
-or extending a pin past either cap fails with `RESOURCE_LIMIT`, and the error
-names the caps and the store's current totals. Expired rows count until expiry
-deletes them, which it does in its own batch before any phase that could stop the
-pass. Releasing a pin is never refused.
+artifact's share, so pins cannot crowd out an artifact row. Admission charges
+27,648 bytes per pin row and 1,376 bytes per member against that one budget.
+The production visit limit covers even the row-only bound. Creating or extending
+a pin beyond the admission limits fails with `RESOURCE_LIMIT`, which names the
+budget and the store's current row and member totals. Expired rows count until
+expiry deletes them. Release does not require pin catalog capacity.
+
+`MAX_PINS` is the row-only upper bound of 2,427 in the default budget. A
+catalog of one-member pins fits up to 2,312 rows. `MAX_PINNED_MEMBERS` is the
+upper bound of 48,750 members after charging one row. Every additional row
+uses part of that capacity. The configured per-collection membership limit
+and the paged pin-read governor apply separately.
 
 A larger artifact ingests through the staged import: the CLI `ingest` command,
 completed-file consumption and the SDK `import_file` calls append it in 64 KiB
@@ -1272,7 +1276,7 @@ a recorded projection failure instead of a JSON projection. A record above
 the last holds 112 MiB, and the last holds more than 16 MiB and at most
 128 MiB. Each record's chunk manifest then fits one retirement pass and one
 catalog read. An artifact admitted under `MAX_IMPORT_BYTES` and the layout check
-fits one pass alongside a record row, and pins stay within their caps, so expiry
+fits one pass alongside a record row, and pins stay within their own budget, so expiry
 and eviction retire the pieces and their artifact in bounded passes.
 Stores laid out before this change keep their records; only new layouts split.
 No step holds more than 16 MiB of an artifact's bytes in memory. Sealing,
@@ -1671,7 +1675,7 @@ archive gate holds an expired record, the record still counts. An entry expiry
 retired before this marker existed is marked at expiry's next visit to it, so it
 stops counting at the next expiry pass. This differs from the per-source `retained_records`, which count entries
 until they are deleted. `unique_payload_chunks` and `unique_json_projections` are the two row
-counts. `active_pins` reads the pin rows, which the pin caps bound, and
+counts. `active_pins` reads the pin rows, which the pin catalog charge bounds, and
 `physical_bytes` measures the database directory, except the files RocksDB
 no longer references (obsolete table and blob files and write-ahead logs below
 the oldest one recovery needs), which RocksDB holds until a reader releases them. Flush and compaction

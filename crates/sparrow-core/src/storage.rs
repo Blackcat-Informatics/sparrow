@@ -713,7 +713,7 @@ struct Writer {
     /// Present exactly when the store archives before deleting.
     archive: Option<std::cell::RefCell<archive::ArchiveState>>,
     query_staging: Arc<std::sync::atomic::AtomicU64>,
-    /// Retirement share the import bound and pin caps derive from: production
+    /// Retirement share the import bound and pin charge derive from: production
     /// defaults except where the dev-only test hook scales them for one open store.
     retirement: std::cell::Cell<eviction::RetirementShare>,
     /// Shared with `Unlocked`; counts every over-bound declaration this writer refuses.
@@ -1243,10 +1243,9 @@ impl Writer {
         }
         Ok(bytes)
     }
-    /// Refuse a pin creation or extension that would take the store past its pin
-    /// caps. Every expiry and eviction pass charges all pin rows, expired ones
-    /// included until expiry deletes them, against the pin capture budget, and the
-    /// caps keep that charge inside it. Release never passes through here.
+    /// Keep the proposed pin catalog within one retirement pass's byte and visit
+    /// budgets. Expired rows count until expiry deletes them. Release never
+    /// passes through this admission check.
     fn admit_pins(
         &self,
         pins: usize,
@@ -1254,13 +1253,14 @@ impl Writer {
         current_pins: usize,
         current_members: usize,
     ) -> Result<(), Error> {
-        let share = self.retirement.get();
-        let (max_pins, max_members) = (share.max_pins(), share.max_pinned_members());
-        if pins > max_pins || members > max_members {
+        let limits = self.retirement.get().limits;
+        let charge = eviction::pin_capture_charge(pins, members);
+        if pins > limits.scan_budget || charge > limits.max_pin_catalog_bytes {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
                 format!(
-                    "pins are capped at {max_pins} rows and {max_members} members store-wide, and the store holds {current_pins} rows with {current_members} members, expired rows included until expiry deletes them; release pins or wait for expiry"
+                    "pin catalog admission allows {} charged bytes and {} row visits. The proposal charges {charge} bytes and {pins} rows, and the store holds {current_pins} rows with {current_members} members. Release pins or wait for expiry.",
+                    limits.max_pin_catalog_bytes, limits.scan_budget
                 ),
             ));
         }
@@ -3357,7 +3357,7 @@ impl Store {
     }
 
     /// [`Store::status_report`] and the number of keys it read from its snapshot: a fixed
-    /// number plus one per pin row, which the pin caps bound, whether or not the counters
+    /// number plus one per pin row, bounded by the pin catalog charge, whether or not the counters
     /// are seeded.
     fn status_counted(
         &self,

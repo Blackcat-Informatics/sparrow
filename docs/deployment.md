@@ -148,10 +148,11 @@ upload with a non-retryable `INVALID_ARGUMENT` (advertised as
 expiry or eviction pass can read, and it is below what one atomic publication can
 carry. A single document above
 128 MiB is stored as consecutive raw records, so within the bound expiry and
-eviction retire it in
-bounded passes. That guarantee also needs pins to stay within their store-wide
-caps of 606 pin rows and 36594 pinned members; creating or extending a pin past
-either cap is refused with `RESOURCE_LIMIT`, and releasing a pin always succeeds.
+eviction retire it in bounded passes. Pin rows and their members share a
+separate retirement budget. Creating or extending a pin beyond that budget
+returns `RESOURCE_LIMIT` with the current totals. Releasing a pin frees its
+charge.
+
 A consume watch splits an over-bound file into ordered parts when the daemon
 advertises the required limits. The watch keeps the claim and names the
 refusal in status if those limits are unavailable. The shipper may refuse an
