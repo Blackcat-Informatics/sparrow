@@ -1,0 +1,121 @@
+{
+  "issue": null,
+  "pr_number": 9,
+  "branch": "paudley/3-report-exact-retained-payload-bytes-per",
+  "stage_dir": "/home/paudley/Active/sparrow-github/.worktrees/3-report-exact-retained-payload-bytes-per/.stage/source-bytes-sync-evidence",
+  "observed_at": "2026-11-24T02:40:08.529430+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews",
+    "merge_candidate"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow-github/.worktrees/3-report-exact-retained-payload-bytes-per/.stage/source-bytes-sync-evidence/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow-github/.worktrees/3-report-exact-retained-payload-bytes-per/.stage/source-bytes-sync-evidence/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow-github/.worktrees/3-report-exact-retained-payload-bytes-per/.stage/source-bytes-sync-evidence/status.json",
+    "checks": "/home/paudley/Active/sparrow-github/.worktrees/3-report-exact-retained-payload-bytes-per/.stage/source-bytes-sync-evidence/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow-github/.worktrees/3-report-exact-retained-payload-bytes-per/.stage/source-bytes-sync-evidence/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict.",
+    "Preflight does not sign, fetch, push or mutate forge state. API permission and read access do not prove Git push authorization or protected-branch admission."
+  ],
+  "pr": {
+    "baseRefName": "main",
+    "baseRefOid": "bd9ccc721f4c848a92b895bbb721063b9a9a04c8",
+    "headRefName": "paudley/3-report-exact-retained-payload-bytes-per",
+    "headRefOid": "206d973e28064048958d0b63e8ab54d2c475ecc3",
+    "isDraft": false,
+    "mergeCommit": null,
+    "mergedAt": null,
+    "number": 9,
+    "state": "OPEN",
+    "title": "Report exact retained payload bytes per source",
+    "url": "https://github.com/Blackcat-Informatics/sparrow/pull/9"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "link": "https://github.com/Blackcat-Informatics/sparrow/actions/runs/45310427366/job/138176306995",
+        "name": "make check",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/Blackcat-Informatics/sparrow/actions/runs/45310427366/job/138164482406",
+        "name": "compile / Compile and census checks",
+        "state": "SUCCESS"
+      },
+      {
+        "link": "https://github.com/Blackcat-Informatics/sparrow/actions/runs/45310427366/job/138164482745",
+        "name": "test / Release tests",
+        "state": "SUCCESS"
+      }
+    ]
+  },
+  "reviews": {
+    "head": "206d973e28064048958d0b63e8ab54d2c475ecc3",
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "complete"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "206d973e28064048958d0b63e8ab54d2c475ecc3",
+    "branch": "paudley/3-report-exact-retained-payload-bytes-per",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 9,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #9 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  },
+  "preflight": {
+    "git": "/usr/bin/git",
+    "python3": "/home/paudley/stage/root/bin/python3",
+    "stagectl": "/home/paudley/stage/root/bin/stagectl",
+    "bash": "/usr/bin/bash",
+    "readlink": "/home/paudley/stage/root/bin/readlink",
+    "sed": "/usr/bin/sed",
+    "awk": "/usr/bin/awk",
+    "ghprsq": "/home/paudley/stage/agents/bin/ghprsq",
+    "archive": {
+      "files": 21,
+      "bytes": 3532169,
+      "errors": [],
+      "limits": "Read-only selected-evidence admission; full newly reachable Git object closure is checked by ghprsq before push."
+    },
+    "signing": {
+      "format": "openpgp",
+      "key_configured": true,
+      "limits": "Configuration inspected; no signing operation was performed."
+    },
+    "forge_permissions": {
+      "admin": true,
+      "maintain": true,
+      "push": true,
+      "triage": true,
+      "pull": true
+    },
+    "merge_candidate": {
+      "base": "bd9ccc721f4c848a92b895bbb721063b9a9a04c8",
+      "head": "206d973e28064048958d0b63e8ab54d2c475ecc3",
+      "status": "clean"
+    }
+  }
+}

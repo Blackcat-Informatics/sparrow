@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow-github/.worktrees/3-report-exact-retained-payload-bytes-per",
+  "branch": "paudley/3-report-exact-retained-payload-bytes-per",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "6766809df04eb9a9331aacb36a526858e4afdf66",
+  "attempt": "/home/paudley/Active/sparrow-github/.worktrees/3-report-exact-retained-payload-bytes-per/.stage/report-exact-retained-payload-bytes-per/sync/20261124T020813-8d333351bbf2480db8ab375daa67d2b3",
+  "conflicts": [
+    "helpers-ledger.ttl"
+  ],
+  "status": "completed",
+  "base": "bd9ccc721f4c848a92b895bbb721063b9a9a04c8",
+  "merge_bases": [
+    "0e474482e348a9baedc6a0cfa730a012e61db9bf"
+  ],
+  "merge_index": "6f0facd23579e375f501a88febb64b8be638a82a543da2ee640322c4211a7f93",
+  "reused_paths": [],
+  "rerere_output": "Recorded preimage for 'helpers-ledger.ttl'\n",
+  "candidate_tree": "0e25efe3878e87d561ba67849cbe34a4aa0d4792",
+  "candidate_patch": "candidate-dbb99501f0b341c99bf060f66eb52593.patch",
+  "stdout_log": "commit-dbb99501f0b341c99bf060f66eb52593.stdout.log",
+  "stderr_log": "commit-dbb99501f0b341c99bf060f66eb52593.stderr.log",
+  "validation_records": [],
+  "commit_duration_seconds": 22.250096681003924,
+  "commit": "206d973e28064048958d0b63e8ab54d2c475ecc3",
+  "tree": "0e25efe3878e87d561ba67849cbe34a4aa0d4792",
+  "exit_code": 0
+}

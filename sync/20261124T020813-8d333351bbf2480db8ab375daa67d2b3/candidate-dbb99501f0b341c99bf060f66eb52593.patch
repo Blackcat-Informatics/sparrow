@@ -1,0 +1,1292 @@
+diff --git Cargo.lock Cargo.lock
+index 25ecb74..27c0af2 100644
+--- Cargo.lock
++++ Cargo.lock
+@@ -46,6 +46,12 @@ dependencies = [
+  "memchr",
+ ]
+ 
++[[package]]
++name = "atomic-waker"
++version = "1.1.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
++
+ [[package]]
+ name = "bindgen"
+ version = "0.72.1"
+@@ -446,6 +452,51 @@ version = "0.17.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+ 
++[[package]]
++name = "http"
++version = "1.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0"
++dependencies = [
++ "bytes",
++ "itoa",
++]
++
++[[package]]
++name = "http-body"
++version = "1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ca2a8f2913ee65f60facd6a5905613afaa448497a0230cc41ce022d93290bc2c"
++dependencies = [
++ "bytes",
++ "http",
++]
++
++[[package]]
++name = "http-body-util"
++version = "0.1.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "23169fe34a5fbcdd3f3862e78fb9b6fccd5f02a6dc6f732547005d45631ce71c"
++dependencies = [
++ "bytes",
++ "futures-core",
++ "http",
++ "http-body",
++ "pin-project-lite",
++]
++
++[[package]]
++name = "httparse"
++version = "1.10.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
++
++[[package]]
++name = "httpdate"
++version = "1.0.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
++
+ [[package]]
+ name = "hybrid-array"
+ version = "0.4.15"
+@@ -455,6 +506,39 @@ dependencies = [
+  "typenum",
+ ]
+ 
++[[package]]
++name = "hyper"
++version = "1.12.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c"
++dependencies = [
++ "atomic-waker",
++ "bytes",
++ "futures-core",
++ "http",
++ "http-body",
++ "httparse",
++ "httpdate",
++ "itoa",
++ "pin-project-lite",
++ "smallvec",
++ "tokio",
++]
++
++[[package]]
++name = "hyper-util"
++version = "0.1.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff"
++dependencies = [
++ "bytes",
++ "http",
++ "http-body",
++ "hyper",
++ "pin-project-lite",
++ "tokio",
++]
++
+ [[package]]
+ name = "indexmap"
+ version = "2.14.2"
+@@ -483,6 +567,12 @@ dependencies = [
+  "either",
+ ]
+ 
++[[package]]
++name = "itoa"
++version = "1.0.19"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
++
+ [[package]]
+ name = "jobserver"
+ version = "0.1.35"
+@@ -1315,6 +1405,12 @@ version = "0.4.12"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+ 
++[[package]]
++name = "smallvec"
++version = "1.16.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3244542535d5de959d90ec55d1b5ff0fd2bb7b1310223907d5f11932847f7b59"
++
+ [[package]]
+ name = "socket2"
+ version = "0.6.5"
+@@ -1331,6 +1427,9 @@ version = "0.1.0"
+ dependencies = [
+  "capnp",
+  "futures",
++ "http-body-util",
++ "hyper",
++ "hyper-util",
+  "purrdf",
+  "purrdf-hash",
+  "purrdf-lex",
+@@ -1339,6 +1438,7 @@ dependencies = [
+  "sparrow-server",
+  "tokio",
+  "toml",
++ "tracing",
+ ]
+ 
+ [[package]]
+diff --git Cargo.toml Cargo.toml
+index df09159..847228d 100644
+--- Cargo.toml
++++ Cargo.toml
+@@ -39,6 +39,9 @@ capnp = "0.28.1"
+ capnp-rpc = "0.28.0"
+ capnpc = "0.28.1"
+ futures = "0.3"
++http-body-util = "0.1"
++hyper = { version = "1", features = ["http1", "server"] }
++hyper-util = { version = "0.1", features = ["tokio"] }
+ tokio-util = { version = "0.7", features = ["compat"] }
+ tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "io-std", "io-util", "process"] }
+ serde = { version = "1", features = ["derive"] }
+diff --git README.md README.md
+index 8df1782..99d736c 100644
+--- README.md
++++ README.md
+@@ -29,7 +29,7 @@ rank text searches, and evaluate governed SPARQL queries. Keep an independent
+ copy of anything irreplaceable. [Architecture](docs/architecture.md)
+ 
+ `sparrowd` serves typed Cap'n Proto RPC. The `sparrow-access` package supplies
+-the `sparrow` CLI and stdio MCP adapter. Rust producers can use
++the `sparrow` CLI and MCP adapter. Rust producers can use
+ [`sparrow-client`](https://crates.io/crates/sparrow-client) and negotiate
+ `sparrow-producer/1` across compatible wire versions. The current wire schema
+ is 73. [Interfaces](docs/interfaces.md)
+@@ -157,7 +157,7 @@ independently. Reads do not extend a pin's deadline.
+   semantic indexes.
+ - **Temporal retention:** time-based expiry, explicit disk-pressure eviction,
+   named pins, and reference-aware reclamation.
+-- **Agent access:** typed Cap'n Proto RPC and a stdio MCP adapter, a CLI, bounded evidence
++- **Agent access:** typed Cap'n Proto RPC, a CLI, stdio and [localhost Streamable HTTP MCP](docs/interfaces.md#local-streamable-http), bounded evidence
+   reads, typed query results, and explicit completeness information.
+ - **Rust logging integration:** a composable `tracing` layer with
+   structured events and spans, bounded buffering, drop counters, and explicit
+diff --git crates/sparrow-access/Cargo.toml crates/sparrow-access/Cargo.toml
+index 62be402..53b7d2c 100644
+--- crates/sparrow-access/Cargo.toml
++++ crates/sparrow-access/Cargo.toml
+@@ -4,7 +4,7 @@
+ [package]
+ name = "sparrow-access"
+ version = "0.1.0"
+-description = "Command-line and stdio MCP access to the Sparrow log store"
++description = "Command-line and MCP access to the Sparrow log store"
+ edition.workspace = true
+ rust-version.workspace = true
+ authors.workspace = true
+@@ -22,6 +22,9 @@ path = "src/main.rs"
+ [dependencies]
+ capnp.workspace = true
+ futures.workspace = true
++http-body-util.workspace = true
++hyper.workspace = true
++hyper-util.workspace = true
+ purrdf.workspace = true
+ purrdf-hash.workspace = true
+ purrdf-lex.workspace = true
+@@ -30,6 +33,7 @@ sparrow-core.workspace = true
+ sparrow-server.workspace = true
+ tokio.workspace = true
+ toml.workspace = true
++tracing.workspace = true
+ 
+ [lints]
+ workspace = true
+diff --git crates/sparrow-access/src/agent/tool.rs crates/sparrow-access/src/agent/tool.rs
+index e0de368..1c18600 100644
+--- crates/sparrow-access/src/agent/tool.rs
++++ crates/sparrow-access/src/agent/tool.rs
+@@ -13,7 +13,7 @@ use purrdf_lex::json::{
+ };
+ 
+ mod catalog;
+-pub(crate) use catalog::{definitions, known};
++pub(crate) use catalog::{definitions, definitions_for, http_read, known};
+ 
+ pub(crate) enum Operation {
+     Status,
+diff --git crates/sparrow-access/src/agent/tool/catalog.rs crates/sparrow-access/src/agent/tool/catalog.rs
+index c385c49..66984c1 100644
+--- crates/sparrow-access/src/agent/tool/catalog.rs
++++ crates/sparrow-access/src/agent/tool/catalog.rs
+@@ -172,6 +172,30 @@ pub(crate) fn known(name: &str) -> bool {
+     TOOLS.iter().any(|(tool, _)| *tool == name)
+ }
+ 
++/// HTTP deliberately admits only named log inspection and search operations.
++pub(crate) fn http_read(name: &str) -> bool {
++    matches!(
++        name,
++        "status"
++            | "sources_list"
++            | "artifacts_list"
++            | "artifact_get"
++            | "records_search"
++            | "records_context"
++            | "record_get"
++            | "bytes_read"
++            | "keys_list"
++            | "values_search"
++            | "text_search"
++            | "sparql_query"
++            | "sparql_explain"
++            | "correlate"
++            | "result_next"
++            | "rdf_inspect"
++            | "payload_lookup"
++    )
++}
++
+ fn string() -> Value {
+     Object::new().with("type", "string").into()
+ }
+@@ -184,7 +208,12 @@ fn integer(maximum: u64) -> Value {
+ }
+ 
+ pub(crate) fn definitions() -> Value {
+-    Value::array(TOOLS.iter().map(|(name, description)| -> Value {
++    definitions_for(|_| true)
++}
++
++pub(crate) fn definitions_for(allowed: impl Fn(&str) -> bool) -> Value {
++    let tools = TOOLS.iter().filter(|(name, _)| allowed(name));
++    Value::array(tools.map(|(name, description)| -> Value {
+         if *name == "sparql_query" || *name == "sparql_explain" || *name == "correlate" {
+             return Object::new()
+                 .with("name", *name)
+diff --git crates/sparrow-access/src/lib.rs crates/sparrow-access/src/lib.rs
+index 0ef17f4..b31238f 100644
+--- crates/sparrow-access/src/lib.rs
++++ crates/sparrow-access/src/lib.rs
+@@ -1,7 +1,7 @@
+ // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+ // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+ 
+-//! CLI and stdio MCP access to Sparrow's typed daemon operations.
++//! CLI and MCP access to Sparrow's typed daemon operations.
+ 
+ use sparrow_client::sparrow_capnp;
+ use sparrow_server::{ConsumeWatch, ProducerContract, access_wire as codec};
+@@ -12,4 +12,4 @@ mod tail_wire;
+ mod text_wire;
+ 
+ pub use agent::{AgentError, AgentResult, run_cli};
+-pub use mcp::run_mcp;
++pub use mcp::{McpHttp, run_mcp};
+diff --git crates/sparrow-access/src/main.rs crates/sparrow-access/src/main.rs
+index 9fdabce..6963f2a 100644
+--- crates/sparrow-access/src/main.rs
++++ crates/sparrow-access/src/main.rs
+@@ -1,17 +1,17 @@
+ // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+ // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+ 
+-//! CLI and stdio MCP entry point over the shared generated daemon client.
++//! CLI and MCP entry point over the shared generated daemon client.
+ 
+ use purrdf_lex::json;
+-use sparrow_access::{run_cli, run_mcp};
++use sparrow_access::{McpHttp, run_cli, run_mcp};
+ use sparrow_client::{Client, Endpoint};
+ mod drain;
+ 
+ #[tokio::main(flavor = "current_thread")]
+ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+     let all: Vec<_> = std::env::args().skip(1).collect();
+-    let usage = "usage: sparrow [--secret-file PATH] ENDPOINT COMMAND; ENDPOINT is a Unix socket path or tcp://IP:PORT; --secret-file authenticates TCP by CHAP; mcp --stdio starts the agent adapter";
++    let usage = "usage: sparrow [--secret-file PATH] ENDPOINT COMMAND; ENDPOINT is a Unix socket path or tcp://IP:PORT; --secret-file authenticates TCP by CHAP; mcp --stdio or mcp --http [LOOPBACK_IP:PORT] starts the agent adapter";
+     let (endpoint, args) =
+         Endpoint::from_args(&all).map_err(|error| format!("{error}; {usage}"))?;
+     if args.is_empty() {
+@@ -19,8 +19,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+     }
+     tokio::task::LocalSet::new()
+         .run_until(async {
+-            if args == ["mcp", "--stdio"] {
+-                run_mcp(&endpoint).await?;
++            if let [command, mode @ ..] = args
++                && command == "mcp"
++            {
++                match mode {
++                    [stdio] if stdio == "--stdio" => run_mcp(&endpoint).await?,
++                    [http, address @ ..] if http == "--http" && address.len() <= 1 => {
++                        let address = address.first().map_or("127.0.0.1:8765", String::as_str);
++                        let listener = McpHttp::bind(address.parse()?).await?;
++                        println!("http://{}/mcp", listener.local_addr());
++                        listener.serve(&endpoint).await?;
++                    }
++                    _ => return Err(usage.into()),
++                }
+             } else {
+                 let output = match args {
+                     [command, rest @ ..] if command == "spool-drain" => {
+diff --git crates/sparrow-access/src/mcp.rs crates/sparrow-access/src/mcp.rs
+index 32e2153..00b9612 100644
+--- crates/sparrow-access/src/mcp.rs
++++ crates/sparrow-access/src/mcp.rs
+@@ -1,7 +1,7 @@
+ // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+ // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+ 
+-//! Bounded stdio MCP lifecycle and tool dispatch over the typed daemon client.
++//! Bounded MCP tool dispatch and stdio lifecycle over the typed daemon client.
+ 
+ use crate::{AgentError, agent::tool};
+ use futures::{
+@@ -16,6 +16,10 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+ 
+ const VERSION: &str = "2025-11-25";
+ const FRAME_LIMIT: usize = 128 * 1024;
++const CALL_LIMIT: usize = 4;
++
++mod http;
++pub use http::McpHttp;
+ 
+ /// Serve newline-delimited MCP on stdin/stdout without opening a database writer.
+ /// Call within a Tokio `LocalSet`; each tool uses the SDK's selected RPC endpoint.
+@@ -104,19 +108,234 @@ fn id_key(id: &Value) -> Option<String> {
+     }
+ }
+ 
+-async fn send<W: AsyncWrite + Unpin>(writer: &mut W, value: &Value) -> io::Result<()> {
+-    let mut message = json::write_compact(value);
++fn encode(value: &Value) -> io::Result<String> {
++    let message = json::write_compact(value);
+     if message.len() > 8 * 1024 * 1024 {
+         return Err(io::Error::new(
+             io::ErrorKind::InvalidData,
+             "MCP response exceeds 8 MiB",
+         ));
+     }
++    Ok(message)
++}
++
++async fn send<W: AsyncWrite + Unpin>(writer: &mut W, value: &Value) -> io::Result<()> {
++    let mut message = encode(value)?;
+     message.push('\n');
+     writer.write_all(message.as_bytes()).await?;
+     writer.flush().await
+ }
+ 
++struct Message {
++    method: String,
++    id: Option<Value>,
++    params: Value,
++}
++
++impl Message {
++    fn decode(bytes: &[u8]) -> Result<Self, Value> {
++        let value = json::read_slice(
++            bytes,
++            json::Limits {
++                max_depth: 64,
++                max_values: 16384,
++                max_string_bytes: FRAME_LIMIT,
++                unique_members: true,
++            },
++        )
++        .map_err(|error| protocol_error(Value::Null, -32700, error.to_string()))?;
++        let decode = || {
++            let mut fields = Record::new(&value, "MCP request")?;
++            let version: String = fields.required("jsonrpc")?;
++            if version != "2.0" {
++                return Err(json::record::DecodeError::custom("jsonrpc requires 2.0"));
++            }
++            let method = fields.required("method")?;
++            let id = fields.raw("id")?.cloned();
++            let params = fields
++                .raw("params")?
++                .cloned()
++                .unwrap_or_else(|| Object::new().into());
++            fields.deny_unknown()?;
++            Ok(Self { method, id, params })
++        };
++        decode().map_err(|error| protocol_error(Value::Null, -32600, error.to_string()))
++    }
++}
++
++/// Transport-specific admission for the shared tool dispatcher.
++#[derive(Clone, Copy)]
++enum ToolAccess {
++    Stdio,
++    HttpRead,
++}
++
++impl ToolAccess {
++    fn allows(self, name: &str) -> bool {
++        match self {
++            Self::Stdio => tool::known(name),
++            Self::HttpRead => tool::http_read(name),
++        }
++    }
++
++    fn instructions(self) -> &'static str {
++        match self {
++            Self::Stdio => {
++                "Queries expose coverage and work limits. Times select server acceptance. Read original bytes to verify evidence. Pin mutations need stable request IDs; cancellation does not prove non-delivery."
++            }
++            Self::HttpRead => {
++                "Use status to find the store ID. Queries expose coverage and work limits. Times select server acceptance. Read original bytes to verify evidence."
++            }
++        }
++    }
++}
++
++enum RequestAction {
++    Reply(Value),
++    Call(Box<tool::Operation>),
++}
++
++fn initialize(params: &Value, access: ToolAccess) -> Result<Value, json::record::DecodeError> {
++    let mut fields = Record::new(params, "initialize params")?;
++    let _: String = fields.required("protocolVersion")?;
++    let capabilities = fields
++        .raw("capabilities")?
++        .ok_or_else(|| json::record::DecodeError::missing_field("capabilities"))?;
++    let _ = Record::new(capabilities, "client capabilities")?;
++    let info = fields
++        .raw("clientInfo")?
++        .ok_or_else(|| json::record::DecodeError::missing_field("clientInfo"))?;
++    let mut info = Record::new(info, "clientInfo")?;
++    let _: String = info.required("name")?;
++    let _: String = info.required("version")?;
++    Ok(Object::new()
++        .with("protocolVersion", VERSION)
++        .with(
++            "capabilities",
++            Object::new().with("tools", Object::new().with("listChanged", false)),
++        )
++        .with(
++            "serverInfo",
++            Object::new()
++                .with("name", "sparrow")
++                .with("version", env!("CARGO_PKG_VERSION")),
++        )
++        .with("instructions", access.instructions())
++        .into())
++}
++
++fn list_tools(params: &Value, access: ToolAccess) -> Result<Value, json::record::DecodeError> {
++    let mut fields = Record::new(params, "tools/list params")?;
++    let _ = fields.raw("_meta")?;
++    fields.deny_unknown()?;
++    Ok(Object::new()
++        .with("tools", tool::definitions_for(|name| access.allows(name)))
++        .into())
++}
++
++fn dispatch(method: &str, params: &Value, id: &Value, access: ToolAccess) -> RequestAction {
++    let invalid = |error: json::record::DecodeError| {
++        RequestAction::Reply(protocol_error(id.clone(), -32602, error.to_string()))
++    };
++    let reply = |value| RequestAction::Reply(response(id.clone(), value));
++    if params.as_object().is_none() {
++        return RequestAction::Reply(protocol_error(
++            id.clone(),
++            -32602,
++            "params requires an object",
++        ));
++    }
++    match method {
++        "ping" => reply(Object::new().into()),
++        "initialize" => initialize(params, access).map_or_else(invalid, reply),
++        "tools/list" => list_tools(params, access).map_or_else(invalid, reply),
++        "tools/call" => {
++            let decode = || {
++                let mut fields = Record::new(params, "tools/call params")?;
++                let name: String = fields.required("name")?;
++                let arguments = fields
++                    .raw("arguments")?
++                    .cloned()
++                    .unwrap_or_else(|| Object::new().into());
++                let _ = fields.raw("_meta")?;
++                fields.deny_unknown()?;
++                Ok((name, arguments))
++            };
++            let (name, arguments) = match decode() {
++                Ok(value) => value,
++                Err(error) => return invalid(error),
++            };
++            if !access.allows(&name) {
++                return RequestAction::Reply(protocol_error(
++                    id.clone(),
++                    -32602,
++                    format!("unknown tool: {name}"),
++                ));
++            }
++            match tool::Operation::parse(&name, &arguments) {
++                Ok(operation) => RequestAction::Call(Box::new(operation)),
++                Err(error) => reply(tool_result(
++                    Object::new().with("error", error.json()).into(),
++                    true,
++                )),
++            }
++        }
++        _ => RequestAction::Reply(protocol_error(
++            id.clone(),
++            -32601,
++            format!("unknown method: {method}"),
++        )),
++    }
++}
++
++fn call_limit(id: Value) -> Value {
++    response(
++        id,
++        tool_result(
++            Object::new()
++                .with(
++                    "error",
++                    Object::new()
++                        .with("code", "RESOURCE_LIMIT")
++                        .with("message", "four MCP calls are already in progress")
++                        .with("retryable", true),
++                )
++                .into(),
++            true,
++        ),
++    )
++}
++
++async fn execute(
++    endpoint: &Endpoint,
++    operation: tool::Operation,
++    id: Value,
++    access: ToolAccess,
++) -> Value {
++    let result = tokio::time::timeout(Duration::from_secs(30), async {
++        let client = Client::connect_endpoint(endpoint).await.map_err(|error| match error {
++            sparrow_client::Error::Io(error) => AgentError::from(capnp::Error::from(error)),
++            error => AgentError::from(error),
++        })?;
++        operation.execute(&client).await
++    }).await.unwrap_or_else(|_| Err(AgentError {
++        code: "RPC_TIMEOUT".into(),
++        message: match access {
++            ToolAccess::Stdio => "tool exceeded 30 seconds; mutation delivery may be unknown; retry its stable request ID",
++            ToolAccess::HttpRead => "tool exceeded 30 seconds",
++        }.into(),
++        retryable: true,
++    }));
++    let output = match result {
++        Ok(value) => {
++            let failed = value.get("execution_status").and_then(Value::as_str) == Some("failed");
++            tool_result(value, failed)
++        }
++        Err(error) => tool_result(Object::new().with("error", error.json()).into(), true),
++    };
++    response(id, output)
++}
++
+ async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+     endpoint: &Endpoint,
+     mut reader: R,
+@@ -147,24 +366,10 @@ async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+                     Err(error) => { send(&mut writer, &protocol_error(Value::Null, -32700, error.to_string())).await?; return Err(error.into()); }
+                 };
+                 drop(incoming); incoming = Box::pin(frame(&mut reader));
+-                let value = match json::read_slice(&bytes, json::Limits { max_depth: 64, max_values: 16384, max_string_bytes: FRAME_LIMIT, unique_members: true }) {
+-                    Ok(value) => value,
+-                    Err(error) => { send(&mut writer, &protocol_error(Value::Null, -32700, error.to_string())).await?; continue; }
++                let Message { method, id, params } = match Message::decode(&bytes) {
++                    Ok(message) => message,
++                    Err(reply) => { send(&mut writer, &reply).await?; continue; }
+                 };
+-                let decode = || {
+-                    let mut record = Record::new(&value, "MCP request")?;
+-                    let version: String = record.required("jsonrpc")?;
+-                    let method: String = record.required("method")?;
+-                    let id = record.raw("id")?.cloned();
+-                    let params = record.raw("params")?.cloned().unwrap_or_else(|| Object::new().into());
+-                    record.deny_unknown()?;
+-                    Ok::<_, purrdf_lex::json::record::DecodeError>((version, method, id, params))
+-                };
+-                let (version, method, id, params) = match decode() {
+-                    Ok(request) => request,
+-                    Err(error) => { send(&mut writer, &protocol_error(Value::Null, -32600, error.to_string())).await?; continue; }
+-                };
+-                if version != "2.0" { send(&mut writer, &protocol_error(Value::Null, -32600, "jsonrpc requires 2.0")).await?; continue; }
+                 let Some(id) = id else {
+                     if params.as_object().is_none() { continue; }
+                     match method.as_str() {
+@@ -179,67 +384,35 @@ async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+                 let Some(key) = id_key(&id) else { send(&mut writer, &protocol_error(Value::Null, -32600, "request ID requires a bounded string or integer")).await?; continue; };
+                 if pending.contains_key(&key) { send(&mut writer, &protocol_error(id, -32600, "request ID is already in progress")).await?; continue; }
+                 if params.as_object().is_none() { send(&mut writer, &protocol_error(id, -32602, "params requires an object")).await?; continue; }
+-                match method.as_str() {
+-                    "ping" => send(&mut writer, &response(id, Object::new().into())).await?,
+-                    "initialize" => {
+-                        if initialized { send(&mut writer, &protocol_error(id, -32600, "session already initialized")).await?; continue; }
+-                        let valid = || {
+-                            let mut fields = Record::new(&params, "initialize params")?;
+-                            let _: String = fields.required("protocolVersion")?;
+-                            let capabilities = fields.raw("capabilities")?.ok_or_else(|| purrdf_lex::json::record::DecodeError::missing_field("capabilities"))?;
+-                            let _ = Record::new(capabilities, "client capabilities")?;
+-                            let info = fields.raw("clientInfo")?.ok_or_else(|| purrdf_lex::json::record::DecodeError::missing_field("clientInfo"))?;
+-                            let mut info = Record::new(info, "clientInfo")?;
+-                            let _: String = info.required("name")?; let _: String = info.required("version")?;
+-                            Ok::<_, purrdf_lex::json::record::DecodeError>(())
+-                        };
+-                        if let Err(error) = valid() { send(&mut writer, &protocol_error(id, -32602, error.to_string())).await?; continue; }
+-                        initialized = true;
+-                        send(&mut writer, &response(id, Object::new().with("protocolVersion", VERSION)
+-                            .with("capabilities", Object::new().with("tools", Object::new().with("listChanged", false)))
+-                            .with("serverInfo", Object::new().with("name", "sparrow").with("version", env!("CARGO_PKG_VERSION")))
+-                            .with("instructions", "Queries expose coverage and work limits. Times select server acceptance. Read original bytes to verify evidence. Pin mutations need stable request IDs; cancellation does not prove non-delivery.")
+-                            .into())).await?;
++                if method == "initialize" && initialized {
++                    send(&mut writer, &protocol_error(id, -32600, "session already initialized")).await?;
++                    continue;
++                }
++                if !ready && !matches!(method.as_str(), "ping" | "initialize") {
++                    send(&mut writer, &protocol_error(id, -32000, "initialize and send notifications/initialized first")).await?;
++                    continue;
++                }
++                let access = ToolAccess::Stdio;
++                match dispatch(&method, &params, &id, access) {
++                    RequestAction::Reply(reply) => {
++                        if method == "initialize" && reply.get("result").is_some() {
++                            initialized = true;
++                        }
++                        send(&mut writer, &reply).await?;
+                     }
+-                    _ if !ready => send(&mut writer, &protocol_error(id, -32000, "initialize and send notifications/initialized first")).await?,
+-                    "tools/list" => {
+-                        let mut fields = Record::new(&params, "tools/list params")?;
+-                        let _ = fields.raw("_meta")?;
+-                        if let Err(error) = fields.deny_unknown() { send(&mut writer, &protocol_error(id, -32602, error.to_string())).await?; continue; }
+-                        send(&mut writer, &response(id, Object::new().with("tools", tool::definitions()).into())).await?;
++                    RequestAction::Call(_) if pending.len() == CALL_LIMIT => {
++                        send(&mut writer, &call_limit(id)).await?;
+                     }
+-                    "tools/call" => {
+-                        let decode = || {
+-                            let mut fields = Record::new(&params, "tools/call params")?;
+-                            let name: String = fields.required("name")?;
+-                            let arguments = fields.raw("arguments")?.cloned().unwrap_or_else(|| Object::new().into());
+-                            let _ = fields.raw("_meta")?; fields.deny_unknown()?;
+-                            Ok::<_, purrdf_lex::json::record::DecodeError>((name, arguments))
+-                        };
+-                        let (name, arguments) = match decode() { Ok(value) => value, Err(error) => { send(&mut writer, &protocol_error(id, -32602, error.to_string())).await?; continue; } };
+-                        if !tool::known(&name) { send(&mut writer, &protocol_error(id, -32602, format!("unknown tool: {name}"))).await?; continue; }
+-                        let operation = match tool::Operation::parse(&name, &arguments) {
+-                            Ok(operation) => operation,
+-                            Err(error) => { send(&mut writer, &response(id, tool_result(Object::new().with("error", error.json()).into(), true))).await?; continue; }
+-                        };
+-                        if pending.len() == 4 { send(&mut writer, &response(id, tool_result(Object::new().with("error", Object::new().with("code", "RESOURCE_LIMIT").with("message", "four MCP calls are already in progress").with("retryable", true)).into(), true))).await?; continue; }
+-                        let endpoint = endpoint.clone(); let result_key = key.clone(); let (handle, registration) = AbortHandle::new_pair(); pending.insert(key, handle);
++                    RequestAction::Call(operation) => {
++                        let endpoint = endpoint.clone();
++                        let result_key = key.clone();
++                        let (handle, registration) = AbortHandle::new_pair();
++                        pending.insert(key, handle);
+                         jobs.push(async move {
+-                            let reply = Abortable::new(async move {
+-                            let result = tokio::time::timeout(Duration::from_secs(30), async {
+-                                let client = Client::connect_endpoint(&endpoint).await.map_err(|error| match error {
+-                                    sparrow_client::Error::Io(error) => AgentError::from(capnp::Error::from(error)),
+-                                    error => AgentError::from(error),
+-                                })?;
+-                                operation.execute(&client).await
+-                            }).await.unwrap_or_else(|_| Err(AgentError { code: "RPC_TIMEOUT".into(), message: "tool exceeded 30 seconds; mutation delivery may be unknown; retry its stable request ID".into(), retryable: true }));
+-                            let output = match result { Ok(value) => { let failed = value.get("execution_status").and_then(Value::as_str) == Some("failed"); tool_result(value, failed) }, Err(error) => tool_result(Object::new().with("error", error.json()).into(), true) };
+-                            response(id, output)
+-                            }, registration).await;
++                            let reply = Abortable::new(execute(&endpoint, *operation, id, access), registration).await;
+                             (result_key, reply)
+                         }.boxed_local());
+                     }
+-                    _ => send(&mut writer, &protocol_error(id, -32601, format!("unknown method: {method}"))).await?,
+                 }
+             }
+         }
+diff --git crates/sparrow-access/src/mcp/http.rs crates/sparrow-access/src/mcp/http.rs
+new file mode 100644
+index 0000000..d859688
+--- /dev/null
++++ crates/sparrow-access/src/mcp/http.rs
+@@ -0,0 +1,241 @@
++// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++//! Stateless Streamable HTTP transport for local log inspection.
++
++use super::{
++    CALL_LIMIT, FRAME_LIMIT, Message, RequestAction, ToolAccess, VERSION, call_limit, dispatch,
++    encode, execute, id_key, protocol_error,
++};
++use futures::{StreamExt, stream::FuturesUnordered};
++use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
++use hyper::{
++    HeaderMap, Method, Request, Response, StatusCode,
++    body::{Bytes, Incoming},
++    header::{self, HeaderName, HeaderValue},
++    server::conn::http1,
++    service::service_fn,
++};
++use hyper_util::rt::{TokioIo, TokioTimer};
++use purrdf_lex::json::{self, Value};
++use sparrow_client::Endpoint;
++use std::{convert::Infallible, io, net::SocketAddr, time::Duration};
++use tokio::{net::TcpListener, sync::Semaphore, time::timeout};
++
++const CONNECTION_LIMIT: usize = 16;
++const READ_TIMEOUT: Duration = Duration::from_secs(5);
++const CONNECTION_TIMEOUT: Duration = Duration::from_secs(45);
++
++/// A loopback-only listener for Sparrow's read-only Streamable HTTP endpoint.
++pub struct McpHttp {
++    listener: TcpListener,
++    address: SocketAddr,
++}
++
++impl McpHttp {
++    /// Bind a numeric IPv4 or IPv6 loopback address. Port zero selects a free port.
++    pub async fn bind(address: SocketAddr) -> io::Result<Self> {
++        if !address.ip().is_loopback() {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "MCP HTTP requires a loopback address such as 127.0.0.1:8765 or [::1]:8765",
++            ));
++        }
++        let listener = TcpListener::bind(address).await?;
++        let address = listener.local_addr()?;
++        Ok(Self { listener, address })
++    }
++
++    /// The numeric address clients can use to reach the listener.
++    #[must_use]
++    pub const fn local_addr(&self) -> SocketAddr {
++        self.address
++    }
++
++    /// Serve `/mcp` until the future is dropped or the listener fails.
++    /// Call within a Tokio `LocalSet` for the typed daemon client.
++    pub async fn serve(self, endpoint: &Endpoint) -> io::Result<()> {
++        let authority = self.address.to_string();
++        let localhost = format!("localhost:{}", self.address.port());
++        let calls = Semaphore::new(CALL_LIMIT);
++        let mut connections = FuturesUnordered::new();
++        let mut http = http1::Builder::new();
++        http.keep_alive(false)
++            .timer(TokioTimer::new())
++            .header_read_timeout(READ_TIMEOUT);
++
++        loop {
++            tokio::select! {
++                _ = connections.next(), if !connections.is_empty() => {},
++                accepted = self.listener.accept(), if connections.len() < CONNECTION_LIMIT => {
++                    let (stream, _) = accepted?;
++                    let service = service_fn(|request| async {
++                        Ok::<_, Infallible>(
++                            handle(request, &authority, &localhost, endpoint, &calls).await,
++                        )
++                    });
++                    let connection = http.serve_connection(TokioIo::new(stream), service);
++                    connections.push(async move {
++                        match timeout(CONNECTION_TIMEOUT, connection).await {
++                            Ok(Ok(())) => {}
++                            Ok(Err(error)) => tracing::debug!(%error, "MCP HTTP connection ended"),
++                            Err(_) => tracing::debug!("MCP HTTP connection exceeded its deadline"),
++                        }
++                    });
++                }
++            }
++        }
++    }
++}
++
++type Reply = Response<Full<Bytes>>;
++
++fn singleton(headers: &HeaderMap, name: HeaderName) -> Result<Option<&str>, ()> {
++    let mut values = headers.get_all(name).iter();
++    let value = values
++        .next()
++        .map(HeaderValue::to_str)
++        .transpose()
++        .map_err(|_| ())?;
++    if values.next().is_some() {
++        return Err(());
++    }
++    Ok(value)
++}
++
++fn local_request(request: &Request<Incoming>, authority: &str, localhost: &str) -> bool {
++    // Accept only origin-form targets and require a single local Host. A remote
++    // origin that resolves its own hostname to loopback still carries that hostname.
++    if request.uri().authority().is_some() {
++        return false;
++    }
++    let Ok(Some(host)) = singleton(request.headers(), header::HOST) else {
++        return false;
++    };
++    let default_port = authority.ends_with(":80");
++    let host = without_default_port(host, default_port);
++    if !host.eq_ignore_ascii_case(without_default_port(authority, default_port))
++        && !host.eq_ignore_ascii_case(without_default_port(localhost, default_port))
++    {
++        return false;
++    }
++    match singleton(request.headers(), header::ORIGIN) {
++        Ok(None) => true,
++        Ok(Some(origin)) => origin.strip_prefix("http://").is_some_and(|origin_host| {
++            without_default_port(origin_host, default_port).eq_ignore_ascii_case(host)
++        }),
++        Err(()) => false,
++    }
++}
++
++fn without_default_port(authority: &str, default_port: bool) -> &str {
++    if default_port {
++        authority.strip_suffix(":80").unwrap_or(authority)
++    } else {
++        authority
++    }
++}
++
++fn empty(status: StatusCode) -> Reply {
++    let mut reply = Response::new(Full::default());
++    *reply.status_mut() = status;
++    reply
++}
++
++fn json_reply(status: StatusCode, value: &Value) -> Reply {
++    let body = encode(value).unwrap_or_else(|error| {
++        let id = value.get("id").cloned().unwrap_or(Value::Null);
++        json::write_compact(&protocol_error(id, -32000, error.to_string()))
++    });
++    let mut reply = Response::new(Full::new(Bytes::from(body)));
++    *reply.status_mut() = status;
++    reply.headers_mut().insert(
++        header::CONTENT_TYPE,
++        HeaderValue::from_static("application/json"),
++    );
++    reply
++        .headers_mut()
++        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
++    reply
++}
++
++async fn handle(
++    request: Request<Incoming>,
++    authority: &str,
++    localhost: &str,
++    endpoint: &Endpoint,
++    calls: &Semaphore,
++) -> Reply {
++    if !local_request(&request, authority, localhost) {
++        return empty(StatusCode::FORBIDDEN);
++    }
++    if request.uri().path() != "/mcp" {
++        return empty(StatusCode::NOT_FOUND);
++    }
++    if !matches!(
++        singleton(
++            request.headers(),
++            HeaderName::from_static("mcp-protocol-version")
++        ),
++        Ok(None | Some(VERSION))
++    ) {
++        return empty(StatusCode::BAD_REQUEST);
++    }
++    if request.method() != Method::POST {
++        let mut reply = empty(StatusCode::METHOD_NOT_ALLOWED);
++        reply
++            .headers_mut()
++            .insert(header::ALLOW, HeaderValue::from_static("POST"));
++        return reply;
++    }
++    if !matches!(
++        singleton(request.headers(), header::CONTENT_TYPE),
++        Ok(Some(value)) if value.split(';').next().is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
++    ) {
++        return empty(StatusCode::UNSUPPORTED_MEDIA_TYPE);
++    }
++
++    let body = match timeout(
++        READ_TIMEOUT,
++        Limited::new(request.into_body(), FRAME_LIMIT).collect(),
++    )
++    .await
++    {
++        Ok(Ok(body)) => body.to_bytes(),
++        Ok(Err(error)) if error.is::<LengthLimitError>() => {
++            return empty(StatusCode::PAYLOAD_TOO_LARGE);
++        }
++        Ok(Err(_)) => return empty(StatusCode::BAD_REQUEST),
++        Err(_) => return empty(StatusCode::REQUEST_TIMEOUT),
++    };
++    let Message { method, id, params } = match Message::decode(&body) {
++        Ok(message) => message,
++        Err(error) => return json_reply(StatusCode::BAD_REQUEST, &error),
++    };
++    let Some(id) = id else {
++        return empty(if params.as_object().is_some() {
++            StatusCode::ACCEPTED
++        } else {
++            StatusCode::BAD_REQUEST
++        });
++    };
++    if id_key(&id).is_none() {
++        return json_reply(
++            StatusCode::BAD_REQUEST,
++            &protocol_error(
++                Value::Null,
++                -32600,
++                "request ID requires a bounded string or integer",
++            ),
++        );
++    }
++    let access = ToolAccess::HttpRead;
++    let reply = match dispatch(&method, &params, &id, access) {
++        RequestAction::Reply(reply) => reply,
++        RequestAction::Call(operation) => match calls.try_acquire() {
++            Ok(_permit) => execute(endpoint, *operation, id, access).await,
++            Err(_) => call_limit(id),
++        },
++    };
++    json_reply(StatusCode::OK, &reply)
++}
+diff --git crates/sparrow-server/tests/rpc.rs crates/sparrow-server/tests/rpc.rs
+index 0c555fe..829db4e 100644
+--- crates/sparrow-server/tests/rpc.rs
++++ crates/sparrow-server/tests/rpc.rs
+@@ -14,6 +14,8 @@ use std::{
+ // A child can briefly inherit CLOEXEC sockets before exec closes them.
+ use sparrow_test_support::crash::PROCESS_START;
+ type TcpReservation = (std::net::TcpListener, std::sync::MutexGuard<'static, ()>);
++#[path = "rpc/mcp_http.rs"]
++mod mcp_http;
+ 
+ #[tokio::test(flavor = "current_thread")]
+ async fn capability_documents_share_cli_mcp_and_typed_transport_contracts() {
+diff --git crates/sparrow-server/tests/rpc/mcp_http.rs crates/sparrow-server/tests/rpc/mcp_http.rs
+new file mode 100644
+index 0000000..1b13000
+--- /dev/null
++++ crates/sparrow-server/tests/rpc/mcp_http.rs
+@@ -0,0 +1,152 @@
++// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++//! Loopback HTTP MCP acceptance against a scratch daemon.
++
++use super::{Duration, ProcessOutput, ProcessStart, Stdio, cli, start, wire, write_server_config};
++use purrdf_lex::json::{self, Value};
++use std::net::SocketAddr;
++use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
++
++/// A URL-based MCP client can find a stored log while off-origin and mutating
++/// requests are refused before they reach the typed operation.
++#[tokio::test(flavor = "current_thread")]
++async fn loopback_http_mcp_discovers_and_searches_logs() {
++    tokio::task::LocalSet::new()
++        .run_until(async {
++            let dir = tempfile::tempdir().unwrap();
++            let data = dir.path().join("store");
++            let socket = data.join("rpc.sock");
++            let config = write_server_config(dir.path(), &data, &socket);
++            let _daemon = start(&config, &socket).await;
++            let client = sparrow_client::Client::connect(&socket).await.unwrap();
++            let receipt = client
++                .ingest("http-search", "http-fixture", wire::Format::Jsonl, b"{\"message\":\"needle\"}\n")
++                .await
++                .unwrap();
++            assert_eq!(receipt.record_ids.len(), 1);
++
++            let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
++                .arg(&socket)
++                .args(["mcp", "--http", "127.0.0.1:0"])
++                .stdout(Stdio::piped())
++                .kill_on_drop(true)
++                .admitted_spawn()
++                .unwrap();
++            let mut ready = String::new();
++            tokio::time::timeout(
++                Duration::from_secs(10),
++                BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready),
++            )
++            .await
++            .expect("HTTP MCP startup timed out")
++            .unwrap();
++            let address: SocketAddr = ready.trim().strip_prefix("http://").unwrap()
++                .strip_suffix("/mcp").unwrap().parse().unwrap();
++
++            let (status, headers, body) = exchange(
++                address,
++                "POST",
++                &address.to_string(),
++                "",
++                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}"#,
++            )
++            .await;
++            assert_eq!(status, 200);
++            assert!(headers.contains("content-type: application/json"));
++            assert!(!headers.contains("mcp-session-id:"));
++            let response = decode(&body);
++            assert_eq!(response["id"].as_u64(), Some(1));
++            assert_eq!(response["result"]["protocolVersion"].as_str(), Some("2025-11-25"));
++
++            let host = format!("localhost:{}", address.port());
++            let post = |body| exchange(address, "POST", &host, "MCP-Protocol-Version: 2025-11-25\r\n", body);
++            let (status, _, body) = post(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).await;
++            assert_eq!(status, 202);
++            assert!(body.is_empty());
++
++            let list = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
++            let (status, _, body) = post(list).await;
++            assert_eq!(status, 200);
++            let response = decode(&body);
++            let tools = response["result"]["tools"].as_array().unwrap();
++            assert!(tools.iter().any(|tool| tool["name"].as_str() == Some("records_search")));
++            assert!(tools.iter().all(|tool| tool["annotations"]["readOnlyHint"].as_bool() == Some(true)));
++            assert!(!tools.iter().any(|tool| tool["name"].as_str() == Some("pin")));
++
++            let (status, _, body) = post(
++                r#"{"jsonrpc":"2.0","id":"search","method":"tools/call","params":{"name":"records_search","arguments":{"source":"http-fixture","text":"needle"}}}"#,
++            )
++            .await;
++            assert_eq!(status, 200);
++            let response = decode(&body);
++            assert_eq!(response["id"].as_str(), Some("search"));
++            assert_eq!(response["result"]["isError"].as_bool(), Some(false), "{response:?}");
++            let rows = &response["result"]["structuredContent"]["rows"];
++            let expected = cli(&socket, &["records", "--source", "http-fixture", "--text", "needle"]);
++            assert_eq!(rows, &expected["rows"]);
++            assert_eq!(rows.as_array().unwrap().len(), 1);
++
++            let (status, _, body) = post(
++                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"pin"}}"#,
++            )
++            .await;
++            assert_eq!(status, 200);
++            assert_eq!(decode(&body)["error"]["message"].as_str(), Some("unknown tool: pin"));
++
++            let untrusted = [
++                ("remote.example", ""),
++                (host.as_str(), "Origin: https://remote.example\r\n"),
++                (host.as_str(), "Origin: null\r\n"),
++                (host.as_str(), "Host: remote.example\r\n"),
++            ];
++            for (host, headers) in untrusted {
++                assert_eq!(exchange(address, "POST", host, headers, list).await.0, 403);
++            }
++            let local_origin = format!("Origin: http://{host}\r\n");
++            assert_eq!(exchange(address, "POST", &host, &local_origin, list).await.0, 200);
++            assert_eq!(exchange(address, "GET", &host, "", "").await.0, 405);
++            assert_eq!(exchange(address, "POST", &host, "MCP-Protocol-Version: invalid\r\n", list).await.0, 400);
++            assert_eq!(post(&" ".repeat(128 * 1024 + 1)).await.0, 413);
++            child.kill().await.unwrap();
++
++            let refused = super::Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
++                .arg(&socket)
++                .args(["mcp", "--http", "0.0.0.0:0"])
++                .admitted_output()
++                .unwrap();
++            assert!(!refused.status.success());
++            assert!(String::from_utf8(refused.stderr).unwrap().contains("requires a loopback address"));
++        })
++        .await;
++}
++
++async fn exchange(
++    address: SocketAddr,
++    method: &str,
++    host: &str,
++    extra_headers: &str,
++    body: &str,
++) -> (u16, String, String) {
++    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
++    let message = format!(
++        "{method} /mcp HTTP/1.1\r\nHost: {host}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra_headers}\r\n{body}",
++        body.len(),
++    );
++    stream.write_all(message.as_bytes()).await.unwrap();
++    let mut response = String::new();
++    tokio::time::timeout(
++        Duration::from_secs(10),
++        stream.read_to_string(&mut response),
++    )
++    .await
++    .expect("HTTP MCP response timed out")
++    .unwrap();
++    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
++    let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
++    (status, headers.to_ascii_lowercase(), body.to_owned())
++}
++
++fn decode(body: &str) -> Value {
++    json::read_slice(body.as_bytes(), json::Limits::default()).unwrap()
++}
+diff --git docs/architecture.md docs/architecture.md
+index d025721..2e9443e 100644
+--- docs/architecture.md
++++ docs/architecture.md
+@@ -64,7 +64,7 @@ those remain performance qualification work.
+ | Sparrow core | Artifact/record identity; sources and provenance; ingestion coordination; persistent storage adapters; retention, pins, recovery, and bounded operations. |
+ | Storage | Persistent catalog, exact bytes, manifests, references, RDF dictionaries/indexes, text postings, and import checkpoints. |
+ | Daemon | One storage owner; typed Cap'n Proto RPC ingestion and queries, syslog, watchers, worker scheduling, and operational metrics. |
+-| `sparrow-access` CLI and stdio MCP adapter | Execute the daemon's typed operations through `sparrow-client`. The daemon owns the database. |
++| `sparrow-access` CLI and MCP adapter | Execute the daemon's typed operations through `sparrow-client`. The daemon owns the database. |
+ | Rust client | Structured logging and upload transport with bounded buffering, explicit delivery state, and shutdown. |
+ 
+ ```mermaid
+@@ -599,8 +599,8 @@ with retryability and delivery state distinguishable from parser diagnostics.
+ The daemon transport is Cap'n Proto RPC over a private Unix-domain socket and
+ a public TCP socket. The selected public binding is
+ `0.0.0.0:518`; ingestion does not require authentication, while reads, queries
+-and administration over TCP require a shared-secret CHAP session. CLI, Rust clients and the stdio MCP adapter use the same
+-generated schema. Requests, binary payloads, instants, integer counts, receipts
++and administration over TCP require a shared-secret CHAP session. CLI, Rust clients and the MCP adapter use the same generated schema.
++The adapter offers stdio and read-only Streamable HTTP on loopback. Requests, binary payloads, instants, integer counts, receipts
+ and failures use typed fields and unions. No HTTP or JSON operation envelope is
+ used between clients and the daemon. Durability comes from atomic storage
+ publication and synchronization. A connection failure before a receipt leaves
+diff --git docs/interfaces.md docs/interfaces.md
+index 419f8a0..b31c55f 100644
+--- docs/interfaces.md
++++ docs/interfaces.md
+@@ -33,13 +33,13 @@ abandoned continuation. A live artifact continuation releases its new handle if
+ it is not rendered, and the handle it continued only after rendering (schema 66). Store identity validation does not wait for the catalogue
+ writer. Cancellation does not
+ establish non-delivery of a mutation, interrupt individual native calls or mutex
+-waits, or qualify direct Cap'n Proto promise cancellation. MCP cancellation
++waits, or qualify direct Cap'n Proto promise cancellation. Stdio MCP cancellation
+ notifications abort only the selected tool's owned SDK connection and retain its
+ four-call admission slot until the job is dropped; cancelled tools emit no reply.
+ See [cooperative query cancellation](query-streaming.md#cooperative-query-cancellation).
+ 
+ The `sparrow-access` package provides the `sparrow` executable, its command
+-dispatcher and its stdio MCP adapter. Both call the daemon through the generated
++dispatcher and its MCP adapter. Both call the daemon through the generated
+ Cap'n Proto client. The daemon owns filtering, retention, pins, query execution
+ and the database. Rust applications can depend on `sparrow-client` independently.
+ 
+@@ -2744,12 +2744,47 @@ Raw SPARQL keeps its existing readiness law and has `correlation=null`.
+ 
+ Correlation requires schema 58 and uses the existing stored RDF vocabulary.
+ 
+-Use the standard stdio MCP transport. The adapter translates MCP messages into
+-generated typed Cap'n Proto client calls over the selected Unix or public TCP endpoint.
+-The stdio adapter writes protocol messages to stdout and diagnostics to stderr.
+-Tools use JSON Schema inputs and bounded structured outputs; reads are marked
+-read-only, while pin mutations are marked as mutations. [MCP transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports),
+-[MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
++Sparrow supports stdio and localhost Streamable HTTP. Both call the daemon
++through the typed Cap'n Proto client over the selected Unix or TCP endpoint.
++Tools use JSON Schema inputs and bounded structured outputs. Stdio writes
++protocol messages to stdout and diagnostics to stderr. It provides both read
++tools and mutations.
++
++### Local Streamable HTTP
++
++Start the read-only HTTP adapter and point a Streamable HTTP MCP client at the
++URL printed on stdout.
++
++```sh
++sparrow /path/to/rpc.sock mcp --http
++# Optional IPv6 listener
++sparrow /path/to/rpc.sock mcp --http '[::1]:8765'
++```
++
++The default URL is `http://127.0.0.1:8765/mcp`. The optional listener address
++must be a numeric loopback address. Port zero lets the OS select a free port.
++The first argument is the daemon endpoint. With a TCP daemon endpoint, pass
++`--secret-file PATH` before it to authenticate the backend reads.
++
++The HTTP adapter serves the read tools listed by `tools/list`, including
++`status`, `records_search`, `records_context`, `text_search`, and `bytes_read`.
++Use `status` to get the store ID for tools that require it. The endpoint uses
++MCP protocol revision `2025-11-25` with stateless JSON responses and HTTP 202
++for accepted notifications. It returns HTTP 405 to GET because it offers no
++server-sent event stream. Request bodies are capped at 128 KiB and responses at
++8 MiB. At most four tool calls run at once.
++
++Any process that can reach the loopback port can read the logs that the
++adapter's daemon connection can access. Run this listener on a trusted host
++and keep it off proxies and tunnels. For per-user access, use stdio with the
++Unix socket's permissions. HTTP requests must name the bound address or
++`localhost` with the bound port in the Host header. If an Origin header is
++present, it must match that HTTP origin.
++
++[MCP transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) ·
++[MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
++
++### Tool catalog
+ 
+ | Tool | Principal input | Output |
+ | --- | --- | --- |
+@@ -4573,9 +4608,9 @@ to 42; storage format and helper-census/runtime dependency revisions are unchang
+ The implemented client takes an optional `--secret-file PATH` and then an endpoint:
+ a Unix socket path or `tcp://IP:PORT`. Without the secret, a TCP endpoint admits
+ only discovery, ingestion, flush and imports. Numeric IPv4 and bracketed IPv6 addresses use the SDK's
+-native endpoint parser. CLI operations and every stdio MCP tool call use the same
+-SDK client constructor and discovery certification over either transport. No
+-HTTP envelope or alternate query implementation is involved.
++native endpoint parser. CLI operations and both MCP transports use the same SDK
++client constructor, discovery certification and typed query implementation.
++HTTP terminates at the local adapter.
+ 
+ ```text
+ sparrow /path/to/rpc.sock status
+diff --git helpers-ledger.ttl helpers-ledger.ttl
+index 8040e6a..befda9c 100644
+--- helpers-ledger.ttl
++++ helpers-ledger.ttl
+@@ -1,5 +1,5 @@
+ VERSION "1.2"
+-BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/23fe1e28b6e59cbf6b77ee2f444f66e1ee2d4705c237678862dd94b901a8e1fe>
++BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/caa41a36a8f4477321cfcd2c4227ceb8291fca0c88d7303228f80855fee6281d>
+ <> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#Ledger> .
+ <> <https://blackcatinformatics.ca/raf/report/1#distinct> <#distinct/0> .
+ <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/active-file-checkpoint-attachment> .
+@@ -148,6 +148,7 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/23fe1e28b6e59c
+ <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/markdown-rdf-projection> .
+ <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/matched-record-summary> .
+ <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/mcp-job-lifetime> .
++<> <https://blackcatinformatics.ca/raf/report/1#job> <#job/mcp-request-dispatch> .
+ <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/merged-eviction-traversal> .
+ <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/native-correlation-control-codec> .
+ <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/native-correlation-recipes> .
+@@ -1903,6 +1904,15 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/23fe1e28b6e59c
+ <#job/mcp-job-lifetime> <https://blackcatinformatics.ca/raf/report/1#specRef> "docs/query-streaming.md: real transport cancellation qualification." .
+ <#job/mcp-job-lifetime> <https://blackcatinformatics.ca/raf/report/1#summary> "One bounded MCP dispatcher retains each admission/ID slot through cancelled job retirement; abort drops the tool's owned SDK connection without emitting a cancelled reply or cancelling sibling tools." .
+ <#job/mcp-job-lifetime> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/tests/rpc.rs" .
++<#job/mcp-request-dispatch> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
++<#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
++<#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_access::mcp::http::McpHttp::serve" .
++<#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_access::run_mcp" .
++<#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#homeSymbol> "sparrow_access::mcp::dispatch" .
++<#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#jobId> "mcp-request-dispatch" .
++<#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#specRef> "docs/interfaces.md: MCP operations." .
++<#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#summary> "Stdio and Streamable HTTP share JSON-RPC tool dispatch. HTTP admits only the configured log read catalog." .
++<#job/mcp-request-dispatch> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/tests/rpc/mcp_http.rs" .
+ <#job/merged-eviction-traversal> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
+ <#job/merged-eviction-traversal> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+ <#job/merged-eviction-traversal> <https://blackcatinformatics.ca/raf/report/1#forbiddenName> "^(collect_eviction_candidates|sort_recordless_artifacts)$" .

@@ -1,0 +1,5 @@
+$ stagectl pr-checks 9
+SUCCESS make check https://github.com/Blackcat-Informatics/sparrow/actions/runs/45310427366/job/138176306995
+SUCCESS compile / Compile and census checks https://github.com/Blackcat-Informatics/sparrow/actions/runs/45310427366/job/138164482406
+SUCCESS test / Release tests https://github.com/Blackcat-Informatics/sparrow/actions/runs/45310427366/job/138164482745
+state: pass
