@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/382-buffered-rpc-flush-test-fails-when-a",
+  "branch": "paudley/382-buffered-rpc-flush-test-fails-when-a",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "33bb02bedee96a77013a018c141593bea77a9e07",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/382-buffered-rpc-flush-test-fails-when-a/.stage/buffered-rpc-flush-test-fails-when-a/sync/20261124T053934-b8da618cb18a4b1bb312ea8f0dcb9d17",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "187668eeab6870fa824ec83f1600b4fe5e2cb365",
+  "merge_bases": [
+    "33bb02bedee96a77013a018c141593bea77a9e07"
+  ],
+  "commit": "187668eeab6870fa824ec83f1600b4fe5e2cb365"
+}
