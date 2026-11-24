@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow-github/.worktrees/4-make-imported-journal-entries-searchable",
+  "branch": "paudley/4-make-imported-journal-entries-searchable",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "c2a4ee4a425119bbc52237ecfdf3ae36e873a29c",
+  "attempt": "/home/paudley/Active/sparrow-github/.worktrees/4-make-imported-journal-entries-searchable/.stage/make-imported-journal-entries-searchable/sync/20261124T035230-b576a9e066e140989b1e3030d36d3565",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "b6f1d32cc85ffbaa14f9e45b89437c4033f0a934",
+  "merge_bases": [
+    "c2a4ee4a425119bbc52237ecfdf3ae36e873a29c"
+  ],
+  "commit": "b6f1d32cc85ffbaa14f9e45b89437c4033f0a934"
+}
