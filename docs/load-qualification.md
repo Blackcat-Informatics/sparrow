@@ -154,6 +154,17 @@ record:
 | RDF dictionary (term, reverse, reference) | 12 | 8.1% |
 | Other catalogs | 6 | 10.0% |
 
+On 2026-11-24, the release daemon and CLI fixtures from `b710a02c8`
+imported the same 1,048,642-byte log into a fresh store over its private
+Unix socket. The import published 14,743 records. Immediately after the
+CLI returned, before shutdown, seven numbered WAL files totaled 190,945,144
+bytes by file length and 227,471,360 bytes in allocated blocks. The earlier
+two-family run retained 189,866,674 WAL bytes by file length. The new
+store's `OPTIONS-000007` lists `default`, `payload` and `rdf_reverse`
+with `max_total_wal_size=268435456` (256 MiB). This sample covers one
+import. The pinned-WAL release regression exercises flushing an idle
+family after writes cross the configured threshold.
+
 Text evidence and postings values are catalog JSON, so shrinking them waits for
 the JSON plan. The six quad orders serve SPARQL access paths, and reducing them
 is a query design change rather than a fix. What remains open on issue #5 is
