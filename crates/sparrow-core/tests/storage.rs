@@ -27002,7 +27002,7 @@ fn cancelling_background_work_after_the_final_flush_loses_no_acknowledged_record
 }
 
 #[test]
-fn expiry_refuses_malformed_timed_record_metadata_without_retiring_evidence() {
+fn open_and_expiry_refuse_malformed_timed_record_metadata() {
     use purrdf_lex::json::{self, Value};
     use sparrow_core::{EventTime, QuerySelection, RdfGraphLayers, TimeRepresentation};
 
@@ -27014,6 +27014,7 @@ fn expiry_refuses_malformed_timed_record_metadata_without_retiring_evidence() {
     let bytes = br#"{"timestamp":"2026-10-07T05:00:00Z","message":"timed event"}"#;
     let old = store.ingest("old", "timed", "json", bytes, 100).unwrap();
     let kept = store.ingest("kept", "timed", "json", bytes, 200).unwrap();
+    let store_id = store.store_id().unwrap();
     let record = store.record(&old.record_ids[0]).unwrap();
     assert!(matches!(record.event_time, EventTime::Known { .. }));
     let mut scope = record_page_scope("timed", 1000);
@@ -27070,7 +27071,25 @@ fn expiry_refuses_malformed_timed_record_metadata_without_retiring_evidence() {
         let db = catalog_db(dir.path()).unwrap();
         db.put(&key, &corrupt).unwrap();
         drop(db);
+        for opened in [
+            Store::open(dir.path(), config()),
+            Store::reopen(dir.path(), config(), &store_id),
+        ] {
+            let error = opened
+                .err()
+                .expect("corrupt record manifest refused at open");
+            assert_eq!(error.code, "STORAGE_FAILURE");
+            assert!(error.message.contains(&record.id), "{error}");
+            assert!(error.message.contains(diagnostic), "{error}");
+        }
+
+        let db = catalog_db(dir.path()).unwrap();
+        assert_eq!(db.get(&key).unwrap().unwrap(), corrupt.as_bytes());
+        assert_eq!(index_rows(&db), original_rows);
+        db.put(&key, &intact).unwrap();
+        drop(db);
         let store = Store::open(dir.path(), config()).unwrap();
+        store.put_raw_for_tests(&key, corrupt.as_bytes()).unwrap();
         let error = store.expire(record.expires_at + 1).unwrap_err();
         assert_eq!(error.code, "STORAGE_FAILURE");
         assert!(error.message.contains(diagnostic), "{error}");
@@ -27083,11 +27102,8 @@ fn expiry_refuses_malformed_timed_record_metadata_without_retiring_evidence() {
         let db = catalog_db(dir.path()).unwrap();
         assert_eq!(db.get(&key).unwrap().unwrap(), corrupt.as_bytes());
         assert_eq!(index_rows(&db), original_rows);
+        db.put(&key, &intact).unwrap();
     }
-
-    let db = catalog_db(dir.path()).unwrap();
-    db.put(&key, intact).unwrap();
-    drop(db);
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(store.expire(record.expires_at + 1).unwrap(), 2);
     assert_eq!(
