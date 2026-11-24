@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/271-document-pressure-admission-archive",
+  "branch": "paudley/271-document-pressure-admission-archive",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "7a7b601dee09fea6a5a2d74258ca1f86ecf74d63",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/271-document-pressure-admission-archive/.stage/document-pressure-admission-archive/sync/20261124T064014-a5be12f9aea848cfb8fbac17b6af0474",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "6499015891fe5d0d52dd42ba3bc47c73c4aeb74d",
+  "merge_bases": [
+    "7a7b601dee09fea6a5a2d74258ca1f86ecf74d63"
+  ],
+  "commit": "6499015891fe5d0d52dd42ba3bc47c73c4aeb74d"
+}
