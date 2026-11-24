@@ -82,12 +82,11 @@ Keep production sample bodies and identities outside tracked source. Use
 synthetic fixtures for tracked qualification and record observation bounds
 and whole-store costs for performance runs.
 
-Native journal decoding is not yet designed. Preserve opaque journal bytes if
-imported, but report text coverage as not applicable until a qualified native
-adapter or explicitly identified journal export is available. Likewise, qualify
-compressed-input decoding separately from preserving its original compressed
-bytes. Search either representation as plain text only when the corresponding
-adapter can interpret it. Unknown `.bin` files remain opaque.
+Journal Export Format imports produce searchable JSON Lines records with the
+journal field names and values. Export native systemd journal files with
+`journalctl --output=export` before importing them. Unknown `.bin` files
+remain opaque. Qualify compressed-input decoding separately from preserving
+the original compressed bytes.
 
 ## Query contracts to implement first
 
