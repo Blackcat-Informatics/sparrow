@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/510-diagnose-the-bulk-import-replay-timeout",
+  "branch": "paudley/510-diagnose-the-bulk-import-replay-timeout",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "879a1d221a134e38730d3bff8cab4b5997405034",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/510-diagnose-the-bulk-import-replay-timeout/.stage/diagnose-the-bulk-import-replay-timeout/sync/20261124T073825-e46e239219064f9690c926ab87c6a7be",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "cb0d9b774bb4a11c89d3f71e62e36a70dc694887",
+  "merge_bases": [
+    "879a1d221a134e38730d3bff8cab4b5997405034"
+  ],
+  "commit": "cb0d9b774bb4a11c89d3f71e62e36a70dc694887"
+}
