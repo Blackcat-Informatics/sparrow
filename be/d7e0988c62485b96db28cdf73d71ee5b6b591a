@@ -1,0 +1,19 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 3d5f953431c62eba10378edd168b196c60dd2ee6
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 529
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/529
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 5ed8a1b83e37a6e19d84ccf6916b543fc852b882
+GhpRsq-Head-Ref: paudley/40-test-the-artifact-listing-s-integrity
+GhpRsq-Head-OID: 3d5f953431c62eba10378edd168b196c60dd2ee6
+GhpRsq-Result-Tree: 75cab0b663a67b9c135f4197637d176c592d79b7
+GhpRsq-Result-Commit: bed7e0988c62485b96db28cdf73d71ee5b6b591a
+GhpRsq-Parent-Hashes: 3d5f953431c62eba10378edd168b196c60dd2ee6
+GhpRsq-Squash-Notes-SHA256: 7ebccf242802a26a289a6ca434f479802016c9a3a902c8e2a55327cd8d41f36a
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
