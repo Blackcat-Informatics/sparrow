@@ -1,0 +1,19 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 0448bf2a0c6fdd5bc14cc97b45cc0e0474815c14
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 543
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/543
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 2e66709d724fe4dc2c1f8989260b4c3a26d38291
+GhpRsq-Head-Ref: paudley/87-admit-pins-on-the-joint-pin-capture
+GhpRsq-Head-OID: 0448bf2a0c6fdd5bc14cc97b45cc0e0474815c14
+GhpRsq-Result-Tree: 45df079bedb101e9379f32f7b9ad16da7250dc6a
+GhpRsq-Result-Commit: 2f37f0d6475e54f02b2ec59c8e8b5a10a52d3a9b
+GhpRsq-Parent-Hashes: 0448bf2a0c6fdd5bc14cc97b45cc0e0474815c14
+GhpRsq-Squash-Notes-SHA256: 210eaff9d74af08ec8acae8b37e85d7017228d152416095332c94ffc4270484c
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
