@@ -14,6 +14,13 @@ data_dir = "/var/lib/sparrow/store"
 rpc_tcp_address = "0.0.0.0:518"
 rpc_tcp_secret_file = "/run/credentials/sparrow.service/tcp.secret"
 
+# Optional group-accessible Unix socket for producers. Enable both path and group together.
+# Use the numeric ID of the sparrow-ingest group on this host. See docs/deployment.md for
+# creating the setgid directory before startup.
+# ingest_socket_path = "/run/sparrow-ingest/ingest.sock"
+# ingest_socket_gid = 1234
+# max_ingest_connections = 16 # optional ceiling, 1..256
+
 # The store's own bytes; other programs share the disk, which min_free_bytes guards (default
 # 4 GiB): below it the daemon refuses writes (keeping connections and reads) instead of failing a write.
 disk_budget = 53687091200
