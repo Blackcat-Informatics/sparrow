@@ -1109,8 +1109,8 @@ impl Writer {
                         Error::new(
                             "STORAGE_FAILURE",
                             format!(
-                                "the per-source index lists {} without its entry or a retained record",
-                                row.id
+                                "the per-source index lists {} at receipt {} ms without its entry or a retained record",
+                                row.id, row.received_at
                             ),
                         )
                     })?;
@@ -1316,8 +1316,8 @@ impl Writer {
                         return Err(Error::new(
                             "STORAGE_FAILURE",
                             format!(
-                                "the per-source index row {} disagrees with its artifact's source or receipt",
-                                row.key
+                                "the per-source index row {} disagrees with its artifact's source or receipt (indexed receipt {} ms, catalog receipt {} ms)",
+                                row.key, row.received_at, artifact.received_at
                             ),
                         ));
                     }
