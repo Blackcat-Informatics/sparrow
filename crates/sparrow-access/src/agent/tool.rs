@@ -13,7 +13,7 @@ use purrdf_lex::json::{
 };
 
 mod catalog;
-pub(crate) use catalog::{definitions, known};
+pub(crate) use catalog::{definitions, definitions_for, http_read, known};
 
 pub(crate) enum Operation {
     Status,

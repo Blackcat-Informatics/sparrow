@@ -33,13 +33,13 @@ abandoned continuation. A live artifact continuation releases its new handle if
 it is not rendered, and the handle it continued only after rendering (schema 66). Store identity validation does not wait for the catalogue
 writer. Cancellation does not
 establish non-delivery of a mutation, interrupt individual native calls or mutex
-waits, or qualify direct Cap'n Proto promise cancellation. MCP cancellation
+waits, or qualify direct Cap'n Proto promise cancellation. Stdio MCP cancellation
 notifications abort only the selected tool's owned SDK connection and retain its
 four-call admission slot until the job is dropped; cancelled tools emit no reply.
 See [cooperative query cancellation](query-streaming.md#cooperative-query-cancellation).
 
 The `sparrow-access` package provides the `sparrow` executable, its command
-dispatcher and its stdio MCP adapter. Both call the daemon through the generated
+dispatcher and its MCP adapter. Both call the daemon through the generated
 Cap'n Proto client. The daemon owns filtering, retention, pins, query execution
 and the database. Rust applications can depend on `sparrow-client` independently.
 
@@ -2744,12 +2744,47 @@ Raw SPARQL keeps its existing readiness law and has `correlation=null`.
 
 Correlation requires schema 58 and uses the existing stored RDF vocabulary.
 
-Use the standard stdio MCP transport. The adapter translates MCP messages into
-generated typed Cap'n Proto client calls over the selected Unix or public TCP endpoint.
-The stdio adapter writes protocol messages to stdout and diagnostics to stderr.
-Tools use JSON Schema inputs and bounded structured outputs; reads are marked
-read-only, while pin mutations are marked as mutations. [MCP transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports),
-[MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
+Sparrow supports stdio and localhost Streamable HTTP. Both call the daemon
+through the typed Cap'n Proto client over the selected Unix or TCP endpoint.
+Tools use JSON Schema inputs and bounded structured outputs. Stdio writes
+protocol messages to stdout and diagnostics to stderr. It provides both read
+tools and mutations.
+
+### Local Streamable HTTP
+
+Start the read-only HTTP adapter and point a Streamable HTTP MCP client at the
+URL printed on stdout.
+
+```sh
+sparrow /path/to/rpc.sock mcp --http
+# Optional IPv6 listener
+sparrow /path/to/rpc.sock mcp --http '[::1]:8765'
+```
+
+The default URL is `http://127.0.0.1:8765/mcp`. The optional listener address
+must be a numeric loopback address. Port zero lets the OS select a free port.
+The first argument is the daemon endpoint. With a TCP daemon endpoint, pass
+`--secret-file PATH` before it to authenticate the backend reads.
+
+The HTTP adapter serves the read tools listed by `tools/list`, including
+`status`, `records_search`, `records_context`, `text_search`, and `bytes_read`.
+Use `status` to get the store ID for tools that require it. The endpoint uses
+MCP protocol revision `2025-11-25` with stateless JSON responses and HTTP 202
+for accepted notifications. It returns HTTP 405 to GET because it offers no
+server-sent event stream. Request bodies are capped at 128 KiB and responses at
+8 MiB. At most four tool calls run at once.
+
+Any process that can reach the loopback port can read the logs that the
+adapter's daemon connection can access. Run this listener on a trusted host
+and keep it off proxies and tunnels. For per-user access, use stdio with the
+Unix socket's permissions. HTTP requests must name the bound address or
+`localhost` with the bound port in the Host header. If an Origin header is
+present, it must match that HTTP origin.
+
+[MCP transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) ·
+[MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
+
+### Tool catalog
 
 | Tool | Principal input | Output |
 | --- | --- | --- |
@@ -4573,9 +4608,9 @@ to 42; storage format and helper-census/runtime dependency revisions are unchang
 The implemented client takes an optional `--secret-file PATH` and then an endpoint:
 a Unix socket path or `tcp://IP:PORT`. Without the secret, a TCP endpoint admits
 only discovery, ingestion, flush and imports. Numeric IPv4 and bracketed IPv6 addresses use the SDK's
-native endpoint parser. CLI operations and every stdio MCP tool call use the same
-SDK client constructor and discovery certification over either transport. No
-HTTP envelope or alternate query implementation is involved.
+native endpoint parser. CLI operations and both MCP transports use the same SDK
+client constructor, discovery certification and typed query implementation.
+HTTP terminates at the local adapter.
 
 ```text
 sparrow /path/to/rpc.sock status

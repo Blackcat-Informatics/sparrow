@@ -64,7 +64,7 @@ those remain performance qualification work.
 | Sparrow core | Artifact/record identity; sources and provenance; ingestion coordination; persistent storage adapters; retention, pins, recovery, and bounded operations. |
 | Storage | Persistent catalog, exact bytes, manifests, references, RDF dictionaries/indexes, text postings, and import checkpoints. |
 | Daemon | One storage owner; typed Cap'n Proto RPC ingestion and queries, syslog, watchers, worker scheduling, and operational metrics. |
-| `sparrow-access` CLI and stdio MCP adapter | Execute the daemon's typed operations through `sparrow-client`. The daemon owns the database. |
+| `sparrow-access` CLI and MCP adapter | Execute the daemon's typed operations through `sparrow-client`. The daemon owns the database. |
 | Rust client | Structured logging and upload transport with bounded buffering, explicit delivery state, and shutdown. |
 
 ```mermaid
@@ -599,8 +599,8 @@ with retryability and delivery state distinguishable from parser diagnostics.
 The daemon transport is Cap'n Proto RPC over a private Unix-domain socket and
 a public TCP socket. The selected public binding is
 `0.0.0.0:518`; ingestion does not require authentication, while reads, queries
-and administration over TCP require a shared-secret CHAP session. CLI, Rust clients and the stdio MCP adapter use the same
-generated schema. Requests, binary payloads, instants, integer counts, receipts
+and administration over TCP require a shared-secret CHAP session. CLI, Rust clients and the MCP adapter use the same generated schema.
+The adapter offers stdio and read-only Streamable HTTP on loopback. Requests, binary payloads, instants, integer counts, receipts
 and failures use typed fields and unions. No HTTP or JSON operation envelope is
 used between clients and the daemon. Durability comes from atomic storage
 publication and synchronization. A connection failure before a receipt leaves

@@ -172,6 +172,30 @@ pub(crate) fn known(name: &str) -> bool {
     TOOLS.iter().any(|(tool, _)| *tool == name)
 }
 
+/// HTTP deliberately admits only named log inspection and search operations.
+pub(crate) fn http_read(name: &str) -> bool {
+    matches!(
+        name,
+        "status"
+            | "sources_list"
+            | "artifacts_list"
+            | "artifact_get"
+            | "records_search"
+            | "records_context"
+            | "record_get"
+            | "bytes_read"
+            | "keys_list"
+            | "values_search"
+            | "text_search"
+            | "sparql_query"
+            | "sparql_explain"
+            | "correlate"
+            | "result_next"
+            | "rdf_inspect"
+            | "payload_lookup"
+    )
+}
+
 fn string() -> Value {
     Object::new().with("type", "string").into()
 }
@@ -184,7 +208,12 @@ fn integer(maximum: u64) -> Value {
 }
 
 pub(crate) fn definitions() -> Value {
-    Value::array(TOOLS.iter().map(|(name, description)| -> Value {
+    definitions_for(|_| true)
+}
+
+pub(crate) fn definitions_for(allowed: impl Fn(&str) -> bool) -> Value {
+    let tools = TOOLS.iter().filter(|(name, _)| allowed(name));
+    Value::array(tools.map(|(name, description)| -> Value {
         if *name == "sparql_query" || *name == "sparql_explain" || *name == "correlate" {
             return Object::new()
                 .with("name", *name)
