@@ -446,7 +446,9 @@ own `expires_at`: a row whose deadline differs from receipt plus retention is
 counted in `ExpiryReport.anomalies` and retires at its own deadline, never
 stopping the pass; a parent artifact whose own deadline is later keeps its records
 undeleted until then. The count is per pass, and the worker journals it. A
-dangling time-index key is the only data-dependent hard failure.
+dangling time-index key or malformed record RDF manifest refuses retirement
+with `STORAGE_FAILURE`. Record RDF retirement checks the manifest's graph owner
+and declared terms before deleting index entries or changing term references.
 Import journal reclamation runs on its own one-second tick, because a published
 journal holds one of the 16 import slots until it is reclaimed. Pressure keeps
 its one-second tick, and buffered synchronization keeps its configured interval.
