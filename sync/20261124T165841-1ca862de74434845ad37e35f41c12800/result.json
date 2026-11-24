@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/51-remove-or-prevent-orphan-owner-to-graph",
+  "branch": "paudley/51-remove-or-prevent-orphan-owner-to-graph",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "edec49da210346ebfb1da8b780cfab7c8a7c8a0c",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/51-remove-or-prevent-orphan-owner-to-graph/.stage/remove-or-prevent-orphan-owner-to-graph/sync/20261124T165841-1ca862de74434845ad37e35f41c12800",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "a3e5638896d90598614a679d816356174ecb9410",
+  "merge_bases": [
+    "edec49da210346ebfb1da8b780cfab7c8a7c8a0c"
+  ],
+  "commit": "a3e5638896d90598614a679d816356174ecb9410"
+}

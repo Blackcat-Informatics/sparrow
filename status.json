@@ -1,0 +1,80 @@
+{
+  "issue": 51,
+  "pr_number": 554,
+  "branch": "paudley/51-remove-or-prevent-orphan-owner-to-graph",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/51-remove-or-prevent-orphan-owner-to-graph/.stage/remove-or-prevent-orphan-owner-to-graph",
+  "observed_at": "2026-11-24T17:14:33.860744+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/51-remove-or-prevent-orphan-owner-to-graph/.stage/remove-or-prevent-orphan-owner-to-graph/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/51-remove-or-prevent-orphan-owner-to-graph/.stage/remove-or-prevent-orphan-owner-to-graph/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/51-remove-or-prevent-orphan-owner-to-graph/.stage/remove-or-prevent-orphan-owner-to-graph/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/51-remove-or-prevent-orphan-owner-to-graph/.stage/remove-or-prevent-orphan-owner-to-graph/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/51-remove-or-prevent-orphan-owner-to-graph/.stage/remove-or-prevent-orphan-owner-to-graph/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 554,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Clear orphan mirrors at the owner-graph writer fence",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/554",
+    "baseRefName": "main",
+    "baseRefOid": "a3e5638896d90598614a679d816356174ecb9410",
+    "headRefName": "paudley/51-remove-or-prevent-orphan-owner-to-graph",
+    "isCrossRepository": false,
+    "headRefOid": "0f4bbfe4d29251ad2d1cdcf8759eaf3be6218718",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/603/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 1,
+    "change_token": "50279822e7aa90db5703eaed995236b2dfa1b88acfa8a7eaab3b8830e2da4714"
+  },
+  "local": {
+    "head": "0f4bbfe4d29251ad2d1cdcf8759eaf3be6218718",
+    "branch": "paudley/51-remove-or-prevent-orphan-owner-to-graph",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 554,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #554 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}
