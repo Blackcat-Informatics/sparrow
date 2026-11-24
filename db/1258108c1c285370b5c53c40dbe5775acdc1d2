@@ -1,0 +1,19 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: d7ebd47af229d679e04784b4ed8bbdd4b802af3e
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 537
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/537
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 5b5247115a7b5e6dbc0a4c1f9b071b1c2a1747cc
+GhpRsq-Head-Ref: paudley/80-make-the-store-free-space-floor-ledger
+GhpRsq-Head-OID: d7ebd47af229d679e04784b4ed8bbdd4b802af3e
+GhpRsq-Result-Tree: 765f1702a1bc8c9c8933a949d6b1d889af087736
+GhpRsq-Result-Commit: db1258108c1c285370b5c53c40dbe5775acdc1d2
+GhpRsq-Parent-Hashes: d7ebd47af229d679e04784b4ed8bbdd4b802af3e
+GhpRsq-Squash-Notes-SHA256: 310d23fc914ea5a266826e211f089a68cccde6fee87d74ba9eee8aa98e681ebd
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
