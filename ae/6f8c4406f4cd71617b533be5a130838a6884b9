@@ -1,0 +1,24 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: d90acc84fa328b332a71e55d0ba4e991f57c2b10
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 518
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/518
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: d68f014e3a5e5f89cfdf7687282cc12134b898df
+GhpRsq-Head-Ref: paudley/41-stop-source-listings-from-charging
+GhpRsq-Head-OID: d90acc84fa328b332a71e55d0ba4e991f57c2b10
+GhpRsq-Result-Tree: 8b8c6f7429e739448143d4a8780272b3c4221245
+GhpRsq-Result-Commit: ae6f8c4406f4cd71617b533be5a130838a6884b9
+GhpRsq-Parent-Hashes: d90acc84fa328b332a71e55d0ba4e991f57c2b10
+GhpRsq-Squash-Notes-SHA256: 6f61b1783894179092715bb9c2dcd0769890283a5a13db3aed7b30bbb7511eef
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Tree: ed6c9637904324a6f9cf3b446d2e836d969e3fe9
+GhpRsq-Stage-Commit: 9c48c25837a9ef8793bf833edfffa9e888e4f44e
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/9c48c25837a9ef8793bf833edfffa9e888e4f44e
+GhpRsq-Stage-Ref: refs/ghprsq/pr/518/stage
+GhpRsq-Stage-Files: 13
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/9c48c25837a9ef8793bf833edfffa9e888e4f44e
