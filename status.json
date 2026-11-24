@@ -1,0 +1,80 @@
+{
+  "issue": 81,
+  "pr_number": 550,
+  "branch": "paudley/81-verify-a-running-daemon-pauses-and",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/81-verify-a-running-daemon-pauses-and/.stage/verify-a-running-daemon-pauses-and",
+  "observed_at": "2026-11-24T14:56:36.527249+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/81-verify-a-running-daemon-pauses-and/.stage/verify-a-running-daemon-pauses-and/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/81-verify-a-running-daemon-pauses-and/.stage/verify-a-running-daemon-pauses-and/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/81-verify-a-running-daemon-pauses-and/.stage/verify-a-running-daemon-pauses-and/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/81-verify-a-running-daemon-pauses-and/.stage/verify-a-running-daemon-pauses-and/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/81-verify-a-running-daemon-pauses-and/.stage/verify-a-running-daemon-pauses-and/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 550,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Verify runtime recovery across the filesystem floor",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/550",
+    "baseRefName": "main",
+    "baseRefOid": "3c817247448e764e4530e60eb7be09dacf301ee2",
+    "headRefName": "paudley/81-verify-a-running-daemon-pauses-and",
+    "isCrossRepository": false,
+    "headRefOid": "641e5fc4f89149e6be04fc0d979bb3bf02dd110a",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/595/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "641e5fc4f89149e6be04fc0d979bb3bf02dd110a",
+    "branch": "paudley/81-verify-a-running-daemon-pauses-and",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 550,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #550 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}

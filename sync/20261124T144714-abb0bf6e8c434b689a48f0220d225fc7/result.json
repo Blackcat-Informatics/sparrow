@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/81-verify-a-running-daemon-pauses-and",
+  "branch": "paudley/81-verify-a-running-daemon-pauses-and",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "7d834ae9bd7b8935cf774d87c85ffaab98d66fa2",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/81-verify-a-running-daemon-pauses-and/.stage/verify-a-running-daemon-pauses-and/sync/20261124T144714-abb0bf6e8c434b689a48f0220d225fc7",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "3c817247448e764e4530e60eb7be09dacf301ee2",
+  "merge_bases": [
+    "7d834ae9bd7b8935cf774d87c85ffaab98d66fa2"
+  ],
+  "commit": "3c817247448e764e4530e60eb7be09dacf301ee2"
+}
