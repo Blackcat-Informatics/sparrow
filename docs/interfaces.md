@@ -1749,9 +1749,9 @@ deadline that has not been retired, for example while the archive gate holds
 it, still counts. Status `live_records` keeps its deadline meaning (see "Store
 counters").
 
-The `sourcesList` wire row reports logical retained payload bytes through
-`retainedPayloadBytes`. CLI and MCP expose the count as the decimal string
-`retained_payload_bytes` or null when an older server omits it. Each complete
+Schema 74 adds `retainedPayloadBytes` to the `sourcesList` wire row. CLI and
+MCP require a matching daemon schema and expose the count as the decimal
+string `retained_payload_bytes`. Each complete
 artifact contributes its original length once, including gaps and recordless
 payloads. An incomplete or missing parent contributes the sum of its remaining
 readable record spans. Retired and evicted spans contribute zero. The total
