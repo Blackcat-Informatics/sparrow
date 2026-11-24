@@ -49,6 +49,15 @@ Both runs completed durable intake, exact-byte readback and full query
 traversals. Page admission can return fewer than the requested number of
 rows. These samples cover the specified workload and limits.
 
+A single-import run of the release daemon and CLI fixtures imported a
+1,048,642-byte synthetic log into a fresh store over its private Unix socket and
+published 14,743 records. Immediately after the CLI returned, before shutdown,
+seven numbered WAL files totaled 190,945,144 bytes by file length and
+227,471,360 bytes in allocated blocks. The store's `OPTIONS-000007` lists the
+`default`, `payload` and `rdf_reverse` families with
+`max_total_wal_size=268435456` (256 MiB). The pinned-WAL release regression
+exercises flushing an idle family after writes cross the configured threshold.
+
 ## Schema 62 native graph and text follow-up
 
 A 64-cohort synthetic run also checked the typed native graph APIs. Four
