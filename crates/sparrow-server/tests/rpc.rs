@@ -20,6 +20,8 @@ mod journal;
 mod mcp_http;
 #[path = "rpc/source_binding.rs"]
 mod source_binding;
+#[path = "rpc/tcp_port.rs"]
+mod tcp_port;
 
 #[tokio::test(flavor = "current_thread")]
 async fn capability_documents_share_cli_mcp_and_typed_transport_contracts() {
@@ -30,7 +32,7 @@ async fn capability_documents_share_cli_mcp_and_typed_transport_contracts() {
             let data = dir.path().join("store");
             let socket = data.join("rpc.sock");
             let config = write_server_config(dir.path(), &data, &socket);
-            let (address, reservation) = configure_tcp_listener(&config);
+            let (address, reservation, _port_lease) = configure_tcp_listener(&config);
             drop(reservation);
             let _daemon = start(&config, &socket).await;
             // INVARIANT: the daemon's group can reach the socket and nothing else in the store.
@@ -322,7 +324,7 @@ async fn log_timestamp_profiles_share_tcp_cli_unix_mcp_and_chronological_capture
             let data = directory.path().join("store");
             let socket = data.join("rpc.sock");
             let config = write_server_config(directory.path(), &data, &socket);
-            let (address, reservation) = configure_tcp_listener(&config);
+            let (address, reservation, _port_lease) = configure_tcp_listener(&config);
             drop(reservation);
             let _daemon = start(&config, &socket).await;
             let endpoint = format!("tcp://{address}");
@@ -662,36 +664,15 @@ async fn tcp_client(
     .await
 }
 
-fn configure_tcp_listener(config: &Path) -> (std::net::SocketAddr, TcpReservation) {
+fn configure_tcp_listener(
+    config: &Path,
+) -> (
+    std::net::SocketAddr,
+    TcpReservation,
+    std::os::unix::net::UnixDatagram,
+) {
     let guard = PROCESS_START.lock().unwrap();
-    // Released bind(0) ports race the kernel's outbound ephemeral allocations.
-    static NEXT_PORT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(10240);
-    let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
-    let bounds = range
-        .split_whitespace()
-        .map(|value| value.parse::<u32>().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(bounds.len(), 2);
-    let mut reservation = None;
-    for _ in 0..128 {
-        let mut port = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if port >= bounds[0] {
-            port += bounds[1] - bounds[0] + 1;
-        }
-        assert!(
-            port <= u32::from(u16::MAX),
-            "no non-ephemeral unprivileged test port is available"
-        );
-        match std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port as u16)) {
-            Ok(listener) => {
-                reservation = Some(listener);
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
-            Err(error) => panic!("test TCP listener admission failed: {error}"),
-        }
-    }
-    let reservation = reservation.expect("test TCP listener range is occupied");
+    let (reservation, port_lease) = tcp_port::reserve(tcp_port::candidates());
     let port = reservation.local_addr().unwrap().port();
     let secret = config.with_file_name("tcp.secret");
     std::fs::write(&secret, b"sparrow test CHAP secret of 32+ bytes").unwrap();
@@ -711,7 +692,7 @@ fn configure_tcp_listener(config: &Path) -> (std::net::SocketAddr, TcpReservatio
         secret.display()
     ));
     std::fs::write(config, text).unwrap();
-    (address, (reservation, guard))
+    (address, (reservation, guard), port_lease)
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -727,7 +708,7 @@ async fn typed_tail_handoff_retires_original_checkpoint_over_tcp_and_replays_thr
         let data = dir.path().join("store");
         let socket = data.join("rpc.sock");
         let config = write_server_config(dir.path(), &data, &socket);
-        let (address, reservation) = configure_tcp_listener(&config);
+        let (address, reservation, _port_lease) = configure_tcp_listener(&config);
         drop(reservation);
         append_tail_config(&config, &root, "log");
         let daemon = start(&config, &socket).await;
@@ -848,7 +829,7 @@ async fn explicit_tail_completion_preserves_partial_bytes_retry_clocks_and_retai
             let data = dir.path().join("store");
             let socket = data.join("rpc.sock");
             let config = write_server_config(dir.path(), &data, &socket);
-            let (address, reservation) = configure_tcp_listener(&config);
+            let (address, reservation, _port_lease) = configure_tcp_listener(&config);
             drop(reservation);
             append_tail_config(&config, &root, "log");
             let daemon = start(&config, &socket).await;
@@ -1633,7 +1614,7 @@ async fn file_generation_queries_preserve_raw_provenance_and_refuse_foreign_or_s
                     .unwrap();
                 (store.store_id().unwrap(), generation.id, record, empty.id)
             };
-            let (address, reservation) = configure_tcp_listener(&config);
+            let (address, reservation, _port_lease) = configure_tcp_listener(&config);
             drop(reservation);
             let daemon = start(&config, &socket).await;
             let client = tcp_client(address).await.unwrap();
@@ -1791,7 +1772,7 @@ async fn tcp_logging_worker_retains_pending_identity_across_outage_and_daemon_re
             let data = dir.path().join("store");
             let socket = data.join("rpc.sock");
             let config = write_server_config(dir.path(), &data, &socket);
-            let (address, reservation) = configure_tcp_listener(&config);
+            let (address, reservation, _port_lease) = configure_tcp_listener(&config);
             drop(reservation);
             let mut settings = sparrow_client::DeliveryConfig::tcp(address, "tcp-logging")
                 .with_quarantine_dir(dir.path().join("quarantine"));
@@ -1883,7 +1864,7 @@ async fn remote_agent_adapters_share_all_query_and_mutation_paths_and_report_con
             let data = dir.path().join("store");
             let socket = data.join("rpc.sock");
             let config = write_server_config(dir.path(), &data, &socket);
-            let (address, reservation) = configure_tcp_listener(&config);
+            let (address, reservation, _port_lease) = configure_tcp_listener(&config);
             drop(reservation);
             let daemon = start(&config, &socket).await;
             let endpoint = format!("tcp://{address}");
@@ -1962,7 +1943,7 @@ async fn public_tcp_requires_chap_for_reads_and_administration_but_not_ingestion
             let data = dir.path().join("store");
             let socket = data.join("rpc.sock");
             let config = write_server_config(dir.path(), &data, &socket);
-            let (address, reservation) = configure_tcp_listener(&config);
+            let (address, reservation, _port_lease) = configure_tcp_listener(&config);
             drop(reservation);
             let definition_file = dir.path().join("definition.toml");
             let definition = watch_definition(&root, "victim", 300, 16, 16);
@@ -2104,7 +2085,7 @@ async fn pipelined_calls_on_a_refused_session_reach_no_service() {
             let data = dir.path().join("store");
             let socket = data.join("rpc.sock");
             let config = write_server_config(dir.path(), &data, &socket);
-            let (address, reservation) = configure_tcp_listener(&config);
+            let (address, reservation, _port_lease) = configure_tcp_listener(&config);
             drop(reservation);
             let _daemon = start(&config, &socket).await;
             let local = sparrow_client::Client::connect(&socket).await.unwrap();
@@ -2610,7 +2591,7 @@ async fn public_tcp_uses_the_same_typed_service_store_and_retry_receipts_as_unix
             let data = dir.path().join("store");
             let socket = data.join("rpc.sock");
             let config = write_server_config(dir.path(), &data, &socket);
-            let (address, reservation) = configure_tcp_listener(&config);
+            let (address, reservation, _port_lease) = configure_tcp_listener(&config);
             drop(reservation);
             let daemon = start(&config, &socket).await;
             let tcp = tcp_client(address).await.unwrap();
@@ -2690,7 +2671,7 @@ async fn configured_syslog_listeners_publish_exact_packets_and_report_transport_
         assert_eq!(text.matches("max_concurrent_requests = 4").count(), 1);
         text = text.replace("max_concurrent_requests = 4", "max_concurrent_requests = 5");
         std::fs::write(&config, text).unwrap();
-        let (rpc_address, reservation) = configure_tcp_listener(&config);
+        let (rpc_address, reservation, _port_lease) = configure_tcp_listener(&config);
         drop(reservation);
         for (id, transport, framing) in [("octets", "tcp", Some("octet_counting")), ("datagrams", "udp", None), ("lf", "tcp", Some("lf")), ("crlf", "tcp", Some("cr_lf"))] {
             append_syslog_config(&config, id, "127.0.0.1:0", &format!("syslog-{id}"), transport, framing);
@@ -3072,7 +3053,7 @@ async fn idle_rpc_connections_share_a_finite_transport_budget_independent_of_sto
                     + "\nmax_rpc_connections = 6\n",
             )
             .unwrap();
-            let (address, reservation) = configure_tcp_listener(&config);
+            let (address, reservation, _port_lease) = configure_tcp_listener(&config);
             drop(reservation);
             let daemon = start(&config, &socket).await;
             let mut idle = Vec::new();
@@ -10767,7 +10748,7 @@ async fn rotating_a_tcp_credential_recovers_the_same_pending_delivery() {
         let store = dir.path().join("store");
         let socket = store.join("rpc.sock");
         let config = write_server_config(dir.path(), &store, &socket);
-        let (address, reservation) = configure_tcp_listener(&config);
+        let (address, reservation, _port_lease) = configure_tcp_listener(&config);
         drop(reservation);
         let _daemon = start(&config, &socket).await;
         let path = dir.path().join("producer.secret");
@@ -10800,7 +10781,7 @@ async fn killed_owner_restarts_without_socket_unlink_and_preserves_durable_evide
             let data = dir.path().join("store");
             let socket = data.join("rpc.sock");
             let config = write_server_config(dir.path(), &data, &socket);
-            let (address, reservation) = configure_tcp_listener(&config);
+            let (address, reservation, _port_lease) = configure_tcp_listener(&config);
             drop(reservation);
             let daemon = start(&config, &socket).await;
             let client = tcp_client(address).await.unwrap();
@@ -11020,7 +11001,7 @@ async fn interrupt_during_startup_is_retained_until_owned_teardown() {
     let data = dir.path().join("store");
     let socket = data.join("rpc.sock");
     let config = write_server_config(dir.path(), &data, &socket);
-    let (address, (reserved, guard)) = configure_tcp_listener(&config);
+    let (address, (reserved, guard), _port_lease) = configure_tcp_listener(&config);
     drop(reserved);
     drop(guard);
     let mut daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_sparrowd-rpc-fixture"))
@@ -11089,7 +11070,7 @@ async fn shutdown_syslog_bind_refusal_cleans_owned_endpoint_and_allows_retry() {
             let data = dir.path().join("store");
             let socket = data.join("rpc.sock");
             let config = write_server_config(dir.path(), &data, &socket);
-            let (address, (occupied, guard)) = configure_tcp_listener(&config);
+            let (address, (occupied, guard), _port_lease) = configure_tcp_listener(&config);
             drop(guard);
             let text = std::fs::read_to_string(&config).unwrap();
             let text = text
@@ -11439,7 +11420,7 @@ async fn typed_upload_resumes_chunks_and_native_preparation_after_daemon_crashes
         let store_path = dir.path().join("store");
         let socket = store_path.join("rpc.sock");
         let config = write_server_config(dir.path(), &store_path, &socket);
-        let (address, reservation) = configure_tcp_listener(&config);
+        let (address, reservation, _port_lease) = configure_tcp_listener(&config);
         let tcp = format!("tcp://{address}");
         drop(reservation);
         let daemon = start(&config, &socket).await;
@@ -11612,7 +11593,7 @@ async fn typed_events_keep_rust_values_context_source_time_and_retry_receipts() 
         let store_path = dir.path().join("store");
         let socket = store_path.join("rpc.sock");
         let config = write_server_config(dir.path(), &store_path, &socket);
-        let (address, reservation) = configure_tcp_listener(&config);
+        let (address, reservation, _port_lease) = configure_tcp_listener(&config);
         drop(reservation);
         let daemon = start(&config, &socket).await;
         let producer = sparrow_client::Client::connect(&socket).await.unwrap();
@@ -13481,7 +13462,7 @@ async fn direct_promises_and_mcp_notifications_cancel_captures_without_closing_t
                 .unwrap()
                 .replace("disk_budget = 134217728", "disk_budget = 1073741824");
             std::fs::write(&config, text).unwrap();
-            let (address, reservation) = configure_tcp_listener(&config);
+            let (address, reservation, _port_lease) = configure_tcp_listener(&config);
             drop(reservation);
             let daemon = start(&config, &socket).await;
             let client = sparrow_client::Client::connect(&socket).await.unwrap();
@@ -14058,7 +14039,7 @@ async fn correlation_cli_mcp_and_typed_pages_retain_native_certainty_and_pin_sco
                 .pin("correlate-pin", "correlation", &targets, 40, old)
                 .unwrap();
             drop(owner);
-            let (address, reservation) = configure_tcp_listener(&config);
+            let (address, reservation, _port_lease) = configure_tcp_listener(&config);
             drop(reservation);
             let _daemon = start(&config, &socket).await;
             let endpoint = format!("tcp://{address}");
@@ -14490,7 +14471,7 @@ async fn native_graph_queries_preserve_forms_certificates_and_leases_over_tcp_cl
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("store"); let socket = data.join("rpc.sock");
         let config = write_server_config(dir.path(),&data,&socket);
-        let (address,reservation) = configure_tcp_listener(&config); drop(reservation);
+        let (address, reservation, _port_lease) = configure_tcp_listener(&config); drop(reservation);
         let _daemon = start(&config,&socket).await;
         let endpoint = format!("tcp://{address}");
         let client = sparrow_client::Client::connect_endpoint(&test_endpoint(&endpoint)).await.unwrap();
@@ -14583,7 +14564,7 @@ async fn stored_text_graph_relations_preserve_corpus_spans_and_explanations_over
         let data = dir.path().join("store");
         let socket = data.join("rpc.sock");
         let config = write_server_config(dir.path(), &data, &socket);
-        let (address, reservation) = configure_tcp_listener(&config);
+        let (address, reservation, _port_lease) = configure_tcp_listener(&config);
         drop(reservation);
         let _daemon = start(&config, &socket).await;
         let endpoint = format!("tcp://{address}");
@@ -14733,7 +14714,7 @@ async fn native_explanation_preserves_measured_work_over_tcp_cli_mcp_and_continu
         let data = dir.path().join("store");
         let socket = data.join("rpc.sock");
         let config = write_server_config(dir.path(), &data, &socket);
-        let (address, reservation) = configure_tcp_listener(&config);
+        let (address, reservation, _port_lease) = configure_tcp_listener(&config);
         drop(reservation);
         let _daemon = start(&config, &socket).await;
         let endpoint = format!("tcp://{address}");
@@ -15708,7 +15689,7 @@ async fn large_json_disk_pages_share_tcp_unix_cli_mcp_and_typed_limits() {
                 .unwrap()
                 .replace("disk_budget = 134217728", "disk_budget = 1073741824");
             std::fs::write(&config, text).unwrap();
-            let (address, reservation) = configure_tcp_listener(&config);
+            let (address, reservation, _port_lease) = configure_tcp_listener(&config);
             drop(reservation);
             let _daemon = start(&config, &socket).await;
             let client = sparrow_client::Client::connect(&socket).await.unwrap();

@@ -32,7 +32,7 @@ async fn bound_source_refuses_writes_from_other_access_classes() {
             let data = dir.path().join("store");
             let socket = data.join("rpc.sock");
             let config = write_server_config(dir.path(), &data, &socket);
-            let (address, reservation) = configure_tcp_listener(&config);
+            let (address, reservation, _port_lease) = configure_tcp_listener(&config);
             drop(reservation);
             let uid = rustix::process::geteuid().as_raw();
             configure(
