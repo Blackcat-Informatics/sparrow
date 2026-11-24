@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/95-enforce-source-bindings-for-every",
+  "branch": "paudley/95-enforce-source-bindings-for-every",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "187668eeab6870fa824ec83f1600b4fe5e2cb365",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/95-enforce-source-bindings-for-every/.stage/enforce-source-bindings-for-every/sync/20261124T061936-8dddb6a2c02849218faab6afad3d94f5",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "7a7b601dee09fea6a5a2d74258ca1f86ecf74d63",
+  "merge_bases": [
+    "187668eeab6870fa824ec83f1600b4fe5e2cb365"
+  ],
+  "commit": "7a7b601dee09fea6a5a2d74258ca1f86ecf74d63"
+}
