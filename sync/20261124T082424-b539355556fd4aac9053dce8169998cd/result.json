@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/41-stop-source-listings-from-charging",
+  "branch": "paudley/41-stop-source-listings-from-charging",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "6e840cf457406e77ed86b46799bf98193b7ff89d",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/41-stop-source-listings-from-charging/.stage/stop-source-listings-from-charging/sync/20261124T082424-b539355556fd4aac9053dce8169998cd",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "d68f014e3a5e5f89cfdf7687282cc12134b898df",
+  "merge_bases": [
+    "6e840cf457406e77ed86b46799bf98193b7ff89d"
+  ],
+  "commit": "d68f014e3a5e5f89cfdf7687282cc12134b898df"
+}

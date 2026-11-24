@@ -1,0 +1,80 @@
+{
+  "issue": 41,
+  "pr_number": 518,
+  "branch": "paudley/41-stop-source-listings-from-charging",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/41-stop-source-listings-from-charging/.stage/stop-source-listings-from-charging",
+  "observed_at": "2026-11-24T08:33:54.345855+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/41-stop-source-listings-from-charging/.stage/stop-source-listings-from-charging/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/41-stop-source-listings-from-charging/.stage/stop-source-listings-from-charging/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/41-stop-source-listings-from-charging/.stage/stop-source-listings-from-charging/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/41-stop-source-listings-from-charging/.stage/stop-source-listings-from-charging/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/41-stop-source-listings-from-charging/.stage/stop-source-listings-from-charging/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 518,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Verify source listings isolate recordless artifacts",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/518",
+    "baseRefName": "main",
+    "baseRefOid": "d68f014e3a5e5f89cfdf7687282cc12134b898df",
+    "headRefName": "paudley/41-stop-source-listings-from-charging",
+    "isCrossRepository": false,
+    "headRefOid": "d90acc84fa328b332a71e55d0ba4e991f57c2b10",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/532/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "d90acc84fa328b332a71e55d0ba4e991f57c2b10",
+    "branch": "paudley/41-stop-source-listings-from-charging",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 518,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #518 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}
