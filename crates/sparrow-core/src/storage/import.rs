@@ -655,8 +655,8 @@ impl Store {
         Ok(())
     }
 
-    /// Size this open store's import bound and pin caps from scaled retirement
-    /// `limits` and record row reserve, so a test can reach both ceilings without
+    /// Size this open store's import bound and pin budget from scaled retirement
+    /// `limits` and record row reserve, so a test can reach the budgets without
     /// multi-GiB inputs. Expiry and eviction must then run with the same limits.
     /// This entry point is absent unless the dev-only test-support feature is selected.
     #[cfg(feature = "test-support")]
