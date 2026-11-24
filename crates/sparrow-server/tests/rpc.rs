@@ -6259,6 +6259,146 @@ async fn daemon_starts_below_the_free_space_floor_and_serves_reads() {
         .await;
 }
 
+/// Exercise the daemon's actual space measurement, RPC, and consume worker in one process.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires the isolated tmpfs from tools/enospc-check.sh floor"]
+async fn runtime_free_space_pauses_writes_and_resumes_consumption() {
+    const MIB: u64 = 1 << 20;
+    const FLOOR: u64 = 64 * MIB;
+    const RESERVE: u64 = 8 * MIB;
+    let mount = std::path::PathBuf::from(
+        std::env::var_os("SPARROW_ENOSPC_DIR").expect("run tools/enospc-check.sh LOG floor"),
+    );
+    let fs = rustix::fs::statfs(&mount).unwrap();
+    // Linux TMPFS_MAGIC from linux/magic.h.
+    assert_eq!(fs.f_type, 0x0102_1994, "the test requires scratch tmpfs");
+    let free = || {
+        let space = rustix::fs::statvfs(&mount).unwrap();
+        space.f_bavail * space.f_frsize
+    };
+    assert!(
+        (FLOOR + 16 * MIB..=192 * MIB).contains(&free()),
+        "the scratch tmpfs must begin with 80 to 192 MiB free"
+    );
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::Builder::new()
+                .prefix("f")
+                .rand_bytes(5)
+                .tempdir_in(&mount)
+                .unwrap();
+            let data = dir.path().join("s");
+            let socket = data.join("r");
+            let root = dir.path().join("completed");
+            std::fs::create_dir(&root).unwrap();
+            let config = write_server_config(dir.path(), &data, &socket);
+            let base = std::fs::read_to_string(&config).unwrap();
+            std::fs::write(
+                &config,
+                base.replace(
+                    "min_free_bytes = 1048576",
+                    &format!("min_free_bytes = {FLOOR}"),
+                ),
+            )
+            .unwrap();
+            append_consume_config(&config, &root, 0, 16, 16);
+            let mut daemon = Watched::spawn(&config, None);
+            daemon.until("sparrowd: store=").await;
+            let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            watch_until(client.capability(), |watch| {
+                watch.get_coverage().unwrap() == wire::WatchCoverage::Covered
+            })
+            .await;
+            let kept = client
+                .ingest("before-floor", "test", wire::Format::Log, b"kept\n")
+                .await
+                .unwrap();
+            assert!(free() > FLOOR);
+
+            let ballast = dir.path().join("ballast");
+            let file = std::fs::File::create_new(&ballast).unwrap();
+            rustix::fs::fallocate(
+                &file,
+                rustix::fs::FallocateFlags::empty(),
+                0,
+                free() - 40 * MIB,
+            )
+            .unwrap();
+            drop(file);
+            assert!((RESERVE..FLOOR).contains(&free()), "free bytes: {}", free());
+            let pause = daemon.until("free space is below the floor:").await;
+            assert!(pause.contains("still accepting connections"), "{pause}");
+            eprint!("{pause}");
+
+            let during = sparrow_client::Client::connect(&socket).await.unwrap();
+            assert_eq!(
+                during.discovery().durability_session,
+                client.discovery().durability_session
+            );
+            assert_eq!(during.bytes(&kept.id, 0, 5).await.unwrap(), b"kept\n");
+            let refused = during
+                .ingest("held-by-floor", "test", wire::Format::Log, b"retry\n")
+                .await
+                .unwrap_err();
+            assert!(
+                refused.is_free_space_floor()
+                    && matches!(&refused, sparrow_client::Error::Domain {
+                        code, retryable: true, ..
+                    } if code == "STORAGE_PRESSURE"),
+                "{refused}"
+            );
+            let status = cli(&socket, &["status"]);
+            assert_ne!(status["floor_pause"]["paused_since"].as_str().unwrap(), "0");
+            assert_eq!(status["floor_pause"]["writes_refused"].as_str(), Some("1"));
+
+            let staged = dir.path().join("staged");
+            let offered = root.join("offered.jsonl");
+            std::fs::write(&staged, b"{\"message\":\"waiting for space\"}\n").unwrap();
+            std::fs::rename(staged, &offered).unwrap();
+            watch_until(during.capability(), |watch| {
+                watch.get_candidates() == 1
+                    && watch.get_pending_claims() == 0
+                    && watch.get_completed_claims() == 0
+            })
+            .await;
+            assert!(offered.is_file());
+            assert!((RESERVE..FLOOR).contains(&free()), "free bytes: {}", free());
+
+            std::fs::remove_file(ballast).unwrap();
+            assert!(free() > FLOOR);
+            let resumed = daemon.until("free space restored after").await;
+            assert!(resumed.contains("writes resume"), "{resumed}");
+            eprint!("{resumed}");
+            // Publication must recover on the floor edge before any client retries a write.
+            watch_until(during.capability(), |watch| {
+                watch.get_completed_claims() == 1
+            })
+            .await;
+            assert!(!offered.exists());
+            let status = cli(&socket, &["status"]);
+            assert_eq!(status["floor_pause"]["paused_since"].as_str(), Some("0"));
+            assert_eq!(status["floor_pause"]["writes_refused"].as_str(), Some("1"));
+            assert_eq!(status["durability"]["latches"].as_str(), Some("0"));
+            assert_eq!(
+                status["durability"]["failure"],
+                purrdf_lex::json::Value::Null
+            );
+            assert_eq!(status["live_records"].as_str(), Some("2"));
+            let receipt = during
+                .ingest("held-by-floor", "test", wire::Format::Log, b"retry\n")
+                .await
+                .unwrap();
+            assert_eq!(receipt.store_id, kept.store_id);
+            assert_eq!(during.bytes(&receipt.id, 0, 6).await.unwrap(), b"retry\n");
+
+            daemon.interrupt();
+            let (exit, remaining) = daemon.exit().await;
+            assert!(exit.success(), "{exit}: {remaining}");
+        })
+        .await;
+}
+
 /// INVARIANT (#440): the wait to open covers the replay of write-ahead log an unclean stop
 /// left, not only the maintenance reserve: with a log in `data_dir` larger than the free
 /// space, the daemon waits without opening the store, and exits cleanly on an interrupt.
