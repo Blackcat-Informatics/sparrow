@@ -1,0 +1,19 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 6a016be7505d4e53809d1dbcf79891f08a9284b4
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 526
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/526
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: ac37cfa76200d024f13ed5e7eb28d19fd7071836
+GhpRsq-Head-Ref: paudley/69-state-flush-in-every-list-of-operations
+GhpRsq-Head-OID: 6a016be7505d4e53809d1dbcf79891f08a9284b4
+GhpRsq-Result-Tree: d751677fa624ca43b5dc44bf23811cc63e27cb52
+GhpRsq-Result-Commit: e483e9c385c331203f0299aff3e5144822f57075
+GhpRsq-Parent-Hashes: 6a016be7505d4e53809d1dbcf79891f08a9284b4
+GhpRsq-Squash-Notes-SHA256: e57db656987b5ced5bed8380c10b561fd5b765f6ba8c96d1a77fede4769d985c
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
