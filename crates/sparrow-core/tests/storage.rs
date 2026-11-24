@@ -13350,6 +13350,104 @@ fn artifacts_listing_reads_only_its_page() {
     assert_eq!(next.page_start, 1);
 }
 
+/// Walk a crowded receipt millisecond and fully fold a new parent after the cursor.
+#[test]
+fn listing_resumed_inside_a_millisecond_counts_a_new_artifacts_records() {
+    use sparrow_core::{ArtifactRead, Durability, MAX_BUFFERED_WRITES, ResultPage};
+    use std::collections::BTreeSet;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), large_config()).unwrap();
+    let received_at = 137;
+    let now = received_at + 1;
+    let page_size = 31;
+    let mut remaining = BTreeSet::new();
+    for (source, count) in [("bulk", 5_000), ("neighbor", page_size)] {
+        for index in 0..count {
+            let artifact = store
+                .ingest_with_durability(
+                    &format!("{source}-{index}"),
+                    source,
+                    "log",
+                    b"",
+                    received_at,
+                    Durability::Buffered,
+                )
+                .unwrap();
+            assert!(remaining.insert(artifact.id));
+            if remaining.len().is_multiple_of(MAX_BUFFERED_WRITES) {
+                store.flush_buffered().unwrap();
+            }
+        }
+    }
+    store.flush_buffered().unwrap();
+
+    let mut page = store
+        .artifact_read(
+            &ArtifactRead {
+                page_size,
+                ..Default::default()
+            },
+            now,
+        )
+        .unwrap();
+    // Both sources fill a page. Whichever sorts first, the other is after this cursor.
+    let first_source = page.body.artifacts.last().unwrap().source.as_str();
+    let later_source = if first_source == "bulk" {
+        "neighbor"
+    } else {
+        "bulk"
+    };
+    assert_eq!(page.body.artifacts.len(), page_size);
+    assert!(
+        page.body
+            .artifacts
+            .iter()
+            .all(|row| row.source == first_source)
+    );
+    let inserted = store
+        .ingest(
+            "between-pages",
+            later_source,
+            "log",
+            b"a\nb\nc\n",
+            received_at,
+        )
+        .unwrap();
+    assert!(remaining.insert(inserted.id.clone()));
+
+    loop {
+        for row in &page.body.artifacts {
+            assert!(
+                remaining.remove(&row.id),
+                "unexpected or repeated artifact {}",
+                row.id
+            );
+            if row.id == inserted.id {
+                assert_eq!(row.retained_records, 3);
+            }
+        }
+        let Some(cursor) = &page.next_cursor else {
+            break;
+        };
+        let ResultPage::Artifacts(next) = store.result_next(&page.store_id, cursor, now).unwrap()
+        else {
+            panic!("the listing cursor must return an artifact page");
+        };
+        assert!(
+            store
+                .result_release(&page.store_id, &page.snapshot_id, now)
+                .unwrap()
+        );
+        page = next;
+    }
+    assert!(
+        remaining.is_empty(),
+        "{} artifacts were omitted",
+        remaining.len()
+    );
+}
+
 #[test]
 fn artifacts_listing_page_over_its_bound_is_refused_by_name() {
     use sparrow_core::ArtifactRead;
