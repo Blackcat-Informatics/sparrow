@@ -70,7 +70,7 @@ pub use storage::ingest_status::{
     PartReceiptState,
 };
 pub use storage::instance_role::{InstanceRole, stamp};
-pub use storage::intake::{INGEST_SOCKET, Intake, PeerCredential, admit_import};
+pub use storage::intake::{INGEST_SOCKET, Intake, PeerCredential};
 pub use storage::listing_build::BuildProgress;
 pub use storage::log_time::LogTimeCapture;
 pub use storage::migration::{Migration, MigrationPage, MigrationStatus};

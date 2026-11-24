@@ -404,6 +404,7 @@ fn tracing_relationships_keep_instance_and_occurrence_evidence_through_backfill_
                 instance: [0x11; 16],
                 sequences: vec![1],
             },
+            None,
             1,
             Durability::Durable,
         )
@@ -421,6 +422,7 @@ fn tracing_relationships_keep_instance_and_occurrence_evidence_through_backfill_
                 instance: [0x22; 16],
                 sequences: vec![1],
             },
+            None,
             2,
             Durability::Durable,
         )
@@ -439,6 +441,7 @@ fn tracing_relationships_keep_instance_and_occurrence_evidence_through_backfill_
                 instance: [0x11; 16],
                 sequences: vec![1],
             },
+            None,
             3,
             Durability::Durable,
         )
@@ -695,6 +698,7 @@ fn source_stream_rdf_deduplicates_union_and_follows_pinned_occurrence_lifetimes(
                 instance: [4; 16],
                 sequences: vec![1, 2],
             },
+            None,
             1,
             Durability::Durable,
         )
@@ -2983,6 +2987,7 @@ fn syslog_format_upgrade_preserves_existing_producer_windows_and_watch_fences() 
                     instance: [3; 16],
                     sequences: vec![1, 4],
                 },
+                None,
                 1,
                 Durability::Durable,
             )
@@ -3053,6 +3058,7 @@ fn producer_positions_gaps_retries_and_retention_share_atomic_publication() {
             "producer",
             b"{}\n{}\n",
             &first,
+            None,
             1,
             Durability::Buffered,
         )
@@ -3094,6 +3100,7 @@ fn producer_positions_gaps_retries_and_retention_share_atomic_publication() {
             "producer",
             b"{}\n",
             &second,
+            None,
             3,
             Durability::Durable,
         )
@@ -3137,6 +3144,7 @@ fn producer_positions_gaps_retries_and_retention_share_atomic_publication() {
                     "producer",
                     b"{}\n{}\n",
                     &input,
+                    None,
                     4,
                     Durability::Durable
                 )
@@ -3160,6 +3168,7 @@ fn producer_positions_gaps_retries_and_retention_share_atomic_publication() {
                 "producer",
                 b"{}\n{}\n",
                 &first,
+                None,
                 5,
                 Durability::Durable
             )
@@ -3185,6 +3194,7 @@ fn producer_positions_gaps_retries_and_retention_share_atomic_publication() {
                 "producer",
                 b"{}\n{}\n",
                 &first,
+                None,
                 6,
                 Durability::Durable
             )
@@ -3218,6 +3228,7 @@ fn producer_positions_gaps_retries_and_retention_share_atomic_publication() {
             "producer",
             b"{}\n{}\n",
             &first,
+            None,
             deadline,
             Durability::Durable,
         )
@@ -3318,6 +3329,7 @@ fn full_producer_registry(store: &Store) {
                     instance: [index as u8 + 1; 16],
                     sequences: vec![1],
                 },
+                None,
                 1,
                 Durability::Durable,
             )
@@ -3346,6 +3358,7 @@ fn full_producer_registry_takes_the_batch_counts_the_loss_and_keeps_retries_idem
             "producer",
             &bytes,
             &overflow,
+            None,
             2,
             Durability::Durable,
         )
@@ -3360,6 +3373,7 @@ fn full_producer_registry_takes_the_batch_counts_the_loss_and_keeps_retries_idem
             "producer",
             &bytes,
             &overflow,
+            None,
             3,
             Durability::Durable,
         )
@@ -3392,6 +3406,7 @@ fn full_producer_registry_takes_the_batch_counts_the_loss_and_keeps_retries_idem
                 "producer",
                 b"{}\n",
                 &held,
+                None,
                 4,
                 Durability::Durable
             )
@@ -3425,6 +3440,7 @@ fn lost_stream_report_names_the_top_streams_and_counts_the_overflow() {
                     instance: [200 + index as u8; 16],
                     sequences: (1..=events).collect(),
                 },
+                None,
                 2,
                 Durability::Durable,
             )
@@ -3457,6 +3473,7 @@ fn producer_registry_has_finite_windows_gap_suffix_and_hard_corruption_failures(
             "producer",
             &bytes,
             &sequence,
+            None,
             1,
             Durability::Durable,
         )
@@ -3484,6 +3501,7 @@ fn producer_registry_has_finite_windows_gap_suffix_and_hard_corruption_failures(
                     instance: [index as u8 + 1; 16],
                     sequences: vec![1],
                 },
+                None,
                 2,
                 Durability::Durable,
             )
@@ -3500,6 +3518,7 @@ fn producer_registry_has_finite_windows_gap_suffix_and_hard_corruption_failures(
             "producer",
             b"{}\n",
             &overflow,
+            None,
             2,
             Durability::Durable,
         )
@@ -4645,7 +4664,15 @@ fn recordless_publication_resets_continuation_and_staged_import_uses_the_same_in
     );
     assert!(store.evict_oldest(21, limits).unwrap().records.is_empty());
     let stage = match store
-        .import_start("empty-staged", "source", "jsonl", 0, &empty.payload_id, 22)
+        .import_start(
+            "empty-staged",
+            "source",
+            "jsonl",
+            0,
+            &empty.payload_id,
+            None,
+            22,
+        )
         .unwrap()
     {
         ImportStart::Staging(stage) => stage,
@@ -7822,6 +7849,7 @@ fn staged_import_pressure_and_impossible_writes_have_distinct_admission_outcomes
                 "log",
                 input.len() as u64,
                 &payload_id,
+                None,
                 2
             )
             .unwrap_err()
@@ -9027,7 +9055,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     );
     assert_eq!(
         store
-            .import_start(&reserved.request_id, "source", "log", 4, &digest, 0)
+            .import_start(&reserved.request_id, "source", "log", 4, &digest, None, 0)
             .unwrap_err()
             .code,
         "CONFLICT"
@@ -9148,7 +9176,15 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         Some("0")
     );
     let recovered = match store
-        .import_start(&reserved.request_id, "source", "log", 4, &digest, 40 * DAY)
+        .import_start(
+            &reserved.request_id,
+            "source",
+            "log",
+            4,
+            &digest,
+            None,
+            40 * DAY,
+        )
         .unwrap()
     {
         ImportStart::Accepted(recovered) => recovered,
@@ -9245,7 +9281,15 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     );
     assert_eq!(
         store
-            .import_start(&reserved.request_id, "source", "log", 4, &digest, 43 * DAY)
+            .import_start(
+                &reserved.request_id,
+                "source",
+                "log",
+                4,
+                &digest,
+                None,
+                43 * DAY
+            )
             .unwrap_err()
             .code,
         "CONFLICT"
@@ -9565,7 +9609,15 @@ fn consumption_missing_publication_receipt_is_a_hard_failure_without_republicati
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store
-            .import_start(&journal.request_id, "source", "log", 4, &digest, 3 * DAY)
+            .import_start(
+                &journal.request_id,
+                "source",
+                "log",
+                4,
+                &digest,
+                None,
+                3 * DAY
+            )
             .unwrap_err()
             .code,
         "STORAGE_FAILURE"
@@ -9813,6 +9865,7 @@ fn buffered_acceptance_has_a_session_fence_and_flush_covers_all_dependencies() {
             "source",
             "json",
             br#"{"message":"buffered evidence"}"#,
+            None,
             100,
             Durability::Buffered,
         )
@@ -9824,6 +9877,7 @@ fn buffered_acceptance_has_a_session_fence_and_flush_covers_all_dependencies() {
             "source",
             "json",
             br#"{"message":"buffered evidence"}"#,
+            None,
             101,
             Durability::Buffered,
         )
@@ -9843,6 +9897,7 @@ fn buffered_acceptance_has_a_session_fence_and_flush_covers_all_dependencies() {
             "source",
             "log",
             b"second\n",
+            None,
             100,
             Durability::Buffered,
         )
@@ -9922,6 +9977,7 @@ fn buffered_ledger_refuses_the_next_write_without_publishing_a_prefix() {
                 "queue",
                 "opaque",
                 b"x",
+                None,
                 0,
                 Durability::Buffered,
             )
@@ -9935,7 +9991,15 @@ fn buffered_ledger_refuses_the_next_write_without_publishing_a_prefix() {
     assert!(store.durability_status().unwrap().pending_bytes <= sparrow_core::MAX_BUFFERED_BYTES);
     assert_eq!(
         store
-            .ingest_with_durability("overflow", "queue", "opaque", b"x", 0, Durability::Buffered)
+            .ingest_with_durability(
+                "overflow",
+                "queue",
+                "opaque",
+                b"x",
+                None,
+                0,
+                Durability::Buffered
+            )
             .unwrap_err()
             .code,
         "STORAGE_PRESSURE"
@@ -9952,7 +10016,15 @@ fn buffered_ledger_refuses_the_next_write_without_publishing_a_prefix() {
         .flush_through(first.unwrap().buffered.as_ref().unwrap())
         .unwrap();
     let accepted = store
-        .ingest_with_durability("overflow", "queue", "opaque", b"x", 0, Durability::Buffered)
+        .ingest_with_durability(
+            "overflow",
+            "queue",
+            "opaque",
+            b"x",
+            None,
+            0,
+            Durability::Buffered,
+        )
         .unwrap();
     assert!(accepted.buffered.is_some());
     store.flush_buffered().unwrap();
@@ -9969,6 +10041,7 @@ fn buffered_batch_byte_charge_refuses_new_unique_payloads_before_the_write_bound
             "byte-queue",
             "opaque",
             bytes,
+            None,
             0,
             sparrow_core::Durability::Buffered,
         )
@@ -10032,6 +10105,7 @@ fn durable_retries_import_receipts_and_empty_control_batches_cover_buffered_inta
             "source",
             "log",
             b"x",
+            None,
             0,
             Durability::Buffered,
         )
@@ -10050,12 +10124,21 @@ fn durable_retries_import_receipts_and_empty_control_batches_cover_buffered_inta
             "source",
             "log",
             b"x",
+            None,
             0,
             Durability::Buffered,
         )
         .unwrap();
     let imported = store
-        .import_start("import-durable", "source", "log", 1, &second.payload_id, 0)
+        .import_start(
+            "import-durable",
+            "source",
+            "log",
+            1,
+            &second.payload_id,
+            None,
+            0,
+        )
         .unwrap();
     match imported {
         sparrow_core::ImportStart::Accepted(artifact) => assert!(artifact.buffered.is_none()),
@@ -10067,6 +10150,7 @@ fn durable_retries_import_receipts_and_empty_control_batches_cover_buffered_inta
             "source",
             "log",
             b"x",
+            None,
             0,
             Durability::Buffered,
         )
@@ -10876,6 +10960,7 @@ fn buffered_and_streamed_ingestion_share_request_identity() {
             "log",
             input.len() as u64,
             &payload,
+            None,
             1,
         )
         .unwrap()
@@ -10891,6 +10976,7 @@ fn buffered_and_streamed_ingestion_share_request_identity() {
                 "log",
                 input.len() as u64,
                 &payload,
+                None,
                 1
             )
             .unwrap_err()
@@ -10905,6 +10991,7 @@ fn buffered_and_streamed_ingestion_share_request_identity() {
                 "opaque",
                 input.len() as u64,
                 &payload,
+                None,
                 1
             )
             .unwrap_err()
@@ -10918,6 +11005,7 @@ fn buffered_and_streamed_ingestion_share_request_identity() {
             "log",
             input.len() as u64,
             &payload,
+            None,
             1,
         )
         .unwrap()
@@ -10955,6 +11043,7 @@ fn buffered_and_streamed_ingestion_share_request_identity() {
             "log",
             input.len() as u64,
             &payload,
+            None,
             3,
         )
         .unwrap()
@@ -13492,6 +13581,7 @@ fn listing_resumed_inside_a_millisecond_counts_a_new_artifacts_records() {
                     source,
                     "log",
                     b"",
+                    None,
                     received_at,
                     Durability::Buffered,
                 )
@@ -15892,6 +15982,7 @@ fn combined_ingest_status_preserves_buffered_ack_and_does_not_flush() {
             "source",
             "json",
             b"{}",
+            None,
             1,
             Durability::Buffered,
         )
@@ -17384,7 +17475,7 @@ fn event_batch_from_a_source_past_the_mapping_ceiling_is_taken_and_counted() {
         sequences: vec![1, 2],
     };
     let ingest = |request: &str, source: &str| {
-        store.ingest_events_with_intake(
+        store.ingest_events(
             request,
             source,
             events,
@@ -17426,7 +17517,7 @@ fn event_batch_from_a_source_past_the_mapping_ceiling_is_taken_and_counted() {
         sequences: vec![3, 4],
     };
     let mapped = store
-        .ingest_events_with_intake(
+        .ingest_events(
             "mapped",
             "source-0",
             events,
@@ -17464,6 +17555,7 @@ fn producer_batch_over_a_fixed_bound_is_refused_non_retryable() {
             "source",
             b"{}\n{}\n",
             &batch,
+            None,
             1,
             Durability::Durable,
         )
@@ -17472,7 +17564,7 @@ fn producer_batch_over_a_fixed_bound_is_refused_non_retryable() {
     // #238: an event-route batch refused for its input alone must not leave a mapping row that
     // spends one of the 1024 slots. The old code bound the mapping before this refusal.
     let events = store
-        .ingest_events_with_intake(
+        .ingest_events(
             "many-events",
             "event-source",
             b"{}\n{}\n",
@@ -17490,7 +17582,7 @@ fn producer_batch_over_a_fixed_bound_is_refused_non_retryable() {
         sequences: vec![1],
     };
     let big = store
-        .ingest_producer("big", "source", &inline, &one, 1, Durability::Durable)
+        .ingest_producer("big", "source", &inline, &one, None, 1, Durability::Durable)
         .unwrap_err();
     assert_eq!(big.code, "INVALID_ARGUMENT");
     assert_eq!(
@@ -17529,7 +17621,15 @@ fn producer_batch_over_the_whole_data_budget_is_refused_non_retryable() {
             sequences: vec![1],
         };
         let refused = store
-            .ingest_producer("budget", "source", b"{}\n", &batch, 1, Durability::Durable)
+            .ingest_producer(
+                "budget",
+                "source",
+                b"{}\n",
+                &batch,
+                None,
+                1,
+                Durability::Durable,
+            )
             .unwrap_err();
         assert_eq!(refused.code, "INVALID_ARGUMENT", "{which}");
         assert!(
@@ -24017,6 +24117,7 @@ fn source_counters_match_a_full_recount_after_every_lifecycle_step() {
                 instance: [0x33; 16],
                 sequences: vec![1],
             },
+            None,
             4,
             Durability::Durable,
         )
@@ -24361,6 +24462,7 @@ fn reopening_recovers_only_the_original_store_and_reports_pending_occurrences() 
             "source",
             "log",
             b"uncertain\n",
+            None,
             2,
             sparrow_core::Durability::Buffered,
         )
@@ -24407,6 +24509,7 @@ fn an_artifact_read_is_served_while_durability_is_latched() {
             "source",
             "log",
             b"uncertain\n",
+            None,
             1,
             sparrow_core::Durability::Buffered,
         )
@@ -24441,6 +24544,7 @@ fn a_durability_latch_refuses_writes_retryably_and_clears_in_place() {
             "source",
             "log",
             b"uncertain\n",
+            None,
             1,
             sparrow_core::Durability::Buffered,
         )
@@ -26020,7 +26124,7 @@ fn ingest_socket_callers_are_refused_consumeset_ids() {
     let manifest = format!("{set}.manifest");
     let part = format!("{set}.part{:010}", 0);
     let refused = store
-        .ingest_with_intake(
+        .ingest_with_durability(
             &manifest,
             "source",
             "json",
@@ -26033,7 +26137,7 @@ fn ingest_socket_callers_are_refused_consumeset_ids() {
     assert_eq!(refused.code, "INVALID_ARGUMENT");
     let digest = format!("blake3:{}", "0".repeat(64));
     let refused = store
-        .import_start_with_intake(&part, "source", "opaque", 4, &digest, intake, 2_000)
+        .import_start(&part, "source", "opaque", 4, &digest, intake, 2_000)
         .unwrap_err();
     assert_eq!(refused.code, "INVALID_ARGUMENT");
     assert!(matches!(
@@ -26338,6 +26442,7 @@ fn a_part_of_a_claim_keeps_its_saved_receipt_until_its_artifact_is_evicted() {
                 "log",
                 longer.len() as u64,
                 &digest_of(longer),
+                None,
                 now,
             )
             .unwrap_err();
@@ -26351,6 +26456,7 @@ fn a_part_of_a_claim_keeps_its_saved_receipt_until_its_artifact_is_evicted() {
                 "log",
                 input.len() as u64,
                 &digest_of(input),
+                None,
                 now,
             )
             .unwrap_err();
@@ -26365,6 +26471,7 @@ fn a_part_of_a_claim_keeps_its_saved_receipt_until_its_artifact_is_evicted() {
                 "log",
                 input.len() as u64,
                 &digest_of(input),
+                None,
                 now,
             )
             .unwrap()
@@ -26418,6 +26525,7 @@ fn publish_part(store: &Store, request: &str, bytes: &[u8], now: u64) -> sparrow
             "log",
             bytes.len() as u64,
             &digest_of(bytes),
+            None,
             now,
         )
         .unwrap()
@@ -26476,6 +26584,7 @@ fn a_claim_publishes_as_one_artifact_or_as_a_set_never_both() {
             "log",
             content.len() as u64,
             &digest_of(content),
+            None,
             1_000,
         )
         .unwrap_err();

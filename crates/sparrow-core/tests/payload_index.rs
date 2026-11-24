@@ -178,7 +178,7 @@ fn a_340_intake_manifest_store_is_lifted_to_395_at_open_and_stays_there() {
         pid: 1,
     }));
     let held = store
-        .ingest_with_intake(
+        .ingest_with_durability(
             "held",
             "src",
             "log",

@@ -689,34 +689,13 @@ impl Store {
         })
     }
 
-    /// Atomically recover a shared ingestion receipt or create/resume private staging.
-    pub fn import_start(
-        &self,
-        request_id: &str,
-        source: &str,
-        format: &str,
-        byte_length: u64,
-        payload_id: &str,
-        now: u64,
-    ) -> Result<ImportStart, Error> {
-        self.import_start_with_intake(
-            request_id,
-            source,
-            format,
-            byte_length,
-            payload_id,
-            None,
-            now,
-        )
-    }
-
-    /// Start or resume an import bound to the endpoint and caller that began it. Its
-    /// published artifact and records carry that intake; see [`Store::import_admit`].
+    /// Recover a receipt or start or resume staging with its initiating intake.
+    /// Published artifacts and records carry that intake. See [`Store::import_admit`].
     #[expect(
         clippy::too_many_arguments,
         reason = "the declared import, its intake binding and the acceptance clock"
     )]
-    pub fn import_start_with_intake(
+    pub fn import_start(
         &self,
         request_id: &str,
         source: &str,
