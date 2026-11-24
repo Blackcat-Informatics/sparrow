@@ -1,5 +1,5 @@
 VERSION "1.2"
-BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/05744f37291c9b98dd8a04a4e7b3d58cd430f85d7d76d6c150d93bc4b401154e>
+BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/274194fce6b6bf119e6aabfca82aa3ec390b47646b9a9092d997c98a20ab8ec9>
 <> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#Ledger> .
 <> <https://blackcatinformatics.ca/raf/report/1#distinct> <#distinct/0> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/active-file-checkpoint-attachment> .
@@ -838,6 +838,7 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/05744f37291c9b
 <#job/catalog-upgrade-pager> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
 <#job/catalog-upgrade-pager> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
 <#job/catalog-upgrade-pager> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::catalog_upgrade::commit" .
+<#job/catalog-upgrade-pager> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::catalog_upgrade::commit_page" .
 <#job/catalog-upgrade-pager> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::catalog_upgrade::run" .
 <#job/catalog-upgrade-pager> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::catalog_upgrade::seed" .
 <#job/catalog-upgrade-pager> <https://blackcatinformatics.ca/raf/report/1#forbiddenName> "^(rebuild_tail_range_index|resume_catalog_index_page)$" .
@@ -1203,6 +1204,7 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/05744f37291c9b
 <#job/daemon-store-session> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/src/session/tests.rs" .
 <#job/data-write-capacity-admission> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
 <#job/data-write-capacity-admission> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+<#job/data-write-capacity-admission> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::catalog_upgrade::admit_data_page" .
 <#job/data-write-capacity-admission> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::pressure::data_batch_estimate" .
 <#job/data-write-capacity-admission> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::pressure::data_write_ceiling" .
 <#job/data-write-capacity-admission> <https://blackcatinformatics.ca/raf/report/1#forbiddenName> "^(admit_direct_disk_write|admit_staged_disk_write)$" .

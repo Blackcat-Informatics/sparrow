@@ -153,14 +153,13 @@ pub(super) fn admit(
     batch.iterate_cf(&mut publication);
     publication.check()?;
     if publication.owned_rdf_metadata {
-        let estimate = super::pressure::data_batch_estimate(batch);
-        let ceiling = super::pressure::data_write_ceiling(disk_budget, reserve, estimate)?;
-        if super::linked_physical_bytes(db)? > ceiling {
-            return Err(Error::new(
-                "STORAGE_PRESSURE",
-                "owned RDF metadata backfill needs more data-write allowance; increase the disk budget or free space before resuming",
-            ));
-        }
+        catalog_upgrade::admit_data_page(
+            db,
+            disk_budget,
+            reserve,
+            batch,
+            "owned RDF metadata backfill needs more data-write allowance; increase the disk budget or free space before resuming",
+        )?;
     }
     Ok(())
 }

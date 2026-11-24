@@ -1865,7 +1865,7 @@ impl Store {
                 db.create_cf(name, &table_options::family(name))?;
             }
         }
-        rdf_index::upgrade_reverse(&db)?;
+        rdf_index::upgrade_reverse(&db, config.disk_budget, config.maintenance_reserve)?;
         recordless::upgrade(&db)?;
         diagnostic::fence_format(&db)?;
         tail_ranges::upgrade(&db)?;
