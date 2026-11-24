@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/64-report-a-chap-nonce-randomness-failure",
+  "branch": "paudley/64-report-a-chap-nonce-randomness-failure",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "58302c81438302e2b97880ce52d3232da62cc46a",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/64-report-a-chap-nonce-randomness-failure/.stage/report-a-chap-nonce-randomness-failure/sync/20261124T140501-036fa968c9ed45f3b71b045f8d986fa9",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "78d9adcc32c9b4a1ab9dad665cd9b144ab5a8244",
+  "merge_bases": [
+    "58302c81438302e2b97880ce52d3232da62cc46a"
+  ],
+  "commit": "78d9adcc32c9b4a1ab9dad665cd9b144ab5a8244"
+}
