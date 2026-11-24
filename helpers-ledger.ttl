@@ -1,5 +1,5 @@
 VERSION "1.2"
-BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/80998565bb192e737352de71e3b90dce2bbae82261a90362202a4ad0d15c5acf>
+BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/549e61494afc9a85a85e7d45f9fcbca02b31547cb93a582c1a63d05db4e133b4>
 <> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#Ledger> .
 <> <https://blackcatinformatics.ca/raf/report/1#distinct> <#distinct/0> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/active-file-checkpoint-attachment> .
@@ -127,6 +127,7 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/80998565bb192e
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/hex> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/immutable-diagnostic-profile> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/immutable-source-profile-admission> .
+<> <https://blackcatinformatics.ca/raf/report/1#job> <#job/import-journal-capacity> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/ingest-label-validation> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/ingest-socket-intake-provenance> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/ingestion-status-agent-test-parity> .
@@ -1663,6 +1664,16 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/80998565bb192e
 <#job/immutable-source-profile-admission> <https://blackcatinformatics.ca/raf/report/1#specRef> "docs/interfaces.md: schema 21 immutable diagnostic mappings." .
 <#job/immutable-source-profile-admission> <https://blackcatinformatics.ca/raf/report/1#summary> "Time and diagnostic definitions share registry capacity validation and physical control admission." .
 <#job/immutable-source-profile-admission> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-core/tests/storage.rs" .
+<#job/import-journal-capacity> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
+<#job/import-journal-capacity> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+<#job/import-journal-capacity> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::import::Store::import_journal_occupancy" .
+<#job/import-journal-capacity> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::import::Writer::imports" .
+<#job/import-journal-capacity> <https://blackcatinformatics.ca/raf/report/1#homeSymbol> "sparrow_core::storage::import::import_rows" .
+<#job/import-journal-capacity> <https://blackcatinformatics.ca/raf/report/1#jobId> "import-journal-capacity" .
+<#job/import-journal-capacity> <https://blackcatinformatics.ca/raf/report/1#specRef> "docs/interfaces.md: Admission waits." .
+<#job/import-journal-capacity> <https://blackcatinformatics.ca/raf/report/1#summary> "One bounded import journal scan supplies admission, reclamation and status as the writer changes its configured capacity." .
+<#job/import-journal-capacity> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-core/tests/storage.rs" .
+<#job/import-journal-capacity> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/tests/rpc.rs" .
 <#job/ingest-label-validation> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
 <#job/ingest-label-validation> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
 <#job/ingest-label-validation> <https://blackcatinformatics.ca/raf/report/1#forbiddenName> "^validate_import_labels$" .

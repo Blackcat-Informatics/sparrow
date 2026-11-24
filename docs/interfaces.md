@@ -132,11 +132,10 @@ runs. Space returns only after tombstone compaction.
 
 Repeated refusals that arrive after preparation, such as RDF write staging, leave
 prepared records until reclaim removes them and can drive `physical_bytes` to
-`STORAGE_PRESSURE`; the lockout clears when compaction returns space. No log measures a
-lockout from RDF staging refusals. Not measured: the 16-journal limit (`MAX_IMPORTS`),
-where an unreclaimed refusal holds its slot (no log counts the journals held), the exact
-staging threshold, and reclaim to zero after the 60,000-record refusal. Issue #389
-tracks the fault.
+`STORAGE_PRESSURE`; the lockout clears when compaction returns space. The
+workload logs leave the RDF staging lockout, occupancy at the tested sixteen-row
+journal limit, the exact staging threshold, and reclamation to zero after the
+60,000-record refusal unmeasured. Issue #389 tracks the fault.
 
 **The staging bound and senders.** The daemon refuses an RDF write when its
 anticipated staged writes exceed 64 MiB. The anticipated size is the sum of the
@@ -455,7 +454,7 @@ manifest refuses open with `STORAGE_FAILURE`. The scan reads the manifests
 without decoding dictionary terms.
 
 Import journal reclamation runs on its own one-second tick, because a published
-journal holds one of the 16 import slots until it is reclaimed. Pressure keeps
+journal holds its import slot until reclamation. Pressure keeps
 its one-second tick, and buffered synchronization keeps its configured interval.
 Eligible duties are selected fairly, including when a short flush interval
 remains due. Stop admission takes priority.
@@ -1252,7 +1251,7 @@ Limits of the part path:
 - The choice between the single path and a split is not durable for a claim with
   no recorded state; a claim whose manifest is accepted or recorded never plans
   again, and a recorded single-path claim returns its saved receipt.
-- A part holds one of the 16 import slots until reclaimed, so a fast set can meet
+- A part holds an import slot until reclaimed, so a fast set can meet
   "journals occupied", which the worker retries.
 - A claim that began single-path staging and is later recorded as a set has that
   staging row released by the next reclaim pass.
@@ -3544,7 +3543,11 @@ Three limits that used to refuse at once now wait, and every wait is counted.
   work, on shutdown beginning, or on the budget closing (`SHUTTING_DOWN`, retryable);
   the only timer is the 3-second bound, which exists because the client stops
   reading after its own deadline.
-- Import journal slots. A begin-import that finds all 16 occupied waits for a slot to
+- Import journal slots. `max_import_journals` defaults to 16 and accepts 20 for
+  expanded admission. Anonymous TCP may create a journal while total occupancy
+  is below 16. Private Unix, group ingest, CHAP and consume can use the configured
+  total. Replays of a receipt and continuation of an existing journal work at
+  capacity. A begin-import that reaches its admission limit waits for a slot to
   free, under one bound of 3 seconds that covers the whole call, including any wait for
   an operation permit (which is capped at the time left); no attempt starts once the
   bound has passed. A slot frees when a reclamation commit deletes a journal (a
@@ -3560,7 +3563,10 @@ Three limits that used to refuse at once now wait, and every wait is counted.
   harmless. The deletion commit signals the waiters; a pass
   that deletes nothing signals nobody, and nothing retries on a clock. The wait also
   ends at shutdown, or at the bound, and then answers the same `RESOURCE_LIMIT`. It
-  holds no permit while it waits.
+  holds no permit while it waits. `Discovery.importJournalLimits` advertises
+  total capacity and the anonymous threshold. `status.importJournals` reports
+  the same limits plus active rows, including cancelled and published journals
+  that still occupy a slot before reclamation.
 - Connection ceilings. The private socket and ingest socket each acquire a
   slot before accepting. A peer over its ceiling waits in the kernel listen
   backlog until a connection ends and releases a slot. Public RPC TCP accepts
@@ -4586,9 +4592,8 @@ batch moves the claim out of the active journal set into a retired record that
 keeps the journal with the time, the caller and the reason. If the claim's
 staged import had begun, the same batch ends its staging lease; the next import
 reclaim pass then frees its staged chunks, private preparation and import slot
-through the ordinary expired-lease removal, so a retired claim never holds one
-of the 16 import slots. Retiring a claim, or that claim completing, clears the
-watch failure only when that claim's recovery set it; another claim's failure
+through the ordinary expired-lease removal. Retiring a claim or completing it
+clears the watch failure only when that claim's recovery set it. Another claim's failure
 stays until that claim resolves. A failure that names no claim (discovery,
 reservation, drain) is kept apart from a claim's failure, so neither hides the
 other in status, and clears when any claim completes, not when one is retired.

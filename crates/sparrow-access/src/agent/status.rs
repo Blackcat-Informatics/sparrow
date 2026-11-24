@@ -168,9 +168,22 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
                 .into()
         }
     };
+    let journals = if value.has_import_journals() {
+        let journals = value.get_import_journals()?;
+        Object::new()
+            .with(
+                "limits",
+                import_journal_limits(Some(journals.get_limits()?.into())),
+            )
+            .with("active", journals.get_active())
+            .into()
+    } else {
+        Value::Null
+    };
     let output = Object::new()
         .with("ingest_socket", ingest_socket)
         .with("admission", admission(value.get_admission()?)?)
+        .with("import_journals", journals)
         .with(
             "connection_lease",
             connection_lease(
@@ -651,6 +664,15 @@ fn connection_lease(limits: Option<sparrow_client::ConnectionLeaseLimits>) -> Va
     })
 }
 
+fn import_journal_limits(limits: Option<sparrow_client::ImportJournalLimits>) -> Value {
+    limits.map_or(Value::Null, |limits| {
+        Object::new()
+            .with("total", limits.total)
+            .with("anonymous_threshold", limits.anonymous_threshold)
+            .into()
+    })
+}
+
 /// The identity the connection learned when it opened, which the ingest socket admits: the store
 /// and its role, so a sender can refuse a store that is not `scratch` before it sends anything.
 pub(super) fn discovery(discovery: &sparrow_client::Discovery) -> Value {
@@ -663,6 +685,10 @@ pub(super) fn discovery(discovery: &sparrow_client::Discovery) -> Value {
             connection_lease(discovery.connection_lease),
         )
         .with("max_import_bytes", discovery.max_import_bytes.to_string())
+        .with(
+            "import_journal_limits",
+            import_journal_limits(discovery.import_journal_limits),
+        )
         .with(
             "producer_profiles",
             Value::array(discovery.producer_profiles.iter().map(String::as_str)),

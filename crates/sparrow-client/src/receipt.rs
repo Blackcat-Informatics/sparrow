@@ -53,6 +53,8 @@ pub struct Discovery {
     pub sealed_event_deadline_ms: u64,
     /// Transport deadlines when the daemon advertises them.
     pub connection_lease: Option<ConnectionLeaseLimits>,
+    /// Import journal admission limits when advertised.
+    pub import_journal_limits: Option<ImportJournalLimits>,
     /// Server limits for tracking producer evidence. These describe the server's windows.
     pub producer_limits: ProducerLimits,
     /// Largest artifact carried in one inline ingest message. Larger artifacts
@@ -108,6 +110,24 @@ impl From<wire::connection_lease_limits::Reader<'_>> for ConnectionLeaseLimits {
             idle_seconds: value.get_idle_seconds(),
             tcp_first_input_seconds: value.get_tcp_first_input_seconds(),
             max_age_seconds: value.get_max_age_seconds(),
+        }
+    }
+}
+
+/// Import journal limits reported by the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportJournalLimits {
+    /// Total capacity for callers that can use the reserve.
+    pub total: u32,
+    /// Anonymous TCP may start a new journal below this total occupancy.
+    pub anonymous_threshold: u32,
+}
+
+impl From<wire::import_journal_limits::Reader<'_>> for ImportJournalLimits {
+    fn from(value: wire::import_journal_limits::Reader<'_>) -> Self {
+        Self {
+            total: value.get_total(),
+            anonymous_threshold: value.get_anonymous_threshold(),
         }
     }
 }
@@ -175,6 +195,14 @@ impl Discovery {
                     value
                         .get_connection_lease()
                         .map(ConnectionLeaseLimits::from)
+                })
+                .transpose()?,
+            import_journal_limits: value
+                .has_import_journal_limits()
+                .then(|| {
+                    value
+                        .get_import_journal_limits()
+                        .map(ImportJournalLimits::from)
                 })
                 .transpose()?,
             producer_limits: ProducerLimits {

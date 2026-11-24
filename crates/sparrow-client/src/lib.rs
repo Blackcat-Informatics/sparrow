@@ -60,8 +60,8 @@ pub use result_release::{ResultReleaseReceipt, release_result};
 mod receipt;
 pub use bytes::{decode_evidence, encode_evidence, read_bytes};
 pub use receipt::{
-    ArtifactReceipt, ConnectionLeaseLimits, Discovery, DurabilityWatermark, ProducerLimits,
-    flush_through,
+    ArtifactReceipt, ConnectionLeaseLimits, Discovery, DurabilityWatermark, ImportJournalLimits,
+    ProducerLimits, flush_through,
 };
 mod expect;
 pub use expect::{Expect, RequiredRole, instance_role_label};

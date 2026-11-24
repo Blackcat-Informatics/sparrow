@@ -1277,6 +1277,11 @@ fn encode_tail_registry_evidence(
     }
 }
 
+fn encode_import_journal_limits(mut out: wire::import_journal_limits::Builder<'_>, store: &Store) {
+    out.set_total(store.max_import_journals() as u32);
+    out.set_anonymous_threshold(sparrow_core::DEFAULT_IMPORT_JOURNALS as u32);
+}
+
 fn producer_limits(
     mut out: wire::producer_limits::Builder<'_>,
     value: &purrdf_lex::json::Value,
@@ -2327,6 +2332,14 @@ impl wire::sparrow::Server for Rpc {
         let kind = format(input.get_format()?);
         let length = input.get_byte_length();
         let intake = self.intake;
+        let journal_admission = if matches!(
+            self.producer,
+            Some(crate::source_binding::Caller::AnonymousTcp {})
+        ) {
+            sparrow_core::ImportAdmission::AnonymousTcp
+        } else {
+            sparrow_core::ImportAdmission::WithReserve
+        };
         let admission = self.admission.clone();
         match admission
             .import_slot(
@@ -2335,17 +2348,21 @@ impl wire::sparrow::Server for Rpc {
                         (request.clone(), source.clone(), payload.clone());
                     self.work_until(deadline, move |store, now| {
                         Ok((
-                            store.import_start(
-                                &request, &source, kind, length, &payload, intake, now,
+                            store.import_start_with_admission(
+                                &request,
+                                &source,
+                                kind,
+                                length,
+                                &payload,
+                                intake,
+                                journal_admission,
+                                now,
                             )?,
                             store.store_id()?,
                         ))
                     })
                 },
-                |error: &Error| {
-                    error.code == "RESOURCE_LIMIT"
-                        && error.message == sparrow_core::IMPORT_JOURNALS_OCCUPIED
-                },
+                sparrow_core::import_journals_occupied,
             )
             .await
         {
@@ -3248,6 +3265,10 @@ impl wire::sparrow::Server for Rpc {
                 let mut out = results.get().init_result().init_ok();
                 out.set_sealed_event_deadline_ms(deadline);
                 crate::transport::encode_lease_limits(out.reborrow().init_connection_lease());
+                encode_import_journal_limits(
+                    out.reborrow().init_import_journal_limits(),
+                    &self.store,
+                );
                 out.set_store_id(field::<String>(&value, "store_id")?);
                 out.set_schema_version(sparrow_client::SCHEMA_VERSION);
                 out.reborrow()
@@ -3298,13 +3319,25 @@ impl wire::sparrow::Server for Rpc {
                     store.recompression_status()?,
                     migrations,
                     store.consumption_retired()?,
+                    store.import_journal_occupancy()?,
                 ))
             })
             .await
         {
             Err(e) => failure(results.get().init_result(), e),
-            Ok((value, durability, pressure, recompression, migrations, retired)) => {
+            Ok((
+                value,
+                durability,
+                pressure,
+                recompression,
+                migrations,
+                retired,
+                active_imports,
+            )) => {
                 let mut out = results.get().init_result().init_ok();
+                let mut journals = out.reborrow().init_import_journals();
+                journals.set_active(active_imports as u32);
+                encode_import_journal_limits(journals.init_limits(), &self.store);
                 crate::pressure::encode(out.reborrow().init_pressure_status(), &pressure)?;
                 crate::recompression::encode(out.reborrow().init_recompression(), &recompression);
                 crate::recompression::encode_migrations(

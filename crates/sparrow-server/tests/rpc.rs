@@ -2584,6 +2584,112 @@ async fn a_seventeenth_import_waits_for_a_slot_and_begins_when_one_is_reclaimed(
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn expanded_import_journals_reserve_private_admission_at_anonymous_capacity() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("store");
+            let socket = data.join("rpc.sock");
+            let config = write_server_config(dir.path(), &data, &socket);
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str("\nmax_import_journals = 20\n");
+            std::fs::write(&config, text).unwrap();
+            let (address, reservation, _port_lease) = configure_tcp_listener(&config);
+            drop(reservation);
+            let _daemon = start(&config, &socket).await;
+            let public =
+                sparrow_client::Client::connect_producer(&sparrow_client::Endpoint::Tcp(address))
+                    .await
+                    .unwrap();
+            let private = sparrow_client::Client::connect(&socket).await.unwrap();
+            let limits = sparrow_client::ImportJournalLimits {
+                total: 20,
+                anonymous_threshold: 16,
+            };
+            assert_eq!(public.discovery().import_journal_limits, Some(limits));
+
+            let occupancy = || async {
+                let reply = private
+                    .capability()
+                    .status_request()
+                    .send()
+                    .promise
+                    .await
+                    .unwrap();
+                let status = rpc_ok(reply.get().unwrap().get_result().unwrap());
+                let journals = status.get_import_journals().unwrap();
+                assert_eq!(
+                    sparrow_client::ImportJournalLimits::from(journals.get_limits().unwrap()),
+                    limits
+                );
+                journals.get_active()
+            };
+            let mut first = String::new();
+            for index in 0..limits.anonymous_threshold {
+                let id = begin_import(public.capability(), &format!("anonymous-{index}"), "public")
+                    .await
+                    .unwrap();
+                if index == 0 {
+                    first = id;
+                }
+            }
+            assert_eq!(occupancy().await, 16);
+            let over_public = tokio::task::spawn_local({
+                let capability = public.capability().clone();
+                async move { begin_import(&capability, "anonymous-over", "public").await }
+            });
+            status_until(private.capability(), |admission| {
+                admission.get_import_slot_wait().unwrap().get_waiting() == 1
+            })
+            .await;
+            begin_import(private.capability(), "private-17", "private")
+                .await
+                .unwrap();
+            assert_eq!(occupancy().await, 17);
+            assert_eq!(over_public.await.unwrap().unwrap_err(), "RESOURCE_LIMIT");
+            for index in 18..=20 {
+                begin_import(private.capability(), &format!("private-{index}"), "private")
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(occupancy().await, 20);
+            let status = cli(&socket, &["status"]);
+            let discovery = cli(&socket, &["discover"]);
+            assert_eq!(status["import_journals"]["active"].as_u64(), Some(20));
+            assert_eq!(
+                status["import_journals"]["limits"],
+                discovery["import_journal_limits"]
+            );
+            assert_eq!(
+                begin_import(public.capability(), "anonymous-0", "public")
+                    .await
+                    .unwrap(),
+                first
+            );
+
+            let waiting = tokio::task::spawn_local({
+                let capability = private.capability().clone();
+                async move { begin_import(&capability, "private-21", "private").await }
+            });
+            status_until(private.capability(), |admission| {
+                admission.get_import_slot_wait().unwrap().get_waiting() == 1
+            })
+            .await;
+            let mut cancel = public.capability().import_cancel_request();
+            upload_ref(
+                cancel.get().init_import(),
+                &public.discovery().store_id,
+                &first,
+            );
+            let reply = cancel.send().promise.await.unwrap();
+            rpc_ok(reply.get().unwrap().get_result().unwrap());
+            assert!(waiting.await.unwrap().is_ok());
+            assert_eq!(occupancy().await, 20);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn public_tcp_uses_the_same_typed_service_store_and_retry_receipts_as_unix() {
     tokio::task::LocalSet::new()
         .run_until(async {
