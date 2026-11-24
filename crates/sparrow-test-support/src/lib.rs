@@ -11,6 +11,8 @@ pub mod crash;
 
 /// Production flush default used by the shared storage fixture macro.
 pub use sparrow_core::DEFAULT_FLUSH_INTERVAL_MS as STORAGE_FLUSH_INTERVAL_MS;
+/// Production import journal default used by the shared storage fixture macro.
+pub use sparrow_core::DEFAULT_IMPORT_JOURNALS;
 /// Native analyzer resolver used by the shared storage fixture macro.
 pub use sparrow_core::resolve_text_analyzer;
 
@@ -91,6 +93,7 @@ macro_rules! storage_config {
                 maintenance_reserve: 8 * 1024 * 1024,
                 min_free_bytes: 1024 * 1024,
                 max_records: 10_000,
+                max_import_journals: $crate::DEFAULT_IMPORT_JOURNALS,
                 max_pin_members: 100,
                 text_analyzer: $crate::resolve_text_analyzer($crate::text_lexicon_dir())
                     .expect("standard storage fixture analyzer"),

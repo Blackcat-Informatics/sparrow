@@ -140,6 +140,13 @@ only one) are reserved: queries and status reads may hold the rest, so a query
 storm cannot starve ingest, and a read beyond its share is refused at once. These
 are separate finite resource budgets; `status` reports each wait.
 
+`max_import_journals` defaults to 16. Set it to 20 to make four additional
+slots available to private Unix, group ingest, CHAP and consume. Anonymous
+TCP can start a journal while total occupancy is below 16. `status` reports
+the limits and occupied slots under `import_journals`. Use the current writer
+to drain the registry before rolling back to an older image.
+[Import journal rollback](../deploy/RECOVERY.md#roll-back-expanded-import-journal-admission)
+
 Sparrow has no configurable per-artifact byte limit. A large artifact ingests
 through the staged import within `disk_budget` and `min_free_bytes`, up to one
 fixed bound: an import above 8515420160 bytes (about 7.93 GiB) is refused before

@@ -220,6 +220,9 @@ operator diagnoses it and resets the unit.
 
 ## Rollback
 
+Before rolling back to an image that predates expanded import admission,
+complete the [journal drain](#roll-back-expanded-import-journal-admission).
+
 - When: a new image misbehaves after `restart.sh`.
 - If the unit is between automatic retries, stop it with `sudo deploy/stop.sh`.
   See [Crash recovery](#crash-recovery).
@@ -239,6 +242,20 @@ operator diagnoses it and resets the unit.
   check does not catch this, so `--rollback` stops the service. Run
   `--rollback` again to swap forward.
 - Reversible: yes; `--rollback` again swaps forward.
+
+### Roll back expanded import journal admission
+
+The earlier writer rejects `max_import_journals` during config parsing and
+refuses reclamation with more than sixteen journal rows. Drain with the current
+writer. Finish ordinary imports or cancel them as their owning caller. Finish
+or reconcile managed consume claims through the consume workflow, then let
+reclamation release the slots.
+
+Quiesce new import starts while draining, or restart the current image with
+`max_import_journals = 16` to enforce the lower admission limit. Verify
+`import_journals.active` in `sparrow SOCKET status` is at most sixteen while
+new starts are quiesced or the lower limit is active. Omit
+`max_import_journals` from the config before starting the older image.
 
 ## Interrupted copy-on-write conversion
 

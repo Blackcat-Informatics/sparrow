@@ -409,6 +409,8 @@ pub struct Config {
     pub min_free_bytes: u64,
     /// Maximum records published by one ingestion operation.
     pub max_records: usize,
+    /// Admission ceiling for staged import journals on this writer.
+    pub max_import_journals: usize,
     /// Maximum direct members in one pin collection.
     pub max_pin_members: usize,
     /// Resolved standard native analysis law, shared across index and query callers.
@@ -448,6 +450,7 @@ impl Config {
         if let Some(policy) = &self.archive {
             policy.validate()?;
         }
+        import::validate_import_journal_limit(self.max_import_journals)?;
         Ok(())
     }
 }
