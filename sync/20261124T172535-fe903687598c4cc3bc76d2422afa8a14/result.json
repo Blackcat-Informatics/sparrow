@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/91-admit-producer-connections-in-their-own",
+  "branch": "paudley/91-admit-producer-connections-in-their-own",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "dd3c6021c3dc209f9af309a72069d7296b2560ff",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/91-admit-producer-connections-in-their-own/.stage/admit-producer-connections-in-their-own/sync/20261124T172535-fe903687598c4cc3bc76d2422afa8a14",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "8d9674f3f21a150c5035230825a8fa2a65f6b9e6",
+  "merge_bases": [
+    "dd3c6021c3dc209f9af309a72069d7296b2560ff"
+  ],
+  "commit": "8d9674f3f21a150c5035230825a8fa2a65f6b9e6"
+}

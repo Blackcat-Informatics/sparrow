@@ -1,0 +1,80 @@
+{
+  "issue": 91,
+  "pr_number": 556,
+  "branch": "paudley/91-admit-producer-connections-in-their-own",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/91-admit-producer-connections-in-their-own/.stage/admit-producer-connections-in-their-own",
+  "observed_at": "2026-11-24T18:06:49.462236+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/91-admit-producer-connections-in-their-own/.stage/admit-producer-connections-in-their-own/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/91-admit-producer-connections-in-their-own/.stage/admit-producer-connections-in-their-own/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/91-admit-producer-connections-in-their-own/.stage/admit-producer-connections-in-their-own/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/91-admit-producer-connections-in-their-own/.stage/admit-producer-connections-in-their-own/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/91-admit-producer-connections-in-their-own/.stage/admit-producer-connections-in-their-own/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 556,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Separate Unix RPC admission and renew progressing leases",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/556",
+    "baseRefName": "main",
+    "baseRefOid": "8d9674f3f21a150c5035230825a8fa2a65f6b9e6",
+    "headRefName": "paudley/91-admit-producer-connections-in-their-own",
+    "isCrossRepository": false,
+    "headRefOid": "a152f4b6676c49fc45902040c7952c3c2a0b34cb",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/608/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 1,
+    "change_token": "d2bd50e3eac51df758eb231b252f4ec2f1311a9deb359f482023f43ec5cdfa22"
+  },
+  "local": {
+    "head": "a152f4b6676c49fc45902040c7952c3c2a0b34cb",
+    "branch": "paudley/91-admit-producer-connections-in-their-own",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 556,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #556 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}
