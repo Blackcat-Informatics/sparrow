@@ -103,9 +103,10 @@ The same 1 MiB log (14,743 records) on the large store shows the cache's effect
 on short records. Before it, preparation took 118.9 seconds with 1,234,857
 read calls and 1.84 GB read from the device. With it, three runs on fresh
 copies took 72.1 to 103.5 seconds with about 135,000 read calls and 0.55 to
-0.73 GB from the device. The spread is host noise under load averages of 25 to
-46: the slowest run had the lowest load but one. A
-fresh store prepares the same log in 11.0 seconds, so the large store still
+0.73 GB from the device. The one-minute load average ranged from 25.17 to
+45.12, and the slowest run recorded 26.82. The issue #5 cache-run logs are
+`big/ab.txt`, `big/ab2.txt` and `big/log-cache.txt`.
+A fresh store prepares the same log in 11.0 seconds, so the large store still
 costs seven to nine times as much. Skipping the stored-count read for terms
 this batch creates was tried and rejected: it left the read calls unchanged,
 because those keys sort above every stored count, and its time and device
