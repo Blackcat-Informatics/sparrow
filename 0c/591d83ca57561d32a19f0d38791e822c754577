@@ -1,0 +1,24 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 0c591d83ca57561d32a19f0d38791e822c754577
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 516
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/516
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: d5da764dd55f83be50c7aeaa9e789c538679dc7b
+GhpRsq-Head-Ref: paudley/510-diagnose-the-bulk-import-replay-timeout
+GhpRsq-Head-OID: 0c591d83ca57561d32a19f0d38791e822c754577
+GhpRsq-Result-Tree: ca00c6b2a3b87e0255fa4eacd570f414c06b2dad
+GhpRsq-Result-Commit: 6e840cf457406e77ed86b46799bf98193b7ff89d
+GhpRsq-Parent-Hashes: 0c591d83ca57561d32a19f0d38791e822c754577
+GhpRsq-Squash-Notes-SHA256: e67bf5014ada14946e38cde76a9f0d3dfc80526a14f9e56041dffc5ac3aef35e
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Tree: 4b2f1b6022c9c300d6024d50133e947485ae2b0a
+GhpRsq-Stage-Commit: cc4bc9eb26db2c11ce3f3f262a3254f6d94a05bb
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/cc4bc9eb26db2c11ce3f3f262a3254f6d94a05bb
+GhpRsq-Stage-Ref: refs/ghprsq/pr/516/stage
+GhpRsq-Stage-Files: 13
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/cc4bc9eb26db2c11ce3f3f262a3254f6d94a05bb
