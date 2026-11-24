@@ -1,0 +1,24 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 5d45a2afbfdb8751947f37a56bc836ea1b0cd75c
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 547
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/547
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: a5583506eeb0e7514dc42383f971be301286a6d1
+GhpRsq-Head-Ref: paudley/55-let-the-system-unit-and-apparmor
+GhpRsq-Head-OID: 5d45a2afbfdb8751947f37a56bc836ea1b0cd75c
+GhpRsq-Result-Tree: 38c9ecac2823e8dc1e3b04409cf0cd632ab00c54
+GhpRsq-Result-Commit: 3854cc995663e29b406a3605ce4a21578270c792
+GhpRsq-Parent-Hashes: 5d45a2afbfdb8751947f37a56bc836ea1b0cd75c
+GhpRsq-Squash-Notes-SHA256: 4d8a4ee95cab8092785b1beaa9dc87624be8d28cf87f71fbb737feb7186d4153
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Tree: 2d816bf7b3e65e4ef111284421827366f71b624e
+GhpRsq-Stage-Commit: 90826f9098725b2dcda890a37d6e697e0260712d
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/90826f9098725b2dcda890a37d6e697e0260712d
+GhpRsq-Stage-Ref: refs/ghprsq/pr/547/stage
+GhpRsq-Stage-Files: 13
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/90826f9098725b2dcda890a37d6e697e0260712d
