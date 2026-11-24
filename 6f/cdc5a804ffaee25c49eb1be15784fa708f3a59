@@ -1,0 +1,19 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 6fcdc5a804ffaee25c49eb1be15784fa708f3a59
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 525
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/525
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: e3df7ce8a7a5f58cc0d33cc5c02364d9372e4917
+GhpRsq-Head-Ref: paudley/40-test-the-artifact-listing-s-integrity
+GhpRsq-Head-OID: 6fcdc5a804ffaee25c49eb1be15784fa708f3a59
+GhpRsq-Result-Tree: 4e436bb2bbcbb992df71aa3c5b1cbab19420585b
+GhpRsq-Result-Commit: ac37cfa76200d024f13ed5e7eb28d19fd7071836
+GhpRsq-Parent-Hashes: 6fcdc5a804ffaee25c49eb1be15784fa708f3a59
+GhpRsq-Squash-Notes-SHA256: f8e96f0365c8e6d65e426c5353f7487dc89e597694e6505ab8926a1157c26797
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
