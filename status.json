@@ -1,0 +1,80 @@
+{
+  "issue": 43,
+  "pr_number": 519,
+  "branch": "paudley/43-count-a-new-artifact-s-records",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/43-count-a-new-artifact-s-records/.stage/count-a-new-artifact-s-records",
+  "observed_at": "2026-11-24T08:44:33.783767+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/43-count-a-new-artifact-s-records/.stage/count-a-new-artifact-s-records/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/43-count-a-new-artifact-s-records/.stage/count-a-new-artifact-s-records/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/43-count-a-new-artifact-s-records/.stage/count-a-new-artifact-s-records/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/43-count-a-new-artifact-s-records/.stage/count-a-new-artifact-s-records/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/43-count-a-new-artifact-s-records/.stage/count-a-new-artifact-s-records/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 519,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Verify live pagination within a crowded receipt millisecond",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/519",
+    "baseRefName": "main",
+    "baseRefOid": "ae6f8c4406f4cd71617b533be5a130838a6884b9",
+    "headRefName": "paudley/43-count-a-new-artifact-s-records",
+    "isCrossRepository": false,
+    "headRefOid": "062d062a704230ffecacce21fbb79410cbcb7b89",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/534/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "062d062a704230ffecacce21fbb79410cbcb7b89",
+    "branch": "paudley/43-count-a-new-artifact-s-records",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 519,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #519 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}
