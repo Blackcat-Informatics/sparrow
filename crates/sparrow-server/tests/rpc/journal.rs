@@ -17,7 +17,7 @@ async fn journal_export_import_preserves_fields_and_searches_diagnostics() {
     let config = write_server_config(dir.path(), &data, &socket);
     let _daemon = start(&config, &socket).await;
     let export = dir.path().join("input.export");
-    let mut payload = b"MESSAGE=heartbeat\nPRIORITY=6\n\n_SYSTEMD_UNIT=worker.service\n_HOSTNAME=node\nPRIORITY=3\n__REALTIME_TIMESTAMP=1790000000123456\nTAG=one\nTAG=two\nMESSAGE\n".to_vec();
+    let mut payload = b"MESSAGE=heartbeat\tready\nPRIORITY=6\n\n_SYSTEMD_UNIT=worker.service\n_HOSTNAME=node\nPRIORITY=3\n__REALTIME_TIMESTAMP=1790000000123456\nTAG=one\nTAG=two\nMESSAGE\n".to_vec();
     let message = b"multiline\njob failed";
     payload.extend_from_slice(&(message.len() as u64).to_le_bytes());
     payload.extend_from_slice(message);
@@ -97,6 +97,11 @@ async fn journal_export_import_preserves_fields_and_searches_diagnostics() {
         (
             &b"MESSAGE=first\n\nBINARY\n\x04\0\0\0\0\0\0\0a"[..],
             "entry 2: truncated binary field",
+        ),
+        (&b"MESSAGE=\xff\n\n"[..], "text field is not UTF-8"),
+        (
+            &b"MESSAGE=control\0byte\n\n"[..],
+            "text field contains a control character",
         ),
         (&b"LPKSHHRH"[..], "journalctl --file FILE --output=export"),
     ] {

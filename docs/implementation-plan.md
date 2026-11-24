@@ -82,11 +82,11 @@ Keep production sample bodies and identities outside tracked source. Use
 synthetic fixtures for tracked qualification and record observation bounds
 and whole-store costs for performance runs.
 
-Journal Export Format imports produce searchable JSON Lines records with the
-journal field names and values. Export native systemd journal files with
-`journalctl --output=export` before importing them. Unknown `.bin` files
-remain opaque. Qualify compressed-input decoding separately from preserving
-the original compressed bytes.
+[Journal export imports](interfaces.md#systemd-journal-export-import) produce
+searchable JSON Lines records that preserve journal field names and values.
+Export native systemd journal files with `journalctl --output=export` before
+importing them. Qualify compressed-input decoding separately from preserving
+the original compressed bytes. Unknown `.bin` files remain opaque.
 
 ## Query contracts to implement first
 

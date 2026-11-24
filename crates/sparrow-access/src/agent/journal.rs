@@ -170,7 +170,16 @@ fn entry(reader: &mut impl BufRead, number: u64) -> Result<Option<Vec<Field>>> {
         }
         let name = String::from_utf8(name).map_err(|_| malformed("invalid export field name"))?;
         let value = match value {
-            Some(value) => value,
+            Some(value) => {
+                let text = std::str::from_utf8(&value)
+                    .map_err(|_| malformed("text field is not UTF-8; use binary framing"))?;
+                if text.chars().any(|ch| ch != '\t' && ch.is_control()) {
+                    return Err(malformed(
+                        "text field contains a control character; use binary framing",
+                    ));
+                }
+                value
+            }
             None => binary_field(reader, &mut remaining, &malformed)?,
         };
         fields.push(Field { name, value });

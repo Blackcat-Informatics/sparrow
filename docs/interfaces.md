@@ -1301,10 +1301,12 @@ journalctl --file input.journal --output=export > input.export
 sparrow /path/to/rpc.sock ingest REQUEST_ID SOURCE journal-export input.export
 ```
 
-Use a dedicated source for journal imports. The CLI registers its immutable
-diagnostic pointers before upload. It derives service from a single usable
-`_SYSTEMD_UNIT`, falling back to `SYSLOG_IDENTIFIER`, host from `_HOSTNAME`,
-and severity from the single-character `PRIORITY` value `0` through `7`.
+Use a dedicated source and connect through a socket that grants the full
+capability. The CLI registers immutable diagnostic pointers before upload.
+The ingest-only socket and anonymous TCP refuse that registration. The CLI
+derives service from a single usable `_SYSTEMD_UNIT`, falling back to
+`SYSLOG_IDENTIFIER`, host from `_HOSTNAME`, and severity from the
+single-character `PRIORITY` value `0` through `7`.
 Each diagnostic needs a nonempty UTF-8 value of at most 512 bytes. Conflicting
 source mappings refuse the import.
 
