@@ -1290,6 +1290,37 @@ fixed 1 MiB window. The archive's `max_segment_bytes` is a closing target from
 1 MiB to 256 MiB, and an entry larger than the target is archived in a segment
 of its own; see [the archive format](archive-format.md).
 
+### Systemd journal export import
+
+Use a completed systemd Journal Export Format file for the `journal-export`
+CLI input format.
+
+```sh
+journalctl --file input.journal --output=export > input.export
+sparrow /path/to/rpc.sock ingest REQUEST_ID SOURCE journal-export input.export
+```
+
+Use a dedicated source for journal imports. The CLI registers its immutable
+diagnostic pointers before upload. It derives service from a single usable
+`_SYSTEMD_UNIT`, falling back to `SYSLOG_IDENTIFIER`, host from `_HOSTNAME`,
+and severity from the single-character `PRIORITY` value `0` through `7`.
+Each diagnostic needs a nonempty UTF-8 value of at most 512 bytes. Conflicting
+source mappings refuse the import.
+
+Each entry becomes one JSON Lines record. The `journal_fields` array retains
+field names, repeats and order. UTF-8 values, including multiline messages,
+use `text`. Other values use standard `base64`. Original journal timestamps
+remain among the fields. Record receipts and byte reads refer to the normalized
+JSON Lines artifact. Text search indexes the decoded text, and records queries
+can filter on the interpreted diagnostic fields.
+
+The CLI parses the entire export into a private temporary file before upload.
+Each entry can occupy at most 1 MiB in the export and contain at most 1,024
+fields. A malformed or truncated entry stops the import with an entry number.
+For larger imports, split the export on entry boundaries so each normalized
+file fits the daemon's staged import limits, and give each completed file its
+own request ID. Retry the same completed export with the original request ID.
+
 ### CLI ingestion and verification of ordered part sets
 
 `sparrow SOCKET ingest REQUEST_ID SOURCE FORMAT FILE` returns the ordinary

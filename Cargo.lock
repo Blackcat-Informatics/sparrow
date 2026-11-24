@@ -1436,6 +1436,7 @@ dependencies = [
  "sparrow-client",
  "sparrow-core",
  "sparrow-server",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",

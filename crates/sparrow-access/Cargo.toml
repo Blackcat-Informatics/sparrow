@@ -31,6 +31,7 @@ purrdf-lex.workspace = true
 sparrow-client.workspace = true
 sparrow-core.workspace = true
 sparrow-server.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
