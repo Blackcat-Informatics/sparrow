@@ -9228,20 +9228,28 @@ async fn missing_producer_profile_resumes_with_negotiated_limits_and_immutable_r
         assert!(stats.terminal_failure.is_none());
         assert!(state.calls.borrow().is_empty());
 
+        // Make the first negotiated batch lose its durable reply.
+        state.drop_first.set(true);
         state.profile.set(Some((true, 2)));
         let strict = Client::connect_endpoint(&endpoint).await;
         assert!(matches!(strict, Err(Error::Unsupported(_))));
-        let watermark = delivery.flush_async(deadline).await.unwrap();
-        assert_eq!(watermark.durable_events, 5);
-        let sizes: Vec<_> = state
-            .calls
-            .borrow()
-            .iter()
-            .map(|call| call.events.len())
-            .collect();
-        assert_eq!(sizes, [1, 2, 2]);
+        let (watermark, first_accepted) = tokio::join!(
+            delivery.flush_async(deadline),
+            tokio::time::timeout(deadline, state.first_accepted.notified()),
+        );
+        first_accepted.expect("the first negotiated batch did not reach durable acceptance");
+        assert_eq!(watermark.unwrap().durable_events, 5);
+        let (initial_attempts, mut oversized) = {
+            let attempts = state.calls.borrow();
+            assert!(attempts.len() >= 4);
+            assert_eq!(attempts[0], attempts[1]);
+            let mut batches: Vec<_> = attempts.iter().collect();
+            batches.dedup();
+            let sizes: Vec<_> = batches.iter().map(|call| call.events.len()).collect();
+            assert_eq!(sizes, [1, 2, 2]);
+            (attempts.len(), (*batches[1]).clone())
+        };
         let direct = Client::connect_producer(&endpoint).await.unwrap();
-        let mut oversized = state.calls.borrow()[1].clone();
         let mut extra = oversized.events[1].clone();
         extra.sequence += 1;
         oversized.events.push(extra);
@@ -9251,7 +9259,7 @@ async fn missing_producer_profile_resumes_with_negotiated_limits_and_immutable_r
         ));
         let read = direct.bytes("artifact:example", 0, 1).await;
         assert!(matches!(read, Err(Error::Unsupported(_))));
-        assert_eq!(state.calls.borrow().len(), 3);
+        assert_eq!(state.calls.borrow().len(), initial_attempts);
 
         state.drop_first.set(true);
         for _ in 0..2 {
@@ -9270,12 +9278,28 @@ async fn missing_producer_profile_resumes_with_negotiated_limits_and_immutable_r
             Some(Error::Unsupported(message)) if message.contains("immutable batch")
         ));
         assert_eq!(stats.quarantined_events, 0);
-        assert_eq!(state.calls.borrow().len(), 4);
+        assert_eq!(state.calls.borrow().len(), initial_attempts + 1);
         state.artifact_limits.set(None);
         let watermark = delivery.shutdown_async(deadline).await.unwrap();
         assert_eq!(watermark.durable_events, 7);
-        assert_eq!(state.calls.borrow().len(), 5);
-        assert_eq!(state.calls.borrow()[3], state.calls.borrow()[4]);
+        let settled_attempts = {
+            let calls = state.calls.borrow();
+            let (first, retries) = calls[initial_attempts..].split_first().unwrap();
+            assert!(!retries.is_empty());
+            assert!(retries.iter().all(|attempt| attempt == first));
+            calls.len()
+        };
+        let status = backend
+            .client
+            .status_request()
+            .send()
+            .promise
+            .await
+            .unwrap();
+        assert_eq!(
+            rpc_ok(status.get().unwrap().get_result().unwrap()).get_live_records(),
+            7
+        );
         // A pristine event whose actual JSONL exceeds the independently lowered inline
         // byte ceiling is rejected locally and saved, without an RPC.
         state.artifact_limits.set(Some((256, 1)));
@@ -9288,7 +9312,7 @@ async fn missing_producer_profile_resumes_with_negotiated_limits_and_immutable_r
         assert!(
             matches!(settled, Err(FlushError::Dropped(value)) if value.quarantined_before_fence == 1)
         );
-        assert_eq!(state.calls.borrow().len(), 5);
+        assert_eq!(state.calls.borrow().len(), settled_attempts);
         proxy.abort();
     };
     tokio::task::LocalSet::new().run_until(test).await;
