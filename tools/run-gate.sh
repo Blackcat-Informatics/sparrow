@@ -17,8 +17,7 @@ log_arg=$1
 shift 2
 directory=$(pwd -P)
 head=$(git rev-parse --verify HEAD)
-git_dir=$(git rev-parse --path-format=absolute --git-common-dir)
-main=$(realpath -e -- "$(dirname -- "$git_dir")")
+main=$("$(dirname -- "${BASH_SOURCE[0]}")/canonical-checkout.sh" "$directory")
 stage=$main/.stage
 [[ -d $stage && ! -L $stage ]] || refuse "create the canonical checkout's .stage directory at $stage"
 

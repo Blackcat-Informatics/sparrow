@@ -50,6 +50,6 @@ keep target/release/examples/stamp "bin/sparrow-stamp-schema$schema-$rev"
 # that deploy/install.sh and deploy/test-instance.sh read. The PurRDF repository itself is found
 # under the canonical checkout root, which a linked worktree under .worktrees/ shares with the main
 # one. They are never read from a working tree.
-canonical=$(dirname -- "$(git rev-parse --path-format=absolute --git-common-dir)")
+canonical=$(tools/canonical-checkout.sh "$PWD")
 lexicons=$(tools/purrdf-lexicons.sh "$canonical" "$PWD/bin")
 echo "install-bin: $lexicons"

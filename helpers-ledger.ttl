@@ -1,5 +1,5 @@
 VERSION "1.2"
-BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/724ee8efe6260c957ed6f7a4a6c722763cccc73d46b78287553d50dcd420bfa0>
+BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/80aa5d98013bcd268996e44a3d9e68717cf8cd348318342c5d052d134bc8714f>
 <> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#Ledger> .
 <> <https://blackcatinformatics.ca/raf/report/1#distinct> <#distinct/0> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/active-file-checkpoint-attachment> .
@@ -3207,7 +3207,7 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/724ee8efe6260c
 <#job/storage-fixture-defaults> <https://blackcatinformatics.ca/raf/report/1#homeSymbol> "sparrow_test_support::text_lexicon_dir" .
 <#job/storage-fixture-defaults> <https://blackcatinformatics.ca/raf/report/1#jobId> "storage-fixture-defaults" .
 <#job/storage-fixture-defaults> <https://blackcatinformatics.ca/raf/report/1#specRef> "AGENTS.md: one dev-only home for shared test scaffolding." .
-<#job/storage-fixture-defaults> <https://blackcatinformatics.ca/raf/report/1#summary> "Dev-only storage_config and record_scope macros own the common unit/integration fixture defaults. One locator supplies the native baseline lexicon artifacts to the macro and daemon configuration writer." .
+<#job/storage-fixture-defaults> <https://blackcatinformatics.ca/raf/report/1#summary> "Dev-only storage_config and record_scope macros own the common unit/integration fixture defaults. One locator supplies the native baseline lexicon artifacts to the macro and daemon configuration writer. tools/canonical-checkout.sh owns the Git common-directory lookup for fixtures, image installation and the gate runner." .
 <#job/storage-fixture-defaults> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-core/src/storage/rdf_view/text_relations/tests.rs" .
 <#job/storage-fixture-defaults> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-core/tests/storage.rs" .
 <#job/storage-physical-footprint> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
