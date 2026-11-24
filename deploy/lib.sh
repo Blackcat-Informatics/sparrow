@@ -150,8 +150,8 @@ swap_link() {
     mv -T -- "$next" "$link"
 }
 
-# Refuse to start a unit that spent its start limit: the repeated failure needs diagnosis first,
-# and resetting it is the operator's decision (RECOVERY.md, "Unit start-limit hit").
+# Respect a start limit set by the installed unit or a local override.
+# Diagnose repeated failures before the operator resets it (RECOVERY.md, "Unit start-limit hit").
 refuse_start_limit() {
     [[ $("${SYSTEMCTL[@]}" show -p Result --value "$SPARROW_UNIT") != start-limit-hit ]] \
         || die "$SPARROW_UNIT hit its start limit; diagnose it (RECOVERY.md, \"Unit start-limit hit\"), \

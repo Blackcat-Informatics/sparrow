@@ -804,7 +804,7 @@ mod tests {
 
     /// Value: a bad `[[syslog]]` block is a refusal only a configuration change clears, and a
     /// restart repeats it (#446). Protects: it reads as a permanent start refusal, not as a
-    /// failed read that the unit would restart until its start limit.
+    /// failed read that the unit would retry through its crash recovery delay.
     #[test]
     fn a_bad_syslog_block_is_a_permanent_configuration_refusal() {
         let dir = tempfile::tempdir().unwrap();

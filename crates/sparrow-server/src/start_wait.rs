@@ -3,10 +3,7 @@
 
 //! Start-time waits: a start condition that will pass is waited for, never exited on.
 //!
-//! The unit restarts a failed daemon every 10 s and gives up after 5 starts in 600 s
-//! (`deploy/systemd/sparrow.service`), so an exit on a condition another process or the
-//! operator clears spends that limit and leaves the unit failed until `reset-failed`. The
-//! conditions that pass are free space for the open and the WAL replay, a pending upgrade's
+//! The daemon waits inside the process for free space for the open and WAL replay, a pending upgrade's
 //! write allowance, the store's lock while another process holds it, and a TCP port or socket
 //! name a departing owner still holds. A refusal a restart repeats (configuration, format,
 //! identity, lexicon) is not waited for; it ends the start at once with its message.
@@ -14,10 +11,10 @@
 //! A start refusal that only a change of configuration, image or store clears is marked
 //! [`Permanent`] where it is produced ([`permanent`], [`bind_failure`], [`open_failure`],
 //! [`consume_start_failure`]). It ends with [`REFUSED_EXIT_STATUS`], which the unit lists in
-//! `RestartPreventExitStatus=`: a restart would repeat it, so the unit neither loops on it nor
-//! spends its start limit, and the journal names the refusal. Any other failure before the daemon
+//! `RestartPreventExitStatus=`. The unit remains failed and the journal names the refusal.
+//! Any other failure before the daemon
 //! serves (a transient I/O error, descriptor exhaustion, a mount that has not come up) keeps the
-//! ordinary failure status, so the unit restarts it within its start limit, and the journal says
+//! ordinary failure status, so the unit retries with its crash recovery delay, and the journal says
 //! it was not classified as permanent.
 //!
 //! While it waits the daemon serves nothing: before the store opens it holds no socket (the

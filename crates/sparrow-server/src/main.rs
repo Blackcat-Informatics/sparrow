@@ -61,9 +61,8 @@ async fn main() -> std::process::ExitCode {
             if !SERVING.load(std::sync::atomic::Ordering::Relaxed)
                 && !start_wait::is_permanent(error.as_ref()) =>
         {
-            // Not named as deterministic (a transient I/O error, descriptor exhaustion, a mount
-            // that has not come up): the ordinary failure status, so the unit restarts it
-            // within its start limit.
+            // An ordinary failure such as transient I/O or descriptor exhaustion uses the
+            // unit's crash retry delay.
             eprintln!(
                 "sparrowd: start failed: {error}; not classified as permanent, so the exit status is 1 and the unit restarts it"
             );
@@ -150,9 +149,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(listener) = &tcp_listener {
         eprintln!("sparrowd: capnp_tcp={}", listener.local_addr()?);
     }
-    // Opening writes a manifest and WAL and replays any WAL an unclean stop left; a filesystem
-    // without room for that, or a pending upgrade the write allowance refuses, would fail the
-    // open and spend systemd's bounded restarts. Wait for them instead (start_wait::open_store).
+    // Opening writes a manifest and WAL and replays any WAL an unclean stop left.
+    // Wait inside the process for room or a pending upgrade's write allowance.
     // Between the open floor and `min_free_bytes` the store opens and the floor pauses writes,
     // so a restart on a nearly full filesystem still serves reads and can reclaim.
     let store = match start_wait::open_store(&mut interrupt, &mut config, Path::new(path)).await? {
