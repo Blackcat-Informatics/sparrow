@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/99-prove-that-pipelined-calls-on-a-refused",
+  "branch": "paudley/99-prove-that-pipelined-calls-on-a-refused",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "2e66709d724fe4dc2c1f8989260b4c3a26d38291",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/99-prove-that-pipelined-calls-on-a-refused/.stage/prove-that-pipelined-calls-on-a-refused/sync/20261124T134229-4bd01b0541be4bd5a1cbcb10be1c0ea6",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "2f37f0d6475e54f02b2ec59c8e8b5a10a52d3a9b",
+  "merge_bases": [
+    "2e66709d724fe4dc2c1f8989260b4c3a26d38291"
+  ],
+  "commit": "2f37f0d6475e54f02b2ec59c8e8b5a10a52d3a9b"
+}
