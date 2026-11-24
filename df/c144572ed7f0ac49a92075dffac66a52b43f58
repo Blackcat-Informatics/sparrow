@@ -1,0 +1,19 @@
+ghprsq source head backlink metadata
+
+parent_hashes: dfc144572ed7f0ac49a92075dffac66a52b43f58
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 535
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/535
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 8cf19bf8ad8ecc2173a8fe99019582e432a1678c
+GhpRsq-Head-Ref: paudley/75-measure-wal-footprint-with-the
+GhpRsq-Head-OID: dfc144572ed7f0ac49a92075dffac66a52b43f58
+GhpRsq-Result-Tree: 59e20497a249481fe546c630e7d3a3d4bc16365b
+GhpRsq-Result-Commit: 1efab0c21928c4f08fa916881c1b1add3540a934
+GhpRsq-Parent-Hashes: dfc144572ed7f0ac49a92075dffac66a52b43f58
+GhpRsq-Squash-Notes-SHA256: 9e70940c1037fa50fe517cf63b2d8224430f19acb6fc6c3603eb6867457e608a
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
