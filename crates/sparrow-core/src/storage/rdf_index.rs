@@ -1377,14 +1377,19 @@ mod tests {
         expected.sort();
         assert_eq!(built(&db), expected);
         assert_eq!(db.get(OWNER_GRAPH_UPGRADE).unwrap().unwrap(), [0]);
+
         db.put(OWNER_GRAPH_UPGRADE, [1]).unwrap();
-        db.put(graph_key(0, 5), []).unwrap();
-        db.delete(owner_graph_key(1, 3)).unwrap();
+        // All four declarations sort before this invalid owner in the same page.
+        db.put(graph_key(10, 0), []).unwrap();
+        for key in expected {
+            db.delete(key).unwrap();
+        }
         assert_eq!(
             owner_graph_step(&db, 64).unwrap_err().code,
             "STORAGE_FAILURE"
         );
-        assert!(db.get(owner_graph_key(1, 3)).unwrap().is_none());
+        assert!(built(&db).is_empty());
+        assert_eq!(db.get(OWNER_GRAPH_UPGRADE).unwrap().unwrap(), [1]);
     }
 
     fn reverse_id(db: &DB, bytes: &[u8]) -> u64 {

@@ -13305,6 +13305,62 @@ fn artifact_capture_refuses_budget_and_corruption_without_publishing_prefixes() 
     }
 }
 
+/// INVARIANT: a live listing rejects an orphaned source index row or a conflicting receipt
+/// without publishing a page handle.
+#[test]
+fn artifacts_listing_refuses_broken_source_index_rows() {
+    use sparrow_core::{ArtifactRead, ArtifactSelector};
+
+    let query = ArtifactRead {
+        selector: ArtifactSelector {
+            source: Some("listed".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for missing_artifact in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        let artifact = store.ingest("indexed", "listed", "log", b"", 1).unwrap();
+        assert!(artifact.record_ids.is_empty());
+        let page = store.artifact_read(&query, 3).unwrap();
+        assert_eq!(page.total_items, 1);
+        assert_eq!(page.body.artifacts[0].id, artifact.id);
+        drop(store);
+
+        let db = catalog_db(dir.path()).unwrap();
+        let (identity, reason) = if missing_artifact {
+            db.delete(&artifact.id).unwrap();
+            (artifact.id, "without its entry or a retained record")
+        } else {
+            let (key, value) = db
+                .prefix_iterator(b"source-artifact:")
+                .next()
+                .unwrap()
+                .unwrap();
+            let key = std::str::from_utf8(&key).unwrap();
+            let suffix = format!("{:016x}:{}", artifact.received_at, artifact.id);
+            let prefix = key.strip_suffix(&suffix).unwrap();
+            let conflicting = format!("{prefix}{:016x}:{}", 2, artifact.id);
+            db.delete(key).unwrap();
+            db.put(&conflicting, value).unwrap();
+            (
+                conflicting,
+                "disagrees with its artifact's source or receipt",
+            )
+        };
+        drop(db);
+
+        let store = Store::open(dir.path(), config()).unwrap();
+        let error = store.artifact_read(&query, 3).unwrap_err();
+        assert_eq!(error.code, "STORAGE_FAILURE");
+        assert!(error.message.contains(&identity), "{error:?}");
+        assert!(error.message.contains(reason), "{error:?}");
+        let status = store.status(3).unwrap();
+        assert_eq!(status["artifact_read_handles"].as_str(), Some("0"));
+    }
+}
+
 #[test]
 fn artifacts_listing_reads_only_its_page() {
     use sparrow_core::{ArtifactRead, ArtifactSelector};
