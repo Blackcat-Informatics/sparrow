@@ -9542,6 +9542,8 @@ async fn producer_receipt_mismatch_never_certifies_or_retires_pending_input() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn buffered_rpc_flush_sdk_cli_mcp_and_recovery_preserve_occurrence_identity() {
+    use sparrow_client::ArtifactReceipt;
+
     tokio::task::LocalSet::new().run_until(async {
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join("store");
@@ -9550,34 +9552,47 @@ async fn buffered_rpc_flush_sdk_cli_mcp_and_recovery_preserve_occurrence_identit
         let original = std::fs::read_to_string(&config).unwrap();
         std::fs::write(&config, format!("{original}\nbuffered_flush_interval_ms = 60000\n")).unwrap();
         let daemon = start(&config, &socket).await;
-        tokio::time::sleep(Duration::from_millis(30)).await;
         let client = sparrow_client::Client::connect(&socket).await.unwrap();
         assert_eq!(client.discovery().flush_interval_ms, 60000);
-        let first = client.ingest_with_durability("buffered-rpc", "buffered-sdk", wire::Format::Json,
-            br#"{"message":"explicit flush evidence"}"#, wire::Durability::Buffered).await.unwrap();
+        let submit = || client.ingest_with_durability(
+            "buffered-rpc", "buffered-sdk", wire::Format::Json,
+            br#"{"message":"explicit flush evidence"}"#, wire::Durability::Buffered,
+        );
+        let first = submit().await.unwrap();
         assert_eq!(first.durability, wire::Durability::Buffered);
         let fence = first.buffered_through.clone().unwrap();
-        assert_eq!(client.artifact(&first.id).await.unwrap(), first);
-        assert_eq!(client.ingest_with_durability("buffered-rpc", "buffered-sdk", wire::Format::Json,
-            br#"{"message":"explicit flush evidence"}"#, wire::Durability::Buffered).await.unwrap(), first);
+        // The maintenance worker can flush between observations. Only the receipt's
+        // durability and watermark may change, and only in the durable direction.
+        let assert_replay = |previous: &ArtifactReceipt, next: &ArtifactReceipt| {
+            let mut expected = previous.clone();
+            if next.durability == wire::Durability::Durable {
+                expected.durability = wire::Durability::Durable;
+                expected.buffered_through = None;
+            }
+            assert_eq!(next, &expected);
+        };
+        let inspected = client.artifact(&first.id).await.unwrap();
+        assert_replay(&first, &inspected);
+        let replay = submit().await.unwrap();
+        assert_replay(&inspected, &replay);
         let reached = client.flush(&fence).await.unwrap();
         assert!(reached.sequence >= fence.sequence);
         let durable = client.artifact(&first.id).await.unwrap();
-        assert_eq!(durable.id, first.id);
-        assert_eq!(durable.record_ids, first.record_ids);
         assert_eq!(durable.durability, wire::Durability::Durable);
-        assert!(durable.buffered_through.is_none());
+        assert_replay(&replay, &durable);
+        let after_flush = submit().await.unwrap();
+        assert_eq!(after_flush, durable);
         let mut event = delivery_event("buffered typed event");
         event.sequence = 1;
         let batch = sparrow_client::EventBatch { request_id: "buffered-event".into(),
             source: "buffered-event-sdk".into(), client_instance: [7; 16], events: vec![event] };
         let buffered_event = client.events_with_durability(&batch, wire::Durability::Buffered).await.unwrap();
         assert_eq!(buffered_event.durability, wire::Durability::Buffered);
-        assert_eq!(client.events_with_durability(&batch, wire::Durability::Buffered).await.unwrap(), buffered_event);
+        let replayed_event = client.events_with_durability(&batch, wire::Durability::Buffered).await.unwrap();
+        assert_replay(&buffered_event, &replayed_event);
         let durable_event = client.events(&batch).await.unwrap();
-        assert_eq!(durable_event.id, buffered_event.id);
-        assert_eq!(durable_event.record_ids, buffered_event.record_ids);
         assert_eq!(durable_event.durability, wire::Durability::Durable);
+        assert_replay(&replayed_event, &durable_event);
         let second = client.ingest_with_durability("buffered-cli", "buffered-sdk", wire::Format::Log,
             b"CLI flush evidence\n", wire::Durability::Buffered).await.unwrap();
         let token = second.buffered_through.unwrap();
