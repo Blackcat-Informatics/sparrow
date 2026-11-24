@@ -93,6 +93,7 @@ async fn recovery_replaces_the_store_session_without_rebinding_its_listeners() {
             "source",
             "log",
             evidence,
+            None,
             sparrow_server::now().unwrap(),
             sparrow_core::Durability::Buffered,
         )

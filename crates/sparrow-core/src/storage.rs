@@ -2132,30 +2132,18 @@ impl Store {
             source,
             format,
             bytes,
+            None,
             now,
             durability::Durability::Durable,
         )
     }
 
-    /// Accept a complete atomic artifact at the caller's explicit WAL boundary.
-    pub fn ingest_with_durability(
-        &self,
-        request_id: &str,
-        source: &str,
-        format: &str,
-        bytes: &[u8],
-        now: u64,
-        mode: durability::Durability,
-    ) -> Result<Artifact, Error> {
-        self.ingest_with_intake(request_id, source, format, bytes, None, now, mode)
-    }
-
-    /// Accept a complete atomic artifact, recording the endpoint and caller that sent it.
+    /// Accept a complete atomic artifact at an explicit WAL boundary with optional intake.
     #[expect(
         clippy::too_many_arguments,
         reason = "the ingest request, its intake provenance and its WAL boundary"
     )]
-    pub fn ingest_with_intake(
+    pub fn ingest_with_durability(
         &self,
         request_id: &str,
         source: &str,
@@ -2177,20 +2165,7 @@ impl Store {
         )
     }
 
-    /// Accept normalized typed events and their producer positions in one WAL batch.
-    pub fn ingest_producer(
-        &self,
-        request_id: &str,
-        source: &str,
-        bytes: &[u8],
-        producer: &producer_stream::ProducerBatch,
-        now: u64,
-        mode: durability::Durability,
-    ) -> Result<Artifact, Error> {
-        self.ingest_producer_with_intake(request_id, source, bytes, producer, None, now, mode)
-    }
-
-    /// Accept a batch on the daemon's event route: [`Store::ingest_producer_with_intake`], with
+    /// Accept a batch on the daemon's event route using [`Store::ingest_producer`] semantics with
     /// the source's `/event_time` (Unix milliseconds) mapping bound on first use. A full source
     /// registry never refuses the batch (#227): it is stored with unknown time (`no_profile`),
     /// and the records without a mapping are counted per source in
@@ -2199,7 +2174,7 @@ impl Store {
         clippy::too_many_arguments,
         reason = "the event batch, its intake provenance and its WAL boundary"
     )]
-    pub fn ingest_events_with_intake(
+    pub fn ingest_events(
         &self,
         request_id: &str,
         source: &str,
@@ -2247,12 +2222,12 @@ impl Store {
         )
     }
 
-    /// Accept typed events, recording the endpoint and caller that sent them.
+    /// Accept typed events, producer positions and optional intake in one WAL batch.
     #[expect(
         clippy::too_many_arguments,
         reason = "the event batch, its intake provenance and its WAL boundary"
     )]
-    pub fn ingest_producer_with_intake(
+    pub fn ingest_producer(
         &self,
         request_id: &str,
         source: &str,

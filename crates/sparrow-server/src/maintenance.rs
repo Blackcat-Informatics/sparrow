@@ -1400,6 +1400,7 @@ mod tests {
                 "source",
                 "opaque",
                 b"buffered",
+                None,
                 now,
                 sparrow_core::Durability::Buffered,
             )
@@ -1547,6 +1548,7 @@ mod tests {
                 "source",
                 "opaque",
                 b"buffered",
+                None,
                 now,
                 sparrow_core::Durability::Buffered,
             )
@@ -1595,6 +1597,7 @@ mod tests {
                 "source",
                 "opaque",
                 b"buffered",
+                None,
                 sparrow_server::now().unwrap(),
                 sparrow_core::Durability::Buffered,
             )
@@ -1719,6 +1722,7 @@ mod tests {
                 "source",
                 "opaque",
                 &payload,
+                None,
                 2,
                 sparrow_core::Durability::Durable,
             ) {
@@ -1788,6 +1792,7 @@ mod tests {
                 "source",
                 "opaque",
                 b"buffered",
+                None,
                 now,
                 sparrow_core::Durability::Buffered,
             )
@@ -2288,6 +2293,7 @@ mod tests {
                 "source",
                 "opaque",
                 b"buffered",
+                None,
                 sparrow_server::now().unwrap(),
                 sparrow_core::Durability::Buffered,
             )

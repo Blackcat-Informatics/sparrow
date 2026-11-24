@@ -487,6 +487,7 @@ mod tests {
                 "source",
                 &b"{}\n".repeat(4),
                 &batch,
+                None,
                 1,
                 crate::Durability::Durable,
             )

@@ -212,6 +212,7 @@ mod tests {
                 "drain",
                 "opaque",
                 b"buffered evidence",
+                None,
                 1000,
                 sparrow_core::Durability::Buffered,
             );

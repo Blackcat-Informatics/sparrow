@@ -100,6 +100,7 @@ fn a_full_disk_latch_clears_once_space_returns() {
                     "source",
                     "opaque",
                     &payload(256 * 1024),
+                    None,
                     2,
                     Durability::Durable,
                 )
