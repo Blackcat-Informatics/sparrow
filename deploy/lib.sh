@@ -504,27 +504,44 @@ keep_store_copy() {
     note "kept a $method copy of $source at $dest: $files files, $bytes bytes"
 }
 
-# Check conversion prerequisites that do not require a closed store. Print the
-# mode for the converter. Restart checks it before stopping and conversion repeats it.
+# Check that both directories still belong to this conversion.
+check_store_conversion_identity() {
+    local data=$1 staged=$2 partial=$1.no-cow.partial current
+    if [[ -d $data && ! -L $data && -d $partial && ! -L $partial ]] &&
+        current=$(stat -c '%d:%i' -- "$data" "$partial") && [[ $current == "$staged" ]]; then
+        return
+    fi
+    die "$data or $partial changed after the pre-copy; preserve the directories and inspect them (deploy/RECOVERY.md)"
+}
+
+# Check conversion prerequisites that do not require a closed store.
 check_store_conversion() {
-    local data=$1 partial parent filesystem flags count report need free status
+    local data=$1 staged=${2:-} partial parent filesystem flags count report need=0 free status
     [[ -d $data ]] || die "$data is not a directory"
     filesystem=$(findmnt -no FSTYPE -T "$data") || die "cannot identify the filesystem of $data"
     if [[ $filesystem != btrfs ]]; then
+        [[ -z $staged ]] || die "$data moved off btrfs after the pre-copy"
         printf '%s\n' other-filesystem
         return 0
     fi
 
     partial=$data.no-cow.partial
-    [[ ! -e $partial && ! -L $partial ]] \
-        || die "$partial is left from an earlier conversion; preserve both directories until you identify the original (deploy/RECOVERY.md)"
-    flags=$(lsattr -d -- "$data") || die "cannot read copy-on-write attributes of $data"
-    if [[ ${flags%% *} == *C* ]]; then
-        count=$(copy_on_write_files "$data") || die "cannot check file attributes under $data"
-        if ((count == 0)); then
-            printf '%s\n' already-converted
-            return 0
+    if [[ -n $staged ]]; then
+        check_store_conversion_identity "$data" "$staged"
+    else
+        [[ ! -e $partial && ! -L $partial ]] \
+            || die "$partial is left from an earlier conversion; preserve both directories until you identify the original (deploy/RECOVERY.md)"
+        flags=$(lsattr -d -- "$data") || die "cannot read copy-on-write attributes of $data"
+        if [[ ${flags%% *} == *C* ]]; then
+            count=$(copy_on_write_files "$data") || die "cannot check file attributes under $data"
+            if ((count == 0)); then
+                printf '%s\n' already-converted
+                return 0
+            fi
         fi
+        report=$(du -ls -B1 -- "$data") || die "cannot measure the size of $data"
+        need=${report%%[[:space:]]*}
+        [[ $need =~ ^[0-9]+$ ]] || die "du reports no size for $data"
     fi
 
     parent=$(dirname -- "$data")
@@ -537,21 +554,44 @@ check_store_conversion() {
     fi
     mv --exchange --no-copy -T --help >/dev/null 2>&1 \
         || die "put GNU mv with --exchange and --no-copy first in PATH before converting $data"
-    report=$(du -s -B1 -- "$data") || die "cannot measure the size of $data"
-    need=${report%%[[:space:]]*}
-    [[ $need =~ ^[0-9]+$ ]] || die "du reports no size for $data"
     free=$(free_bytes "$parent") || exit 1
     ((free > need + 10 * 1024 ** 3)) \
         || die "only $free bytes free beside $data; converting it needs $need bytes plus 10 GiB"
     printf '%s\n' convert
 }
 
-# Copy the closed store, verify it, and exchange the two sibling directories.
+create_no_cow_sibling() {
+    local partial=$1
+    mkdir -- "$partial" || die "cannot create $partial"
+    chattr +C -- "$partial" || die "cannot switch copy-on-write off for $partial"
+}
+
+# Stage an initial copy while the daemon can still write. Only the closed
+# source decides which files are published. Leave hard links to the final
+# pass so links split by the live writer cannot leave shared destination inodes.
+precopy_store_no_cow() {
+    local data=$1 partial=$1.no-cow.partial original candidate staged status=0
+    command -v rsync >/dev/null || die "install rsync before converting a running store"
+    original=$(stat -c '%d:%i' -- "$data") || die "cannot identify $data"
+    create_no_cow_sibling "$partial"
+    candidate=$(stat -c '%d:%i' -- "$partial") || die "cannot identify $partial"
+    staged=$original$'\n'$candidate
+    rsync -aAXS --numeric-ids -- "$data/" "$partial/" >&2 || status=$?
+    # Exit 24 covers files that disappear while rsync reads the live tree.
+    ((status == 0 || status == 24)) || die "pre-copy of $data failed with exit $status; inspect $partial"
+    sync -f -- "$partial" || die "cannot synchronize the pre-copy at $partial"
+    check_store_conversion "$data" "$staged" >/dev/null || exit 1
+    printf '%s\n' "$staged"
+}
+
+# Copy or reconcile the closed store, verify it, and exchange the siblings.
 # Between the exchange and retention, the partial name holds the original.
 convert_store_no_cow() {
-    local data partial kept mode count files parent
-    data=$(realpath -e -- "$1") || die "$1 does not exist"
-    mode=$(check_store_conversion "$data") || exit 1
+    local data=$1 staged=${2:-} partial kept mode count files parent
+    if [[ -z $staged ]]; then
+        data=$(realpath -e -- "$1") || die "$1 does not exist"
+    fi
+    mode=$(check_store_conversion "$data" "$staged") || exit 1
     case $mode in
         other-filesystem) note "$data is not on btrfs; it has no copy-on-write to switch off"; return 0 ;;
         already-converted) note "copy-on-write is already off for $data and every file in it"; return 0 ;;
@@ -562,11 +602,15 @@ convert_store_no_cow() {
     kept=$data.cow-$(date -u +%Y%m%dT%H%M%SZ)
     [[ ! -e $kept && ! -L $kept ]] || die "$kept already exists; retain it and retry with a new timestamp"
 
-    mkdir -- "$partial" || die "cannot create $partial; $data is unchanged"
-    chattr +C -- "$partial" || die "cannot switch copy-on-write off for $partial; $data is unchanged"
-    # cp -a copies the mode, owner and ACLs. Files inherit the sibling's attribute.
-    cp -a --reflink=never -- "$data/." "$partial/" \
-        || die "copying $data failed; $data is unchanged and $partial is kept for inspection"
+    if [[ -n $staged ]]; then
+        rsync -aHAXS --numeric-ids --checksum --delete -- "$data/" "$partial/" \
+            || die "reconciling $data failed; $data is unchanged and $partial is kept for inspection"
+    else
+        create_no_cow_sibling "$partial"
+        # cp -a copies the mode, owner and ACLs. Files inherit the sibling's attribute.
+        cp -a --reflink=never -- "$data/." "$partial/" \
+            || die "copying $data failed; $data is unchanged and $partial is kept for inspection"
+    fi
     find "$partial" -type s -delete || die "cannot remove stale sockets from $partial; $data is unchanged"
     store_listings_match "$data" "$partial" \
         || die "the copy's file list differs from $data or cannot be read; $data is unchanged and $partial is kept"
@@ -578,6 +622,9 @@ convert_store_no_cow() {
     fi
     files=$(find "$partial" -type f -printf . | wc -c) || die "cannot count files in $partial; $data is unchanged"
     sync -f -- "$partial" || die "cannot synchronize $partial; $data is unchanged"
+    if [[ -n $staged ]]; then
+        check_store_conversion_identity "$data" "$staged"
+    fi
     mv --exchange --no-copy -T -- "$data" "$partial" \
         || die "exchange of $data and $partial did not report success; preserve both and inspect them (deploy/RECOVERY.md)"
     # Candidate bytes are already durable. Persist the sibling names without

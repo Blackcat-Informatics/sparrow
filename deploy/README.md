@@ -65,16 +65,21 @@ and over the kept images in `./bin`.
 
 Copy-on-write is off for the store. `install.sh`
 sets the btrfs no-copy-on-write attribute on `/var/lib/sparrow/store` while it is empty, so every file
-created in it inherits it. `restart.sh` rewrites a closed store that
-still has copy-on-write files, using `deploy/copy-on-write.sh convert`, and keeps the original
-beside it as `store.cow-STAMP`; remove that copy once the converted store has been checked. The store gives up
+created in it inherits it. `restart.sh` rewrites stores that still contain
+copy-on-write files and keeps the original beside them as `store.cow-STAMP`.
+Remove that copy once the converted store has been checked. The store gives up
 btrfs checksums and compression; its own digests and compression cover both.
 
 Conversion requires GNU `mv` with `--exchange` and `--no-copy` first in
 `PATH`. Restart checks for an interrupted conversion, available space, and
-the required `mv` options before stopping the unit. The converter repeats those checks and
-checks for open files after the stop. It exchanges the verified copy into
-the canonical path before retaining the original.
+the required `mv` options before stopping the unit. For a running unit that
+needs conversion, restart uses `rsync` to stage a sibling on Btrfs before the
+drain, then updates changed and added files and removes stale paths using the
+closed store. Restart checks the source and sibling identities before the drain
+and again before exchange. The converter rechecks prerequisites and open files
+after the stop. Byte comparison still reads every regular file. The converter exchanges
+the verified copy into the canonical path before retaining the original.
+Use `deploy/copy-on-write.sh convert` to convert an already closed store.
 [Interrupted conversion](RECOVERY.md#interrupted-copy-on-write-conversion)
 
 | Path | Owner, mode | Contents |
