@@ -928,6 +928,43 @@ mod tests {
         assert!(unconfigured.open_store().is_err());
     }
 
+    #[test]
+    fn server_toml_example_documents_every_ingest_key() {
+        let example = include_str!("../../../deploy/config/server.toml.example");
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("server.toml");
+        std::fs::write(&config, example).unwrap();
+        let disabled = ServerConfig::read(&config).unwrap();
+        assert!(disabled.ingest_socket_path.is_none());
+        assert!(disabled.ingest_socket_gid.is_none());
+
+        let keys = [
+            "ingest_socket_path",
+            "ingest_socket_gid",
+            "max_ingest_connections",
+        ];
+        let mut enabled = example.to_owned();
+        for key in keys {
+            let commented = format!("# {key} =");
+            assert!(
+                example.lines().any(|line| line.starts_with(&commented)),
+                "missing {key}"
+            );
+            enabled = enabled.replacen(&commented, &format!("{key} ="), 1);
+        }
+        std::fs::write(&config, enabled).unwrap();
+        let enabled = ServerConfig::read(&config).unwrap();
+        assert_eq!(
+            enabled.ingest_socket_path.as_deref(),
+            Some(std::path::Path::new("/run/sparrow-ingest/ingest.sock"))
+        );
+        assert!(enabled.ingest_socket_gid.is_some());
+        assert_eq!(
+            enabled.max_ingest_connections,
+            disabled.max_ingest_connections
+        );
+    }
+
     /// INVARIANT: a consume or tail root that contains, or lies inside, any path the daemon
     /// writes itself (store, sockets, archive) refuses configuration load and
     /// names both paths, because the daemon would otherwise watch its own output.
