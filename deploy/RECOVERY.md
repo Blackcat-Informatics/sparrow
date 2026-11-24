@@ -244,7 +244,8 @@ operator diagnoses it and resets the unit.
 
 An atomic exchange keeps the canonical store directory present throughout
 conversion. Before the exchange, the canonical directory holds the original
-and its `.no-cow.partial` sibling holds the candidate. After the exchange,
+and its `.no-cow.partial` sibling holds the candidate. Restart can create
+this sibling while the daemon is still running. After the exchange,
 the canonical directory holds the verified conversion and the sibling holds
 the original until it moves to `.cow-STAMP`.
 

@@ -6,8 +6,8 @@
 # installed and verified while the old daemon still runs; the stop goes through the drain; the
 # image the links named becomes the rollback (.previous). After the start the store identity must
 # be the one the old daemon reported. There is no automatic rollback: an image may upgrade the
-# store's format, and an older image cannot read it (RECOVERY.md, "Rollback"). A store that still
-# has copy-on-write files is rewritten without it while closed, and the original is kept beside it.
+# store's format, and an older image cannot read it (RECOVERY.md, "Rollback"). Copy-on-write
+# conversion stages a sibling before stopping, then reconciles it against the closed store.
 set -euo pipefail
 umask 022
 
@@ -47,7 +47,7 @@ fi
 require_settled
 data=$(config_value data_dir)
 data=$(realpath -e -- "$data") || die "configured store directory does not exist"
-check_store_conversion "$data" >/dev/null || exit 1
+conversion=$(check_store_conversion "$data") || exit 1
 # The checks run on the kept images before anything is installed, so a refusal changes nothing.
 verify_image "$daemon" 'usage: sparrowd --config'
 verify_image "$cli" 'usage: sparrow'
@@ -58,16 +58,19 @@ if [[ $MODE != rollback ]]; then
     cli=$(install_image "$cli") || exit 1
 fi
 
-store=
+store=''
+staged=''
 if unit_active; then
     # A unit that has just started (by systemd, say) may not answer yet.
     wait_ready
     store=$(status_json | status_field store_id)
     [[ $(readlink -- "$LIBEXEC/sparrowd") != "${daemon##*/}" ]] || note "already on ${daemon##*/}; restarting it"
+    if [[ $conversion == convert ]]; then
+        staged=$(precopy_store_no_cow "$data") || exit 1
+    fi
 fi
 drain_stop
-# While the store is closed, rewrite it with copy-on-write off if any file still has it (lib.sh).
-convert_store_no_cow "$data"
+convert_store_no_cow "$data" "$staged"
 select_current "$daemon" "$cli"
 note "starting $SPARROW_UNIT on ${daemon##*/}"
 "${SYSTEMCTL[@]}" start "$SPARROW_UNIT"
