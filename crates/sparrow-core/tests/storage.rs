@@ -22355,6 +22355,12 @@ fn migrate(store: &Store) -> usize {
 /// Records whose layers exercise metadata, diagnostic and content graphs, shared content
 /// owners and facts repeated across graphs, all from source `graphs` received at 1..=4.
 fn owner_graph_fixture(store: &Store) -> Vec<String> {
+    let mut records = first_owner_graph_record(store);
+    extend_owner_graph_fixture(store, &mut records);
+    records
+}
+
+fn first_owner_graph_record(store: &Store) -> Vec<String> {
     use sparrow_core::DiagnosticDimension;
     store
         .define_diagnostic_profile(
@@ -22362,9 +22368,14 @@ fn owner_graph_fixture(store: &Store) -> Vec<String> {
             [(DiagnosticDimension::Service, "/svc".to_owned())].into(),
         )
         .unwrap();
-    let mut records = Vec::new();
+    store
+        .ingest("graphs-a", "graphs", "json", br#"{"svc":"a","n":1}"#, 1)
+        .unwrap()
+        .record_ids
+}
+
+fn extend_owner_graph_fixture(store: &Store, records: &mut Vec<String>) {
     for (request, format, bytes, now) in [
-        ("graphs-a", "json", &br#"{"svc":"a","n":1}"#[..], 1),
         ("graphs-b", "json", &br#"{"svc":"a","n":1}"#[..], 2),
         (
             "graphs-c",
@@ -22381,7 +22392,6 @@ fn owner_graph_fixture(store: &Store) -> Vec<String> {
                 .record_ids,
         );
     }
-    records
 }
 
 /// Declared `(owner, graph)` pairs from `rdf:g:` beside the `rdf:o:` mirror rows.
@@ -22448,7 +22458,7 @@ fn scoped_sparql_answers_match_the_store_wide_plan() {
     use sparrow_core::RdfGraphLayers;
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
-    let records = owner_graph_fixture(&store);
+    let mut records = first_owner_graph_record(&store);
     let record = format!("urn:sparrow:{}", records[0]);
     let graph = format!("urn:sparrow:graph:{}", records[0]);
     let queries = [
@@ -22470,8 +22480,9 @@ fn scoped_sparql_answers_match_the_store_wide_plan() {
     let mut window = store_wide.clone();
     window.received_from = 1;
     window.received_before = 5;
-    let mut nonempty = 0;
-    for layers in [
+    let mut subset = window.clone();
+    subset.received_before = 2;
+    let layer_sets = [
         RdfGraphLayers::ALL,
         RdfGraphLayers {
             metadata: true,
@@ -22488,16 +22499,37 @@ fn scoped_sparql_answers_match_the_store_wide_plan() {
             diagnostic: false,
             content: true,
         },
-    ] {
-        for query in &queries {
+    ];
+    // A store-wide read before adding the excluded owners supplies the oracle
+    // with the original occurrence and graph identities.
+    let expected_subset = layer_sets.map(|layers| {
+        queries
+            .each_ref()
+            .map(|query| scoped_rows(&store, &store_wide, layers, query, 5).0)
+    });
+    extend_owner_graph_fixture(&store, &mut records);
+    let mut nonempty = 0;
+    let mut dropped_rows = false;
+    for (layers, subset_answers) in layer_sets.into_iter().zip(expected_subset) {
+        for (query, subset_expected) in queries.iter().zip(subset_answers) {
             let (expected, _) = scoped_rows(&store, &store_wide, layers, query, 5);
             for scope in [&record_page_scope("graphs", 1000), &window] {
                 let (rows, _) = scoped_rows(&store, scope, layers, query, 5);
                 assert_eq!(rows, expected, "{layers:?}: {query}");
             }
+            let (actual_subset, _) = scoped_rows(&store, &subset, layers, query, 5);
+            assert_eq!(
+                actual_subset, subset_expected,
+                "strict subset {layers:?}: {query}"
+            );
+            dropped_rows |= actual_subset.len() < expected.len();
             nonempty += usize::from(!expected.is_empty());
         }
     }
+    assert!(
+        dropped_rows,
+        "the strict subset must exclude at least one row"
+    );
     assert!(nonempty >= 30, "only {nonempty} nonempty comparisons");
     // Facts repeated across graphs are answered once from the union default graph.
     let all = RdfGraphLayers::ALL;
