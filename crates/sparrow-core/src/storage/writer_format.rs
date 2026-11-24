@@ -606,15 +606,195 @@ const SEALED: [[&[u8]; 11]; 5] = [
         b"sparrow.store/461",
     ],
 ];
+
+// The expanded source summary rows require a reader and writer that know their byte totals.
+const SOURCE_BYTES: [[&[u8]; 11]; 5] = [
+    [
+        b"sparrow.store/462",
+        b"sparrow.store/463",
+        b"sparrow.store/464",
+        b"sparrow.store/465",
+        b"sparrow.store/466",
+        b"sparrow.store/467",
+        b"sparrow.store/468",
+        b"sparrow.store/469",
+        b"sparrow.store/470",
+        b"sparrow.store/471",
+        b"sparrow.store/472",
+    ],
+    [
+        b"sparrow.store/473",
+        b"sparrow.store/474",
+        b"sparrow.store/475",
+        b"sparrow.store/476",
+        b"sparrow.store/477",
+        b"sparrow.store/478",
+        b"sparrow.store/479",
+        b"sparrow.store/480",
+        b"sparrow.store/481",
+        b"sparrow.store/482",
+        b"sparrow.store/483",
+    ],
+    [
+        b"sparrow.store/484",
+        b"sparrow.store/485",
+        b"sparrow.store/486",
+        b"sparrow.store/487",
+        b"sparrow.store/488",
+        b"sparrow.store/489",
+        b"sparrow.store/490",
+        b"sparrow.store/491",
+        b"sparrow.store/492",
+        b"sparrow.store/493",
+        b"sparrow.store/494",
+    ],
+    [
+        b"sparrow.store/495",
+        b"sparrow.store/496",
+        b"sparrow.store/497",
+        b"sparrow.store/498",
+        b"sparrow.store/499",
+        b"sparrow.store/500",
+        b"sparrow.store/501",
+        b"sparrow.store/502",
+        b"sparrow.store/503",
+        b"sparrow.store/504",
+        b"sparrow.store/505",
+    ],
+    [
+        b"sparrow.store/506",
+        b"sparrow.store/507",
+        b"sparrow.store/508",
+        b"sparrow.store/509",
+        b"sparrow.store/510",
+        b"sparrow.store/511",
+        b"sparrow.store/512",
+        b"sparrow.store/513",
+        b"sparrow.store/514",
+        b"sparrow.store/515",
+        b"sparrow.store/516",
+    ],
+];
+const SEALED_SOURCE_BYTES: [[&[u8]; 11]; 5] = [
+    [
+        b"sparrow.store/517",
+        b"sparrow.store/518",
+        b"sparrow.store/519",
+        b"sparrow.store/520",
+        b"sparrow.store/521",
+        b"sparrow.store/522",
+        b"sparrow.store/523",
+        b"sparrow.store/524",
+        b"sparrow.store/525",
+        b"sparrow.store/526",
+        b"sparrow.store/527",
+    ],
+    [
+        b"sparrow.store/528",
+        b"sparrow.store/529",
+        b"sparrow.store/530",
+        b"sparrow.store/531",
+        b"sparrow.store/532",
+        b"sparrow.store/533",
+        b"sparrow.store/534",
+        b"sparrow.store/535",
+        b"sparrow.store/536",
+        b"sparrow.store/537",
+        b"sparrow.store/538",
+    ],
+    [
+        b"sparrow.store/539",
+        b"sparrow.store/540",
+        b"sparrow.store/541",
+        b"sparrow.store/542",
+        b"sparrow.store/543",
+        b"sparrow.store/544",
+        b"sparrow.store/545",
+        b"sparrow.store/546",
+        b"sparrow.store/547",
+        b"sparrow.store/548",
+        b"sparrow.store/549",
+    ],
+    [
+        b"sparrow.store/550",
+        b"sparrow.store/551",
+        b"sparrow.store/552",
+        b"sparrow.store/553",
+        b"sparrow.store/554",
+        b"sparrow.store/555",
+        b"sparrow.store/556",
+        b"sparrow.store/557",
+        b"sparrow.store/558",
+        b"sparrow.store/559",
+        b"sparrow.store/560",
+    ],
+    [
+        b"sparrow.store/561",
+        b"sparrow.store/562",
+        b"sparrow.store/563",
+        b"sparrow.store/564",
+        b"sparrow.store/565",
+        b"sparrow.store/566",
+        b"sparrow.store/567",
+        b"sparrow.store/568",
+        b"sparrow.store/569",
+        b"sparrow.store/570",
+        b"sparrow.store/571",
+    ],
+];
+
+pub(super) fn has_source_bytes(format: &[u8]) -> bool {
+    position(&SOURCE_BYTES, format).is_some() || position(&SEALED_SOURCE_BYTES, format).is_some()
+}
+
+pub(super) fn enable_source_bytes(format: &[u8]) -> Result<&'static [u8], Error> {
+    position(&SOURCE_BYTES, format)
+        .or_else(|| position(&PAYLOAD_INDEX, format))
+        .map(|(family, index)| SOURCE_BYTES[family][index])
+        .or_else(|| {
+            position(&SEALED_SOURCE_BYTES, format)
+                .or_else(|| position(&SEALED, format))
+                .map(|(family, index)| SEALED_SOURCE_BYTES[family][index])
+        })
+        .ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "source bytes require a payload-index authority family",
+            )
+        })
+}
+
+fn before_source_bytes(format: &[u8]) -> &[u8] {
+    if let Some((family, index)) = position(&SOURCE_BYTES, format) {
+        return PAYLOAD_INDEX[family][index];
+    }
+    position(&SEALED_SOURCE_BYTES, format).map_or(format, |(family, index)| SEALED[family][index])
+}
+
 pub(super) const RETRY_GC: &str = "producer:sealed-receipt-gc";
 
 fn sealed(format: &[u8]) -> Option<&'static [u8]> {
-    position(&SEALED, format).map(|(family, i)| SEALED[family][i])
+    position(&SEALED_SOURCE_BYTES, format)
+        .map(|(family, index)| SEALED_SOURCE_BYTES[family][index])
+        .or_else(|| position(&SEALED, format).map(|(family, index)| SEALED[family][index]))
+}
+
+fn payload_index(format: &[u8]) -> Option<&'static [u8]> {
+    position(&SOURCE_BYTES, format)
+        .map(|(family, index)| SOURCE_BYTES[family][index])
+        .or_else(|| {
+            position(&PAYLOAD_INDEX, format).map(|(family, index)| PAYLOAD_INDEX[family][index])
+        })
 }
 
 fn enable_sealed(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some((family, index)) = position(&SOURCE_BYTES, format) {
+        return Ok(SEALED_SOURCE_BYTES[family][index]);
+    }
+    if let Some(identity) = sealed(format) {
+        return Ok(identity);
+    }
     position(&PAYLOAD_INDEX, format)
-        .or_else(|| position(&SEALED, format))
         .map(|(family, i)| SEALED[family][i])
         .ok_or_else(|| {
             Error::new(
@@ -657,6 +837,7 @@ pub(super) fn activate_sealed(db: &DB) -> Result<(), Error> {
 /// format lifts;
 /// other formats are unchanged.
 fn lower(format: &[u8]) -> &[u8] {
+    let format = before_source_bytes(format);
     let format = position(&SEALED, format).map_or(format, |(family, i)| PAYLOAD_INDEX[family][i]);
     let format = position(&PAYLOAD_INDEX, format)
         .map_or(format, |(family, index)| STORE_COUNTERS[family][index]);
@@ -692,10 +873,15 @@ fn relift<'a>(current: &[u8], next: &'a [u8]) -> Result<&'a [u8], Error> {
     } else {
         next
     };
-    if sealed(current).is_some() {
+    let next = if sealed(current).is_some() {
         enable_sealed(enable_payload_index(next)?)
     } else if has_payload_index(current) {
         enable_payload_index(next)
+    } else {
+        Ok(next)
+    }?;
+    if has_source_bytes(current) {
+        enable_source_bytes(next)
     } else {
         Ok(next)
     }
@@ -728,6 +914,7 @@ pub(super) fn lower_store_counters(format: &[u8]) -> &[u8] {
 /// The store counter identity a payload index family lifts; other formats are unchanged.
 #[cfg(feature = "test-support")]
 pub(super) fn lower_payload_index(format: &[u8]) -> &[u8] {
+    let format = before_source_bytes(format);
     let format = position(&SEALED, format).map_or(format, |(family, i)| PAYLOAD_INDEX[family][i]);
     position(&PAYLOAD_INDEX, format).map_or(format, |(family, index)| STORE_COUNTERS[family][index])
 }
@@ -741,7 +928,7 @@ pub(super) fn has_store_counters(format: &[u8]) -> bool {
 }
 
 pub(super) fn has_payload_index(format: &[u8]) -> bool {
-    position(&PAYLOAD_INDEX, format).is_some() || sealed(format).is_some()
+    payload_index(format).is_some() || sealed(format).is_some()
 }
 
 /// Fence a current store counter family for the payload id index (#323); idempotent.
@@ -749,9 +936,10 @@ pub(super) fn enable_payload_index(format: &[u8]) -> Result<&'static [u8], Error
     if let Some(identity) = sealed(format) {
         return Ok(identity);
     }
-    position(&PAYLOAD_INDEX, format)
-        .or_else(|| position(&STORE_COUNTERS, format))
-        .map(|(family, index)| PAYLOAD_INDEX[family][index])
+    payload_index(format)
+        .or_else(|| {
+            position(&STORE_COUNTERS, format).map(|(family, index)| PAYLOAD_INDEX[family][index])
+        })
         .ok_or_else(|| {
             Error::new(
                 "STORAGE_FAILURE",
@@ -765,8 +953,8 @@ pub(super) fn enable_store_counters(format: &[u8]) -> Result<&'static [u8], Erro
     if let Some(identity) = sealed(format) {
         return Ok(identity);
     }
-    if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {
-        return Ok(PAYLOAD_INDEX[family][index]);
+    if let Some(identity) = payload_index(format) {
+        return Ok(identity);
     }
     position(&STORE_COUNTERS, format)
         .or_else(|| position(&SOURCE_SUMMARY, format))
@@ -785,8 +973,8 @@ pub(super) fn enable_source_summary(format: &[u8]) -> Result<&'static [u8], Erro
     if let Some(identity) = sealed(format) {
         return Ok(identity);
     }
-    if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {
-        return Ok(PAYLOAD_INDEX[family][index]);
+    if let Some(identity) = payload_index(format) {
+        return Ok(identity);
     }
     if let Some((family, index)) = position(&STORE_COUNTERS, format) {
         return Ok(STORE_COUNTERS[family][index]);
@@ -807,8 +995,8 @@ pub(super) fn enable_owner_graphs(format: &[u8]) -> Result<&'static [u8], Error>
     if let Some(identity) = sealed(format) {
         return Ok(identity);
     }
-    if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {
-        return Ok(PAYLOAD_INDEX[family][index]);
+    if let Some(identity) = payload_index(format) {
+        return Ok(identity);
     }
     if let Some((family, index)) = position(&STORE_COUNTERS, format) {
         return Ok(STORE_COUNTERS[family][index]);
@@ -832,8 +1020,8 @@ pub(super) fn enable_event_fallback(format: &[u8]) -> Result<&'static [u8], Erro
     if let Some(identity) = sealed(format) {
         return Ok(identity);
     }
-    if let Some((family, index)) = position(&PAYLOAD_INDEX, format) {
-        return Ok(PAYLOAD_INDEX[family][index]);
+    if let Some(identity) = payload_index(format) {
+        return Ok(identity);
     }
     if let Some((family, index)) = position(&STORE_COUNTERS, format) {
         return Ok(STORE_COUNTERS[family][index]);
@@ -874,6 +1062,8 @@ fn families() -> impl Iterator<Item = &'static &'static [u8]> {
         .chain(STORE_COUNTERS.iter().flatten())
         .chain(PAYLOAD_INDEX.iter().flatten())
         .chain(SEALED.iter().flatten())
+        .chain(SOURCE_BYTES.iter().flatten())
+        .chain(SEALED_SOURCE_BYTES.iter().flatten())
 }
 
 fn base_index(format: &[u8], purpose: &str) -> Result<usize, Error> {
@@ -1010,22 +1200,9 @@ pub(super) fn has_artifact_rdf(format: &[u8]) -> bool {
 /// Authority checks use their original family. Public discovery uses the raw identity.
 pub(super) fn read(db: &DB) -> Result<Option<Vec<u8>>, Error> {
     Ok(db.get("store_format")?.map(|raw| {
-        RDF.iter()
-            .chain(ALL_RDF.iter())
-            .chain(PROVENANCE.iter())
-            .chain(TRACING.iter())
-            .chain(LOG_TIME.iter())
-            .chain(ARCHIVE.iter())
-            .chain(INTAKE.iter())
-            .chain(INTAKE_ARCHIVE.iter())
-            .chain(FALLBACK.iter().flatten())
-            .chain(OWNER_GRAPH.iter().flatten())
-            .chain(SOURCE_SUMMARY.iter().flatten())
-            .chain(STORE_COUNTERS.iter().flatten())
-            .chain(PAYLOAD_INDEX.iter().flatten())
-            .chain(SEALED.iter().flatten())
+        families()
             .position(|identity| *identity == raw)
-            .map_or(raw.clone(), |index| BASE[index % BASE.len()].to_vec())
+            .map_or(raw, |index| BASE[index % BASE.len()].to_vec())
     }))
 }
 
