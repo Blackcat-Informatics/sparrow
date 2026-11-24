@@ -13331,7 +13331,10 @@ fn artifacts_listing_refuses_broken_source_index_rows() {
         let db = catalog_db(dir.path()).unwrap();
         let (identity, reason) = if missing_artifact {
             db.delete(&artifact.id).unwrap();
-            (artifact.id, "without its entry or a retained record")
+            (
+                artifact.id,
+                "at receipt 1 ms without its entry or a retained record",
+            )
         } else {
             let (key, value) = db
                 .prefix_iterator(b"source-artifact:")
@@ -13344,10 +13347,7 @@ fn artifacts_listing_refuses_broken_source_index_rows() {
             let conflicting = format!("{prefix}{:016x}:{}", 2, artifact.id);
             db.delete(key).unwrap();
             db.put(&conflicting, value).unwrap();
-            (
-                conflicting,
-                "disagrees with its artifact's source or receipt",
-            )
+            (conflicting, "indexed receipt 2 ms, catalog receipt 1 ms")
         };
         drop(db);
 
