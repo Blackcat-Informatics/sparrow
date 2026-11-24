@@ -1,0 +1,113 @@
+{
+  "issue": 57,
+  "pr_number": 549,
+  "branch": "paudley/57-add-the-ingest-keys-to-server-toml",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/57-add-the-ingest-keys-to-server-toml/.stage/add-the-ingest-keys-to-server-toml",
+  "observed_at": "2026-11-24T14:46:21.451085+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews",
+    "merge_candidate"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/57-add-the-ingest-keys-to-server-toml/.stage/add-the-ingest-keys-to-server-toml/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/57-add-the-ingest-keys-to-server-toml/.stage/add-the-ingest-keys-to-server-toml/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/57-add-the-ingest-keys-to-server-toml/.stage/add-the-ingest-keys-to-server-toml/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/57-add-the-ingest-keys-to-server-toml/.stage/add-the-ingest-keys-to-server-toml/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/57-add-the-ingest-keys-to-server-toml/.stage/add-the-ingest-keys-to-server-toml/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict.",
+    "Preflight does not sign, fetch, push or mutate forge state. API permission and read access do not prove Git push authorization or protected-branch admission."
+  ],
+  "pr": {
+    "number": 549,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Document optional ingest socket settings in the server example",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/549",
+    "baseRefName": "main",
+    "baseRefOid": "7d834ae9bd7b8935cf774d87c85ffaab98d66fa2",
+    "headRefName": "paudley/57-add-the-ingest-keys-to-server-toml",
+    "isCrossRepository": false,
+    "headRefOid": "5f34ddbbc2952bef55a23a1779e4760fbebf8e38",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/593/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "5f34ddbbc2952bef55a23a1779e4760fbebf8e38",
+    "branch": "paudley/57-add-the-ingest-keys-to-server-toml",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 549,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #549 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  },
+  "preflight": {
+    "git": "/usr/bin/git",
+    "python3": "/home/paudley/stage/root/bin/python3",
+    "stagectl": "/home/paudley/stage/root/bin/stagectl",
+    "bash": "/usr/bin/bash",
+    "readlink": "/home/paudley/stage/root/bin/readlink",
+    "sed": "/usr/bin/sed",
+    "awk": "/usr/bin/awk",
+    "ghprsq": "/home/paudley/stage/agents/bin/ghprsq",
+    "archive": {
+      "files": 12,
+      "bytes": 13684,
+      "errors": [],
+      "limits": "Read-only selected-evidence admission; full newly reachable Git object closure is checked by ghprsq before push."
+    },
+    "signing": {
+      "format": "openpgp",
+      "key_configured": true,
+      "limits": "Configuration inspected; no signing operation was performed."
+    },
+    "forge_permissions": {
+      "admin": true,
+      "push": true,
+      "pull": true
+    },
+    "merge_candidate": {
+      "base": "7d834ae9bd7b8935cf774d87c85ffaab98d66fa2",
+      "head": "5f34ddbbc2952bef55a23a1779e4760fbebf8e38",
+      "status": "clean"
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/57-add-the-ingest-keys-to-server-toml",
+  "branch": "paudley/57-add-the-ingest-keys-to-server-toml",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "3854cc995663e29b406a3605ce4a21578270c792",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/57-add-the-ingest-keys-to-server-toml/.stage/add-the-ingest-keys-to-server-toml/sync/20261124T143509-2ef7e792bc03438e914af889379e2d45",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "7d834ae9bd7b8935cf774d87c85ffaab98d66fa2",
+  "merge_bases": [
+    "3854cc995663e29b406a3605ce4a21578270c792"
+  ],
+  "commit": "7d834ae9bd7b8935cf774d87c85ffaab98d66fa2"
+}
