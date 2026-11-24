@@ -91,9 +91,8 @@ for buffered occurrence IDs reported missing or still unverified.
 
 - Symptom: the unit is `active (running)` but nothing answers, and the journal
   holds a line `sparrowd: waiting to <what>: <reason>; checking again every N s`,
-  repeated each minute while the reason stands. The daemon waits, and does not
-  exit, on every start condition that will pass, so the unit does not spend its
-  start limit on it:
+  repeated each minute while the reason stands. The daemon waits inside the
+  running process for these conditions:
   - `open the store`: free space below the maintenance reserve plus the
     write-ahead log left in `data_dir` (checked each second); an open that
     failed with no space left on the device, or with `STORAGE_PRESSURE` because
@@ -131,27 +130,34 @@ for buffered occurrence IDs reported missing or still unverified.
   name that is not a socket, an ingest socket
   directory or socket with the wrong owner or mode. The daemon journals
   `sparrowd: refused to start: <reason>` and exits with status 78, which the
-  unit lists in `RestartPreventExitStatus=`: it is not restarted, spends no
-  start, and `systemctl status` shows the unit `failed` with
+  unit lists in `RestartPreventExitStatus=`. The unit remains `failed` with
   `status=78/CONFIG`. Correct the cause (restore the image, lexicon or
   configuration that wrote the store, see "Refused open"), then
   `sudo systemctl reset-failed sparrow.service && sudo deploy/start.sh`.
   Any other failure before the daemon serves (corruption or an I/O error at the
   open, a descriptor limit, a mount that has not come up) is not classified as
   permanent: the daemon journals `sparrowd: start failed: ...; not classified as
-  permanent` and exits 1, and the unit restarts it within its start limit.
+  permanent` and exits 1. The unit retries with the crash recovery delay.
 - Reversible: yes.
+
+## Crash recovery
+
+The unit automatically retries ordinary failures. The restart delay starts
+at 10 seconds and increases over six steps to two minutes. Retries continue
+at the maximum delay. Use `journalctl -u sparrow.service -b --no-pager` to
+see each failed exit and scheduled restart. `systemctl status sparrow.service`
+shows the current state and the most recent service messages. After the cause
+clears, the next attempt can start the service.
+
+To switch images during a retry loop, stop the unit with `sudo deploy/stop.sh`
+before running `deploy/restart.sh`. Stopping cancels the pending retry.
 
 ## Unit start-limit hit
 
-- Symptom: `systemctl status sparrow.service` shows `start-limit-hit`; five
-  failed runs within ten minutes stopped the unit. A refused start named as deterministic (a
-  refused open for format, identity, analyzer, lexicon or archive fence below, a
-  missing lexicon bundle or credential, a bad `[[syslog]]` block, a
-  `socket_path` longer than 107 bytes) exits with status 78 and is not
-  restarted, so it shows `failed` with `status=78/CONFIG` and does not reach the
-  limit; free space, a pending upgrade's allowance and a held port or socket
-  name are waited for (see "Start waiting").
+An installed unit with a locally configured start limit can report
+`start-limit-hit`. The deployment scripts preserve that state until the
+operator diagnoses it and resets the unit.
+
 - Diagnose: the cause is in the failed runs' output:
   `journalctl -u sparrow.service -b --no-pager | tail -100`. Common causes are
   an AppArmor denial, a crash, an out-of-memory kill, or a worker that ended
@@ -191,17 +197,16 @@ for buffered occurrence IDs reported missing or still unverified.
   `STORAGE_FAILURE: log time interpretation law and writer fence disagree`
   on a store with a log time profile.
   The `UNSUPPORTED` and archive refusals end the start with status 78; the
-  `STORAGE_FAILURE` one is not classified as permanent and exits 1, so the unit
-  restarts it until its start limit.
+  `STORAGE_FAILURE` one exits 1 and follows the crash recovery delay.
 - Diagnose: which image runs (`readlink /usr/local/libexec/sparrow/sparrowd`),
   which image last opened the store (the receipts and the journal), and
   whether `text_lexicon_dir` changed (`grep text_lexicon_dir /etc/sparrow/server.toml`).
 - Recover: an unsupported format means an image older than the store; return
   to the image that last opened it (`sudo deploy/restart.sh --rev REV`). On a
-  log time store an older image reports the law and fence disagreement
-  instead, because it does not know the newer fence identity: recover it the
-  same way. An
-  analyzer change means the lexicon bundle differs from the one the store was
+  log time store an older image reports the law and fence disagreement because
+  it does not know the newer fence identity. Cancel any pending retry with
+  `sudo deploy/stop.sh` before switching back.
+  An analyzer change means the lexicon bundle differs from the one the store was
   built with; point `text_lexicon_dir` back at that bundle. A Markdown
   count means the store still holds Markdown projections from before PurRDF
   a PurRDF revision that advances the RDF profile: return to the previous image (`sudo deploy/restart.sh
@@ -216,6 +221,8 @@ for buffered occurrence IDs reported missing or still unverified.
 ## Rollback
 
 - When: a new image misbehaves after `restart.sh`.
+- If the unit is between automatic retries, stop it with `sudo deploy/stop.sh`.
+  See [Crash recovery](#crash-recovery).
 - Do: `sudo deploy/restart.sh --rollback`. It verifies the previous pair runs,
   stops through the drain, swaps the links (the bad pair becomes `.previous`),
   starts and checks the store identity.

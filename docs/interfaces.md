@@ -583,8 +583,8 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
   reads. Only free space below the maintenance reserve (capped at `min_free_bytes`) plus every byte of write-ahead log an
   unclean stop left in `data_dir`, which an open writes its manifest, new WAL and replayed level-0 files into,
   keeps it waiting (`sparrowd: waiting to open the store`, nothing can answer then); the replay part is never capped.
-  Every start condition that will pass is waited for, never exited on, so the unit does not spend its start limit: an open
-  that fails for lack of space, an open the write allowance of a pending upgrade refuses (`STORAGE_PRESSURE`; the wait reads
+  The running process waits for an open that fails for lack of space, an open
+  the write allowance of a pending upgrade refuses (`STORAGE_PRESSURE`; the wait reads
   the three storage limits from the configuration file again before each attempt that follows a refused open, so a raised `disk_budget` is noticed
   without a restart), the store's `LOCK` file while another process holds it, and a TCP port, Unix socket name or syslog
   port a departing owner still holds. Each wait journals
@@ -595,7 +595,10 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
   watch configuration that contradicts a pending claim) is not waited for: the daemon journals `sparrowd: refused to start: ...` and exits
   with status 78, which the unit's `RestartPreventExitStatus=` does not restart. Only conditions named as deterministic
   take that status; any other failure before the daemon serves (corruption or I/O at the open, a descriptor limit) exits 1
-  with `sparrowd: start failed: ...; not classified as permanent`, and the unit restarts it within its start limit. A wait is also reported as the unit's
+  with `sparrowd: start failed: ...; not classified as permanent`. The system
+  unit retries these exits with a delay that starts at 10 seconds and reaches
+  two minutes over six steps. The journal records failures and scheduled restarts.
+  A wait is also reported as the unit's
   `StatusText` (`sd_notify` `STATUS=`), which reads `serving` once the daemon serves.
   A write of the watch catalog that
   pressure refuses (the first store of the configured catalog, and the retirement of a disabled watch) is retried on each worker pass. A paused

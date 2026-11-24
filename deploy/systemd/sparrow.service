@@ -18,20 +18,16 @@
 Description=Sparrow typed diagnostic evidence server
 Documentation=file:///usr/local/share/doc/sparrow/deploy/README.md
 RequiresMountsFor=/var/lib/sparrow
-# Bound restarts so a failed run stops for diagnosis instead of looping (deploy/RECOVERY.md, "Unit
-# start-limit hit"). A start condition that will pass does not spend them: the daemon waits, and does
-# not exit, for free space for the open and the WAL replay, for a pending upgrade's write allowance,
-# and for a port or socket name a departing owner holds (deploy/RECOVERY.md, "Start waiting"). A start
-# condition that cannot pass without a change of configuration, image or store ends with
-# exit status 78 (RestartPreventExitStatus below), which the unit does not restart, and the journal
-# names it.
+# Automatic crash recovery uses the bounded delay below. Keep retrying after
+# the delay reaches its maximum. A refused start exits with status 78 and
+# stops recovery. The daemon waits inside the process for startup conditions
+# such as space, upgrade allowance, or a held port or socket name.
 #
 # The unit stays Type=exec: it is active (running) through a wait, so a readiness gate would hold it
 # in activating and the start timeout would kill a wait that lasts as long as its condition. The wait
 # is reported instead as StatusText, which the daemon sets through NotifyAccess=main
 # (systemctl show -p StatusText sparrow.service), and as journal lines.
-StartLimitIntervalSec=600
-StartLimitBurst=5
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec
@@ -57,8 +53,10 @@ TimeoutStopSec=120
 # Recover from crashes and host OOM kills. Startup removes a stale Unix socket only after it holds
 # the store's exclusive lock, so a restart cannot open a second writer.
 Restart=on-failure
-RestartSec=10
-# A refused start (exit status 78, sysexits EX_CONFIG) repeats on every restart: it is not restarted.
+RestartSec=10s
+RestartSteps=6
+RestartMaxDelaySec=2min
+# A refused start (exit status 78, sysexits EX_CONFIG) requires operator recovery.
 RestartPreventExitStatus=78
 # The daemon reports its start wait and then readiness as STATUS=/READY=1 (start_wait.rs).
 NotifyAccess=main
