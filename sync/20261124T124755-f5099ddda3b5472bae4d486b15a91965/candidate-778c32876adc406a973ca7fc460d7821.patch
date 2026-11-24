@@ -1,0 +1,309 @@
+diff --git crates/sparrow-core/src/storage.rs crates/sparrow-core/src/storage.rs
+index 13d00db..196d9fe 100644
+--- crates/sparrow-core/src/storage.rs
++++ crates/sparrow-core/src/storage.rs
+@@ -1865,7 +1865,7 @@ impl Store {
+                 db.create_cf(name, &table_options::family(name))?;
+             }
+         }
+-        rdf_index::upgrade_reverse(&db)?;
++        rdf_index::upgrade_reverse(&db, config.disk_budget, config.maintenance_reserve)?;
+         recordless::upgrade(&db)?;
+         diagnostic::fence_format(&db)?;
+         tail_ranges::upgrade(&db)?;
+diff --git crates/sparrow-core/src/storage/artifact_rdf.rs crates/sparrow-core/src/storage/artifact_rdf.rs
+index 05a8dbd..537ae12 100644
+--- crates/sparrow-core/src/storage/artifact_rdf.rs
++++ crates/sparrow-core/src/storage/artifact_rdf.rs
+@@ -153,14 +153,13 @@ pub(super) fn admit(
+     batch.iterate_cf(&mut publication);
+     publication.check()?;
+     if publication.owned_rdf_metadata {
+-        let estimate = super::pressure::data_batch_estimate(batch);
+-        let ceiling = super::pressure::data_write_ceiling(disk_budget, reserve, estimate)?;
+-        if super::linked_physical_bytes(db)? > ceiling {
+-            return Err(Error::new(
+-                "STORAGE_PRESSURE",
+-                "owned RDF metadata backfill needs more data-write allowance; increase the disk budget or free space before resuming",
+-            ));
+-        }
++        catalog_upgrade::admit_data_page(
++            db,
++            disk_budget,
++            reserve,
++            batch,
++            "owned RDF metadata backfill needs more data-write allowance; increase the disk budget or free space before resuming",
++        )?;
+     }
+     Ok(())
+ }
+diff --git crates/sparrow-core/src/storage/catalog_upgrade.rs crates/sparrow-core/src/storage/catalog_upgrade.rs
+index b6cf9ea..d539d86 100644
+--- crates/sparrow-core/src/storage/catalog_upgrade.rs
++++ crates/sparrow-core/src/storage/catalog_upgrade.rs
+@@ -155,12 +155,37 @@ pub(super) fn step<P: Publication>(
+     admit: PageAdmission<'_>,
+ ) -> Result<(), Error> {
+     let (batch, _) = page(db, job, progress, maximum)?;
++    commit_page(db, batch, admit)
++}
++
++/// Check a migration page's admission before committing its atomic batch.
++pub(super) fn commit_page(
++    db: &DB,
++    batch: WriteBatch,
++    admit: PageAdmission<'_>,
++) -> Result<(), Error> {
+     if let Some(admit) = admit {
+         admit(&batch)?;
+     }
+     commit(db, batch)
+ }
+ 
++/// Charge a migration data page against the ordinary write allowance.
++pub(super) fn admit_data_page(
++    db: &DB,
++    disk_budget: u64,
++    reserve: u64,
++    batch: &WriteBatch,
++    pressure_message: &str,
++) -> Result<(), Error> {
++    let estimate = super::pressure::data_batch_estimate(batch);
++    let ceiling = super::pressure::data_write_ceiling(disk_budget, reserve, estimate)?;
++    if super::linked_physical_bytes(db)? > ceiling {
++        return Err(Error::new("STORAGE_PRESSURE", pressure_message));
++    }
++    Ok(())
++}
++
+ /// Read a job's committed checkpoint.
+ pub(super) fn progress<P>(db: &DB, job: &Job<P>) -> Result<Progress, Error> {
+     read_progress(job.checkpoint, |key| Ok(db.get(key)?))
+diff --git crates/sparrow-core/src/storage/rdf_index.rs crates/sparrow-core/src/storage/rdf_index.rs
+index 7cba923..35db451 100644
+--- crates/sparrow-core/src/storage/rdf_index.rs
++++ crates/sparrow-core/src/storage/rdf_index.rs
+@@ -272,8 +272,17 @@ pub(super) fn reverse_family(db: &DB) -> Result<&ColumnFamily, Error> {
+ 
+ /// Move reverse keys that predate their family. Each page moves atomically, so
+ /// an interrupted open resumes with exactly the keys that remain.
+-pub(super) fn upgrade_reverse(db: &DB) -> Result<(), Error> {
++pub(super) fn upgrade_reverse(db: &DB, disk_budget: u64, reserve: u64) -> Result<(), Error> {
+     let family = reverse_family(db)?;
++    let admit = |batch: &WriteBatch| {
++        super::catalog_upgrade::admit_data_page(
++            db,
++            disk_budget,
++            reserve,
++            batch,
++            "reverse-family migration needs more data-write allowance. Increase the disk budget or free space before resuming.",
++        )
++    };
+     let mut batch = WriteBatch::default();
+     for row in db.prefix_iterator(REVERSE_PREFIX) {
+         let (key, value) = row?;
+@@ -289,11 +298,11 @@ pub(super) fn upgrade_reverse(db: &DB) -> Result<(), Error> {
+         batch.put_cf(family, &key, &value);
+         batch.delete(&key);
+         if batch.len() >= REVERSE_PAGE * 2 {
+-            super::catalog_upgrade::commit(db, std::mem::take(&mut batch))?;
++            super::catalog_upgrade::commit_page(db, std::mem::take(&mut batch), Some(&admit))?;
+         }
+     }
+     if !batch.is_empty() {
+-        super::catalog_upgrade::commit(db, batch)?;
++        super::catalog_upgrade::commit_page(db, batch, Some(&admit))?;
+     }
+     Ok(())
+ }
+diff --git crates/sparrow-core/tests/storage.rs crates/sparrow-core/tests/storage.rs
+index 2287acb..04c055d 100644
+--- crates/sparrow-core/tests/storage.rs
++++ crates/sparrow-core/tests/storage.rs
+@@ -8,6 +8,9 @@ use sparrow_core::{
+ };
+ use sparrow_test_support::{catalog_db, remove_artifact_rdf_upgrade, remove_tail_range_index};
+ 
++#[path = "storage/reverse_migration.rs"]
++mod reverse_migration;
++
+ const DAY: u64 = 86_400_000;
+ const HOUR: u64 = 60 * 60 * 1000;
+ /// A syntactically valid future identity outside all allocated writer families.
+diff --git crates/sparrow-core/tests/storage/reverse_migration.rs crates/sparrow-core/tests/storage/reverse_migration.rs
+new file mode 100644
+index 0000000..0e14a04
+--- /dev/null
++++ crates/sparrow-core/tests/storage/reverse_migration.rs
+@@ -0,0 +1,125 @@
++// SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
++// SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
++
++//! Disk admission and restart behavior of the RDF reverse-family migration.
++
++use super::{Store, catalog_db, config};
++
++fn legacy_reverse_key(index: u64) -> String {
++    format!("rdf:reverse:{index:064x}")
++}
++
++fn legacy_reverse_store(entries: u64) -> tempfile::TempDir {
++    let dir = tempfile::tempdir().unwrap();
++    drop(Store::open(dir.path(), config()).unwrap());
++    let db = catalog_db(dir.path()).unwrap();
++    let mut legacy = rocksdb::WriteBatch::default();
++    for index in 0..entries {
++        legacy.put(legacy_reverse_key(index), index.to_be_bytes());
++    }
++    db.write(legacy).unwrap();
++    db.flush().unwrap();
++    dir
++}
++
++fn assert_migrated_reverse_rows(db: &rocksdb::DB, expected: u64) {
++    let reverse = db.cf_handle("rdf_reverse").unwrap();
++    let count = db
++        .iterator_cf(reverse, rocksdb::IteratorMode::Start)
++        .enumerate()
++        .inspect(|(index, row)| {
++            let (key, value) = row.as_ref().unwrap();
++            let index = *index as u64;
++            assert_eq!(key.as_ref(), legacy_reverse_key(index).as_bytes());
++            assert_eq!(value.as_ref(), index.to_be_bytes());
++        })
++        .count();
++    assert_eq!(count as u64, expected);
++}
++
++#[test]
++fn reverse_migration_refuses_beyond_the_disk_budget() {
++    let dir = legacy_reverse_store(2);
++    let settings = config();
++    let ballast = dir.path().join("reverse-migration-ballast");
++    std::fs::File::create(&ballast)
++        .unwrap()
++        .set_len(settings.disk_budget)
++        .unwrap();
++
++    let error = Store::open(dir.path(), settings.clone())
++        .err()
++        .expect("the migration must refuse before writing its data page");
++    assert_eq!(error.code, "STORAGE_PRESSURE");
++    assert!(error.message.contains("reverse-family migration"));
++    {
++        let db = catalog_db(dir.path()).unwrap();
++        assert_migrated_reverse_rows(&db, 0);
++        for index in 0_u64..2 {
++            let value = db.get(legacy_reverse_key(index)).unwrap().unwrap();
++            assert_eq!(value, index.to_be_bytes());
++        }
++    }
++
++    std::fs::remove_file(ballast).unwrap();
++    drop(Store::open(dir.path(), settings).unwrap());
++    let db = catalog_db(dir.path()).unwrap();
++    assert_migrated_reverse_rows(&db, 2);
++    assert!(db.get(legacy_reverse_key(0)).unwrap().is_none());
++    assert!(db.get(legacy_reverse_key(1)).unwrap().is_none());
++}
++
++#[test]
++fn reverse_migration_moves_all_rows_across_pages() {
++    let entries = 65_537;
++    let dir = legacy_reverse_store(entries);
++    drop(Store::open(dir.path(), config()).unwrap());
++    let db = catalog_db(dir.path()).unwrap();
++    assert_migrated_reverse_rows(&db, entries);
++    assert!(
++        !db.prefix_iterator(b"rdf:reverse:")
++            .any(|row| row.unwrap().0.starts_with(b"rdf:reverse:"))
++    );
++}
++
++#[test]
++fn reverse_migration_keeps_the_corrupt_page_unpublished_and_resumes() {
++    let first_page = 65_536;
++    let bad = first_page + 1;
++    let entries = bad + 1;
++    let dir = legacy_reverse_store(entries);
++    {
++        let db = catalog_db(dir.path()).unwrap();
++        db.put(legacy_reverse_key(bad), b"bad").unwrap();
++    }
++
++    let error = Store::open(dir.path(), config())
++        .err()
++        .expect("an invalid reverse identity must refuse startup");
++    assert_eq!(error.code, "STORAGE_FAILURE");
++    assert!(error.message.contains("invalid RDF reverse identity"));
++    {
++        let db = catalog_db(dir.path()).unwrap();
++        assert_migrated_reverse_rows(&db, first_page);
++        assert!(db.get(legacy_reverse_key(0)).unwrap().is_none());
++        assert!(
++            db.get(legacy_reverse_key(first_page - 1))
++                .unwrap()
++                .is_none()
++        );
++        assert_eq!(
++            db.get(legacy_reverse_key(first_page)).unwrap().unwrap(),
++            first_page.to_be_bytes()
++        );
++        assert_eq!(db.get(legacy_reverse_key(bad)).unwrap().unwrap(), b"bad");
++        db.put(legacy_reverse_key(bad), bad.to_be_bytes()).unwrap();
++    }
++
++    drop(Store::open(dir.path(), config()).unwrap());
++    let db = catalog_db(dir.path()).unwrap();
++    assert_migrated_reverse_rows(&db, entries);
++    assert!(
++        !db.prefix_iterator(b"rdf:reverse:")
++            .any(|row| row.unwrap().0.starts_with(b"rdf:reverse:"))
++    );
++}
+diff --git docs/architecture.md docs/architecture.md
+index 4ecdb5c..af92c39 100644
+--- docs/architecture.md
++++ docs/architecture.md
+@@ -647,9 +647,11 @@ live in their own `rdf_reverse` column family with a whole-key Bloom filter:
+ they are the dictionary's only point reads that usually miss, and a filter over
+ the much larger scanned index keys would cost far more memory. Opening an
+ existing store validates its writer format, identity, interpretation profiles and
+-archive compatibility before creating any missing column families. Startup upgrades then move legacy
+-reverse lookups from the default family one atomic page at a time. Older
+-writers cannot open a store with the reverse family. Preserve blank-node
++archive compatibility before creating any missing column families. Startup
++upgrades move legacy reverse lookups from the default family in atomic pages.
++Each page checks the data-write allowance before committing. A refused page's
++rows stay in the default family for a later retry. Older writers cannot open a
++store with the reverse family. Preserve blank-node
+ scope, language and base direction, nested triple terms, graph declarations,
+ reifiers, and annotations. Keep each native RDF stream distinguishable and
+ advertise only capabilities the backend actually preserves.
+diff --git helpers-ledger.ttl helpers-ledger.ttl
+index a7672eb..5a00d9a 100644
+--- helpers-ledger.ttl
++++ helpers-ledger.ttl
+@@ -1,5 +1,5 @@
+ VERSION "1.2"
+-BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/05744f37291c9b98dd8a04a4e7b3d58cd430f85d7d76d6c150d93bc4b401154e>
++BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/274194fce6b6bf119e6aabfca82aa3ec390b47646b9a9092d997c98a20ab8ec9>
+ <> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#Ledger> .
+ <> <https://blackcatinformatics.ca/raf/report/1#distinct> <#distinct/0> .
+ <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/active-file-checkpoint-attachment> .
+@@ -838,6 +838,7 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/05744f37291c9b
+ <#job/catalog-upgrade-pager> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
+ <#job/catalog-upgrade-pager> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+ <#job/catalog-upgrade-pager> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::catalog_upgrade::commit" .
++<#job/catalog-upgrade-pager> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::catalog_upgrade::commit_page" .
+ <#job/catalog-upgrade-pager> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::catalog_upgrade::run" .
+ <#job/catalog-upgrade-pager> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::catalog_upgrade::seed" .
+ <#job/catalog-upgrade-pager> <https://blackcatinformatics.ca/raf/report/1#forbiddenName> "^(rebuild_tail_range_index|resume_catalog_index_page)$" .
+@@ -1203,6 +1204,7 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/05744f37291c9b
+ <#job/daemon-store-session> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/src/session/tests.rs" .
+ <#job/data-write-capacity-admission> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
+ <#job/data-write-capacity-admission> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
++<#job/data-write-capacity-admission> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::catalog_upgrade::admit_data_page" .
+ <#job/data-write-capacity-admission> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::pressure::data_batch_estimate" .
+ <#job/data-write-capacity-admission> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::pressure::data_write_ceiling" .
+ <#job/data-write-capacity-admission> <https://blackcatinformatics.ca/raf/report/1#forbiddenName> "^(admit_direct_disk_write|admit_staged_disk_write)$" .

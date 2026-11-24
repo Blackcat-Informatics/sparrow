@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "issue": 85,
+  "repo": "sparrow",
+  "forge": "forgejo",
+  "nwo": "fleet/sparrow",
+  "read_access": "anon-read",
+  "main_root": "/home/paudley/Active/sparrow",
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/85-refuse-restart-sh-on-a-unit-in",
+  "branch": "paudley/85-refuse-restart-sh-on-a-unit-in",
+  "slug": "refuse-restart-sh-on-a-unit-in",
+  "slug_drift": false,
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/85-refuse-restart-sh-on-a-unit-in/.stage/refuse-restart-sh-on-a-unit-in",
+  "stage_tracked": true,
+  "base": "refs/remotes/origin/main",
+  "base_oid": "f1e8a7336a0fc12844d115d86a05d35ce1bfc14a",
+  "reused": false,
+  "adr_repo": false,
+  "created": [
+    "worktree:/home/paudley/Active/sparrow/.worktrees/85-refuse-restart-sh-on-a-unit-in",
+    "branch:paudley/85-refuse-restart-sh-on-a-unit-in",
+    "ignored:168 files (168 reflinked, 0 written)",
+    "rust-caches:reflinked /home/paudley/Active/sparrow/.worktrees/74-admit-the-reverse-family-migration caches into /home/paudley/Active/sparrow/.worktrees/85-refuse-restart-sh-on-a-unit-in plus 0 dependency units from 0 other checkouts in 2.0s; 327 unchanged files keep their built mtimes; 7 other files take the seed time and rebuild; 9 units naming another checkout rebuild",
+    "stage:/home/paudley/Active/sparrow/.worktrees/85-refuse-restart-sh-on-a-unit-in/.stage/refuse-restart-sh-on-a-unit-in",
+    "issue:/home/paudley/Active/sparrow/.worktrees/85-refuse-restart-sh-on-a-unit-in/.stage/refuse-restart-sh-on-a-unit-in/issue.md"
+  ],
+  "warnings": [
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only",
+    "forgejo: no blockedBy/subIssues/closedByPullRequests fields; link crawl uses body regex only"
+  ],
+  "timestamp": "2026-11-24T06:38:28-0600",
+  "seed_error": ""
+}

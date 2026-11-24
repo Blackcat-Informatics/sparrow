@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/85-refuse-restart-sh-on-a-unit-in",
+  "branch": "paudley/85-refuse-restart-sh-on-a-unit-in",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "c42edb1c393f6eb82e4d5133807d66757b065a88",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/85-refuse-restart-sh-on-a-unit-in/.stage/refuse-restart-sh-on-a-unit-in/sync/20261124T124755-f5099ddda3b5472bae4d486b15a91965",
+  "conflicts": [],
+  "status": "completed",
+  "base": "80bbc6c7cc8589f53fa7b134984b1726520bd95c",
+  "merge_bases": [
+    "f1e8a7336a0fc12844d115d86a05d35ce1bfc14a"
+  ],
+  "merge_index": "5c799ab6cf881929f06ce261b1b5c4cbcd30876f07fb4268ea7bb8a9f085aa57",
+  "candidate_tree": "94f3643f143e36bd664578edfaa6de8b5f41fb59",
+  "candidate_patch": "candidate-778c32876adc406a973ca7fc460d7821.patch",
+  "stdout_log": "commit-778c32876adc406a973ca7fc460d7821.stdout.log",
+  "stderr_log": "commit-778c32876adc406a973ca7fc460d7821.stderr.log",
+  "validation_records": [],
+  "commit_duration_seconds": 10.047599755984265,
+  "commit": "613ad9e550fb253a0dc3247477e2334af7cc2da6",
+  "tree": "94f3643f143e36bd664578edfaa6de8b5f41fb59",
+  "exit_code": 0
+}
