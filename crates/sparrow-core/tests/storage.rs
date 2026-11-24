@@ -42,7 +42,7 @@ fn native_log_time_profiles_preserve_byte_ranges_event_order_and_immutable_histo
         .unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/363")
+        Some("sparrow.store/473")
     );
     assert_eq!(
         store
@@ -228,12 +228,12 @@ fn native_log_time_profiles_preserve_byte_ranges_event_order_and_immutable_histo
         .unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/363")
+        Some("sparrow.store/473")
     );
     store.watch_registry_replace(None, b"registered").unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/365")
+        Some("sparrow.store/475")
     );
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
@@ -297,7 +297,7 @@ fn native_log_time_refusals_do_not_publish_records_or_guess_optional_captures() 
         assert!(store.time_profile("invalid-log-map").unwrap().is_none());
         assert_eq!(
             store.properties().unwrap()["store_format"].as_str(),
-            Some("sparrow.store/352")
+            Some("sparrow.store/462")
         );
     }
     store
@@ -569,7 +569,7 @@ fn tracing_relationships_keep_instance_and_occurrence_evidence_through_backfill_
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/352")
+        Some("sparrow.store/462")
     );
     assert!(migrate(&store) > 0);
     // The reader derived the receipt-time facts and wrote no source eventTime.
@@ -1255,7 +1255,7 @@ fn receiver_observations_commit_with_packets_and_outlive_summary_only_under_pins
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.status(12).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/360")
+        Some("sparrow.store/470")
     );
     assert_eq!(
         store.watch_registry().unwrap().as_deref(),
@@ -1437,7 +1437,7 @@ fn receiver_registry_admission_and_fence_corruption_are_hard_failures() {
     let intact = db.get("syslog-receiver-registry").unwrap().unwrap();
     assert_eq!(
         db.get("store_format").unwrap().as_deref(),
-        Some(b"sparrow.store/359".as_slice())
+        Some(b"sparrow.store/469".as_slice())
     );
     db.delete("syslog-receiver-registry").unwrap();
     drop(db);
@@ -1808,7 +1808,7 @@ fn completed_tail_claim_preserves_original_publication_after_checkpoint_expiry()
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/356")
+        Some("sparrow.store/466")
     );
     assert_eq!(
         store
@@ -1942,7 +1942,7 @@ fn completed_tail_claim_preserves_original_publication_after_checkpoint_expiry()
         .unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/356")
+        Some("sparrow.store/466")
     );
     drop(store);
     let store = Store::open(dir.path(), config()).unwrap();
@@ -2523,7 +2523,7 @@ fn current_tail_writer_upgrade_preserves_checkpoints_and_refuses_missing_or_unfe
         let store = Store::open(dir.path(), config()).unwrap();
         assert_eq!(
             store.properties().unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", legacy + 327).as_str())
+            Some(format!("sparrow.store/{}", legacy + 437).as_str())
         );
         assert_eq!(store.tail_generation(&generation.id).unwrap(), original);
         assert_eq!(store.bytes(&first.record_ids[0], 0, 2, 3).unwrap(), b"n\n");
@@ -3023,7 +3023,7 @@ fn syslog_format_upgrade_preserves_existing_producer_windows_and_watch_fences() 
         }
         assert_eq!(
             store.status(2).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", current + 319).as_str())
+            Some(format!("sparrow.store/{}", current + 429).as_str())
         );
         let state = store.producer_stream(&id, 2).unwrap();
         assert_eq!(state.accepted_events, 2);
@@ -3575,7 +3575,7 @@ fn producer_writer_upgrade_preserves_diagnostic_and_watch_authority_without_anno
         assert_eq!(store.store_id().unwrap(), identity);
         assert_eq!(
             store.status(2).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", current + 319).as_str())
+            Some(format!("sparrow.store/{}", current + 429).as_str())
         );
         let record = store.record(&a.record_ids[0]).unwrap();
         assert!(record.producer.is_none());
@@ -4227,7 +4227,7 @@ fn staged_diagnostics_capture_absence_once_and_format_upgrade_preserves_fences()
         assert_eq!(store.store_id().unwrap(), id);
         assert_eq!(
             store.status(0).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", version + 343).as_str())
+            Some(format!("sparrow.store/{}", version + 453).as_str())
         );
         if version >= 11 {
             assert_eq!(
@@ -4754,7 +4754,7 @@ fn legacy_recordless_upgrade_preserves_each_existing_writer_fence_and_identity()
         assert_eq!(store.store_id().unwrap(), identity);
         assert_eq!(
             store.status(3).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", current + 319).as_str())
+            Some(format!("sparrow.store/{}", current + 429).as_str())
         );
         assert_eq!(
             store.bytes(&populated.id, 0, 10, 3).unwrap(),
@@ -5238,7 +5238,7 @@ fn manifest_retirement_survives_reopen_without_rewriting_original_catalog_or_rec
     let root = db.get(&original.id).unwrap().unwrap();
     assert_eq!(
         db.get("store_format").unwrap().as_deref(),
-        Some(b"sparrow.store/361".as_slice())
+        Some(b"sparrow.store/471".as_slice())
     );
     let position = db
         .get(format!("artifact-retirement:{}", original.id))
@@ -5316,7 +5316,7 @@ fn manifest_retirement_fences_later_writers_and_rejects_corrupt_state() {
         .unwrap();
     assert_eq!(
         store.status(3).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/362")
+        Some("sparrow.store/472")
     );
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
@@ -5924,7 +5924,7 @@ fn pressure_retirement_wait_survives_reopen_without_retiring_more_evidence() {
     // Force a strictly larger linked footprint: this is no native recovery observation.
     assert_eq!(
         store.status(4).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/361")
+        Some("sparrow.store/471")
     );
     file.set_len(15 * 1024 * 1024).unwrap();
     drop(file);
@@ -5978,21 +5978,21 @@ fn pressure_retirement_wait_survives_reopen_without_retiring_more_evidence() {
     assert!(db.get("pressure-reclamation-wait").unwrap().is_none());
     assert_eq!(
         db.get("store_format").unwrap().as_deref(),
-        Some(b"sparrow.store/361".as_slice())
+        Some(b"sparrow.store/471".as_slice())
     );
     drop(db);
     let store = Store::open(dir.path(), config()).unwrap();
     store.watch_registry_replace(None, b"registered").unwrap();
     assert_eq!(
         store.status(6).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/362")
+        Some("sparrow.store/472")
     );
     store
         .watch_registry_replace(Some(b"registered"), b"updated")
         .unwrap();
     assert_eq!(
         store.status(6).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/362")
+        Some("sparrow.store/472")
     );
 }
 
@@ -8229,7 +8229,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/354")
+        Some("sparrow.store/464")
     );
     store
         .watch_registry_replace(Some(b"catalog-one"), b"catalog-two")
@@ -8244,7 +8244,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
     assert_eq!(store.consumption_get(&journal.import_id).unwrap(), journal);
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/354")
+        Some("sparrow.store/464")
     );
 }
 
@@ -8944,7 +8944,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     let identity = store.store_id().unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/352")
+        Some("sparrow.store/462")
     );
     let digest = format!(
         "blake3:{}",
@@ -8970,7 +8970,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/353")
+        Some("sparrow.store/463")
     );
     assert_eq!(
         store
@@ -9006,7 +9006,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     );
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/355")
+        Some("sparrow.store/465")
     );
     // Catalog updates must never downgrade the handoff writer fence.
     let selector = IngestSelector::Handoff(handoff.request_id.clone());
@@ -9023,7 +9023,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/355")
+        Some("sparrow.store/465")
     );
     assert_eq!(
         store
@@ -9301,7 +9301,7 @@ fn explicit_handoff_admission_is_atomic_bounded_and_conflicting_retries_never_re
     assert!(store.consumption_pending().unwrap().is_empty());
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/354")
+        Some("sparrow.store/464")
     );
     let reserved = store
         .consumption_handoff_reserve(&intent, "source", "log", CONSUMPTION_DIRECTORIES, 0)
@@ -14796,7 +14796,7 @@ fn rdf_profile_identity_is_required_and_drift_refuses_reopen() {
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/352")
+        Some("sparrow.store/462")
     );
     assert_eq!(
         store.status(0).unwrap()["rdf_profile"]
@@ -21831,8 +21831,8 @@ fn archive_fence_refuses_unconfigured_open_and_older_writers() {
             .parse::<u32>()
             .unwrap()
     };
-    assert!((374..=384).contains(&number(&fenced)), "{fenced}");
-    assert_eq!(number(&fenced) - 374, (number(&unfenced) - 33) % 11);
+    assert!((484..=494).contains(&number(&fenced)), "{fenced}");
+    assert_eq!(number(&fenced) - 484, (number(&unfenced) - 33) % 11);
     assert_eq!(
         store.archive_state().unwrap(),
         Some(sparrow_core::ArchiveState::default())
@@ -21843,7 +21843,7 @@ fn archive_fence_refuses_unconfigured_open_and_older_writers() {
         .as_str()
         .unwrap()
         .to_owned();
-    assert!((374..=384).contains(&number(&watched)), "{watched}");
+    assert!((484..=494).contains(&number(&watched)), "{watched}");
     drop(store);
     let refused = Store::open(dir.path(), config()).err().unwrap();
     assert_eq!(refused.code, "INVALID_ARGUMENT");
@@ -22458,7 +22458,7 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/352")
+        Some("sparrow.store/462")
     );
     let pending = store.migrations().unwrap();
     assert_eq!(
@@ -22471,12 +22471,11 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
             "payload-index"
         ]
     );
-    // The per-source counters and the source timeline cache were not part of schema 69
-    // and stay complete; the store counters are reseeded because the fixture rewrote
-    // checkpoints offline.
-    assert!(pending[2..4].iter().all(|m| m.complete()), "{pending:?}");
+    // The source timeline cache stays complete. The byte-accounting upgrade rebuilds the
+    // source summaries, and the fixture's offline checkpoints reseed the store counters.
+    assert!(pending[3].complete(), "{pending:?}");
     assert!(!pending[0].complete(), "{pending:?}");
-    for migration in &pending[1..2] {
+    for migration in &pending[1..3] {
         assert!(!migration.complete(), "{migration:?}");
         assert_eq!(migration.done, 0, "{migration:?}");
         // Totals count while the store counters seed.
@@ -22540,13 +22539,14 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     };
     let late_during = late_answers(&store);
 
-    // The counters seed first; then one page builds the whole index, and a restart
-    // resumes with the source summary.
+    // The counters seed before the owner graph index, which completes in one page.
     let mut page = store.migrate_step().unwrap().unwrap();
-    while page.migration == sparrow_core::Migration::StoreCounters {
-        page = store.migrate_step().unwrap().unwrap();
-    }
-    while page.migration == sparrow_core::Migration::PayloadIndex {
+    while matches!(
+        page.migration,
+        sparrow_core::Migration::StoreCounters
+            | sparrow_core::Migration::SourceSummary
+            | sparrow_core::Migration::PayloadIndex
+    ) {
         page = store.migrate_step().unwrap().unwrap();
     }
     assert_eq!(page.migration, sparrow_core::Migration::OwnerGraphIndex);
@@ -23941,9 +23941,11 @@ fn status_reads_fixed_keys_without_the_writer_while_a_migration_runs() {
     assert!(seeding_keys < 64, "{seeding_keys} keys");
 
     while store.migrate_step().unwrap().unwrap().migration == Migration::StoreCounters {}
-    assert_counts_match_recount(&store);
+    let (rows, recounted) = store.store_counter_audit_for_tests().unwrap();
+    assert_eq!(rows, recounted);
     // Run the source timeline rebuild one page so it is part way, past the payload index.
     while store.migrate_step().unwrap().unwrap().migration != Migration::SourceContext {}
+    assert_counts_match_recount(&store);
     let (status, migrations, keys) = store.status_with_key_reads_for_tests(4).unwrap();
     assert_eq!(status["counts"].as_str(), Some("exact"));
     assert_eq!(live(&status), 25_000);
@@ -24588,14 +24590,14 @@ fn source_index_migration_seeds_exact_counters_and_fences_older_writers() {
             .parse::<u32>()
             .unwrap()
     };
-    assert!((352..=406).contains(&number(&fenced)), "{fenced}");
+    assert!((462..=516).contains(&number(&fenced)), "{fenced}");
     drop(store);
-    // Before #14 the store carried the owner-graph family 55 identities below.
+    // Before the source summaries the store carried the owner-graph family.
     let db = catalog_db(dir.path()).unwrap();
     sparrow_test_support::pending_source_summary_migration(&db).unwrap();
     let legacy = String::from_utf8(db.get("store_format").unwrap().unwrap()).unwrap();
-    // The fixture lowers the payload index, store counter and source summary fences, 55 each.
-    assert_eq!(number(&legacy), number(&fenced) - 165);
+    // The fixture lowers the byte counters, payload index, store counters and source summary.
+    assert_eq!(number(&legacy), number(&fenced) - 275);
     let entries = [b"artifact:".as_slice(), b"record:"]
         .into_iter()
         .map(|prefix| {
@@ -25001,6 +25003,61 @@ fn source_summary_migration_serves_at_once_and_listings_answer_finished_counts()
         listed_artifacts(&store, "pending-source", 2),
         [(artifact.id, 2, true)]
     );
+}
+
+/// Shared chunks count for each source. Retirement charges only readable spans, and an
+/// upgrade from the previous writer family gives the same totals during its backfill.
+#[test]
+fn sources_report_exact_retained_payload_bytes_through_retirement_and_upgrade() {
+    use sparrow_core::{Migration, SourceRead};
+    use std::collections::BTreeMap;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input = b"first\nsecond\n";
+    let old = store.ingest("left", "left", "log", input, 0).unwrap();
+    store
+        .ingest("right", "right", "log", input, 2 * DAY)
+        .unwrap();
+    let totals = |store: &Store, now| {
+        store
+            .source_read(&SourceRead::default(), now, &[])
+            .unwrap()
+            .body
+            .sources
+            .into_iter()
+            .map(|row| (row.source_id, row.retained_payload_bytes))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        totals(&store, 2 * DAY),
+        BTreeMap::from([("left".into(), 13), ("right".into(), 13)])
+    );
+    store
+        .pin("left-pin", "fragment", &old.record_ids[..1], 40, 2 * DAY)
+        .unwrap();
+    store.expire(31 * DAY).unwrap();
+    let expected = BTreeMap::from([("left".into(), 6), ("right".into(), 13)]);
+    assert_eq!(totals(&store, 31 * DAY), expected);
+    drop(store);
+
+    let db = catalog_db(dir.path()).unwrap();
+    assert_eq!(
+        db.get("store_format").unwrap().as_deref(),
+        Some(b"sparrow.store/471".as_slice())
+    );
+    db.put("store_format", b"sparrow.store/361").unwrap();
+    // The prior writer used an eight-byte record count followed by a mode byte.
+    db.put(
+        format!("artifact-retained:{}", old.id),
+        [0, 0, 0, 0, 0, 0, 0, 1, 0],
+    )
+    .unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert!(!store.migrations().unwrap()[Migration::SourceSummary.index()].complete());
+    assert_eq!(totals(&store, 31 * DAY), expected);
+    while store.migrate_step().unwrap().is_some() {}
+    assert_eq!(totals(&store, 31 * DAY), expected);
 }
 
 fn full_registry_declaration(index: u64) -> sparrow_core::TailStart {

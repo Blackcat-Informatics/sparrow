@@ -110,6 +110,10 @@ pub(super) fn render(page: wire::source_list_page::Reader<'_>) -> Result<Value> 
                 .with("fragment_parents", row.get_fragment_parents().to_string())
                 .with("retained_records", row.get_retained_records().to_string())
                 .with(
+                    "retained_payload_bytes",
+                    super::render_count(row.get_retained_payload_bytes()?)?,
+                )
+                .with(
                     "time_profile_id",
                     optional_value(row.get_time_profile_id()?)?,
                 )

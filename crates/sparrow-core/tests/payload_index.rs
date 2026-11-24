@@ -156,7 +156,7 @@ fn the_migration_indexes_artifacts_ingested_before_it_existed_and_new_ingest_sta
 
 /// INVARIANT (#398): the open-time payload-index fence lifts the format the live store reads,
 /// `sparrow.store/340` (the intake family's manifest retirement with a watch registry), to
-/// `sparrow.store/395`, an identity no earlier build wrote, so an older writer refuses it.
+/// `sparrow.store/505`, an identity no earlier build wrote, so an older writer refuses it.
 /// The store is built through the production writers (an ingest-socket write, a manifest
 /// retirement, a watch registry and a receiver registry) and lowered to its `/340` image, so
 /// every companion row is the one that family carries. The lift keeps the retired artifact
@@ -212,7 +212,7 @@ fn a_340_intake_manifest_store_is_lifted_to_395_at_open_and_stays_there() {
     drop(db);
 
     let store = Store::open(dir.path(), config()).unwrap();
-    assert_eq!(format(&store, 3), "sparrow.store/395");
+    assert_eq!(format(&store, 3), "sparrow.store/505");
     assert_eq!(
         store.watch_registry().unwrap().as_deref(),
         Some(b"watch-state".as_slice())
@@ -222,7 +222,7 @@ fn a_340_intake_manifest_store_is_lifted_to_395_at_open_and_stays_there() {
     assert!(!pending.complete);
     // A write after the lift restages the manifest family and must keep the fence.
     store.ingest("later", "src", "log", b"later\n", 4).unwrap();
-    assert_eq!(format(&store, 4), "sparrow.store/395");
+    assert_eq!(format(&store, 4), "sparrow.store/505");
     migrate(&store);
     let report = store.migrations().unwrap();
     assert!(
@@ -235,6 +235,6 @@ fn a_340_intake_manifest_store_is_lifted_to_395_at_open_and_stays_there() {
     drop(store);
 
     let store = Store::open(dir.path(), config()).unwrap();
-    assert_eq!(format(&store, 5), "sparrow.store/395");
+    assert_eq!(format(&store, 5), "sparrow.store/505");
     assert!(store.migrate_step().unwrap().is_none());
 }

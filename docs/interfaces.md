@@ -1671,10 +1671,11 @@ seeding watermark; nothing recounts. The migration journal reports
 The store keeps three derived catalog row families exact in every write:
 
 - `source-summary:<source key>`, one per source with retained input: the exact
-  source label and its `retained_records`, `complete_artifacts` and
-  `fragment_parents` counts. The row is deleted when all three are zero.
-- `artifact-retained:<artifact id>`: the artifact's retained record count, and
-  whether that count is full or partial. A full count covers every retained
+  source label and its `retained_records`, `complete_artifacts`,
+  `fragment_parents` and `retained_payload_bytes` totals. The row is deleted
+  when there are no retained records or complete artifacts.
+- `artifact-retained:<artifact id>`: the artifact's retained record count and
+  readable record bytes, with a full or partial marker. A full count covers every retained
   record of the artifact. A partial count belongs to a parent whose entry was
   deleted before the `source-summary` migration reached it, and covers only the
   records the migration's record phase has passed; the migration completes it,
@@ -1704,13 +1705,21 @@ deadline that has not been retired, for example while the archive gate holds
 it, still counts. Status `live_records` keeps its deadline meaning (see "Store
 counters").
 
-Opening a store written before these rows moves its format to a source summary
-writer family, `sparrow.store/242` to `/296`, which lifts each owner-graph
-family by 55 and keeps its log time, archive and intake switches, so older
-binaries refuse the store. The same synchronized batch seeds the checkpoint of
-the `source-summary` online migration (`source-summary-upgrade`), and the
-service answers at once. Rows found under an older writer identity are not
-trusted: that batch discards them and the migration recounts every source.
+The `sourcesList` wire row reports logical retained payload bytes through
+`retainedPayloadBytes`. CLI and MCP expose the count as the decimal string
+`retained_payload_bytes` or null when an older server omits it. Each complete
+artifact contributes its original length once, including gaps and recordless
+payloads. An incomplete or missing parent contributes the sum of its remaining
+readable record spans. Retired and evicted spans contribute zero. The total
+measures logical occurrences before physical deduplication, compression or
+RocksDB overhead.
+
+Opening a store from an older writer family moves it into `sparrow.store/462`
+through `/571`. The identity preserves its log time, archive, intake, and
+sealed receipt settings. The synchronized open batch clears the old source
+summary rows, resets that migration's progress and fences older writers out.
+The service answers while the `source-summary` migration rebuilds those rows.
+To roll back to an older binary, restore a backup taken before this upgrade.
 
 The migration runs in the maintenance duty directly after `store-counters`,
 before `owner-graph-index`, with the same admission,
@@ -1859,9 +1868,8 @@ read-only MCP tool is `payload_lookup`; both render `answer_certainty`:
 holds the digest), `pending` before (every listed artifact is held, and an
 unlisted one is unknown, never absent).
 
-A store written before the index is fenced at open with a new writer family
-(`sparrow.store/352` to `406`, lifting the store counter families) so an older
-binary cannot write or delete an artifact without its key. The open seeds the
+A store written before the index is fenced at open so an older binary cannot
+write or delete an artifact without its key. The open seeds the
 `payload-index-upgrade` checkpoint and zero counter rows. The `payload-index`
 migration then walks the artifact entries in id order, 1,024 entries at a time,
 puts the key of each complete one and advances the checkpoint in one batch

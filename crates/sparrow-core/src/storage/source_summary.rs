@@ -10,8 +10,10 @@
 //!   (record entries present and not evicted), `complete_artifacts` (artifact entries
 //!   present and not evicted, by their own flag or their manifest retirement state) and
 //!   `fragment_parents` (artifacts that are not complete while at least one of their
-//!   records is retained). A source whose three counts are all 0 has no row.
-//! - `artifact-retained:<artifact id>`: the artifact's retained record count, present
+//!   records is retained). The logical byte total counts complete artifacts once and
+//!   readable spans of their incomplete parents. A source without retained input has no row.
+//! - `artifact-retained:<artifact id>`: the artifact's retained record count and readable
+//!   record bytes (including while the parent is complete), present
 //!   exactly while the artifact is complete or has a retained record.
 //! - `source-artifact:<source hash>:<received_at as 16 hex digits>:<artifact id>`: the
 //!   per-source artifact index, present under the same condition.
@@ -108,6 +110,7 @@ pub(super) struct Counts {
     pub(super) retained_records: u64,
     pub(super) complete_artifacts: u64,
     pub(super) fragment_parents: u64,
+    pub(super) retained_payload_bytes: u64,
 }
 
 impl Counts {
@@ -118,6 +121,10 @@ impl Counts {
                 .with("retained_records", self.retained_records.to_string())
                 .with("complete_artifacts", self.complete_artifacts.to_string())
                 .with("fragment_parents", self.fragment_parents.to_string())
+                .with(
+                    "retained_payload_bytes",
+                    self.retained_payload_bytes.to_string(),
+                )
                 .into(),
         )
     }
@@ -130,6 +137,7 @@ impl Counts {
             retained_records: integer(&value, "retained_records")?,
             complete_artifacts: integer(&value, "complete_artifacts")?,
             fragment_parents: integer(&value, "fragment_parents")?,
+            retained_payload_bytes: integer(&value, "retained_payload_bytes")?,
         };
         if counts.source.is_empty()
             || counts.source.len() > 512
@@ -153,6 +161,7 @@ struct Delta {
     retained_records: i64,
     complete_artifacts: i64,
     fragment_parents: i64,
+    retained_payload_bytes: i128,
     /// Whether any changed artifact of the source was counted before the batch.
     counted_before: bool,
 }
@@ -186,7 +195,23 @@ fn shifted(mut counts: Counts, delta: &Delta) -> Result<Counts, Error> {
         counts.fragment_parents,
         delta.fragment_parents,
     )?;
+    counts.retained_payload_bytes = shift_bytes(
+        &source,
+        counts.retained_payload_bytes,
+        delta.retained_payload_bytes,
+    )?;
     Ok(counts)
+}
+
+fn shift_bytes(owner: &str, bytes: u64, change: i128) -> Result<u64, Error> {
+    i128::from(bytes)
+        .checked_add(change)
+        .and_then(|total| u64::try_from(total).ok())
+        .ok_or_else(|| {
+            failure(format!(
+                "retained payload bytes of {owner:?} overflow or underflow"
+            ))
+        })
 }
 
 /// Read one source's summary row from a database or snapshot reader.
@@ -209,7 +234,8 @@ fn merge(db: &DB, batch: &mut WriteBatch, deltas: BTreeMap<String, Delta>) -> Re
             delta.retained_records,
             delta.complete_artifacts,
             delta.fragment_parents,
-        ) == (0, 0, 0)
+            delta.retained_payload_bytes,
+        ) == (0, 0, 0, 0)
         {
             continue;
         }
@@ -260,6 +286,7 @@ enum Counted {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Retained {
     count: u64,
+    bytes: u64,
     mode: Mode,
 }
 
@@ -268,9 +295,12 @@ impl Retained {
         let Some(bytes) = reader.get(retained_key(id).as_bytes())? else {
             return Ok(None);
         };
-        let (count, mode) = bytes
+        let (count, rest) = bytes
             .split_first_chunk::<8>()
             .ok_or_else(|| failure(format!("invalid retained record count of {id}")))?;
+        let (bytes, mode) = rest
+            .split_first_chunk::<8>()
+            .ok_or_else(|| failure(format!("invalid retained payload bytes of {id}")))?;
         let mode = match mode {
             [0] => Mode::Full,
             [1] => Mode::Partial,
@@ -278,14 +308,16 @@ impl Retained {
         };
         Ok(Some(Self {
             count: u64::from_be_bytes(*count),
+            bytes: u64::from_be_bytes(*bytes),
             mode,
         }))
     }
 
-    fn encode(self) -> [u8; 9] {
-        let mut bytes = [0; 9];
+    fn encode(self) -> [u8; 17] {
+        let mut bytes = [0; 17];
         bytes[..8].copy_from_slice(&self.count.to_be_bytes());
-        bytes[8] = u8::from(self.mode == Mode::Partial);
+        bytes[8..16].copy_from_slice(&self.bytes.to_be_bytes());
+        bytes[16] = u8::from(self.mode == Mode::Partial);
         bytes
     }
 }
@@ -374,6 +406,14 @@ pub(super) fn fence(
     format: &[u8],
     batch: &mut WriteBatch,
 ) -> Result<&'static [u8], Error> {
+    reset(db, batch)?;
+    let format = super::writer_format::enable_source_summary(format)?;
+    batch.put("store_format", format);
+    Ok(format)
+}
+
+/// Rebuild derived rows from the catalog under the newly admitted writer.
+pub(super) fn reset(db: &DB, batch: &mut WriteBatch) -> Result<(), Error> {
     for prefix in [SUMMARY, RETAINED, INDEX] {
         // Every family prefix ends in ':'; ';' is the next byte, so the range is exactly
         // the family.
@@ -391,9 +431,7 @@ pub(super) fn fence(
         }
         .encode(),
     );
-    let format = super::writer_format::enable_source_summary(format)?;
-    batch.put("store_format", format);
-    Ok(format)
+    Ok(())
 }
 
 /// A record entry's identity and retirement state.
@@ -402,6 +440,7 @@ struct RecordState {
     source: String,
     received_at: u64,
     retained: bool,
+    bytes: u64,
 }
 
 fn record_state(id: &str, bytes: &[u8]) -> Result<RecordState, Error> {
@@ -411,11 +450,22 @@ fn record_state(id: &str, bytes: &[u8]) -> Result<RecordState, Error> {
             "record catalog entry {id} names another identity"
         )));
     }
+    let retained = !read_field::<bool>(&value, "evicted")?;
+    let retired = value.get("retired").is_some() && read_field::<bool>(&value, "retired")?;
+    let bytes = if retained && !retired {
+        let start = integer(&value, "byte_start")?;
+        integer(&value, "byte_end")?
+            .checked_sub(start)
+            .ok_or_else(|| failure(format!("invalid byte span of retained record {id}")))?
+    } else {
+        0
+    };
     Ok(RecordState {
         artifact: read_field(&value, "artifact_id")?,
         source: read_field(&value, "source")?,
         received_at: integer(&value, "received_at")?,
-        retained: !read_field::<bool>(&value, "evicted")?,
+        retained,
+        bytes,
     })
 }
 
@@ -424,6 +474,7 @@ struct EntryState {
     source: String,
     received_at: u64,
     evicted: bool,
+    byte_length: u64,
 }
 
 fn entry_state(id: &str, bytes: &[u8]) -> Result<EntryState, Error> {
@@ -438,6 +489,7 @@ fn entry_state(id: &str, bytes: &[u8]) -> Result<EntryState, Error> {
         source: header.artifact.source,
         received_at: header.artifact.received_at,
         evicted: header.artifact.evicted,
+        byte_length: header.artifact.byte_length,
     })
 }
 
@@ -514,8 +566,8 @@ impl super::durability::BatchObserver for Changes {
 /// One artifact's record changes in a batch.
 #[derive(Default)]
 struct Touched {
-    /// Signed retained-record change and record ID, per changed record.
-    records: Vec<(String, i64)>,
+    /// Record ID, retained-record change and readable byte change.
+    records: Vec<(String, i64, i128)>,
     identity: Option<(String, u64)>,
 }
 
@@ -569,7 +621,12 @@ pub(super) fn apply(writer: &Writer, batch: &mut WriteBatch) -> Result<(), Error
             &state.source,
             state.received_at,
         )?;
-        entry.records.push((id.clone(), change));
+        let bytes = |state: Option<&RecordState>| state.map_or(0, |state| i128::from(state.bytes));
+        entry.records.push((
+            id.clone(),
+            change,
+            bytes(after.as_ref()) - bytes(before.as_ref()),
+        ));
     }
     for id in changes.artifacts.keys().chain(changes.retirements.keys()) {
         touched.entry(id.clone()).or_default();
@@ -589,6 +646,7 @@ pub(super) fn apply(writer: &Writer, batch: &mut WriteBatch) -> Result<(), Error
                 source: state.source.clone(),
                 received_at: state.received_at,
                 evicted: state.evicted,
+                byte_length: state.byte_length,
             }),
         };
         for state in before.iter().chain(after.iter()) {
@@ -665,17 +723,31 @@ pub(super) fn apply(writer: &Writer, batch: &mut WriteBatch) -> Result<(), Error
                 "complete artifact {id} of source {source:?} has no retained record count"
             )));
         }
-        let change_records: i64 = change
+        let (change_records, change_bytes) = change
             .records
             .iter()
-            .filter(|(record, _)| counted == Counted::All || progress.record_counted(record))
-            .map(|(_, change)| *change)
-            .sum();
+            .filter(|(record, _, _)| counted == Counted::All || progress.record_counted(record))
+            .fold(
+                (0, 0),
+                |(records, bytes), (_, record_change, byte_change)| {
+                    (records + record_change, bytes + byte_change)
+                },
+            );
         let count_after = count_before.checked_add_signed(change_records).ok_or_else(|| {
             failure(format!(
                 "retained records of artifact {id} of source {source:?} would go below 0 (stored {count_before}, change {change_records})"
             ))
         })?;
+        let bytes_before = row.map_or(0, |row| row.bytes);
+        let bytes_after = shift_bytes(&id, bytes_before, change_bytes)?;
+        let payload_before = before
+            .as_ref()
+            .filter(|_| complete_before)
+            .map_or(bytes_before, |state| state.byte_length);
+        let payload_after = after
+            .as_ref()
+            .filter(|_| complete_after)
+            .map_or(bytes_after, |state| state.byte_length);
         let listed_before = complete_before || count_before > 0;
         let listed_after = complete_after || count_after > 0;
         let mode = row.map_or(Mode::Full, |row| row.mode);
@@ -684,6 +756,7 @@ pub(super) fn apply(writer: &Writer, batch: &mut WriteBatch) -> Result<(), Error
                 retained_key(&id),
                 Retained {
                     count: count_after,
+                    bytes: bytes_after,
                     mode,
                 }
                 .encode(),
@@ -700,6 +773,7 @@ pub(super) fn apply(writer: &Writer, batch: &mut WriteBatch) -> Result<(), Error
         let delta = deltas.entry(source).or_default();
         delta.counted_before |= listed_before;
         delta.retained_records += change_records;
+        delta.retained_payload_bytes += i128::from(payload_after) - i128::from(payload_before);
         delta.complete_artifacts += i64::from(complete_after) - i64::from(complete_before);
         delta.fragment_parents +=
             fragment(complete_after, count_after) - fragment(complete_before, count_before);
@@ -1044,6 +1118,7 @@ fn count_artifact(
     let received_at = header.artifact.received_at;
     let ids = header.record_ids(bytes, &mut remaining, 0, usize::MAX)?;
     let mut retained = 0_u64;
+    let mut retained_bytes = 0_u64;
     for record in &ids {
         let Some(bytes) = reader.get(record.as_bytes())? else {
             continue;
@@ -1058,12 +1133,14 @@ fn count_artifact(
         let mut known = Some((source.clone(), received_at));
         agree(id, &mut known, &state.source, state.received_at)?;
         retained += u64::from(state.retained);
+        retained_bytes = shift_bytes(id, retained_bytes, i128::from(state.bytes))?;
     }
     if complete || retained > 0 {
         rows.retained(
             id,
             Retained {
                 count: retained,
+                bytes: retained_bytes,
                 mode: Mode::Full,
             },
         );
@@ -1072,6 +1149,11 @@ fn count_artifact(
         delta.retained_records += i64::try_from(retained)
             .map_err(|_| failure(format!("retained records of artifact {id} overflow")))?;
         delta.complete_artifacts += i64::from(complete);
+        delta.retained_payload_bytes += i128::from(if complete {
+            header.artifact.byte_length
+        } else {
+            retained_bytes
+        });
         delta.fragment_parents += i64::from(!complete && retained > 0);
     }
     Ok(ids.len())
@@ -1085,7 +1167,7 @@ fn record_page(
     entry: &mut dyn FnMut(u64) -> Result<bool, Error>,
 ) -> Result<Progress, Error> {
     // Deleted parents counted by this page, with their row before it.
-    let mut parents = BTreeMap::<String, (Option<Retained>, u64, String, u64)>::new();
+    let mut parents = BTreeMap::<String, (Option<Retained>, u64, u64, String, u64)>::new();
     let mut last = None;
     let mut records = 0;
     let mut exhausted = true;
@@ -1111,13 +1193,13 @@ fn record_page(
                 std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     let row = Retained::read(reader, &state.artifact)?;
-                    entry.insert((row, 0, state.source.clone(), state.received_at))
+                    entry.insert((row, 0, 0, state.source.clone(), state.received_at))
                 }
             };
             if parent.0.is_some_and(|row| row.mode == Mode::Full) {
                 return Ok(true);
             }
-            let mut known = Some((parent.2.clone(), parent.3));
+            let mut known = Some((parent.3.clone(), parent.4));
             agree(
                 &state.artifact,
                 &mut known,
@@ -1125,10 +1207,11 @@ fn record_page(
                 state.received_at,
             )?;
             parent.1 += 1;
+            parent.2 = shift_bytes(&state.artifact, parent.2, i128::from(state.bytes))?;
             Ok(true)
         },
     )?;
-    for (id, (row, added, source, received_at)) in parents {
+    for (id, (row, added, bytes, source, received_at)) in parents {
         if added == 0 {
             continue;
         }
@@ -1137,6 +1220,7 @@ fn record_page(
             &id,
             Retained {
                 count: before + added,
+                bytes: shift_bytes(&id, row.map_or(0, |row| row.bytes), i128::from(bytes))?,
                 mode: Mode::Partial,
             },
         );
@@ -1148,6 +1232,7 @@ fn record_page(
         delta.retained_records += i64::try_from(added)
             .map_err(|_| failure(format!("retained records of artifact {id} overflow")))?;
         delta.fragment_parents += i64::from(before == 0);
+        delta.retained_payload_bytes += i128::from(bytes);
     }
     Ok(if exhausted {
         Progress::Complete

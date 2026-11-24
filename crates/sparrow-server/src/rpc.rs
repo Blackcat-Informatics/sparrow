@@ -868,6 +868,9 @@ fn sources_page(
         row.set_complete_artifacts(summary.complete_artifacts as u64);
         row.set_fragment_parents(summary.fragment_parents as u64);
         row.set_retained_records(summary.retained_records as u64);
+        row.reborrow()
+            .init_retained_payload_bytes()
+            .set_known(summary.retained_payload_bytes);
         row.set_continuity_unknown(summary.continuity_unknown);
         sparrow_client::encode_optional(
             row.reborrow().init_time_profile_id(),
