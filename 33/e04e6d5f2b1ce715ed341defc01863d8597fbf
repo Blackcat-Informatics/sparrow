@@ -1,0 +1,24 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: c37e1559d3a6503d408c83a3db1046da50adddc1
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 557
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/557
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: b0a5552d04ddb69e72b75dcddcc38791f94445e7
+GhpRsq-Head-Ref: paudley/106-raise-the-import-slot-count-and-let-a
+GhpRsq-Head-OID: c37e1559d3a6503d408c83a3db1046da50adddc1
+GhpRsq-Result-Tree: b3cd5ee65f28e8059af8a1e1fd713d5dac754566
+GhpRsq-Result-Commit: 33e04e6d5f2b1ce715ed341defc01863d8597fbf
+GhpRsq-Parent-Hashes: c37e1559d3a6503d408c83a3db1046da50adddc1
+GhpRsq-Squash-Notes-SHA256: 822a09e0f47b41a9cd10f8fc85b8867ed7d10b3fd5bcd36ffe0d4bac8dd18d4c
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Tree: 3d83ac6f6d4cdbfef720f05387cc9d9643b4cd33
+GhpRsq-Stage-Commit: e9f51ae6a98d6b20f407617b1f39618a6d5a8303
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/e9f51ae6a98d6b20f407617b1f39618a6d5a8303
+GhpRsq-Stage-Ref: refs/ghprsq/pr/557/stage
+GhpRsq-Stage-Files: 14
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/e9f51ae6a98d6b20f407617b1f39618a6d5a8303
