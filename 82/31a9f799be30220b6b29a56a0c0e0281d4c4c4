@@ -1,0 +1,19 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 8231a9f799be30220b6b29a56a0c0e0281d4c4c4
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 545
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/545
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 58302c81438302e2b97880ce52d3232da62cc46a
+GhpRsq-Head-Ref: paudley/94-recover-the-daemon-unit-from-repeated
+GhpRsq-Head-OID: 8231a9f799be30220b6b29a56a0c0e0281d4c4c4
+GhpRsq-Result-Tree: 2cdc17463c40b8ca68315985d49b9624b1b7d454
+GhpRsq-Result-Commit: 78d9adcc32c9b4a1ab9dad665cd9b144ab5a8244
+GhpRsq-Parent-Hashes: 8231a9f799be30220b6b29a56a0c0e0281d4c4c4
+GhpRsq-Squash-Notes-SHA256: 7a06bf9042e3da3ae97cb5e93afd036c45b77b4ce8ff7f39bdfe0c1e3c52f8d5
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
