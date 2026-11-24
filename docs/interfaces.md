@@ -1828,11 +1828,13 @@ MCP `build`) reports `read`, the catalog entries the build has read, and
 the build's. Following that cursor waits on the same build again and never
 starts another; a capture's lease starts when its first page is delivered. A
 build's lease runs 60 seconds from the last call that followed its cursor, and
-`resultRelease` with its `snapshot_id` cancels it. An abandoned build is
-dropped when its lease ends, at the latest at the next read-lease purge, which
-cancels its thread and drops its snapshot. A finished build stays until the page
-built from it has been delivered, so a call that fails or is cancelled while its
-page waits for the writer is retried on the same cursor. A page with `build` has
+`resultRelease` with its `snapshot_id` cancels it. Cancellation of a
+`resultNext` call stops its build wait or live page read at a cancellation
+check. A build whose cursor has already been returned keeps its lease when
+cancellation interrupts its poll. The next read-lease purge drops an abandoned
+build after expiry, cancels its thread and releases its snapshot.
+The store retires a finished build once it publishes the resulting page in the
+read registry. A page with `build` has
 no rows and is not a result: `total_items` of a `sources` build page is 0 and does
 not mean an empty catalog, so a client follows `next_cursor`. At most eight builds
 of each listing run at a time, counting a live `artifacts` window continuation; a

@@ -4311,8 +4311,9 @@ impl wire::sparrow::Server for Rpc {
         // A live artifact continuation publishes a page under the same delivery
         // guard as `artifacts_list`; every other operation replays its capture.
         match self
-            .read_work(move |store, now, _| {
-                Ok(match store.result_next(&store_id, &cursor, now)? {
+            .read_work(move |store, now, cancellation| {
+                let next = store.result_next_cancellable(&store_id, &cursor, now, &cancellation)?;
+                Ok(match next {
                     sparrow_core::ResultPage::Artifacts(page) => {
                         Next::Artifacts(Box::new(QueryReply::new(page, store, Some(&cursor))))
                     }
@@ -4672,6 +4673,105 @@ mod tests {
                 Some("0")
             );
         }
+    }
+
+    /// A cancelled result-next caller releases its read permit while the published
+    /// listing build continues under its own lease.
+    #[tokio::test]
+    async fn cancelled_result_next_releases_admission_while_the_listing_build_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let config =
+            sparrow_test_support::write_server_config(dir.path(), &data, &data.join("rpc.sock"));
+        let config = crate::ServerConfig::read(&config).unwrap();
+        let store = config.open_store().unwrap();
+        let received = now().unwrap();
+        store
+            .ingest("listing", "listing", "log", b"held\n", received)
+            .unwrap();
+        drop(store);
+        let db = sparrow_test_support::catalog_db(&data).unwrap();
+        sparrow_test_support::pending_source_summary_migration(&db).unwrap();
+        drop(db);
+        let store = config.open_store().unwrap();
+
+        let (held, worker_entered) = tokio::sync::oneshot::channel();
+        let (release_build, paused) = std::sync::mpsc::channel();
+        let hold = std::sync::Mutex::new(Some((held, paused)));
+        store
+            .hold_listing_builds_for_tests(1, move || {
+                let first = hold.lock().unwrap().take();
+                if let Some((held, paused)) = first {
+                    let _ = held.send(());
+                    let _ = paused.recv();
+                }
+            })
+            .unwrap();
+        store
+            .set_listing_build_wait_for_tests(std::time::Duration::ZERO)
+            .unwrap();
+        let page = store
+            .artifact_read(&sparrow_core::ArtifactRead::default(), received)
+            .unwrap();
+        let cursor = page.next_cursor.unwrap();
+        assert!(page.build.is_some());
+        let deadline = std::time::Duration::from_secs(10);
+        tokio::time::timeout(deadline, worker_entered)
+            .await
+            .expect("build worker did not reach the hold")
+            .unwrap();
+        store
+            .set_listing_build_wait_for_tests(std::time::Duration::from_secs(60))
+            .unwrap();
+        let (polled, poll_entered) = tokio::sync::oneshot::channel();
+        store
+            .notify_artifact_listing_poll_for_tests(move || {
+                let _ = polled.send(());
+            })
+            .unwrap();
+
+        let admission = Arc::new(Semaphore::new(1));
+        let (rpc, connection) = Rpc::new(store.clone(), admission.clone(), 100).for_connection();
+        let client = rpc.into_client();
+        let mut request = client.result_next_request();
+        let mut query = request.get().init_query();
+        query.set_store_id(&page.store_id);
+        query.set_schema_version(sparrow_client::SCHEMA_VERSION);
+        query.set_cursor(&cursor);
+        let mut response = std::pin::pin!(request.send().promise);
+        tokio::time::timeout(deadline, async {
+            tokio::select! {
+                started = poll_entered => started.unwrap(),
+                _ = &mut response => panic!("result-next returned before reaching the build poll"),
+            }
+        })
+        .await
+        .expect("result-next did not reach the build poll");
+        assert_eq!(admission.available_permits(), 0);
+        drop(connection);
+        let response = tokio::time::timeout(deadline, response)
+            .await
+            .expect("cancelled result-next still waits for the build")
+            .unwrap();
+        match response
+            .get()
+            .unwrap()
+            .get_result()
+            .unwrap()
+            .which()
+            .unwrap()
+        {
+            wire::result::Error(error) => {
+                assert_eq!(error.unwrap().get_code().unwrap(), "CANCELLED");
+            }
+            wire::result::Ok(_) => panic!("cancelled result-next returned a page"),
+        }
+        assert_eq!(admission.available_permits(), 1);
+        assert_eq!(store.listing_builds_for_tests().unwrap()[1], (1, 1, 1));
+
+        release_build.send(()).unwrap();
+        drop(client);
+        assert!(store.close_for_reopen().is_empty());
     }
 
     #[tokio::test]

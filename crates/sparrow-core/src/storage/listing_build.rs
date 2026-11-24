@@ -273,6 +273,8 @@ pub(super) struct Builds<C, T> {
     hold: Option<Hold>,
     #[cfg(feature = "test-support")]
     fail_delivery: bool,
+    #[cfg(feature = "test-support")]
+    poll_started: Option<Box<dyn FnOnce() + Send>>,
     /// Dev-only: entries every finished build read, re-bases included.
     #[cfg(feature = "test-support")]
     entries: Arc<AtomicU64>,
@@ -289,6 +291,8 @@ impl<C, T> Default for Builds<C, T> {
             hold: None,
             #[cfg(feature = "test-support")]
             fail_delivery: false,
+            #[cfg(feature = "test-support")]
+            poll_started: None,
             #[cfg(feature = "test-support")]
             entries: Arc::default(),
         }
@@ -402,6 +406,10 @@ impl<C, T: Send + 'static> Builds<C, T> {
             .checked_add(LEASE_MS)
             .ok_or_else(|| Error::new("INVALID_ARGUMENT", "listing build deadline overflow"))?;
         *lock(&build.shared.polled) = Instant::now();
+        #[cfg(feature = "test-support")]
+        if let Some(started) = self.poll_started.take() {
+            started();
+        }
         Ok((&build.context, Waiter(Arc::clone(&build.shared))))
     }
 
@@ -437,6 +445,12 @@ impl<C, T: Send + 'static> Builds<C, T> {
     #[cfg(feature = "test-support")]
     pub(super) fn set_wait_for_tests(&mut self, wait: Duration) {
         self.wait = wait;
+    }
+
+    /// Dev-only: signal once a caller has entered a build poll.
+    #[cfg(feature = "test-support")]
+    pub(super) fn notify_poll_for_tests(&mut self, started: impl FnOnce() + Send + 'static) {
+        self.poll_started = Some(Box::new(started));
     }
 
     /// Dev-only: hold every later build's thread with `hold.1` once it has read `hold.0`
