@@ -3548,7 +3548,9 @@ reconnects for each tool call and authenticates each connection.
 Calls queued on the promised session can reach the service after authentication
 succeeds. A refused exchange fails those queued calls before they return status
 or records. The RPC test `pipelined_calls_on_a_refused_session_reach_no_service`
-exercises both outcomes.
+exercises both outcomes. If the operating system random source fails, the
+challenge publishes no nonce and returns `RANDOMNESS_UNAVAILABLE` with
+`retryable = false`.
 
 CHAP authenticates only the start of a session. Traffic is not encrypted, the
 client does not authenticate the server, and an on-path attacker can observe or
@@ -5438,6 +5440,7 @@ refusal and every refusal of an older daemon.
 | `RESOURCE_LIMIT` / `RESULT_TOO_LARGE` | Host admission/output refusal. `RESOURCE_LIMIT` is retryable when transient occupancy caused it (a full import journal table, a busy admission queue, a held read slot) and not retryable when a bound on the input itself caused it (more than 32,768 records in one publication, RDF write or dictionary staging over its cap, an input over the record, batch or whole-budget bound); the wire `retryable` flag says which and the message names the bound. Native certified governor outcomes retain their read receipts. |
 | `STORAGE_PRESSURE` | Insufficient safe write capacity, with retry state. |
 | `STORAGE_FAILURE` | Typed I/O, integrity, or commit failure; retryability follows the actual cause. |
+| `RANDOMNESS_UNAVAILABLE` | The operating system random source failed to generate a CHAP nonce. The refusal carries the cause and has `retryable = false`. |
 | `ARCHIVE_WATERMARK` | Publication at or behind the archive watermark. Not retryable as sent. |
 | `UNSUPPORTED` | Unsupported format operation, query capability, or mutation on the read surface. Raw artifact preservation can still succeed independently of projection support. |
 | `READ_ONLY` | A write sent to a query-only daemon (schema 67). Not retryable against that daemon. |

@@ -40,6 +40,22 @@ impl AnonymousTcp {
         }
         Ok(())
     }
+
+    fn issue_challenge(
+        &self,
+        fill: impl FnOnce(&mut [u8]) -> Result<(), getrandom::Error>,
+    ) -> Result<[u8; CHAP_BYTES], Error> {
+        self.open()?;
+        let mut nonce = [0; CHAP_BYTES];
+        fill(&mut nonce).map_err(|error| {
+            Error::new(
+                "RANDOMNESS_UNAVAILABLE",
+                format!("CHAP nonce generation failed. Check the operating system random source. {error}"),
+            )
+        })?;
+        self.nonce.set(Some(nonce));
+        Ok(nonce)
+    }
 }
 
 impl crate::ingest_gate::Policy for AnonymousTcp {
@@ -48,12 +64,7 @@ impl crate::ingest_gate::Policy for AnonymousTcp {
     }
 
     fn challenge(&self, _: &WriteGate) -> Result<[u8; CHAP_BYTES], Error> {
-        self.open()?;
-        let mut nonce = [0; CHAP_BYTES];
-        getrandom::fill(&mut nonce)
-            .map_err(|error| Error::new("STORAGE_FAILURE", format!("CHAP nonce: {error}")))?;
-        self.nonce.set(Some(nonce));
-        Ok(nonce)
+        self.issue_challenge(getrandom::fill)
     }
 
     /// Consume the challenge and finish this connection's only attempt before any await.
@@ -86,6 +97,29 @@ fn unauthenticated(message: &str) -> Error {
 mod tests {
     use super::*;
 
+    fn secret_fixture(dir: &std::path::Path) -> TcpSecret {
+        let secret = dir.join("tcp.secret");
+        std::fs::write(&secret, [9; 32]).unwrap();
+        std::fs::set_permissions(
+            &secret,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .unwrap();
+        TcpSecret::read(&secret).unwrap()
+    }
+
+    #[test]
+    fn chap_nonce_failure_is_not_a_storage_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = AnonymousTcp::new(secret_fixture(dir.path()), "test".into());
+        let unavailable = getrandom::Error::UNSUPPORTED;
+        let error = policy.issue_challenge(|_| Err(unavailable)).unwrap_err();
+        assert_eq!(error.code, "RANDOMNESS_UNAVAILABLE");
+        assert!(!error.is_retryable());
+        assert!(error.message.contains(&unavailable.to_string()));
+        assert!(policy.nonce.get().is_none());
+    }
+
     /// INVARIANT: an anonymous TCP peer of a query-only service reaches the same write gate
     /// as a Unix connection, so the writes it may otherwise call are refused with READ_ONLY.
     #[tokio::test(flavor = "current_thread")]
@@ -104,17 +138,10 @@ mod tests {
             100,
         )
         .query_only();
-        let secret = dir.path().join("tcp.secret");
-        std::fs::write(&secret, [9; 32]).unwrap();
-        std::fs::set_permissions(
-            &secret,
-            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
-        )
-        .unwrap();
         let client: crate::sparrow_capnp::sparrow::Client =
             capnp_rpc::new_client(crate::ingest_gate::IngestGate::new(
                 rpc,
-                AnonymousTcp::new(TcpSecret::read(&secret).unwrap(), "test".into()),
+                AnonymousTcp::new(secret_fixture(dir.path()), "test".into()),
             ));
         let mut request = client.ingest_request();
         let mut input = request.get().init_request();
