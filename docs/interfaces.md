@@ -428,13 +428,15 @@ work with no external event: the next retirement or deletion deadline or the
 earliest live pin deadline. The worker sleeps until then, never less than one
 second and never more than one hour. The ceiling protects against a wall clock
 that stepped forward, since the sleep itself is monotonic. A pin release, a pin
-commit and an archive commit wake the worker at once. Below the free-space floor the
-pass runs under the maintenance reserve (#267, below); when free space is under the
-reserve it is refused before it reads anything, and it then waits for the floor's resume,
-which wakes it at once (#247), or for the pressure pass, which wakes it the first time it
-finds free space back above the reserve while a floor episode is open, with no retry clock
-and no journal line per attempt; the one-hour ceiling is only its backstop. A pass that failed for any other reason retries
-after 60 seconds, for want of any event that says it would now succeed. Retry rows
+commit and an archive commit wake the worker at once.
+
+Below the free-space floor, expiry uses the maintenance reserve and refuses
+before reading any entries if free space is below the reserve. The floor's
+resume wakes expiry immediately. During a floor episode, the pressure pass
+also wakes expiry when it first observes that free space has reached the
+reserve. An expiry pass refused below the reserve during a floor pause uses
+the one-hour idle backstop and stays quiet on each refusal. Other failures
+are journaled and retry after 60 seconds. Retry rows
 (`request:`) have no time index; one pass scans them once per hour, and their
 logical expiry is exact at read time regardless. The purge of expired read
 leases runs on its own 60-second tick, not inside expiry. Expiry honours each row's
@@ -447,8 +449,7 @@ Import journal reclamation runs on its own one-second tick, because a published
 journal holds one of the 16 import slots until it is reclaimed. Pressure keeps
 its one-second tick, and buffered synchronization keeps its configured interval.
 Eligible duties are selected fairly, including when a short flush interval
-remains due; stop admission takes priority. An expiry refusal reports its error
-and returns to the ordinary tick rather than repeatedly retrying a busy loop.
+remains due. Stop admission takes priority.
 
 Shutdown prevents further maintenance admission and joins work that has already
 entered storage. Teardown joins the archive coordinator, intake and maintenance
@@ -537,8 +538,8 @@ refused while an honest avenue remains. What protects the reserve headroom the p
 flush and compaction need is the batch size (the ordinary 32 units) and that every batch is
 admitted against the reserve, so a batch that would find free space under it is refused;
 the duty continues a backlog by its continuation flag (an event) until nothing is due or the
-reserve refuses, and a refusal parks it until the pass finds free space above the reserve
-again. On a store with no archive policy
+reserve refuses, and a refusal parks it until the pass finds that free space has reached
+the reserve again. On a store with no archive policy
 ageing out is the only avenue. The lease purge writes nothing and ends the read snapshots a
 pass stalls on ("open read snapshots"), so it runs below the floor and wakes the pass.
 Import reclamation and online migration write more than they free (a migration page
@@ -661,10 +662,11 @@ and it applies only to a store with an archive policy. Archived evidence has its
 retiring some of it earlier than the budget would, to take the log being offered now, is
 allowed up to a bound: the first measured deficit plus `maintenance_reserve`, counted in
 linked store bytes freed. Past the bound the pass retires nothing more for that episode and
-says the rest is held outside Sparrow. Freed bytes lag retirement until native compaction
-runs, so the episode is also capped at 8 retirement batches, whatever they have freed so far. A store with no archive policy retires nothing early
-for the floor: nothing there is marked archived, so "archived" protects nothing. There a
-floor episode uses ageing out only, described below.
+says the rest is held outside Sparrow. Native compaction returns the
+freed bytes after retirement. Each floor episode therefore allows at most
+eight early retirement batches, even while their reclaimed bytes remain
+unmeasured. In a store without an archive policy, expiry is the only route
+to evidence retirement during the episode.
 
 The honest state of a store with no archive policy and nothing expired: at the floor it has
 no avenue left and refuses writes until space returns from outside. The counters that show
@@ -728,6 +730,10 @@ is true while expiry and eviction keep evidence for want of an archive, because 
 has no archive policy or the last pass stopped at the archive watermark; `last_pass.frontier`
 names the frontier. `reserve_headroom` is the budget less the reserve less `linked_bytes` at
 the last pass, a signed decimal string that is negative once the store is over that line.
+
+Both pressure paths expose `waitingOn`, rendered as `waiting_on` by CLI and
+MCP, for display. Use structured fields such as `phase`, `last_pass.frontier`
+and the floor counters in automation.
 
 ### Archive-before-delete gate (schema 63)
 
@@ -827,13 +833,15 @@ id)` advances the watermark and removes the intent in one synchronized batch.
 is at or before the watermark or the in-flight intent's end is refused with
 `STORAGE_FAILURE`, and the message says to correct the clock.
 
-Both archive commits unlock retirement of archived evidence, so they are
-admitted at the maintenance reserve instead of the free-space floor, as the
-pressure pass's own commits are. Below the floor and above the reserve they
-succeed while ordinary writes are still refused with the floor label. Below the
-reserve they fail with `STORAGE_PRESSURE` and the reserve text, and the
-watermark does not move; the archive worker must hold and retry on the floor
-resume edge.
+Archive intent and watermark commits use the maintenance reserve for
+filesystem admission, as do pressure reclamation commits. Ordinary writes
+use the free-space floor. If the reserve is lower than the floor, reaching the
+reserve lets the archive worker commit on a subsequent pass while writes can
+still receive a floor refusal. If the floor is lower than the reserve, writes
+can clear their filesystem check first while archive commits still wait for
+the reserve. A reserve refusal returns `STORAGE_PRESSURE` with the reserve
+diagnostic and leaves the watermark in place. The archive worker retries on
+its configured interval.
 
 Schema 63 adds the enum values `PressurePhase.awaitingArchive` and
 `EvictionFrontier.archiveLag`. CLI and MCP status render them as
@@ -3591,9 +3599,9 @@ stream or discards a frame:
   The one-second observation is the cadence at which the daemon measures the floor; it
   is one tick for every held frame, never a timer per frame. The same table governs the
   other waits: online migration skipped below the floor wakes on its resume, and expiry
-  refused under the maintenance reserve wakes on it too, or when the pressure pass finds free
-  space back above the reserve while a floor episode is open (an event, never a timer);
-  the pressure pass's one-to-30-second delay is the observer of native state above.
+  refused under the maintenance reserve wakes on the floor's resume or when
+  the pressure pass sees free space reach the reserve during a floor episode.
+  The pressure pass's one-to-30-second delay observes native state.
 
   A held connection is not idle. The read timeout does not run while it holds,
   and an arrival at the connection ceiling cannot reclaim it; it is reclaimed
