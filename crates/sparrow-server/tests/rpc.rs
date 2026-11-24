@@ -2118,7 +2118,8 @@ async fn start_with_ingest(config: &Path, socket: &Path, ingest: &Path) -> Daemo
 
 /// INVARIANT: evidence accepted on the ingest socket carries the caller's kernel-reported
 /// uid, gid and pid in its typed intake, its CLI rendering and its metadata graphs, and
-/// the socket inherits the configured group with mode 0660.
+/// the socket inherits the configured group with mode 0660. The first write durably fences
+/// older writers before any other intake operation can change the store format.
 #[tokio::test(flavor = "current_thread")]
 async fn ingest_socket_records_peer_credentials_in_provenance() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -2138,6 +2139,18 @@ async fn ingest_socket_records_peer_credentials_in_provenance() {
                 .ingest("peer-ingest", "peer.ingest", wire::Format::Log, b"from a peer\n")
                 .await
                 .unwrap();
+            let status = cli(&socket, &["status"]);
+            let writer_format = status["store_format"].as_str().unwrap();
+            let format_number: u32 = writer_format
+                .strip_prefix("sparrow.store/")
+                .unwrap()
+                .parse()
+                .unwrap();
+            // The non-archiving intake family with retained source byte totals.
+            assert!(
+                (495..=505).contains(&format_number),
+                "first ingest-socket write left the store at {writer_format}"
+            );
             let mut event = delivery_event("from a peer");
             event.sequence = 1;
             let events = producer

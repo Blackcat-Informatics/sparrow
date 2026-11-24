@@ -199,7 +199,8 @@ mod tests {
     }
 
     /// INVARIANT: an import is bound to the uid of the connection that ran importBegin, so
-    /// another caller can neither append to it nor publish it under the owner's provenance.
+    /// another caller cannot alter, publish or cancel it. Publication retains the original
+    /// credentials even when the owner resumes from a different connection.
     #[tokio::test(flavor = "current_thread")]
     async fn import_resumed_by_another_uid_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -211,21 +212,26 @@ mod tests {
             .open_store()
             .unwrap();
         let rpc = crate::Rpc::new(
-            store,
+            store.clone(),
             std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             100,
         );
-        let caller = |uid| -> sparrow::Client {
+        let caller = |credential| -> sparrow::Client {
             capnp_rpc::new_client(IngestGate::new(
-                rpc.clone().with_peer(sparrow_core::PeerCredential {
-                    uid,
-                    gid: 900,
-                    pid: 42,
-                }),
+                rpc.clone().with_peer(credential),
                 IngestSocketPolicy,
             ))
         };
-        let (owner, other) = (caller(951), caller(952));
+        let initiator = sparrow_core::PeerCredential {
+            uid: 951,
+            gid: 900,
+            pid: 42,
+        };
+        let owner = caller(initiator);
+        let other = caller(sparrow_core::PeerCredential {
+            uid: 952,
+            ..initiator
+        });
         let bytes = b"resumed\n";
         let mut begin = owner.import_begin_request();
         let mut input = begin.get().init_request();
@@ -247,7 +253,7 @@ mod tests {
                 panic!("importBegin failed: {:?}", error.unwrap().get_message())
             }
         };
-        let (store, id) = (
+        let (store_id, id) = (
             staging.get_store_id().unwrap().to_str().unwrap().to_owned(),
             staging.get_id().unwrap().to_str().unwrap().to_owned(),
         );
@@ -255,7 +261,7 @@ mod tests {
             let mut request = client.import_append_request();
             let mut chunk = request.get().init_request();
             let mut import = chunk.reborrow().init_import();
-            import.set_store_id(&store);
+            import.set_store_id(&store_id);
             import.set_id(&id);
             chunk.set_offset(0);
             chunk.set_bytes(bytes);
@@ -268,15 +274,53 @@ mod tests {
         );
         let mut publish = other.import_publish_request();
         let mut import = publish.get().init_import();
-        import.set_store_id(&store);
+        import.set_store_id(&store_id);
         import.set_id(&id);
         let refused = publish.send().promise.await.unwrap();
         assert_eq!(
             code(refused.get().unwrap().get_result().unwrap()).as_deref(),
             Some("PERMISSION_DENIED")
         );
-        let resumed = append(&owner).await.unwrap();
+        let mut cancel = other.import_cancel_request();
+        let mut import = cancel.get().init_import();
+        import.set_store_id(&store_id);
+        import.set_id(&id);
+        let refused = cancel.send().promise.await.unwrap();
+        assert_eq!(
+            code(refused.get().unwrap().get_result().unwrap()).as_deref(),
+            Some("PERMISSION_DENIED"),
+            "a different UID must not cancel the staged import"
+        );
+
+        drop(owner);
+        let resumed_owner = caller(sparrow_core::PeerCredential {
+            gid: 901,
+            pid: 43,
+            ..initiator
+        });
+        let resumed = append(&resumed_owner).await.unwrap();
         assert_eq!(code(resumed.get().unwrap().get_result().unwrap()), None);
+
+        let path = dir.path().join("resumed.log");
+        std::fs::write(&path, bytes).unwrap();
+        let mut file = sparrow_client::open_completed_file(&path).unwrap();
+        let receipt = sparrow_client::import_open_file(
+            &resumed_owner,
+            "bound-import",
+            "peer",
+            crate::sparrow_capnp::Format::Log,
+            &mut file,
+        )
+        .await
+        .unwrap();
+        let expected = Some(sparrow_core::Intake::IngestSocket(initiator));
+        let artifact = store.artifact(&receipt.id).unwrap();
+        assert_eq!(artifact.intake, expected);
+        assert_eq!(artifact.record_ids.len(), 1);
+        assert_eq!(
+            store.record(&artifact.record_ids[0]).unwrap().intake,
+            expected
+        );
     }
 
     /// INVARIANT: the shared producer-only gate decides every `Sparrow` operation exactly
