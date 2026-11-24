@@ -14821,6 +14821,28 @@ fn rdf_read_controls_and_selected_catalog_identity_are_verified() {
 }
 
 #[test]
+fn refused_open_adds_no_column_family() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = rocksdb::Options::default();
+    options.create_if_missing(true);
+    options.create_missing_column_families(true);
+    let db = rocksdb::DB::open_cf(&options, dir.path(), ["default", "payload"]).unwrap();
+    db.put("store_format", b"unsupported.store/1").unwrap();
+    drop(db);
+
+    let mut before = rocksdb::DB::list_cf(&options, dir.path()).unwrap();
+    before.sort_unstable();
+    assert_eq!(before, ["default", "payload"]);
+    let error = Store::open(dir.path(), config())
+        .err()
+        .expect("the writer format must be refused");
+    assert_eq!(error.code, "UNSUPPORTED");
+    let mut after = rocksdb::DB::list_cf(&options, dir.path()).unwrap();
+    after.sort_unstable();
+    assert_eq!(after, before);
+}
+
+#[test]
 fn reverse_lookups_from_older_writers_move_into_their_family_at_open() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
@@ -14829,19 +14851,27 @@ fn reverse_lookups_from_older_writers_move_into_their_family_at_open() {
         .ingest("rdf-reverse-first", "rdf", "json", bytes, 0)
         .unwrap();
     let inspection = store.rdf_inspect(&first.record_ids[0], 1).unwrap();
+    let store_id = store.store_id().unwrap();
     drop(store);
     // Older writers kept every reverse lookup in the default family.
-    let db = catalog_db(dir.path()).unwrap();
+    let mut db = catalog_db(dir.path()).unwrap();
     let reverse = db.cf_handle("rdf_reverse").unwrap();
     let mut legacy = rocksdb::WriteBatch::default();
     for row in db.iterator_cf(reverse, rocksdb::IteratorMode::Start) {
         let (key, value) = row.unwrap();
         legacy.put(&key, &value);
-        legacy.delete_cf(reverse, &key);
     }
     assert!(!legacy.is_empty());
     db.write(legacy).unwrap();
+    db.drop_cf("rdf_reverse").unwrap();
     drop(db);
+    assert!(Store::reopen(dir.path(), config(), &store_id).is_err());
+    assert!(
+        !rocksdb::DB::list_cf(&rocksdb::Options::default(), dir.path())
+            .unwrap()
+            .iter()
+            .any(|name| name == "rdf_reverse")
+    );
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.rdf_inspect(&first.record_ids[0], 1).unwrap(),
@@ -22157,9 +22187,19 @@ fn archive_fence_refuses_unconfigured_open_and_older_writers() {
         .to_owned();
     assert!((484..=494).contains(&number(&watched)), "{watched}");
     drop(store);
+    let mut db = catalog_db(dir.path()).unwrap();
+    db.drop_cf("rdf_reverse").unwrap();
+    drop(db);
+    let options = rocksdb::Options::default();
+    let mut before = rocksdb::DB::list_cf(&options, dir.path()).unwrap();
+    before.sort_unstable();
+    assert_eq!(before, ["default", "payload"]);
     let refused = Store::open(dir.path(), config()).err().unwrap();
     assert_eq!(refused.code, "INVALID_ARGUMENT");
     assert!(refused.message.contains("[archive]"));
+    let mut after = rocksdb::DB::list_cf(&options, dir.path()).unwrap();
+    after.sort_unstable();
+    assert_eq!(after, before);
     let invalid = Config {
         archive: Some(sparrow_core::ArchivePolicy {
             start_fraction: 0.2,

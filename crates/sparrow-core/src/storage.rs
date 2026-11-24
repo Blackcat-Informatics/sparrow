@@ -1191,8 +1191,9 @@ impl Writer {
         *self.pressure.borrow_mut() = pressure::State::load(&self.db)?;
         *self.recompression.borrow_mut() = recompression::State::load(&self.db)?;
         if let Some(state) = &self.archive {
-            let reloaded =
-                archive::open(&self.db, self.config.archive.as_ref())?.ok_or_else(|| {
+            let reloaded = archive::prepare_open(&self.db, self.config.archive.as_ref())?
+                .finish(&self.db)?
+                .ok_or_else(|| {
                     Error::new("STORAGE_FAILURE", "archive state missing on re-validation")
                 })?;
             *state.borrow_mut() = reloaded;
@@ -1717,13 +1718,14 @@ impl Store {
         config.validate()?;
         // The Rust binding creates the directory before the native open even when both
         // native creation options are off. A missing store should not create that directory.
+        let exists = path.join("CURRENT").try_exists().map_err(|error| {
+            Error::new(
+                "STORAGE_FAILURE",
+                format!("cannot inspect the database at {}: {error}", path.display()),
+            )
+        })?;
         if let Some(expected) = expected_store_id
-            && !path.join("CURRENT").try_exists().map_err(|error| {
-                Error::new(
-                    "STORAGE_FAILURE",
-                    format!("cannot inspect the database at {}: {error}", path.display()),
-                )
-            })?
+            && !exists
         {
             return Err(Error::new(
                 "NOT_FOUND",
@@ -1732,11 +1734,13 @@ impl Store {
         }
         let space = space::SpaceFloor::new(path, config.min_free_bytes);
         let open_files = open_files::OpenFiles::from_process()?;
-        let db = DB::open_cf_descriptors(
-            &table_options::database(open_files.max_open_files, expected_store_id.is_none())?,
-            path,
-            table_options::descriptors(),
-        )?;
+        let options = table_options::database(open_files.max_open_files, !exists)?;
+        let mut descriptors = table_options::descriptors();
+        if exists && expected_store_id.is_none() {
+            let present = DB::list_cf(&options, path)?;
+            descriptors.retain(|family| present.iter().any(|name| name == family.name()));
+        }
+        let mut db = DB::open_cf_descriptors(&options, path, descriptors)?;
         timer.lap("rocksdb");
         let format = writer_format::read(&db)?;
         let persisted_id =
@@ -1853,7 +1857,14 @@ impl Store {
                 ));
             }
         };
+        let archive = archive::prepare_open(&db, config.archive.as_ref())?;
         timer.lap("identity");
+        // The same open handle owns the store throughout validation and upgrades.
+        for name in FAMILIES {
+            if db.cf_handle(name).is_none() {
+                db.create_cf(name, &table_options::family(name))?;
+            }
+        }
         rdf_index::upgrade_reverse(&db)?;
         recordless::upgrade(&db)?;
         diagnostic::fence_format(&db)?;
@@ -1867,7 +1878,7 @@ impl Store {
         migration::fence(&db)?;
         let retry_gc = writer_format::retry_watermark(&db)?;
         timer.lap("migration_fence");
-        let archive = archive::open(&db, config.archive.as_ref())?;
+        let archive = archive.finish(&db)?;
         if db.get(producer_stream::KEY)?.is_none() {
             return Err(Error::new(
                 "STORAGE_FAILURE",
