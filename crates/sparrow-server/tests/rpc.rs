@@ -18,6 +18,8 @@ type TcpReservation = (std::net::TcpListener, std::sync::MutexGuard<'static, ()>
 mod journal;
 #[path = "rpc/mcp_http.rs"]
 mod mcp_http;
+#[path = "rpc/source_binding.rs"]
+mod source_binding;
 
 #[tokio::test(flavor = "current_thread")]
 async fn capability_documents_share_cli_mcp_and_typed_transport_contracts() {
@@ -2369,9 +2371,10 @@ async fn status_until(
 }
 
 /// Begin one staged import of `name`'s bytes; its import id, or the error code.
-async fn begin_numbered_import(
+async fn begin_import(
     client: &wire::sparrow::Client,
     name: &str,
+    source: &str,
 ) -> Result<String, String> {
     let input = name.as_bytes();
     let payload = format!(
@@ -2381,7 +2384,7 @@ async fn begin_numbered_import(
     let mut request = client.import_begin_request();
     let mut begin = request.get().init_request();
     begin.set_request_id(name);
-    begin.set_source("numbered");
+    begin.set_source(source);
     begin.set_format(wire::Format::Log);
     begin.set_byte_length(input.len() as u64);
     begin.set_payload_id(&payload);
@@ -2431,14 +2434,14 @@ async fn a_seventeenth_import_waits_for_a_slot_and_begins_when_one_is_reclaimed(
             let mut ids = Vec::new();
             for index in 0..16 {
                 ids.push(
-                    begin_numbered_import(&client, &format!("slot-{index}"))
+                    begin_import(&client, &format!("slot-{index}"), "numbered")
                         .await
                         .unwrap(),
                 );
             }
             let seventeenth = tokio::task::spawn_local({
                 let client = client.clone();
-                async move { begin_numbered_import(&client, "slot-16").await }
+                async move { begin_import(&client, "slot-16", "numbered").await }
             });
             status_until(&client, |admission| {
                 let waiting = admission.get_import_slot_wait().unwrap();
@@ -16882,7 +16885,7 @@ async fn an_over_bound_declaration_is_permanent_named_advertised_and_counted() {
                 message.contains(&format!("at most {bound} bytes")) && message.contains("split"),
                 "{message}"
             );
-            begin_numbered_import(&client, "in-bound").await.unwrap();
+            begin_import(&client, "in-bound", "numbered").await.unwrap();
             let response = client.status_request().send().promise.await.unwrap();
             let status = rpc_ok(response.get().unwrap().get_result().unwrap());
             assert_eq!(status.get_import_over_bound_refusals(), 1);

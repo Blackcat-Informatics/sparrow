@@ -762,43 +762,60 @@ impl Store {
             .map(ImportStart::Staging)
     }
 
-    /// Refuse a caller other than the one that began this import. A missing or
-    /// malformed import is left for the operation itself to report.
+    pub(super) fn import_operation<'a>(
+        &'a self,
+        id: &'a str,
+        now: u64,
+    ) -> Result<ImportOperation<'a>, Error> {
+        Ok(ImportOperation {
+            writer: self.lock()?,
+            store: self,
+            id,
+            now,
+        })
+    }
+
+    /// Check source and caller admission while holding the operation's writer lock.
+    pub fn authorize_import<'a>(
+        &'a self,
+        id: &'a str,
+        caller: Option<&super::intake::Intake>,
+        now: u64,
+        admit_source: impl FnOnce(&str) -> Result<(), Error>,
+    ) -> Result<ImportOperation<'a>, Error> {
+        let operation = self.import_operation(id, now)?;
+        if id.starts_with("import:") {
+            let manifest = match super::publication::published(&operation.writer, id, now)? {
+                Some((manifest, _)) => Some(manifest),
+                None => operation
+                    .writer
+                    .db
+                    .get(id)?
+                    .map(|bytes| ImportManifest::decode(&parse(&bytes)?))
+                    .transpose()?,
+            };
+            if let Some(manifest) = manifest {
+                admit_source(&manifest.source)?;
+                super::intake::admit_import(manifest.intake.as_ref(), caller)?;
+            }
+        }
+        Ok(operation)
+    }
+
+    /// Refuse a caller other than the one that began this import.
+    /// Use `authorize_import` to keep the lock through an operation.
     pub fn import_admit(
         &self,
         id: &str,
         caller: Option<&super::intake::Intake>,
         now: u64,
     ) -> Result<(), Error> {
-        if !id.starts_with("import:") {
-            return Ok(());
-        }
-        let writer = self.lock()?;
-        let bound = match super::publication::published(&writer, id, now)? {
-            Some((manifest, _)) => manifest.intake,
-            None => match writer.db.get(id)? {
-                Some(bytes) => ImportManifest::decode(&parse(&bytes)?)?.intake,
-                None => return Ok(()),
-            },
-        };
-        super::intake::admit_import(bound.as_ref(), caller)
+        self.authorize_import(id, caller, now, |_| Ok(())).map(drop)
     }
 
     /// Recover the committed offset and fixed lease after a client/daemon restart.
     pub fn import_get(&self, id: &str, now: u64) -> Result<ImportManifest, Error> {
-        if !id.starts_with("import:") {
-            return Err(Error::new(
-                "INVALID_ARGUMENT",
-                "require an import staging ID",
-            ));
-        }
-        let writer = self.lock()?;
-        if let Some((manifest, _)) = super::publication::published(&writer, id, now)? {
-            return Ok(manifest);
-        }
-        let manifest: ImportManifest = writer.get(id)?;
-        manifest.require_live(now)?;
-        Ok(manifest)
+        self.import_operation(id, now)?.get()
     }
 
     /// Append exactly one fixed-size chunk (or the declared final remainder).
@@ -810,52 +827,7 @@ impl Store {
         bytes: &[u8],
         now: u64,
     ) -> Result<ImportManifest, Error> {
-        if bytes.is_empty() || bytes.len() > CHUNK || !offset.is_multiple_of(CHUNK as u64) {
-            return Err(Error::new(
-                "INVALID_ARGUMENT",
-                "require a nonempty chunk of at most 64 KiB at an aligned offset",
-            ));
-        }
-        let writer = self.lock()?;
-        let mut manifest: ImportManifest = writer.get(id)?;
-        manifest.require_live(now)?;
-        if offset >= manifest.byte_length
-            || bytes.len() as u64 != (manifest.byte_length - offset).min(CHUNK as u64)
-        {
-            return Err(Error::new(
-                "INVALID_ARGUMENT",
-                "chunk must match its declared complete-input range",
-            ));
-        }
-        if offset < manifest.received_bytes {
-            if writer.import_chunk(&manifest, offset)? != bytes {
-                return Err(Error::new(
-                    "CONFLICT",
-                    "committed import offset contains different bytes",
-                ));
-            }
-            return Ok(manifest);
-        }
-        if offset != manifest.received_bytes || manifest.sealed {
-            return Err(Error::new(
-                "CONFLICT",
-                "append must follow the committed offset of an unsealed import",
-            ));
-        }
-        let mut encoded = Vec::with_capacity(32 + bytes.len());
-        encoded.extend_from_slice(blake3::hash(bytes).as_bytes());
-        encoded.extend_from_slice(bytes);
-        let cf = writer
-            .db
-            .cf_handle("payload")
-            .ok_or_else(|| Error::new("STORAGE_FAILURE", "payload family missing"))?;
-        let mut batch = WriteBatch::default();
-        batch.put_cf(cf, chunk_key(id, offset), encoded);
-        manifest.received_bytes += bytes.len() as u64;
-        put(&mut batch, id, &manifest);
-        writer.admit_import_batch(&batch)?;
-        writer.commit(batch)?;
-        Ok(manifest)
+        self.import_operation(id, now)?.append(offset, bytes)
     }
 
     /// Read one checked staging chunk for recovery/publication, never as evidence.
@@ -904,135 +876,19 @@ impl Store {
     /// Verify every committed chunk and the complete digest with native bounded
     /// streaming BLAKE3. Sealing is not artifact publication or deletion authority.
     pub fn import_seal(&self, id: &str, now: u64) -> Result<ImportManifest, Error> {
-        let writer = self.lock()?;
-        let mut manifest: ImportManifest = writer.get(id)?;
-        manifest.require_live(now)?;
-        if manifest.received_bytes != manifest.byte_length {
-            return Err(Error::new("CONFLICT", "cannot seal an incomplete import"));
-        }
-        let mut hash = blake3::Hasher::new();
-        for chunk in 0..manifest.chunk_count() {
-            hash.update(&writer.import_chunk(&manifest, chunk * CHUNK as u64)?);
-        }
-        if format!("blake3:{}", hex::encode(hash.finalize().as_bytes())) != manifest.payload_id {
-            return Err(Error::new(
-                "CONFLICT",
-                "complete staged digest differs from declared payload; cancel and correct the input",
-            ));
-        }
-        if !manifest.sealed {
-            manifest.sealed = true;
-            let mut batch = WriteBatch::default();
-            put(&mut batch, id, &manifest);
-            writer.admit_import_batch(&batch)?;
-            writer.commit(batch)?;
-        }
-        Ok(manifest)
+        self.import_operation(id, now)?.seal()
     }
 
     /// End a staging lease durably. Physical cleanup is bounded and resumable.
     pub fn import_cancel(&self, id: &str, now: u64) -> Result<(), Error> {
-        let writer = self.lock()?;
-        if super::publication::published(&writer, id, now)?.is_some() {
-            return Err(Error::new(
-                "CONFLICT",
-                "published evidence cannot be canceled as staging",
-            ));
-        }
-        let mut manifest: ImportManifest = writer.get(id)?;
-        if manifest.consumption {
-            return Err(Error::new(
-                "CONFLICT",
-                "consumption staging owns a claimed source; reconcile its journal instead of canceling its recovery state",
-            ));
-        }
-        if manifest.published_artifact.is_some() {
-            return Err(Error::new(
-                "CONFLICT",
-                "published evidence cannot be canceled as staging",
-            ));
-        }
-        manifest.expires_at = manifest.expires_at.min(now);
-        let mut batch = WriteBatch::default();
-        put(&mut batch, id, &manifest);
-        writer.commit(batch)?;
-        drop(writer);
-        // The lease has ended: the journal is reclaimable now, so tell the reclamation duty.
-        self.wake_import_reclaim();
-        Ok(())
+        self.import_operation(id, now)?.cancel()
     }
 
     /// Durably prepare exact record spans with bounded memory. Repeated or
     /// interrupted attempts rebuild deterministic private pages, never occurrences.
     /// This is preparation for publication, not an acceptance/deletion receipt.
     pub fn import_prepare_layout(&self, id: &str, now: u64) -> Result<ImportManifest, Error> {
-        let writer = self.lock()?;
-        let mut manifest: ImportManifest = writer.get(id)?;
-        manifest.require_live(now)?;
-        if !manifest.sealed {
-            return Err(Error::new(
-                "CONFLICT",
-                "seal all raw bytes before preparing their record layout",
-            ));
-        }
-        if manifest.layout_complete {
-            return Ok(manifest);
-        }
-        let split = writer.import_ledger.raw_split();
-        let mut layout = Layout {
-            writer: &writer,
-            rows: Vec::with_capacity(IMPORT_LAYOUT_PAGE_RECORDS),
-            next_index: 0,
-            record_start: 0,
-            record_hash: blake3::Hasher::new(),
-            pending: None,
-            split,
-            piece: split - crate::projection::RECORD_BYTES,
-            chunks: 0,
-        };
-        let mut input_hash = blake3::Hasher::new();
-        let count = manifest.chunk_count().max(1);
-        for chunk in 0..count {
-            let bytes = if manifest.byte_length == 0 {
-                Vec::new()
-            } else {
-                writer.import_chunk(&manifest, chunk * CHUNK as u64)?
-            };
-            input_hash.update(&bytes);
-            let base = chunk * CHUNK as u64;
-            let mut cursor = 0;
-            for end in record_ends(&manifest.format, &bytes, chunk + 1 == count) {
-                layout.feed(&mut manifest, base + cursor as u64, &bytes[cursor..end])?;
-                layout.finish_record(&mut manifest, base + end as u64)?;
-                cursor = end;
-            }
-            layout.feed(&mut manifest, base + cursor as u64, &bytes[cursor..])?;
-        }
-        let Layout {
-            rows,
-            next_index,
-            record_start,
-            chunks,
-            ..
-        } = layout;
-        if next_index < manifest.layout_records
-            || record_start != manifest.byte_length
-            || format!("blake3:{}", hex::encode(input_hash.finalize().as_bytes()))
-                != manifest.payload_id
-        {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "prepared record layout does not match the complete sealed input",
-            ));
-        }
-        // Refuse a many-record artifact here, before publication work, rather than
-        // only when it is published; the publish-time check remains for layouts that
-        // completed earlier.
-        let records = usize::try_from(next_index)
-            .map_err(|_| Error::new("RESOURCE_LIMIT", "import layout record count overflow"))?;
-        writer.require_retirable(chunks, records)?;
-        writer.commit_layout_page(&mut manifest, &rows, true)?;
-        Ok(manifest)
+        self.import_operation(id, now)?.prepare_layout()
     }
 
     /// Retrieve one checked, complete layout page at an aligned record ordinal.
@@ -1189,6 +1045,227 @@ impl Store {
             self.wake_import_reclaim();
         }
         Ok(removed)
+    }
+}
+
+/// An import operation under an exclusive store writer lock.
+pub struct ImportOperation<'a> {
+    pub(super) store: &'a Store,
+    pub(super) writer: std::sync::MutexGuard<'a, Writer>,
+    pub(super) id: &'a str,
+    pub(super) now: u64,
+}
+
+impl ImportOperation<'_> {
+    /// Get under the admitted writer lock.
+    pub fn get(self) -> Result<ImportManifest, Error> {
+        let Self {
+            writer, id, now, ..
+        } = self;
+        if !id.starts_with("import:") {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "require an import staging ID",
+            ));
+        }
+        if let Some((manifest, _)) = super::publication::published(&writer, id, now)? {
+            return Ok(manifest);
+        }
+        let manifest: ImportManifest = writer.get(id)?;
+        manifest.require_live(now)?;
+        Ok(manifest)
+    }
+
+    /// Append under the admitted writer lock.
+    pub fn append(self, offset: u64, bytes: &[u8]) -> Result<ImportManifest, Error> {
+        let Self {
+            writer, id, now, ..
+        } = self;
+        if bytes.is_empty() || bytes.len() > CHUNK || !offset.is_multiple_of(CHUNK as u64) {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "require a nonempty chunk of at most 64 KiB at an aligned offset",
+            ));
+        }
+        let mut manifest: ImportManifest = writer.get(id)?;
+        manifest.require_live(now)?;
+        if offset >= manifest.byte_length
+            || bytes.len() as u64 != (manifest.byte_length - offset).min(CHUNK as u64)
+        {
+            return Err(Error::new(
+                "INVALID_ARGUMENT",
+                "chunk must match its declared complete-input range",
+            ));
+        }
+        if offset < manifest.received_bytes {
+            if writer.import_chunk(&manifest, offset)? != bytes {
+                return Err(Error::new(
+                    "CONFLICT",
+                    "committed import offset contains different bytes",
+                ));
+            }
+            return Ok(manifest);
+        }
+        if offset != manifest.received_bytes || manifest.sealed {
+            return Err(Error::new(
+                "CONFLICT",
+                "append must follow the committed offset of an unsealed import",
+            ));
+        }
+        let mut encoded = Vec::with_capacity(32 + bytes.len());
+        encoded.extend_from_slice(blake3::hash(bytes).as_bytes());
+        encoded.extend_from_slice(bytes);
+        let cf = writer
+            .db
+            .cf_handle("payload")
+            .ok_or_else(|| Error::new("STORAGE_FAILURE", "payload family missing"))?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(cf, chunk_key(id, offset), encoded);
+        manifest.received_bytes += bytes.len() as u64;
+        put(&mut batch, id, &manifest);
+        writer.admit_import_batch(&batch)?;
+        writer.commit(batch)?;
+        Ok(manifest)
+    }
+
+    /// Seal under the admitted writer lock.
+    pub fn seal(self) -> Result<ImportManifest, Error> {
+        let Self {
+            writer, id, now, ..
+        } = self;
+        let mut manifest: ImportManifest = writer.get(id)?;
+        manifest.require_live(now)?;
+        if manifest.received_bytes != manifest.byte_length {
+            return Err(Error::new("CONFLICT", "cannot seal an incomplete import"));
+        }
+        let mut hash = blake3::Hasher::new();
+        for chunk in 0..manifest.chunk_count() {
+            hash.update(&writer.import_chunk(&manifest, chunk * CHUNK as u64)?);
+        }
+        if format!("blake3:{}", hex::encode(hash.finalize().as_bytes())) != manifest.payload_id {
+            return Err(Error::new(
+                "CONFLICT",
+                "complete staged digest differs from declared payload; cancel and correct the input",
+            ));
+        }
+        if !manifest.sealed {
+            manifest.sealed = true;
+            let mut batch = WriteBatch::default();
+            put(&mut batch, id, &manifest);
+            writer.admit_import_batch(&batch)?;
+            writer.commit(batch)?;
+        }
+        Ok(manifest)
+    }
+
+    /// Cancel under the admitted writer lock.
+    pub fn cancel(self) -> Result<(), Error> {
+        let Self {
+            store,
+            writer,
+            id,
+            now,
+        } = self;
+        if super::publication::published(&writer, id, now)?.is_some() {
+            return Err(Error::new(
+                "CONFLICT",
+                "published evidence cannot be canceled as staging",
+            ));
+        }
+        let mut manifest: ImportManifest = writer.get(id)?;
+        if manifest.consumption {
+            return Err(Error::new(
+                "CONFLICT",
+                "consumption staging owns a claimed source; reconcile its journal instead of canceling its recovery state",
+            ));
+        }
+        if manifest.published_artifact.is_some() {
+            return Err(Error::new(
+                "CONFLICT",
+                "published evidence cannot be canceled as staging",
+            ));
+        }
+        manifest.expires_at = manifest.expires_at.min(now);
+        let mut batch = WriteBatch::default();
+        put(&mut batch, id, &manifest);
+        writer.commit(batch)?;
+        drop(writer);
+        // The lease has ended: the journal is reclaimable now, so tell the reclamation duty.
+        store.wake_import_reclaim();
+        Ok(())
+    }
+
+    /// Prepare layout under the admitted writer lock.
+    pub fn prepare_layout(self) -> Result<ImportManifest, Error> {
+        let Self {
+            writer, id, now, ..
+        } = self;
+        let mut manifest: ImportManifest = writer.get(id)?;
+        manifest.require_live(now)?;
+        if !manifest.sealed {
+            return Err(Error::new(
+                "CONFLICT",
+                "seal all raw bytes before preparing their record layout",
+            ));
+        }
+        if manifest.layout_complete {
+            return Ok(manifest);
+        }
+        let split = writer.import_ledger.raw_split();
+        let mut layout = Layout {
+            writer: &writer,
+            rows: Vec::with_capacity(IMPORT_LAYOUT_PAGE_RECORDS),
+            next_index: 0,
+            record_start: 0,
+            record_hash: blake3::Hasher::new(),
+            pending: None,
+            split,
+            piece: split - crate::projection::RECORD_BYTES,
+            chunks: 0,
+        };
+        let mut input_hash = blake3::Hasher::new();
+        let count = manifest.chunk_count().max(1);
+        for chunk in 0..count {
+            let bytes = if manifest.byte_length == 0 {
+                Vec::new()
+            } else {
+                writer.import_chunk(&manifest, chunk * CHUNK as u64)?
+            };
+            input_hash.update(&bytes);
+            let base = chunk * CHUNK as u64;
+            let mut cursor = 0;
+            for end in record_ends(&manifest.format, &bytes, chunk + 1 == count) {
+                layout.feed(&mut manifest, base + cursor as u64, &bytes[cursor..end])?;
+                layout.finish_record(&mut manifest, base + end as u64)?;
+                cursor = end;
+            }
+            layout.feed(&mut manifest, base + cursor as u64, &bytes[cursor..])?;
+        }
+        let Layout {
+            rows,
+            next_index,
+            record_start,
+            chunks,
+            ..
+        } = layout;
+        if next_index < manifest.layout_records
+            || record_start != manifest.byte_length
+            || format!("blake3:{}", hex::encode(input_hash.finalize().as_bytes()))
+                != manifest.payload_id
+        {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "prepared record layout does not match the complete sealed input",
+            ));
+        }
+        // Refuse a many-record artifact here, before publication work, rather than
+        // only when it is published; the publish-time check remains for layouts that
+        // completed earlier.
+        let records = usize::try_from(next_index)
+            .map_err(|_| Error::new("RESOURCE_LIMIT", "import layout record count overflow"))?;
+        writer.require_retirable(chunks, records)?;
+        writer.commit_layout_page(&mut manifest, &rows, true)?;
+        Ok(manifest)
     }
 }
 

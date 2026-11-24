@@ -48,27 +48,14 @@ where
 /// Who reached the daemon, which selects the bootstrap capability.
 pub enum Access {
     /// The private Unix socket: the complete typed service, or its query-only gate. Its
-    /// admin operations record this caller (see [`local_caller`]).
-    Local(String),
+    /// admin operations record this kernel-reported caller.
+    Local(tokio::net::unix::UCred),
     /// Public TCP: the anonymous gate, upgraded by CHAP with this secret; the authenticated
     /// session records this peer address as its administrator.
     PublicTcp(sparrow_client::TcpSecret, String),
     /// The group-accessible ingest socket: producer operations only, each recording this
     /// kernel-reported caller in the provenance of the evidence it creates.
     IngestSocket(sparrow_core::PeerCredential),
-}
-
-/// The private socket's caller as the kernel reports it, which admin operations record. The
-/// socket is mode 0600, so only the daemon's own account reaches it; the process is named.
-pub fn local_caller(stream: &tokio::net::UnixStream) -> std::io::Result<String> {
-    let credential = stream.peer_cred()?;
-    Ok(format!(
-        "unix uid={} pid={}",
-        credential.uid(),
-        credential
-            .pid()
-            .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string())
-    ))
 }
 
 /// Every Unix or TCP connection closes this long after admission.
@@ -85,10 +72,18 @@ where
         let connection = connection;
         let (rpc, _lifetime) = rpc.for_connection();
         let client = match access {
-            Access::Local(caller) => rpc.with_admin(caller).into_client(),
+            Access::Local(credential) => {
+                let uid = credential.uid();
+                let pid = credential
+                    .pid()
+                    .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
+                rpc.with_producer(crate::source_binding::Caller::PrivateUnix { uid })
+                    .with_admin(format!("unix uid={uid} pid={pid}"))
+                    .into_client()
+            }
             Access::PublicTcp(secret, peer) => {
                 capnp_rpc::new_client(crate::ingest_gate::IngestGate::new(
-                    rpc,
+                    rpc.with_producer(crate::source_binding::Caller::AnonymousTcp {}),
                     crate::tcp_gate::AnonymousTcp::new(secret, peer),
                 ))
             }

@@ -206,6 +206,7 @@ impl Session {
             self.operations.clone(),
             config.max_pin_members,
         )
+        .with_source_bindings(config.source_bindings.clone())
         .with_archive_status(archive_status.clone())
         .with_admission(self.admission.clone())
         .with_connections(connections.clone())

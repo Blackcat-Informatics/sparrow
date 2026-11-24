@@ -1,5 +1,5 @@
 VERSION "1.2"
-BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/99cd62d4e53fd90901f7cb29205f3e55c3ed33dfe0499d4abdff4a4ef9894f12>
+BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/724ee8efe6260c957ed6f7a4a6c722763cccc73d46b78287553d50dcd420bfa0>
 <> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#Ledger> .
 <> <https://blackcatinformatics.ca/raf/report/1#distinct> <#distinct/0> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/active-file-checkpoint-attachment> .
@@ -203,6 +203,7 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/99cd62d4e53fd9
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/producer-pending-batch> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/producer-queue-admission> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/producer-sequence-window-publication> .
+<> <https://blackcatinformatics.ca/raf/report/1#job> <#job/producer-source-admission> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/producer-span-charge> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/producer-span-identity> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/producer-spool> .
@@ -2515,6 +2516,17 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/99cd62d4e53fd9
 <#job/producer-sequence-window-publication> <https://blackcatinformatics.ca/raf/report/1#summary> "One bounded checkpoint owner observes producer positions and recent gaps; the shared ingestion pipeline commits registry, occurrences and immutable retry provenance together." .
 <#job/producer-sequence-window-publication> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-core/tests/storage.rs" .
 <#job/producer-sequence-window-publication> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/tests/rpc.rs" .
+<#job/producer-source-admission> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
+<#job/producer-source-admission> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+<#job/producer-source-admission> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_server::rpc::Rpc::accept_events" .
+<#job/producer-source-admission> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_server::rpc::Rpc::import_begin" .
+<#job/producer-source-admission> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_server::rpc::Rpc::import_work" .
+<#job/producer-source-admission> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_server::rpc::Rpc::ingest" .
+<#job/producer-source-admission> <https://blackcatinformatics.ca/raf/report/1#homeSymbol> "sparrow_server::source_binding::SourceBindings::admit" .
+<#job/producer-source-admission> <https://blackcatinformatics.ca/raf/report/1#jobId> "producer-source-admission" .
+<#job/producer-source-admission> <https://blackcatinformatics.ca/raf/report/1#specRef> "docs/interfaces.md: Producer source admission." .
+<#job/producer-source-admission> <https://blackcatinformatics.ca/raf/report/1#summary> "Authorize source writes through one policy and check a staged import under its operation lock." .
+<#job/producer-source-admission> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/tests/rpc/source_binding.rs" .
 <#job/producer-span-charge> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
 <#job/producer-span-charge> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
 <#job/producer-span-charge> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_client::events::EventSpan::admission_bytes" .
