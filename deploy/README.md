@@ -315,6 +315,9 @@ the new pair (the old pair becomes `.previous`), starts, and fails unless the
 store identity is unchanged. `sudo deploy/restart.sh --rev REV` selects another
 kept pair; `sudo deploy/restart.sh --rollback` swaps back to the previous pair.
 
+`start.sh` and `restart.sh` require the unit to be active, inactive, or failed
+before installing images. Wait for a transitioning unit to settle before retrying.
+
 A newer image may upgrade the store's format, and an older image then refuses
 to open it (the store fence). The scripts enforce this by the schema number in the image names
 (`sparrowd-schemaN-REV`), not by reading the store: `start.sh` and `restart.sh`
