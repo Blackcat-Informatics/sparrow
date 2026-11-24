@@ -127,7 +127,7 @@ pub use replay::{ReplayReceipt, replay_quarantine};
 pub use sparrow_capnp::{Durability, EventKind, EventLevel, Format};
 
 /// Exact schema version used by query and administrative clients.
-pub const SCHEMA_VERSION: u32 = 73;
+pub const SCHEMA_VERSION: u32 = 74;
 /// Ingestion and durability profile advertised across compatible schema versions.
 pub const PRODUCER_PROFILE: &str = "sparrow-producer/1";
 /// Fixed upload unit admitted by the schema's private staging contract.

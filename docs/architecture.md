@@ -414,7 +414,7 @@ admitting buffered writes when the durability queue cannot remain bounded.
 Configured SDKs acknowledge local disk acceptance independently of remote
 publication. When a producer first uses conditional sealed ingestion, the
 store atomically lifts its raw writer identity from the corresponding
-`sparrow.store/352` through `406` family to `407` through `461` and initializes
+`sparrow.store/462` through `516` family to `517` through `571` and initializes
 `producer:sealed-receipt-gc`. The eight-byte watermark is the greatest
 expiration time of any subsequently retired inline ingestion receipt.
 Retirement advances it in the same durable write as deletion. A missing
@@ -749,10 +749,11 @@ Source and artifact discovery read three derived catalog row families instead of
 the record catalog:
 
 - `source-summary:<source key>` holds a source's label and its exact
-  `retained_records`, `complete_artifacts` and `fragment_parents` counts;
-- `artifact-retained:<artifact id>` holds an artifact's retained record count,
-  marked full, or partial for a parent whose entry was deleted before the
-  seeding migration reached it, while the artifact is listable;
+  `retained_records`, `complete_artifacts`, `fragment_parents` and
+  `retained_payload_bytes` totals;
+- `artifact-retained:<artifact id>` holds an artifact's retained record count
+  and readable record bytes while it is listable. A partial row belongs to a
+  parent whose entry was deleted before the seeding migration reached it.
 - `source-artifact:<source key>:<receipt>:<artifact id>` is the per-source
   artifact index, ordered by receipt time within each source.
 

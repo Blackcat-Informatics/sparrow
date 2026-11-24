@@ -70,11 +70,16 @@ For an explicit drain, run the `sparrow-client` example
 `producer ENDPOINT SOURCE lossless SPOOL_DIR 0 1 drain` after the previous
 writer releases the directory. Inspect its final JSON progress and exit code.
 
-The first conditional sealed request eligible for new publication enables the receipt-retirement
-watermark and its raw writer format. Use a daemon that supports store writer
-families 407 through 461 when reopening an upgraded store. To roll back to an
-older binary, restore a compatible pre-upgrade store snapshot. See
-[publication and durability](architecture.md#61-publication-and-durability).
+Schema 74 rebuilds the derived source summaries in resumable pages. Opening
+a store selects writer family 462 through 516 without a sealed receipt
+watermark, or 517 through 571 with one. The first eligible sealed request
+activates the watermark and advances the writer family within those ranges.
+During the rebuild, source listings combine rebuilt rows with totals from the
+remaining catalog entries. See [publication and durability](architecture.md#61-publication-and-durability).
+
+The image schema guard refuses a previous daemon with a lower schema before
+stopping the service. To use an older daemon after the format upgrade, restore
+a compatible pre-upgrade store snapshot.
 
 Upgrade the CLI with the daemon when the wire schema changes. Producers that
 support `sparrow-producer/1` can connect across compatible schema versions.

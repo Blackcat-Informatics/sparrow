@@ -191,7 +191,8 @@ pub(super) fn fence(db: &DB) -> Result<(), Error> {
     if !writer_format::has_owner_graphs(&format) {
         format = rdf_index::fence_owner_graphs(db, &format, &mut batch)?.to_vec();
     }
-    if !writer_format::has_source_summary(&format) {
+    let had_source_summary = writer_format::has_source_summary(&format);
+    if !had_source_summary {
         format = source_summary::fence(db, &format, &mut batch)?.to_vec();
     }
     source_context::fence(db, &mut batch)?;
@@ -203,7 +204,14 @@ pub(super) fn fence(db: &DB) -> Result<(), Error> {
     }
     // After the counters, whose zero rows it extends with its own.
     if !writer_format::has_payload_index(&format) {
-        payload_index::fence(db, &format, &mut batch)?;
+        format = payload_index::fence(db, &format, &mut batch)?.to_vec();
+    }
+    if !writer_format::has_source_bytes(&format) {
+        if had_source_summary {
+            source_summary::reset(db, &mut batch)?;
+            store_counters::reset(&mut batch, Counter::SourceSummaryDone);
+        }
+        batch.put("store_format", writer_format::enable_source_bytes(&format)?);
     }
     if !batch.is_empty() {
         catalog_upgrade::commit(db, batch)?;
