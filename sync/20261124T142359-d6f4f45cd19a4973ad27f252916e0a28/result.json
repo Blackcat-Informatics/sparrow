@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/23-make-test-tcp-ports-collision-free",
+  "branch": "paudley/23-make-test-tcp-ports-collision-free",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "a5583506eeb0e7514dc42383f971be301286a6d1",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/23-make-test-tcp-ports-collision-free/.stage/make-test-tcp-ports-collision-free/sync/20261124T142359-d6f4f45cd19a4973ad27f252916e0a28",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "3854cc995663e29b406a3605ce4a21578270c792",
+  "merge_bases": [
+    "a5583506eeb0e7514dc42383f971be301286a6d1"
+  ],
+  "commit": "3854cc995663e29b406a3605ce4a21578270c792"
+}

@@ -1,0 +1,80 @@
+{
+  "issue": 23,
+  "pr_number": 548,
+  "branch": "paudley/23-make-test-tcp-ports-collision-free",
+  "stage_dir": "/home/paudley/Active/sparrow/.worktrees/23-make-test-tcp-ports-collision-free/.stage/make-test-tcp-ports-collision-free",
+  "observed_at": "2026-11-24T14:34:30.895613+00:00",
+  "completed": [
+    "pr",
+    "checks",
+    "reviews"
+  ],
+  "blocked": [],
+  "unavailable": [],
+  "next_actions": [],
+  "artifacts": {
+    "ci_failures": "/home/paudley/Active/sparrow/.worktrees/23-make-test-tcp-ports-collision-free/.stage/make-test-tcp-ports-collision-free/ci-failures.md",
+    "reviews": "/home/paudley/Active/sparrow/.worktrees/23-make-test-tcp-ports-collision-free/.stage/make-test-tcp-ports-collision-free/pr-comments.md",
+    "status": "/home/paudley/Active/sparrow/.worktrees/23-make-test-tcp-ports-collision-free/.stage/make-test-tcp-ports-collision-free/status.json",
+    "checks": "/home/paudley/Active/sparrow/.worktrees/23-make-test-tcp-ports-collision-free/.stage/make-test-tcp-ports-collision-free/pr-checks.txt",
+    "review_evidence": "/home/paudley/Active/sparrow/.worktrees/23-make-test-tcp-ports-collision-free/.stage/make-test-tcp-ports-collision-free/review-evidence.json"
+  },
+  "limits": [
+    "Mechanical evidence only; artifact presence does not establish a passing review or acceptance verdict."
+  ],
+  "pr": {
+    "number": 548,
+    "state": "OPEN",
+    "isDraft": false,
+    "title": "Lease RPC fixture ports across test processes",
+    "url": "http://lillith:7555/fleet/sparrow/pulls/548",
+    "baseRefName": "main",
+    "baseRefOid": "3854cc995663e29b406a3605ce4a21578270c792",
+    "headRefName": "paudley/23-make-test-tcp-ports-collision-free",
+    "isCrossRepository": false,
+    "headRefOid": "ec06abe8fe80f196c0e61cf8b1b4dab227827e10",
+    "mergedAt": "",
+    "mergeCommit": {
+      "oid": ""
+    },
+    "nwo": "fleet/sparrow"
+  },
+  "checks": {
+    "state": "pass",
+    "checks": [
+      {
+        "name": "CI / make check (pull_request)",
+        "state": "skipped",
+        "link": "/fleet/sparrow/actions/runs/591/jobs/0"
+      }
+    ]
+  },
+  "reviews": {
+    "head": null,
+    "coverage": {
+      "comments": "complete",
+      "reviews": "complete",
+      "inline_comments": "complete",
+      "threads": "Forgejo exposes per-comment resolvers, not GitHub thread identities"
+    },
+    "items": 0,
+    "change_token": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "local": {
+    "head": "ec06abe8fe80f196c0e61cf8b1b4dab227827e10",
+    "branch": "paudley/23-make-test-tcp-ports-collision-free",
+    "dirty_paths": []
+  },
+  "ci_logs": {
+    "pr": 548,
+    "jobs": [],
+    "ok": true,
+    "summary": "# PR #548 failed CI logs\n\nNo failed checks in this snapshot.\n"
+  },
+  "review_debt": [],
+  "unresolved_threads": [],
+  "validation": {
+    "results": [],
+    "limits": "Scopes are caller-selected. Unchanged scope is reusable evidence, not a gate waiver; environment capture is not exhaustive."
+  }
+}
