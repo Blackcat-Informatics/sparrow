@@ -3601,6 +3601,16 @@ impl Store {
         Ok(())
     }
 
+    /// Dev-only: signal once a caller has entered an artifact listing build poll.
+    #[cfg(feature = "test-support")]
+    pub fn notify_artifact_listing_poll_for_tests(
+        &self,
+        started: impl FnOnce() + Send + 'static,
+    ) -> Result<(), Error> {
+        self.artifact_builds()?.notify_poll_for_tests(started);
+        Ok(())
+    }
+
     /// Dev-only: source then artifact listing builds, each as registered builds, threads
     /// still running and builds ever started.
     #[cfg(feature = "test-support")]

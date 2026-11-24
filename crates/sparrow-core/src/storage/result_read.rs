@@ -79,8 +79,19 @@ impl Store {
         Ok(false)
     }
 
-    /// Resume the cursor's captured operation, selector and limits without renewing its lease.
+    /// Resume the cursor's operation with its original selector and limits.
     pub fn result_next(&self, store_id: &str, cursor: &str, now: u64) -> Result<ResultPage, Error> {
+        self.result_next_cancellable(store_id, cursor, now, &crate::QueryCancellation::default())
+    }
+
+    /// Resume the cursor and apply caller cancellation to live page and build work.
+    pub fn result_next_cancellable(
+        &self,
+        store_id: &str,
+        cursor: &str,
+        now: u64,
+        cancellation: &crate::QueryCancellation,
+    ) -> Result<ResultPage, Error> {
         if self.lock()?.id != store_id {
             return Err(Error::new(
                 "STORE_MISMATCH",
@@ -88,15 +99,15 @@ impl Store {
             ));
         }
         let cursor = catalog_lease::Cursor::parse(cursor)?;
-        let cancellation = crate::QueryCancellation::default();
+        cancellation.checkpoint()?;
         if super::listing_build::is_build(&cursor, super::artifact_read::BUILD) {
             return self
-                .artifact_build_poll(&cursor, None, now, &cancellation)
+                .artifact_build_poll(&cursor, None, now, cancellation)
                 .map(ResultPage::Artifacts);
         }
         if super::listing_build::is_build(&cursor, super::source_read::BUILD) {
             return self
-                .source_build_poll(&cursor, None, now, &cancellation)
+                .source_build_poll(&cursor, None, now, cancellation)
                 .map(ResultPage::Sources);
         }
         {
@@ -134,14 +145,14 @@ impl Store {
                 .lock()
                 .map_err(|_| Error::new("STORAGE_FAILURE", "artifact read registry poisoned"))?;
             reads.purge(now);
-            match self.artifact_next(&mut reads, &cursor, None, now, &cancellation)? {
+            match self.artifact_next(&mut reads, &cursor, None, now, cancellation)? {
                 Some(super::artifact_read::Next::Page(page)) => {
                     return Ok(ResultPage::Artifacts(page));
                 }
                 Some(super::artifact_read::Next::Window(pending)) => {
                     drop(reads);
                     return self
-                        .artifact_window(pending, now, &cancellation)
+                        .artifact_window(pending, now, cancellation)
                         .map(ResultPage::Artifacts);
                 }
                 None => {}
