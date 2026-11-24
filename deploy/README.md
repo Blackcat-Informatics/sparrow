@@ -70,6 +70,13 @@ still has copy-on-write files, using `deploy/copy-on-write.sh convert`, and keep
 beside it as `store.cow-STAMP`; remove that copy once the converted store has been checked. The store gives up
 btrfs checksums and compression; its own digests and compression cover both.
 
+Conversion requires GNU `mv` with `--exchange` and `--no-copy` first in
+`PATH`. Restart checks for an interrupted conversion, available space, and
+the required `mv` options before stopping the unit. The converter repeats those checks and
+checks for open files after the stop. It exchanges the verified copy into
+the canonical path before retaining the original.
+[Interrupted conversion](RECOVERY.md#interrupted-copy-on-write-conversion)
+
 | Path | Owner, mode | Contents |
 | --- | --- | --- |
 | `/usr/local/libexec/sparrow/sparrowd-schemaN-REV` | root, 0755 | Daemon images, one per revision, never overwritten: `N` is the client schema version, `REV` the short Sparrow commit. |

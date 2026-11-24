@@ -45,6 +45,9 @@ else
     read -r daemon cli <<<"$images"
 fi
 require_settled
+data=$(config_value data_dir)
+data=$(realpath -e -- "$data") || die "configured store directory does not exist"
+check_store_conversion "$data" >/dev/null || exit 1
 # The checks run on the kept images before anything is installed, so a refusal changes nothing.
 verify_image "$daemon" 'usage: sparrowd --config'
 verify_image "$cli" 'usage: sparrow'
@@ -62,7 +65,6 @@ if unit_active; then
     store=$(status_json | status_field store_id)
     [[ $(readlink -- "$LIBEXEC/sparrowd") != "${daemon##*/}" ]] || note "already on ${daemon##*/}; restarting it"
 fi
-data=$(config_value data_dir)
 drain_stop
 # While the store is closed, rewrite it with copy-on-write off if any file still has it (lib.sh).
 convert_store_no_cow "$data"
