@@ -1,0 +1,24 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 613ad9e550fb253a0dc3247477e2334af7cc2da6
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 540
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/540
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 80bbc6c7cc8589f53fa7b134984b1726520bd95c
+GhpRsq-Head-Ref: paudley/85-refuse-restart-sh-on-a-unit-in
+GhpRsq-Head-OID: 613ad9e550fb253a0dc3247477e2334af7cc2da6
+GhpRsq-Result-Tree: 94f3643f143e36bd664578edfaa6de8b5f41fb59
+GhpRsq-Result-Commit: 6f2b40dcca30438d25041af3030df52435d4f06c
+GhpRsq-Parent-Hashes: 613ad9e550fb253a0dc3247477e2334af7cc2da6
+GhpRsq-Squash-Notes-SHA256: 94d988d8c89425b7b1122155baf481880a17241061d75e2580718e37e704dc18
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Tree: ac9364fe4fd922e347cde6676546ccf84aef2935
+GhpRsq-Stage-Commit: 3fc3fface79b919724cf7f229596cc9f8d502634
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/3fc3fface79b919724cf7f229596cc9f8d502634
+GhpRsq-Stage-Ref: refs/ghprsq/pr/540/stage
+GhpRsq-Stage-Files: 15
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/3fc3fface79b919724cf7f229596cc9f8d502634
