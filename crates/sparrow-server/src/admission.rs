@@ -568,7 +568,7 @@ impl Admitted {
 /// The accept loop takes a [`Slot`] first and accepts second, so a peer over the ceiling waits
 /// in the kernel's listen backlog and is served when a slot frees, instead of being accepted
 /// and reset. A slot frees when its connection ends: the peer closes, the RPC fails, the
-/// 60-second lease expires, or the daemon stops.
+/// transport lease expires, or the daemon stops.
 pub struct Ceiling {
     name: &'static str,
     max: usize,
@@ -711,7 +711,7 @@ pub(crate) fn encode_wait(
 }
 
 impl Admission {
-    /// Write the admission section of `status`, with the shared RPC ceiling when there is one.
+    /// Write operation waits and the private Unix ceiling in `status`.
     pub(crate) fn encode(
         &self,
         mut out: crate::sparrow_capnp::admission_status::Builder<'_>,

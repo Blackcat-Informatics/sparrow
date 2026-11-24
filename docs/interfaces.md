@@ -576,10 +576,10 @@ non-ready phase, and, at most once a minute, the passes that made no progress.
 
 Below `min_free_bytes` the daemon keeps working; only writes wait.
 
-- Accepting. The accept loops of the private socket, the ingest socket, public TCP and
-  syslog TCP no longer stop. Connection slots are still taken before accept (the
-  ceiling, #246) and the 60-second lease is unchanged, so the floor adds no new
-  bound. A syslog TCP frame refused for the floor is held unread past (#243) whether
+- Accepting. The private socket, ingest socket, public TCP and syslog TCP keep
+  accepting. Unix listeners require a connection slot before accepting, and the
+  RPC transport deadlines apply during the pause. A syslog TCP frame refused
+  for the floor is held unread past (#243) whether
   or not its connection was accepted before or during the pause. Syslog UDP is held by
   its own hold (below): datagrams queue in the daemon up to `hold_bytes`, then in the
   kernel buffer. Consume watches keep discovering candidates while claims and
@@ -1840,8 +1840,8 @@ reader refuses because a migration is pending.
 #### Listing builds
 
 On the live store the pass costs the unmigrated part of the store, which can
-take longer than a caller's deadline (30 seconds for an MCP tool call, and the
-60-second connection lease for every RPC connection). So the first call
+take longer than a caller's deadline (30 seconds for an MCP tool call or the
+connection's idle deadline). The first call
 registers the capture's build and starts it at once on its own thread, which
 takes and holds its own snapshot; the writer lock is held only while a `sources`
 build reads its registries and takes that snapshot. Each call then waits for the
@@ -3463,12 +3463,32 @@ removal until resolved. Schema 39 provides explicit retained-generation
 completion as above. Schema 41 adds the separately admitted completed-tail
 handoff; ordinary consumption admission cannot supply that authority.
 
+### RPC connection admission and leases
+
+`max_rpc_connections` reserves connection slots for the private Unix socket.
+The group ingest socket uses `max_ingest_connections`. The daemon acquires
+each Unix slot before accepting, so extra peers wait in the listener backlog.
+Public TCP is admitted independently of both ceilings, including connections
+that authenticate after admission. The listeners share storage operation
+admission and process resources, including file descriptors.
+
+A public TCP connection has 10 seconds to send its first bytes. Unix
+connections have 60 seconds. Each positive read renews the 60-second idle
+lease. Every connection closes by 10 minutes after admission, even while
+traffic continues. An RPC with no further input can reach the idle deadline
+while a reply is pending. The transport closes the connection, and the
+operation keeps its normal durable retry contract.
+
+Discovery and status advertise the deadlines in `connectionLease`.
+Status reports the Unix ceiling under `admission.rpcConnections` and active
+public TCP connections and their idle and maximum-age closures under
+`admission.publicTcpConnections`.
+
 ### Public TCP and syslog packet interpretation
 
 `rpc_tcp_address` enables public Cap'n Proto TCP, as requested on 2026-10-08. It
 requires `rpc_tcp_secret_file`, and either setting without the other refuses
-startup. Both listeners share connection and operation ceilings and the
-60-second connection lease.
+startup. See [RPC connection admission and leases](#rpc-connection-admission-and-leases).
 
 A TCP connection bootstraps an anonymous `Sparrow` capability with the
 [producer operations](#producer-contract-sparrow-producer1) and the CHAP
@@ -3492,8 +3512,8 @@ strings), and in the metadata graphs. An import keeps the intake of the
 connection that ran `importBegin`; `importAppend` through `importPublish` from
 another uid return `PERMISSION_DENIED`, and an inline retry of a request
 committed by another caller returns `CONFLICT`. Its connections have their own
-ceiling, `max_ingest_connections` (1..256, default 16), and the same 60-second
-lease. The private socket records no caller identity. `status.ingestSocket`
+ceiling, `max_ingest_connections` (1..256, default 16), and use the Unix RPC
+connection deadlines. The private socket records no caller identity. `status.ingestSocket`
 reports the path, group, ceiling, active connections and refused connections,
 which now counts only a peer whose credentials the kernel cannot report; a peer
 over the ceiling waits (see Admission waits).
@@ -3541,29 +3561,28 @@ Three limits that used to refuse at once now wait, and every wait is counted.
   that deletes nothing signals nobody, and nothing retries on a clock. The wait also
   ends at shutdown, or at the bound, and then answers the same `RESOURCE_LIMIT`. It
   holds no permit while it waits.
-- Connection ceilings. The daemon takes a connection slot before it accepts, for the
-  private socket and public TCP (one shared ceiling) and for the ingest socket. A
-  peer over the ceiling waits in the kernel listen backlog and is served when a slot
-  frees; a slot frees when a connection ends, which includes its 60-second lease
-  expiring. The lease is unchanged, so a stalled peer holds its slot until then.
-  Accepting still stops at once on shutdown. The free-space floor no longer pauses
-  accepting (#257, see "The free-space pause"); the ceiling and the lease bound the
-  connections below it exactly as above it. A syslog TCP listener already holds its
-  arrival and reclaims the longest-idle connection, and is unchanged. The kernel does not report how many
-  peers wait in a backlog or overflow it, so a ceiling wait counts the times the
-  accept loop had to wait for a slot, not peers.
+- Connection ceilings. The private socket and ingest socket each acquire a
+  slot before accepting. A peer over its ceiling waits in the kernel listen
+  backlog until a connection ends and releases a slot. Public RPC TCP accepts
+  independently. [RPC connection admission and leases](#rpc-connection-admission-and-leases)
+  defines the transport deadlines. Shutdown stops accepting. A syslog TCP
+  listener holds a waiting arrival and reclaims the longest-idle connection.
+  A ceiling wait counts how often the accept loop waits for a slot. The kernel
+  backlog has no per-peer count in status.
 
-`status.admission` (added after `sourceTimeLoss`, no schema bump) reports
+`status.admission` reports
 `writerReserve`, `readerSlots`, `writerWaitLimitMs`, `writerPermitWait`,
 `readerRefusals`, `importSlotWait`, `importSlotWaitLimitMs` and `rpcConnections`
-(the shared ceiling: `maxConnections`, `activeConnections`, `ceilingWait`,
-`leaseExpiries`). Each wait has `waits` (acquisitions that had to wait), `waiting`
+(the private Unix `maxConnections`, `activeConnections`, `ceilingWait` and
+`leaseExpiries`). It also reports `publicTcpConnections`.
+Each wait has `waits` (acquisitions that had to wait), `waiting`
 (now), `longestWaitMs` (finished or running) and `timeouts`. `status.ingestSocket`
-gains `ceilingWait` and `leaseExpiries`. The CLI and MCP status show them as
+reports `ceilingWait` and `leaseExpiries`. The CLI and MCP status show them as
 `admission` and `ingest_socket`. The daemon journals a line when a wait episode
 begins, at most one a minute per kind, and a line when an announced episode (or any
 episode of a minute or more) ends, with the waits, timeouts and longest wait.
-Counters are process-lifetime evidence and reset on restart.
+`status.admission` counters cover the current serving session and reset on a
+restart or in-process store reopen.
 
 Shared-secret CHAP upgrades a connection. `authChallenge` returns a fresh 32-byte
 nonce. `authenticate(response)` consumes it and checks the BLAKE3 keyed hash of
@@ -4774,7 +4793,7 @@ a result. A governed query failure can emit its typed failed receipt on stdout
 and also exit nonzero; consumers must inspect the receipt and exit status.
 
 CLI `ingest` uploads over its own connection to the same endpoint. When that
-connection is lost, for example to the 60-second connection lease or a daemon
+connection is lost, for example to a transport deadline or a daemon
 restart, it reconnects, waiting up to 30 seconds for the daemon to accept
 connections again, and resumes the same request from its durable checkpoint for
 as long as each attempt advances the received bytes, seal, layout or
@@ -4797,8 +4816,8 @@ resumes it. Any other attempt that fails after its journal began cancels the jou
 over the same connection, so a refused import does not hold an import slot for the
 retry window. A cancellation answered `CONFLICT` retries the upload once: the publication committed, or the
 daemon's file watcher owns the staging and its journal stays intact. When the
-connection is lost before the cancellation arrives, for example at the 60-second
-connection lease, or the daemon refuses the cancellation with a retryable hold
+connection is lost before the cancellation arrives, for example at a transport
+deadline, or the daemon refuses the cancellation with a retryable hold
 (free-space floor, restart, busy admission), the error is the retryable
 `IMPORT_RESUMABLE` naming the import and keeping the refusal's class. A retry under
 the same request ID resumes the journal if it is still staged. If the cancellation

@@ -140,8 +140,7 @@ const RETRY_FIRST: Duration = Duration::from_secs(5);
 const RETRY_CEILING: Duration = Duration::from_secs(15 * 60);
 /// Longest consume publication. Its connection must outlive it under the lease.
 const PUBLICATION_DEADLINE: Duration = Duration::from_secs(45);
-const _: () =
-    assert!(PUBLICATION_DEADLINE.as_secs() < crate::transport::CONNECTION_LEASE.as_secs());
+const _: () = assert!(PUBLICATION_DEADLINE.as_secs() < crate::transport::CONNECTION_IDLE.as_secs());
 
 /// Delay before retrying a claim after `failures` consecutive failed publication
 /// attempts: 5 seconds, doubling, at most 15 minutes. A claim that cannot finish
@@ -2451,9 +2450,9 @@ async fn pass(
             // A permit the last wait acquired for a tail drain is not held through an
             // ordinary connection or publication.
             *waiting.permit = None;
-            // Replace a connection the lease would cut during this publication.
+            // Reconnect when there is too little idle allowance even without further reads.
             if client.as_ref().is_some_and(|(_, opened)| {
-                opened.elapsed() + PUBLICATION_DEADLINE > crate::transport::CONNECTION_LEASE
+                opened.elapsed() + PUBLICATION_DEADLINE > crate::transport::CONNECTION_IDLE
             }) {
                 *client = None;
             }

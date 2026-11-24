@@ -171,6 +171,15 @@ pub(super) async fn execute(client: &wire::sparrow::Client) -> Result<Value> {
     let output = Object::new()
         .with("ingest_socket", ingest_socket)
         .with("admission", admission(value.get_admission()?)?)
+        .with(
+            "connection_lease",
+            connection_lease(
+                value
+                    .has_connection_lease()
+                    .then(|| value.get_connection_lease().map(|lease| lease.into()))
+                    .transpose()?,
+            ),
+        )
         .with("floor_pause", floor_pause(value.get_floor_pause()?))
         .with(
             "staging_refusals",
@@ -603,6 +612,16 @@ fn admission(status: wire::admission_status::Reader<'_>) -> capnp::Result<Value>
                 .into()
         }
     };
+    let tcp = if status.has_public_tcp_connections() {
+        let tcp = status.get_public_tcp_connections()?;
+        Object::new()
+            .with("active_connections", tcp.get_active_connections())
+            .with("idle_expiries", tcp.get_idle_expiries().to_string())
+            .with("max_age_expiries", tcp.get_max_age_expiries().to_string())
+            .into()
+    } else {
+        Value::Null
+    };
     Ok(Object::new()
         .with("writer_reserve", u64::from(status.get_writer_reserve()))
         .with("reader_slots", u64::from(status.get_reader_slots()))
@@ -618,7 +637,18 @@ fn admission(status: wire::admission_status::Reader<'_>) -> capnp::Result<Value>
             u64::from(status.get_import_slot_wait_limit_ms()),
         )
         .with("rpc_connections", connections)
+        .with("public_tcp_connections", tcp)
         .into())
+}
+
+fn connection_lease(limits: Option<sparrow_client::ConnectionLeaseLimits>) -> Value {
+    limits.map_or(Value::Null, |limits| {
+        Object::new()
+            .with("idle_seconds", limits.idle_seconds)
+            .with("tcp_first_input_seconds", limits.tcp_first_input_seconds)
+            .with("max_age_seconds", limits.max_age_seconds)
+            .into()
+    })
 }
 
 /// The identity the connection learned when it opened, which the ingest socket admits: the store
@@ -628,6 +658,10 @@ pub(super) fn discovery(discovery: &sparrow_client::Discovery) -> Value {
         .with("operation", "discover")
         .with("store_id", discovery.store_id.as_str())
         .with("schema_version", discovery.schema_version)
+        .with(
+            "connection_lease",
+            connection_lease(discovery.connection_lease),
+        )
         .with("max_import_bytes", discovery.max_import_bytes.to_string())
         .with(
             "producer_profiles",

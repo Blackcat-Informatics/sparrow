@@ -350,6 +350,7 @@ struct Status {
   # these fields sees no change.
   retiredClaimCount @66 :UInt32; maxRetiredClaims @67 :UInt32;
   producerProfiles @68 :List(Text);
+  connectionLease @69 :ConnectionLeaseLimits;
 }
 # What a store is for, fixed at creation from the `instance_role` configuration key. A sender
 # that must refuse the live store reads it from `Discovery`. `unspecified` is a store with no
@@ -394,12 +395,18 @@ struct FloorPauseStatus {
 struct WaitStatus { waits @0 :UInt64; waiting @1 :UInt32; longestWaitMs @2 :UInt64; timeouts @3 :UInt64; }
 # A connection ceiling that holds peers in the kernel backlog instead of resetting them. `ceilingWait`
 # counts the times the accept loop found every slot taken and paused for one; `leaseExpiries`
-# counts connections closed by the 60-second lease.
+# counts connections closed by a transport deadline.
 struct ConnectionCeilingStatus {
   maxConnections @0 :UInt32; activeConnections @1 :UInt32;
   ceilingWait @2 :WaitStatus; leaseExpiries @3 :UInt64;
 }
 struct OptionalConnectionCeilingStatus { union { absent @0 :Void; value @1 :ConnectionCeilingStatus; } }
+struct TcpConnectionStatus {
+  activeConnections @0 :UInt32; idleExpiries @1 :UInt64; maxAgeExpiries @2 :UInt64;
+}
+struct ConnectionLeaseLimits {
+  idleSeconds @0 :UInt64; tcpFirstInputSeconds @1 :UInt64; maxAgeSeconds @2 :UInt64;
+}
 struct AdmissionStatus {
   # Operation permits no reader may hold, permits readers may hold, and how long a writer waits.
   writerReserve @0 :UInt32; readerSlots @1 :UInt32; writerWaitLimitMs @2 :UInt32;
@@ -407,8 +414,9 @@ struct AdmissionStatus {
   # Reads answered RESOURCE_LIMIT at once (a reader never waits).
   readerRefusals @4 :UInt64;
   importSlotWait @5 :WaitStatus; importSlotWaitLimitMs @6 :UInt32;
-  # The shared ceiling of the private Unix socket and public TCP, absent in a test harness.
+  # The private Unix ceiling, absent in a test harness.
   rpcConnections @7 :OptionalConnectionCeilingStatus;
+  publicTcpConnections @8 :TcpConnectionStatus;
 }
 # A full tail generation registry never refuses a file. A file tailed without a stored
 # checkpoint is read again from its start after a restart, so its `records` and `bytes` are at
@@ -499,6 +507,7 @@ struct Discovery {
   # Latest suggested last instant for first admission of a sealed event request.
   # Zero when the server lacks conditional durable replay.
   sealedEventDeadlineMs @18 :UInt64;
+  connectionLease @19 :ConnectionLeaseLimits;
 }
 
 enum PressurePhase { ready @0; requested @1; awaitingReclamation @2; blocked @3; awaitingArchive @4; }

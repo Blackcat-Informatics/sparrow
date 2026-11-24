@@ -54,7 +54,7 @@ pub struct ServerConfig {
     pub max_pin_members: usize,
     /// Bound on simultaneous storage operations, shared with intake workers.
     pub max_concurrent_requests: usize,
-    /// Independent bound on admitted Unix and TCP RPC connections.
+    /// Bound on admitted private Unix RPC connections.
     #[serde(default = "default_rpc_connections")]
     pub max_rpc_connections: usize,
     /// Optional group-accessible ingest-only Unix socket. Its parent directory is outside
