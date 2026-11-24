@@ -15,7 +15,17 @@ configuration and the behavior those procedures rely on.
 
 ## Kept images
 
-Install the helper census with `make install-census`, then run `make check`.
+Install the helper census with `make install-census`. Run the gate from the
+checkout being qualified. Choose a new log under the canonical checkout's
+`.stage/` and create its parent directory first.
+
+```sh
+tools/run-gate.sh /path/to/main/.stage/build-check.log -- make check
+```
+
+The runner takes the shared Cargo lock and logs the working directory, commit,
+UTC time, command and output. Its final `EXIT=` line and its process status
+both report the gate command's exit status.
 Commit through the normal verification hook and run `make install-bin`.
 It builds the release daemon, CLI, recovery probe and role stamp
 through cargo and copies them into `./bin` with
