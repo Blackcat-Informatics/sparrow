@@ -6,6 +6,9 @@
 use super::{Result, failure, wire};
 use purrdf::{SparqlResult, TermFactory, ir::RdfDatasetBuilder};
 use purrdf_lex::json::{self, Object, Value};
+use sparrow_core::{
+    CorrelationClock, CorrelationInterval, CorrelationRelation, CorrelationSelector,
+};
 
 pub(crate) struct Input {
     explain: bool,
@@ -752,16 +755,6 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
     if seen.len() != sparrow_core::DiagnosticDimension::ALL.len() {
         return Err(protocol("missing diagnostic interpretation counters"));
     }
-    let interpretations = Object::new()
-        .with(
-            "event_time",
-            Object::new()
-                .with("known", c.get_event_time_known().to_string())
-                .with("unknown", unknown(c.get_event_time_known())?.to_string())
-                // Every unknown source time is placed on the event timeline at receipt time.
-                .with("fallback", unknown(c.get_event_time_known())?.to_string()),
-        )
-        .with("diagnostics", diagnostic_known);
     let correlation = match value.get_correlation()?.which()? {
         wire::optional_correlation_capture::Absent(()) => None,
         wire::optional_correlation_capture::Value(capture) => Some(
@@ -769,6 +762,34 @@ pub(super) fn render(value: wire::sparql_page::Reader<'_>) -> Result<Value> {
                 .map_err(|error| protocol(error.to_string()))?,
         ),
     };
+    let event_known = c.get_event_time_known();
+    let event_unknown = unknown(event_known)?;
+    let mut event_time = Object::new()
+        .with("known", event_known.to_string())
+        .with("unknown", event_unknown.to_string());
+    if correlation.as_ref().is_some_and(|capture| {
+        matches!(
+            (&capture.selector, capture.relation),
+            (
+                CorrelationSelector::Time(CorrelationInterval {
+                    clock: CorrelationClock::Event,
+                    ..
+                }),
+                _
+            ) | (
+                _,
+                CorrelationRelation::Time(CorrelationInterval {
+                    clock: CorrelationClock::Event,
+                    ..
+                })
+            )
+        )
+    }) {
+        event_time.insert("fallback", event_unknown.to_string());
+    }
+    let interpretations = Object::new()
+        .with("event_time", event_time)
+        .with("diagnostics", diagnostic_known);
     let d = c.get_diagnostics()?;
     let text =
         crate::text_wire::render_capture(value.get_text()?, selected, d.get_membership_complete())?;

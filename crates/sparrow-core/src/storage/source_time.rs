@@ -276,7 +276,7 @@ impl EventTime {
             Self::Unknown { .. } => EventPlacement::receipt(received_at),
         }
     }
-    pub(crate) fn encode(&self) -> Value {
+    pub(crate) fn encode(&self) -> Object {
         match self {
             Self::Known {
                 millis,
@@ -290,16 +290,14 @@ impl EventTime {
                 .with("profile_id", profile_id.clone())
                 .with("occurrence", occurrence.to_string())
                 .with("source_start", source_start.to_string())
-                .with("source_end", source_end.to_string())
-                .into(),
+                .with("source_end", source_end.to_string()),
             Self::Unknown { reason, profile_id } => Object::new()
                 .with("state", "unknown")
                 .with("reason", reason.clone())
                 .with(
                     "profile_id",
                     profile_id.clone().map(Value::from).unwrap_or(Value::Null),
-                )
-                .into(),
+                ),
         }
     }
     pub(crate) fn decode(value: &Value) -> Result<Self, Error> {

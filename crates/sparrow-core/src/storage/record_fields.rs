@@ -224,8 +224,17 @@ pub(super) fn qualify_from_projection<B: AsRef<[u8]>>(
     Ok(Some(evidence))
 }
 
-/// One record summary owns the unchanged field/time/diagnostic evidence row.
-pub(super) fn matched_record_row(record: &Record, fields: Vec<Value>) -> Result<Object, Error> {
+/// Project the evidence and, for event-clock queries, the time basis of the match.
+pub(super) fn matched_record_row(
+    record: &Record,
+    fields: Vec<Value>,
+    event_clock: bool,
+) -> Result<Object, Error> {
+    let mut event_time = record.event_time.encode();
+    if event_clock {
+        let placement = record.event_time.placement(record.received_at);
+        event_time.insert("basis", placement.basis.name());
+    }
     Ok(Object::new()
         .with("record_id", record.id.clone())
         .with("artifact_id", record.artifact_id.clone())
@@ -234,6 +243,6 @@ pub(super) fn matched_record_row(record: &Record, fields: Vec<Value>) -> Result<
         .with("received_at", crate::format_instant(record.received_at)?)
         .with("byte_start", record.byte_start.to_string())
         .with("byte_end", record.byte_end.to_string())
-        .with("event_time", record.event_time.encode())
+        .with("event_time", event_time)
         .with("fields", Value::array(fields)))
 }
