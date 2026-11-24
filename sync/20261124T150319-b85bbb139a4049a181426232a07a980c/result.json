@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/66-refuse-a-malformed-metadata-graph-at",
+  "branch": "paudley/66-refuse-a-malformed-metadata-graph-at",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "3c817247448e764e4530e60eb7be09dacf301ee2",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/66-refuse-a-malformed-metadata-graph-at/.stage/refuse-a-malformed-metadata-graph-at/sync/20261124T150319-b85bbb139a4049a181426232a07a980c",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "ef620459d57878dbf3f5926d6c3d4c0c7a3c68da",
+  "merge_bases": [
+    "3c817247448e764e4530e60eb7be09dacf301ee2"
+  ],
+  "commit": "ef620459d57878dbf3f5926d6c3d4c0c7a3c68da"
+}
