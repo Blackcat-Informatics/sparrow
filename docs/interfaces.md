@@ -1498,6 +1498,11 @@ the basis (`known` is `source`, `unknown` is `receipt`). Schema 69 adds
 read placed by receipt time (0 for a receipt-time read). Older endpoints fail the
 exact schema discovery check.
 
+For event-clock queries, each core `Store::records_query` JSON row includes
+`event_time.basis` with the clock that supplies its placement. The row retains
+the original event-time evidence, including the reason for an unknown source
+instant.
+
 The CLI and MCP JSON shape for record output (`records`, `record`, `context`)
 renders the basis explicitly as `event_time.basis`. A `source` basis keeps
 `instant` and its source evidence. A `receipt` basis adds `fallback_instant`
@@ -2789,8 +2794,10 @@ Content projection is not needed: correlation reads metadata and diagnostics.
 All native graph replies additionally expose `interpretations`: known/unknown
 event-time and per-dimension diagnostic counts among known selected occurrences.
 Outer diagnostic-membership unknowns remain separate in the existing coverage.
-Agent output adds `interpretations.event_time.fallback`, equal to the unknown
-count, because every unknown is placed by receipt time.
+CLI and MCP correlation replies include `interpretations.event_time.fallback`
+when the selector or relation uses the event clock. It counts selected scope
+occurrences whose event-clock placement uses receipt time. Raw SPARQL and
+correlation without an event clock omit the field.
 For correlation, `coverage.complete` also requires known diagnostic interpretations
 for all selector/relation fields throughout that selected scope, not only matching
 rows. Every record has an event-clock placement, so an unknown source time alone

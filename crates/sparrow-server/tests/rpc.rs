@@ -5601,8 +5601,7 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
                 assert_eq!(migration["watermark"].as_str(), Some("start"));
                 assert!(migration["failure"].is_null());
             }
-            // A SPARQL answer over the unmigrated record graph counts the graph served the
-            // facts the backfill still owes.
+            // The selected graph lacks stored fallback facts, so the view derives them.
             let request = purrdf_lex::json::Object::new()
                 .with("store_id", store.as_str())
                 .with("query", "SELECT ?s WHERE { ?s ?p ?o } LIMIT 1")
@@ -5621,6 +5620,9 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
             .unwrap();
             let answer = cli(&copy_socket, &["sparql", request_file.to_str().unwrap()]);
             assert_eq!(answer["execution_status"].as_str(), Some("complete"));
+            let event_time = &answer["interpretations"]["event_time"];
+            assert_eq!(event_time["unknown"].as_str(), Some("1"));
+            assert!(event_time.get("fallback").is_none());
             let coverage = &answer["coverage"];
             assert_eq!(
                 coverage["event_fallback_pending"].as_str(),
@@ -13992,6 +13994,7 @@ async fn correlation_cli_mcp_and_typed_pages_retain_native_certainty_and_pin_sco
                 first["correlation"]["profile"].as_str(),
                 Some(sparrow_core::CORRELATION_PROFILE)
             );
+            assert!(first["interpretations"]["event_time"].get("fallback").is_none());
             assert_eq!(first["scope"]["pin"]["revision"].as_str(), Some("1"));
             assert!(first["has_more"].as_bool().unwrap());
             let mut mcp = Mcp::start(&socket);
@@ -14002,6 +14005,30 @@ async fn correlation_cli_mcp_and_typed_pages_retain_native_certainty_and_pin_sco
             assert_eq!(captured["scope"], first["scope"]);
             assert_eq!(captured["correlation"], first["correlation"]);
             assert_eq!(captured["rows"], first["rows"]);
+            let event = mcp
+                .tool(
+                    4,
+                    "correlate",
+                    args.clone()
+                        .with(
+                            "relation",
+                            Object::new()
+                                .with("kind", "cooccurs_in_interval")
+                                .with(
+                                    "interval",
+                                    Object::new()
+                                        .with("clock", "event")
+                                        .with("from", sparrow_core::format_instant(old).unwrap())
+                                        .with("before", sparrow_core::format_instant(old + 1).unwrap()),
+                                ),
+                        )
+                        .with("page_size", 10_u32)
+                        .into(),
+                )
+                .await;
+            assert_eq!(event["isError"].as_bool(), Some(false), "{event:?}");
+            let event_time = &event["structuredContent"]["interpretations"]["event_time"];
+            assert_eq!(event_time["fallback"].as_str(), Some("3"));
             let strict = mcp
                 .tool(
                     3,

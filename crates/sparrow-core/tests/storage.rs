@@ -17116,28 +17116,20 @@ fn event_query(from: u64, before: u64) -> sparrow_core::RecordQuery {
 /// receipt time, marked `receipt`, counted as a fallback, and keeps its stored reason.
 #[test]
 fn event_interval_includes_receipt_fallback() {
-    use sparrow_core::{EventTime, EventTimeBasis};
-    let (_dir, store, fallback, _) = fallback_fixture();
-    let record = store.record(&fallback).unwrap();
-    assert!(matches!(
-        &record.event_time,
-        EventTime::Unknown { reason, profile_id: None } if reason == "no_profile"
-    ));
-    let placement = record.event_time.placement(record.received_at);
-    assert_eq!(placement.millis, 5000);
-    assert_eq!(placement.basis, EventTimeBasis::Receipt);
+    let (_dir, store, fallback, sourced) = fallback_fixture();
+    let mut scope = record_page_scope("unused", 10);
+    scope.source = None;
     let result = store
-        .records_query(
-            &record_page_scope("fallback-plain", 10),
-            &event_query(4000, 6000),
-            6000,
-        )
+        .records_query(&scope, &event_query(1000, 6000), 6000)
         .unwrap();
     let rows = result["rows"].as_array().unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["record_id"].as_str(), Some(fallback.as_str()));
-    assert_eq!(rows[0]["event_time"]["state"].as_str(), Some("unknown"));
-    assert_eq!(rows[0]["event_time"]["reason"].as_str(), Some("no_profile"));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["record_id"].as_str(), Some(sourced.as_str()));
+    assert_eq!(rows[0]["event_time"]["basis"].as_str(), Some("source"));
+    assert_eq!(rows[1]["record_id"].as_str(), Some(fallback.as_str()));
+    assert_eq!(rows[1]["event_time"]["basis"].as_str(), Some("receipt"));
+    assert_eq!(rows[1]["event_time"]["state"].as_str(), Some("unknown"));
+    assert_eq!(rows[1]["event_time"]["reason"].as_str(), Some("no_profile"));
     assert_eq!(result["time_basis"].as_str(), Some("event_time"));
     assert_eq!(result["event_time_fallback"].as_str(), Some("1"));
     assert_eq!(result["event_coverage"]["unknown"].as_str(), Some("1"));
