@@ -14,30 +14,53 @@ pub use sparrow_core::DEFAULT_FLUSH_INTERVAL_MS as STORAGE_FLUSH_INTERVAL_MS;
 /// Native analyzer resolver used by the shared storage fixture macro.
 pub use sparrow_core::resolve_text_analyzer;
 
+fn canonical_checkout(checkout: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let output = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tools/canonical-checkout.sh"
+    ))
+    .arg(checkout)
+    .env_remove("GIT_DIR")
+    .env_remove("GIT_WORK_TREE")
+    .env_remove("GIT_COMMON_DIR")
+    .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(
+            String::from_utf8_lossy(&output.stderr).trim_end(),
+        ));
+    }
+    let root = String::from_utf8(output.stdout).map_err(std::io::Error::other)?;
+    Ok(std::path::PathBuf::from(root.trim_end_matches('\n')))
+}
+
+#[cfg(test)]
+#[test]
+fn canonical_root_fails_when_the_checkout_has_no_git_parent() {
+    let directory = tempfile::tempdir().unwrap();
+    let error = canonical_checkout(directory.path()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot find the Git common directory"),
+        "{error}"
+    );
+}
+
 /// Baseline native analyzer artifacts for workspace storage fixtures. The registry crates
 /// exclude the lexicons, so `tools/purrdf-lexicons.sh` archives them from the PurRDF repository
 /// at the revision that published the locked release (refusing when the registry, `Cargo.lock`
 /// and the crate's `.cargo_vcs_info.json` disagree) into `bin/lexicons-<revision>` of the
-/// canonical checkout root, and prints that directory. A linked worktree under
-/// `<root>/.worktrees/` uses the canonical root's `bin/` here; `make install-bin` instead places
+/// canonical checkout root, and prints that directory. A linked worktree uses Git's common directory to find the
+/// canonical root's `bin/`; `make install-bin` instead places
 /// the same bundle in the invoking checkout's own `bin/`, beside the images. They are never read
 /// from a PurRDF working tree.
 pub fn text_lexicon_dir() -> &'static std::path::Path {
     static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
         let checkout = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
-        let root = match checkout.canonicalize() {
-            Ok(path)
-                if path.parent().and_then(std::path::Path::file_name)
-                    == Some(std::ffi::OsStr::new(".worktrees")) =>
-            {
-                path.parent()
-                    .and_then(std::path::Path::parent)
-                    .map(std::path::Path::to_path_buf)
-                    .expect("INVARIANT: a .worktrees directory has a parent repository root")
-            }
-            _ => checkout.to_path_buf(),
-        };
+        let root = canonical_checkout(checkout).unwrap_or_else(|error| {
+            panic!("resolve test checkout {}: {error}", checkout.display())
+        });
         let output = std::process::Command::new(checkout.join("tools/purrdf-lexicons.sh"))
             .arg(&root)
             .arg(root.join("bin"))
