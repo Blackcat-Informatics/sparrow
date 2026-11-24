@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "worktree": "/home/paudley/Active/sparrow/.worktrees/514-diagnose-an-extra-producer-batch",
+  "branch": "paudley/514-diagnose-an-extra-producer-batch",
+  "base_ref": "refs/remotes/origin/main",
+  "head": "d5da764dd55f83be50c7aeaa9e789c538679dc7b",
+  "attempt": "/home/paudley/Active/sparrow/.worktrees/514-diagnose-an-extra-producer-batch/.stage/diagnose-an-extra-producer-batch/sync/20261124T080647-8adf46c84ebb4b1993a5ef6f02b8f8ee",
+  "conflicts": [],
+  "status": "fast_forward",
+  "base": "6e840cf457406e77ed86b46799bf98193b7ff89d",
+  "merge_bases": [
+    "d5da764dd55f83be50c7aeaa9e789c538679dc7b"
+  ],
+  "commit": "6e840cf457406e77ed86b46799bf98193b7ff89d"
+}
