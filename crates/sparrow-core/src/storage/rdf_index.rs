@@ -332,15 +332,18 @@ fn owner_graph_failure(message: &str) -> Error {
     Error::new("STORAGE_FAILURE", format!("owner graph index: {message}"))
 }
 
-/// Fence older writers into `batch`, returning the fenced format, and seed the `rdf:o:` build from the existing graph
-/// declarations; the build itself runs online, one page per maintenance admission. It
-/// reads only `rdf:g:` keys, so graphs prepared by an unfinished staged import, which have
-/// no catalog record yet, are covered too.
+/// Fence older writers and seed the online `rdf:o:` build in the same batch.
+/// The build reads `rdf:g:` declarations, including graphs of unpublished imports.
 pub(super) fn fence_owner_graphs(
     db: &DB,
     format: &[u8],
     batch: &mut WriteBatch,
 ) -> Result<&'static [u8], Error> {
+    // A pre-fence writer can retire a declaration without deleting its mirror.
+    // Clear all pre-fence mirrors before rebuilding from surviving declarations.
+    if super::any_key(db, OWNER_GRAPH_PREFIX)? {
+        batch.delete_range(OWNER_GRAPH_PREFIX, b"rdf:o;");
+    }
     // With no declaration to copy the build is complete as it starts.
     batch.put(
         OWNER_GRAPH_UPGRADE,

@@ -22835,6 +22835,9 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
             })
             .collect::<Vec<_>>()
     };
+    let named = "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } } ORDER BY ?g";
+    let named_before = scoped_rows(&store, &one, RdfGraphLayers::ALL, named, 6).0;
+    assert!(!named_before.is_empty());
     let migrated = answers(&store);
     assert!(!migrated[2].0.is_empty(), "fallback facts are queryable");
     assert!(store.migrations().unwrap().iter().all(|m| m.complete()));
@@ -22842,6 +22845,27 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     let db = catalog_db(dir.path()).unwrap();
     let (declared, _) = owner_graph_rows(&db);
     sparrow_test_support::pending_schema_69_migrations(&db).unwrap();
+    // The fallback writer family precedes the owner-graph fence for this store.
+    db.put("store_format", b"sparrow.store/132").unwrap();
+    db.delete("owner-graph-index-upgrade").unwrap();
+    let record_owner = |record: &str| {
+        let manifest = db.get(format!("rdf:graph:{record}")).unwrap().unwrap();
+        purrdf_lex::json::read_slice(&manifest, purrdf_lex::json::Limits::DEFAULT).unwrap()["owner"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+    };
+    // An older writer retired the declaration for this pair and left the mirror.
+    // Both ordinals still name real metadata graphs, one outside the narrow scope.
+    let owner = record_owner(records.last().unwrap()).to_be_bytes();
+    let graph = record_owner(&records[0]).to_be_bytes();
+    let mut orphan = [0; 16];
+    orphan[..8].copy_from_slice(&owner);
+    orphan[8..].copy_from_slice(&graph);
+    assert!(!declared.contains(&orphan));
+    let orphan = [b"rdf:o:".as_slice(), &orphan].concat();
+    db.put(&orphan, []).unwrap();
     drop(db);
 
     let store = Store::open(dir.path(), config()).unwrap();
@@ -22883,6 +22907,10 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     };
     // A scoped read reads its graphs from the mirror and the uncopied declarations, and
     // equals the whole live store's answer filtered to the scope.
+    assert_eq!(
+        scoped_rows(&store, &one, RdfGraphLayers::ALL, named, 6).0,
+        named_before
+    );
     let during = answers(&store);
     let mut whole = wide.clone();
     whole.source = None;
@@ -22942,6 +22970,10 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     assert!(page.complete);
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
+    assert!(
+        db.get(&orphan).unwrap().is_none(),
+        "pre-fence orphan mirror survived rebuild"
+    );
     let (now_declared, mirrored) = owner_graph_rows(&db);
     assert_eq!(now_declared, mirrored);
     assert!(declared.iter().all(|row| now_declared.contains(row)));
