@@ -8715,12 +8715,13 @@ async fn bulk_reopens_an_unacknowledged_range_and_publishes_while_input_is_open(
         bulk::{BulkConfig, BulkFile, BulkImporter},
     };
     use tokio::io::AsyncWriteExt;
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    let socket = store.join("rpc.sock");
+    let config = write_server_config(dir.path(), &store, &socket);
+    // Start has its own readiness deadline. Begin timing replay once the socket is ready.
+    let _daemon = start(&config, &socket).await;
     let test = async {
-        let dir = tempfile::tempdir().unwrap();
-        let store = dir.path().join("store");
-        let socket = store.join("rpc.sock");
-        let config = write_server_config(dir.path(), &store, &socket);
-        let _daemon = start(&config, &socket).await;
         let backend = connect(&socket).await.unwrap();
         let relay_path = dir.path().join("bulk.sock");
         let (state, proxy) = relay(&relay_path, backend.client.clone());
@@ -8922,7 +8923,7 @@ async fn bulk_reopens_an_unacknowledged_range_and_publishes_while_input_is_open(
     tokio::task::LocalSet::new()
         .run_until(tokio::time::timeout(Duration::from_secs(30), test))
         .await
-        .unwrap();
+        .expect("bulk replay timed out after daemon readiness");
 }
 
 fn relay(
