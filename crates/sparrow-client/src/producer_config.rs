@@ -24,7 +24,7 @@ pub struct ConfigError {
 }
 
 impl ConfigError {
-    fn at(path: &Path, cause: impl Into<Cause>) -> Self {
+    pub(crate) fn at(path: &Path, cause: impl Into<Cause>) -> Self {
         Self {
             path: path.to_owned(),
             cause: cause.into(),

@@ -14,7 +14,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 pub enum Endpoint {
     /// Private local Unix socket.
     Unix(std::path::PathBuf),
-    /// Numeric TCP address used anonymously: discovery, ingestion, flush and imports only.
+    /// Numeric TCP address using the anonymous producer capability.
     Tcp(std::net::SocketAddr),
     /// Numeric TCP address whose session is authenticated by the shared-secret CHAP law.
     AuthenticatedTcp(std::net::SocketAddr, crate::TcpSecret),
@@ -52,7 +52,15 @@ impl Endpoint {
         };
         let endpoint = Self::parse(endpoint)?;
         let endpoint = match secret_path {
-            Some(path) => endpoint.with_secret_file(path)?,
+            Some(path) => endpoint
+                .with_secret_file(path)
+                .map_err(|error| match error {
+                    crate::Error::Io(cause) => {
+                        std::io::Error::new(cause.kind(), crate::ConfigError::at(path, cause))
+                            .into()
+                    }
+                    error => error,
+                })?,
             None => endpoint,
         };
         Ok((endpoint, rest))

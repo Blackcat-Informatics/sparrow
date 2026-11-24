@@ -1929,6 +1929,23 @@ async fn remote_agent_adapters_share_all_query_and_mutation_paths_and_report_con
         .await;
 }
 
+/// A secret file failure reports the path that the CLI tried to read and the I/O cause.
+#[test]
+fn bad_secret_file_error_names_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing-tcp.secret");
+    let output = Command::new(env!("CARGO_BIN_EXE_sparrow-rpc-fixture"))
+        .arg("--secret-file")
+        .arg(&path)
+        .args(["tcp://127.0.0.1:5180", "status"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    assert!(stderr.contains(path.to_str().unwrap()), "{stderr}");
+    assert!(stderr.contains("os error 2"), "{stderr}");
+}
+
 /// INVARIANT: an anonymous public TCP peer can discover and ingest but cannot read,
 /// report status or administer watches; one wrong CHAP response ends authentication on
 /// that connection; the right response grants the complete service; Unix runs no CHAP.
