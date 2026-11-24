@@ -5,23 +5,26 @@ SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 # PurRDF integration gaps
 
-The native integration tasks below are implemented and deployed. This file
-preserves their source-bound qualification and the remaining operational work.
-Historical versioned observations do not describe the newer installed images.
+## Current integration
 
-## Current integration state
+Sparrow exposes native SELECT, ASK, CONSTRUCT, DESCRIBE and measured EXPLAIN
+through typed RPC, the CLI and MCP. Graph scope includes metadata for artifacts
+with or without records, as well as retained Source and Stream declarations.
+Immutable, byte-bounded continuation preserves the captured scope, native
+result evidence and source and coverage receipts.
+The [interface contract](interfaces.md) describes the query operations, limits
+and coverage rules.
 
-Schema 62 is deployed on format 92 with native SELECT, ASK, CONSTRUCT,
-DESCRIBE and measured EXPLAIN, typed RPC, CLI/MCP, immutable byte-bounded continuation, retained native
-certificates and source/coverage receipts. Metadata includes populated/recordless
-artifacts and retained Source/Stream declarations.
-Caller-selected stored-text rank/span relations are qualified through typed
-RPC, CLI/MCP and immutable continuation. They preserve native scores, captured
-corpus identity, original byte spans and independent coverage. Current-source
+## Historical qualification for schema 62
+
+The schema 62 qualification used store format 92. It exercised caller-selected
+stored-text rank and span relations through typed RPC, the CLI, MCP and immutable
+continuation. The results preserved native scores, captured corpus identity,
+original byte spans and independent coverage. The schema 62
 [turnover](turnover-qualification.md#schema-62-retention-and-native-compaction-policy)
 and [load/native measurements](load-qualification.md#schema-62-native-graph-and-text-follow-up)
 pass for their declared finite envelopes; broader production capacity is not
-established. The installed source selects
+established. The qualified images used PurRDF revision
 `a47940e1f130bf3739c6d59aaf89643209905ea4`; PR #615 supplied query-scoped
 producers for #601. Earlier upstream PR #609 closed
 [PurRDF #605](https://github.com/Blackcat-Informatics/purrdf/issues/605) with
@@ -38,10 +41,12 @@ checks: the original 2,990-triple export completes in 43 pages under unchanged
 limits; all 253 byte targets match; timestamp profiles and generation receipts
 are unchanged. The qualification evidence below records how these surfaces grew.
 
-Source schema 57 shares frozen logical scope receipts across native graph,
+### Earlier qualification for schemas 57 through 60
+
+Source schema 57 introduced shared frozen logical scope receipts across native graph,
 context and record/text/key/value captures. Graph receipt ownership uses the
 existing native owned-workspace seam; query certainty and coverage retain their
-original owners. The remaining requirements listed above are still open.
+original owners.
 
 Deployed schema 58 adds native correlation through fixed SELECT recipes and typed
 substitutions, sharing the same immutable scope, governor, cancellation and
@@ -50,8 +55,7 @@ source labels and explicit receipt/event intervals. Relationships cover shared
 trace ID, span ID, Source entity and co-occurrence within an explicit interval.
 Unknown interpretations reduce coverage and strict requests refuse them; native
 certainty remains independent. This source implementation does not resolve the
-borrowed text producer or operational EXPLAIN gaps below. Default-image private
-qualification and live adoption are recorded separately in Development runtime.
+borrowed text producer or operational EXPLAIN work.
 
 Deployed schema 59 adds the normalized tracing observation view through the
 existing metadata graph and query paths. It consumes native ordered JSON facts,
@@ -60,8 +64,7 @@ evidence, and uses the shared catalog pager/native dictionary owner for backfill
 Invalid claimed observations expose interpretation diagnostics without partial
 relationships. Required projection/profile corruption remains a hard failure.
 This is independent of the borrowed text producer, governed explanation and
-physical reclamation gaps below. Default-image, closed-copy and live qualification
-are separately recorded in Development runtime. A supplementary unbound content
+physical reclamation work. A supplementary unbound content
 export over the nine original producer records was refused by the existing
 schema-58 workspace ceiling; complete content-export/resource acceptance is not
 claimed from the successful byte or metadata migration checks.
@@ -69,17 +72,20 @@ claimed from the successful byte or metadata migration checks.
 Deployed schema 60 adds explicit plain-log timestamp captures using the public
 native XPath engine, sharing timestamp interpretation and byte evidence with
 JSON bindings. A direct reference to the already locked `purrdf-core` supplies
-that public API without a facade re-export or a second matcher. Source,
-default-image and live qualification are recorded separately in Development
-runtime. The synthetic control-only profile advances the live writer fence
+that public API without a facade re-export or a second matcher. The synthetic
+control-only profile advanced the writer fence
 without new records; original JSON profile identities and recovered generation
 receipts remain unchanged. All 253 retained byte targets match their prior hashes.
+
+The source, default-image and live qualification records are in the archived
+runtime report at revision `d3a893690eee`.
 
 An earlier 2026-10-18 readback found upstream main at
 `9a6055e8a60d34656d9d47c70ba5b85270142a54`, whose OWL causal-dependency changes
 left #600 and #601 open at that time. Subsequent PR #611 closed #600. The probes
 against `c75cbf94` and preceding source/census selection `7734b013` below remain
-historical evidence; current source selection is recorded above.
+historical evidence. The supplier pin is maintained in
+[the compatibility registry](../registry/compatibility.toml).
 
 ## Query-scoped stored text producers
 
@@ -102,8 +108,8 @@ workspace tests, seeded census self-tests and 300 pinned ownership jobs with
 zero distinct exceptions. Its log is
 `.stage/native-graph-integration/stored-text/full-check-v2.log`.
 See [the schema-62 contract](interfaces.md#stored-text-graph-relations-source-schema-62).
-Production-image and live TCP/Unix CLI/MCP qualification now pass as recorded
-in Development runtime. Nine runtime documents retain the preceding corpus
+The production-image and live TCP/Unix CLI/MCP checks passed. Nine runtime
+documents retained the preceding corpus
 identity, all scores/order and original record-local span bytes. The original
 2,990-triple export and all 253 byte targets are unchanged.
 
@@ -119,8 +125,8 @@ the borrowed-producer integration seam. It is now closed as completed: PR #615,
 commit `a47940e1f130bf3739c6d59aaf89643209905ea4`, adds query-scoped registries and
 cursors. That commit exists in the read-only supplier object database and is an
 ancestor of observed main `25de0d0de0856c7b88288d0ee65777bd1e95b34b`.
-Sparrow source now selects `a47940e1f130bf3739c6d59aaf89643209905ea4` for
-runtime dependencies and census discovery. The preceding schema-61 image used
+The schema 62 qualification used `a47940e1f130bf3739c6d59aaf89643209905ea4`
+for runtime dependencies and census discovery. The preceding schema 61 image used
 `9b2bf3b`. The analyzer and ranking implementations are unchanged between
 these revisions. Source and runtime qualification are recorded above;
 there is no upstream availability blocker. The observations below
@@ -297,6 +303,8 @@ unsanctioned duplicate group. Logs are retained locally under
 `.stage/native-graph-integration/`. These finite checks do not establish the
 unfinished public graph surface or production-volume acceptance.
 
+### Early core graph qualification
+
 The former runtime revision `e58974e504b9681597faea1490002ce8ddaf7448`
 admitted only projected SELECT/BGP without an explicit dataset. Its refusal of
 GRAPH, ASK, CONSTRUCT, DESCRIBE, broader algebra, substitutions and extension
@@ -319,8 +327,9 @@ at the shared 64x encoded-byte law. It retains only admitted graph-owner IDs for
 execution, with the original owned workspace scope capability. It does not copy
 the selected RDF corpus into memory. Cooperative cancellation is checked during
 capture and by the native read-account checkpoints throughout execution.
-This is record-backed graph membership: it does not yet add independent metadata
-graphs for recordless artifacts or expose the RPC/CLI/MCP query operations.
+This early core fixture qualified record-backed graph membership. The
+[current interface contract](interfaces.md) covers recordless artifact metadata
+and the RPC, CLI and MCP query operations.
 
 `Store::sparql_query` is the core execution caller. It accepts a native
 `SparqlRequest` with typed substitutions and explicit governors, invokes native
@@ -338,8 +347,8 @@ content/unknown diagnostic coverage. The full `make check` gate passes release
 Clippy with warnings denied, all 172 storage tests, the existing 60 RPC tests,
 the other workspace tests, seeded census tests and the pinned cross gate
 (263 ownership jobs, zero distinct exceptions). Evidence is
-`.stage/native-graph-integration/scoped-graph-full-check.log`. Existing RPC tests
-do not establish a graph RPC surface; that remains unimplemented.
+`.stage/native-graph-integration/scoped-graph-full-check.log`. The existing
+RPC tests in that run did not exercise graph queries.
 
 The core `sparql_read`/`sparql_read_next` path now retains that same native
 outcome behind the shared catalog lease owner and precomputes item/byte page
@@ -359,10 +368,10 @@ tests, 17 core unit tests, 60 existing RPC tests, the remaining workspace tests,
 release Clippy and both census gates (267 jobs, zero distinct exceptions).
 Evidence is `.stage/native-graph-integration/native-pages-full-check.log`.
 The shared registry accounting now gives status and maintenance the same expiry
-path. These core pages still require typed graph RPC, generic `result_next`
-dispatch and CLI/MCP integration; the installed daemon cannot create them.
+path. The run qualified core pages. See the interface contract for typed graph RPC,
+generic `result_next` dispatch and CLI and MCP integration.
 
-The remaining text surfaces must reuse native prepared bindings,
+Stored-text SPARQL relations must reuse native prepared bindings,
 typed Cap'n Proto publication, retained-page dispatch, cancellation and CLI/MCP
 parity. Complete, certain, at-most, unknown and operational failure outcomes must
 retain the native distinction. A missing or failed source checkpoint must never
@@ -371,9 +380,8 @@ same bounded persisted view.
 
 Do not suppress the bounded-view declaration, substitute a no-op reservation,
 replay a selected corpus into a resident dataset in production, or copy the
-private evaluator or workspace-pricing implementation. The complete SPARQL
-CLI/MCP surface must not be advertised until its native admission and egress are
-qualified.
+private evaluator or workspace-pricing implementation. Qualify native admission
+and egress before advertising a SPARQL operation through the CLI or MCP.
 
 Full qualification must compare resident and persisted answers for all four
 forms, named/default graph selection, joins/modifiers/paths, RDF 1.2 layers and
