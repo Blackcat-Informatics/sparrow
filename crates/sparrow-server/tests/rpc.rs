@@ -5420,8 +5420,12 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
             append_consume_config(&config, &root, 0, 16, 16);
             let daemon = start(&config, &socket).await;
             let client = sparrow_client::Client::connect(&socket).await.unwrap();
+            let ready = dir.path().join("ready.jsonl");
             let consumed = root.join("consumed.jsonl");
-            std::fs::write(&consumed, b"{\"copy\":1}\n").unwrap();
+            // A zero quiet interval can admit a visible file before its writer closes it.
+            // Hand off this completed fixture through MOVED_TO.
+            std::fs::write(&ready, b"{\"copy\":1}\n").unwrap();
+            std::fs::rename(&ready, &consumed).unwrap();
             watch_until(client.capability(), |watch| {
                 watch.get_completed_claims() == 1 && watch.get_pending_claims() == 0
             })
