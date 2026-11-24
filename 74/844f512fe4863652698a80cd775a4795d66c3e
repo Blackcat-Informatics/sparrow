@@ -1,0 +1,19 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 1eb75ce19b6fd6130b7af1bb79bbb6da5a8a32eb
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 531
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/531
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: bed7e0988c62485b96db28cdf73d71ee5b6b591a
+GhpRsq-Head-Ref: paudley/530-preserve-socket-validation-and-cleanup
+GhpRsq-Head-OID: 1eb75ce19b6fd6130b7af1bb79bbb6da5a8a32eb
+GhpRsq-Result-Tree: f85acadade9486eb0fa2b530a917d4f5f4e3ad87
+GhpRsq-Result-Commit: 74844f512fe4863652698a80cd775a4795d66c3e
+GhpRsq-Parent-Hashes: 1eb75ce19b6fd6130b7af1bb79bbb6da5a8a32eb
+GhpRsq-Squash-Notes-SHA256: dc7b96138c89305717e85a82fc2f2a5d69e7eed8fb9fb8dd23d7153630ec1c0b
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
