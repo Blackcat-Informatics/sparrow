@@ -10502,6 +10502,72 @@ fn split_raw_document_reads_back_exactly_and_both_expires_and_evicts() {
 }
 
 #[test]
+fn oversized_line_splits_and_preserves_neighboring_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), large_config()).unwrap();
+    let chunk_bytes = sparrow_core::IMPORT_CHUNK_BYTES;
+    let ceiling = 32 * 1024 * 1024 + chunk_bytes;
+    store.split_raw_records_above(ceiling as u64).unwrap();
+
+    let before = b"before\n";
+    let mut input = before.to_vec();
+    input.resize(before.len() + ceiling + 17, b'x');
+    for (index, chunk) in input[before.len()..].chunks_mut(chunk_bytes).enumerate() {
+        let marker = format!("{index:04x}");
+        chunk[..marker.len()].copy_from_slice(marker.as_bytes());
+    }
+    input.push(b'\n');
+    let after_start = input.len() as u64;
+    input.extend_from_slice(b"after\n");
+
+    let manifest = stage_fixture(&store, "oversized-middle-line", "log", &input);
+    assert!(manifest.layout_records >= 4);
+    for ordinal in 0..manifest.layout_records {
+        let mut saw_raw = false;
+        let prepared = (0..64).any(|_| {
+            let progress = store
+                .import_prepare_record(&manifest.id, ordinal, 0)
+                .unwrap();
+            saw_raw |= progress.raw.is_some();
+            progress.prepared_records > ordinal
+        });
+        assert!(
+            prepared,
+            "record {ordinal} did not prepare in bounded steps"
+        );
+        assert_eq!(
+            saw_raw,
+            ordinal > 0 && ordinal + 1 < manifest.layout_records
+        );
+    }
+    let artifact = store.import_publish(&manifest.id, 0).unwrap();
+    assert_eq!(artifact.record_ids.len() as u64, manifest.layout_records);
+    let mut offset = 0;
+    for (index, id) in artifact.record_ids.iter().enumerate() {
+        let record = store.record(id).unwrap();
+        assert_eq!(record.byte_start, offset);
+        assert!(record.byte_end > offset && record.byte_end - offset <= ceiling as u64);
+        if index == 0 {
+            assert_eq!(record.byte_end, before.len() as u64);
+        }
+        if index + 1 == artifact.record_ids.len() {
+            assert_eq!(record.byte_start, after_start);
+        }
+        offset = record.byte_end;
+    }
+    assert_eq!(offset, input.len() as u64);
+
+    let window = 1024 * 1024;
+    for offset in (0..input.len()).step_by(window) {
+        let length = window.min(input.len() - offset);
+        assert_eq!(
+            store.bytes(&artifact.id, offset as u64, length, 1).unwrap(),
+            input[offset..offset + length]
+        );
+    }
+}
+
+#[test]
 fn oversized_json_record_resumes_bounded_raw_checkpoints_and_preserves_pinned_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
