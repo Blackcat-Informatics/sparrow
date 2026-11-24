@@ -211,9 +211,10 @@ and do not use a passphrase: an observer of one CHAP exchange can test guesses
 offline. The unit passes it to the daemon as a systemd credential, so
 `rpc_tcp_secret_file` names `/run/credentials/sparrow.service/tcp.secret`.
 Copy the same file privately to each remote agent host and pass it with
-`sparrow --secret-file PATH tcp://ADDRESS:518 COMMAND`. Producers that only
-discover, ingest and import need no secret. CHAP does not encrypt traffic or
-authenticate the server, so restrict the listener to trusted networks.
+`sparrow --secret-file PATH tcp://ADDRESS:518 COMMAND`. A producer can use the
+[producer operations](interfaces.md#producer-contract-sparrow-producer1) without
+the shared secret. CHAP does not encrypt traffic or authenticate the server,
+so restrict the listener to trusted networks.
 
 Port 518 is below 1024. The unit grants `CAP_NET_BIND_SERVICE` as an ambient
 capability and holds nothing else in its bounding set; no file capability is
@@ -251,12 +252,11 @@ or move the file out of the spill directory by hand.
 
 ### Ingest-only group socket
 
-Daemons that run as other accounts log into Sparrow
-through a second Unix socket. It admits only producer operations (`discover`,
-`ingest`, the import operations, `eventsIngest` and `flush`) and refuses every
-other operation with `PERMISSION_DENIED`. Each artifact and record it accepts
-records the caller's uid, gid and pid, which the kernel reports for the
-connection (`SO_PEERCRED`).
+Daemons that run as other accounts log into Sparrow through a second Unix
+socket. It admits the [producer operations](interfaces.md#producer-contract-sparrow-producer1)
+and refuses read and administrative operations with `PERMISSION_DENIED`.
+Sparrow records the caller's uid, gid and pid on every accepted artifact
+and record, using the kernel's connection credentials (`SO_PEERCRED`).
 
 1. Create the group and add each producer account to it:
 

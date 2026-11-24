@@ -46,7 +46,7 @@ impl Policy for IngestSocketPolicy {
     fn refusal(&self) -> Error {
         Error::new(
             "PERMISSION_DENIED",
-            "the ingest socket admits only discover, ingest, import, eventsIngest and flush; use the private socket for every other operation",
+            "use the private socket for this operation",
         )
     }
 
