@@ -1,0 +1,24 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 5f34ddbbc2952bef55a23a1779e4760fbebf8e38
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 549
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/549
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 7d834ae9bd7b8935cf774d87c85ffaab98d66fa2
+GhpRsq-Head-Ref: paudley/57-add-the-ingest-keys-to-server-toml
+GhpRsq-Head-OID: 5f34ddbbc2952bef55a23a1779e4760fbebf8e38
+GhpRsq-Result-Tree: 95b74838c6c27e6d02f7e3d910d4d9a5d41a3100
+GhpRsq-Result-Commit: 3c817247448e764e4530e60eb7be09dacf301ee2
+GhpRsq-Parent-Hashes: 5f34ddbbc2952bef55a23a1779e4760fbebf8e38
+GhpRsq-Squash-Notes-SHA256: 138ed6d6392162da94628006ddd5a1bbe6d96d9c6632c1e456dffcc66d62ed5c
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Tree: d5a8544859c0e7c1377870b7aaa433a882ebf9e4
+GhpRsq-Stage-Commit: c5049ccefee2bf9485eb30c560d678eaa37a4c52
+GhpRsq-Stage-Tag: refs/tags/ghprsq/artifacts/c5049ccefee2bf9485eb30c560d678eaa37a4c52
+GhpRsq-Stage-Ref: refs/ghprsq/pr/549/stage
+GhpRsq-Stage-Files: 13
+GhpRsq-Stage-URL: http://lillith:7555/fleet/sparrow/src/commit/c5049ccefee2bf9485eb30c560d678eaa37a4c52
