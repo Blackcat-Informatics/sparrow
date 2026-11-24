@@ -24428,9 +24428,9 @@ fn negative_or_missing_source_counter_is_a_storage_failure() {
 
 /// INVARIANT: `artifacts --source A` reads only A's per-source index rows, A's artifact
 /// entries and their records: a scan budget of exactly those catalog rows suffices beside a
-/// second source of 20,000 records, and the listing reads exactly that many.
+/// second source with 20,000 records and 20 recordless artifacts.
 #[test]
-fn artifacts_by_source_reads_only_that_source() {
+fn source_listing_does_not_charge_other_sources_recordless_artifacts() {
     use sparrow_core::{ArtifactRead, ArtifactSelector};
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), large_config()).unwrap();
@@ -24445,6 +24445,10 @@ fn artifacts_by_source_reads_only_that_source() {
                 1,
             )
             .unwrap();
+        let empty = store
+            .ingest(&format!("by-source-empty-{index}"), "bulk", "log", b"", 1)
+            .unwrap();
+        assert!(empty.record_ids.is_empty());
     }
     let mut a = Vec::new();
     for time in 2..5 {
