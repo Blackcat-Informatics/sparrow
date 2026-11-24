@@ -1552,13 +1552,18 @@ which scoped SPARQL reads use to find their graphs (see the cost rule under
 SPARQL below). Opening a store written before this index first moves the store
 format to an owner-graph writer family, `sparrow.store/187` to `/241`, which lifts
 each event fallback family by 55 and keeps its log time, archive and intake
-switches, so older binaries refuse the store. A resumable online job
+switches, so older binaries refuse the store. The same synchronized batch
+clears any existing owner-to-graph rows and seeds the rebuild checkpoint.
+This removes orphan mirrors left when an older writer retires declarations
+after an interrupted upgrade. This cleanup runs when the fence is installed.
+A resumable online job
 (`owner-graph-index-upgrade`, see "Online store migrations") then copies every
 existing declaration in durable pages of 65,536, each committed with its
 frontier, so a restart resumes after the last committed page. It reads only
 declaration keys, so a graph prepared by an unfinished staged import is covered
 before its publication. The build reads each declaration once and writes one
-small row for it. Until it completes, scoped SPARQL keeps the whole-store plan.
+small row for it. While the build is pending, scoped SPARQL combines the
+mirrors with declarations after the build frontier from the same snapshot.
 
 ### Online store migrations (schema 69)
 
