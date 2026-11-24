@@ -1176,6 +1176,7 @@ mod tests {
                 min_free_bytes: config.min_free_bytes,
                 max_records: config.max_records,
                 max_pin_members: config.max_pin_members,
+                max_import_journals: config.max_import_journals,
                 text_analyzer: sparrow_core::resolve_text_analyzer(&config.text_lexicon_dir)?,
                 archive: None,
                 retire_without_archive: true,

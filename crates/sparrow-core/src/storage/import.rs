@@ -9,12 +9,37 @@ use super::{
     json, parse, put, read_chunk_range, read_field, record_ends, validate_ingest_labels,
 };
 use purrdf_lex::json::{Object, Value};
-use rocksdb::WriteBatch;
+use rocksdb::{DB, WriteBatch};
 use sparrow_limits::MAX_PUBLICATION_RECORDS;
 
 /// Fixed raw staging unit; only the final unit may be shorter.
 pub const IMPORT_CHUNK_BYTES: usize = CHUNK;
-const MAX_IMPORTS: usize = 16;
+/// Default total and the anonymous TCP limit on starting new journals.
+pub const DEFAULT_IMPORT_JOURNALS: usize = 16;
+/// Maximum supported total. The writer can reclaim this many rows at either admission setting.
+pub const MAX_IMPORT_JOURNALS: usize = 20;
+const IMPORT_PREFIX: &[u8] = b"import:";
+
+/// Which part of the import journal registry a new request may use.
+#[derive(Clone, Copy)]
+pub enum ImportAdmission {
+    /// Anonymous TCP may start a journal while total occupancy is below sixteen.
+    AnonymousTcp,
+    /// An authenticated or local caller may use the configured total.
+    WithReserve,
+}
+
+/// Validate a configured import journal capacity before opening a store.
+pub fn validate_import_journal_limit(limit: usize) -> Result<(), Error> {
+    if matches!(limit, DEFAULT_IMPORT_JOURNALS | MAX_IMPORT_JOURNALS) {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "INVALID_ARGUMENT",
+            "max_import_journals must be 16 or 20",
+        ))
+    }
+}
 
 /// The import bound a store advertises and the over-bound refusals it has counted. One
 /// instance is shared by the writer, which enforces the bound, and `Store::properties`,
@@ -93,6 +118,17 @@ impl ImportLedger {
 /// daemon waits for a slot on exactly this refusal (#246); no other refusal is one.
 pub const IMPORT_JOURNALS_OCCUPIED: &str =
     "16 import journals are occupied; resume, cancel, or reclaim them";
+const EXPANDED_JOURNALS_OCCUPIED: &str =
+    "20 import journals are occupied; resume, cancel, or reclaim them";
+
+/// Whether a begin-import refusal can clear when a journal is reclaimed.
+pub fn import_journals_occupied(error: &Error) -> bool {
+    error.code == "RESOURCE_LIMIT"
+        && matches!(
+            error.message.as_str(),
+            IMPORT_JOURNALS_OCCUPIED | EXPANDED_JOURNALS_OCCUPIED
+        )
+}
 const MANIFEST_BYTES: usize = 8192;
 const RECLAIM_CHUNKS: u64 = 128;
 /// Maximum record spans in one immutable layout page.
@@ -425,30 +461,42 @@ pub struct ImportLayoutPage {
     pub next_index: Option<u64>,
 }
 
-impl Writer {
-    fn imports(&self) -> Result<Vec<ImportManifest>, Error> {
-        let mut rows = Vec::new();
-        for entry in self.db.prefix_iterator("import:") {
-            let (key, bytes) = entry?;
-            if !key.starts_with(b"import:") {
-                break;
-            }
-            if rows.len() >= MAX_IMPORTS || bytes.len() > MANIFEST_BYTES {
+type JournalRow = (Box<[u8]>, Box<[u8]>);
+
+fn import_rows(db: &DB) -> impl Iterator<Item = Result<JournalRow, Error>> + '_ {
+    db.prefix_iterator(IMPORT_PREFIX)
+        .take_while(|row| match row {
+            Ok((key, _)) => key.starts_with(IMPORT_PREFIX),
+            Err(_) => true,
+        })
+        .enumerate()
+        .map(|(index, row)| {
+            let (key, bytes) = row?;
+            if index >= MAX_IMPORT_JOURNALS || bytes.len() > MANIFEST_BYTES {
                 return Err(Error::new(
                     "STORAGE_FAILURE",
                     "import registry exceeds its admitted bounds",
                 ));
             }
-            let manifest = ImportManifest::decode(&parse(&bytes)?)?;
-            if key.as_ref() != manifest.id.as_bytes() {
-                return Err(Error::new(
-                    "STORAGE_FAILURE",
-                    "import registry key mismatch",
-                ));
-            }
-            rows.push(manifest);
-        }
-        Ok(rows)
+            Ok((key, bytes))
+        })
+}
+
+impl Writer {
+    fn imports(&self) -> Result<Vec<ImportManifest>, Error> {
+        import_rows(&self.db)
+            .map(|row| {
+                let (key, bytes) = row?;
+                let manifest = ImportManifest::decode(&parse(&bytes)?)?;
+                if key.as_ref() != manifest.id.as_bytes() {
+                    return Err(Error::new(
+                        "STORAGE_FAILURE",
+                        "import registry key mismatch",
+                    ));
+                }
+                Ok(manifest)
+            })
+            .collect()
     }
 
     pub(super) fn import_chunk(
@@ -615,6 +663,16 @@ impl Writer {
 }
 
 impl Store {
+    /// Count existing journals with a bounded catalog iterator without taking the writer lock.
+    pub fn import_journal_occupancy(&self) -> Result<usize, Error> {
+        import_rows(&self.unlocked.db).try_fold(0, |count, row| row.map(|_| count + 1))
+    }
+
+    /// Configured ceiling for callers that can use the private reserve.
+    pub fn max_import_journals(&self) -> usize {
+        self.unlocked.config.max_import_journals
+    }
+
     /// Create or resume a bounded durable journal for a declared complete input.
     /// This does not create an artifact, records, or a deletion receipt.
     pub fn import_begin(
@@ -633,6 +691,7 @@ impl Store {
             byte_length,
             payload_id,
             None,
+            ImportAdmission::WithReserve,
             now,
         )
     }
@@ -705,6 +764,34 @@ impl Store {
         intake: Option<super::intake::Intake>,
         now: u64,
     ) -> Result<ImportStart, Error> {
+        self.import_start_with_admission(
+            request_id,
+            source,
+            format,
+            byte_length,
+            payload_id,
+            intake,
+            ImportAdmission::WithReserve,
+            now,
+        )
+    }
+
+    /// Recover a receipt or start or resume staging under the caller's journal admission class.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the declared import, caller admission, intake binding and acceptance clock"
+    )]
+    pub fn import_start_with_admission(
+        &self,
+        request_id: &str,
+        source: &str,
+        format: &str,
+        byte_length: u64,
+        payload_id: &str,
+        intake: Option<super::intake::Intake>,
+        admission: ImportAdmission,
+        now: u64,
+    ) -> Result<ImportStart, Error> {
         validate_ingest_labels(request_id, source, format)?;
         if !valid_payload_id(payload_id) {
             return Err(Error::new(
@@ -736,6 +823,7 @@ impl Store {
                 byte_length,
                 payload_id,
                 intake,
+                admission,
                 now,
             )
             .map(ImportStart::Staging)
@@ -926,7 +1014,7 @@ impl Store {
     }
 
     /// Reclaim at most 128 published or expired staging units per call,
-    /// including at most one private prepared record, and 16 journals.
+    /// including at most one private prepared record. A pass examines at most twenty journals.
     /// Each synced batch atomically advances its persistent cleanup cursor.
     pub fn import_reclaim(&self, now: u64) -> Result<u64, Error> {
         let writer = self.lock()?;
@@ -1275,7 +1363,7 @@ impl Writer {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "the declared import, its intake binding and the acceptance clock"
+        reason = "the declared import, caller admission, intake binding and acceptance clock"
     )]
     fn begin_import(
         &self,
@@ -1285,6 +1373,7 @@ impl Writer {
         byte_length: u64,
         payload_id: &str,
         intake: Option<super::intake::Intake>,
+        admission: ImportAdmission,
         now: u64,
     ) -> Result<ImportManifest, Error> {
         validate_ingest_labels(request_id, source, format)?;
@@ -1408,8 +1497,17 @@ impl Writer {
             return Ok(previous);
         }
         writer.require_within_import_bound(byte_length)?;
-        if writer.imports()?.len() >= MAX_IMPORTS {
-            return Err(Error::new("RESOURCE_LIMIT", IMPORT_JOURNALS_OCCUPIED));
+        let ceiling = match admission {
+            ImportAdmission::AnonymousTcp => DEFAULT_IMPORT_JOURNALS,
+            ImportAdmission::WithReserve => writer.config.max_import_journals,
+        };
+        if writer.imports()?.len() >= ceiling {
+            let message = if ceiling == DEFAULT_IMPORT_JOURNALS {
+                IMPORT_JOURNALS_OCCUPIED
+            } else {
+                EXPANDED_JOURNALS_OCCUPIED
+            };
+            return Err(Error::new("RESOURCE_LIMIT", message));
         }
         let expires_at = now
             .checked_add(RETRY_WINDOW)

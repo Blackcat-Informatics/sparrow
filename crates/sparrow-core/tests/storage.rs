@@ -17774,6 +17774,52 @@ fn an_input_bound_refusal_is_not_retryable_while_occupancy_stays_retryable() {
 }
 
 #[test]
+fn import_reclamation_can_drain_expanded_rows_after_lowering_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let expanded = Config {
+        max_import_journals: sparrow_core::MAX_IMPORT_JOURNALS,
+        ..config()
+    };
+    let payload = format!("blake3:{}", "1".repeat(64));
+    let store = Store::open(dir.path(), expanded).unwrap();
+    for index in 0..sparrow_core::MAX_IMPORT_JOURNALS {
+        store
+            .import_begin(
+                &format!("rollback-{index}"),
+                "source",
+                "opaque",
+                1,
+                &payload,
+                0,
+            )
+            .unwrap();
+    }
+    store.flush().unwrap();
+    drop(store);
+
+    // The current writer can lower admission and drain a previously expanded registry.
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.max_import_journals(),
+        sparrow_core::DEFAULT_IMPORT_JOURNALS
+    );
+    assert_eq!(
+        store.import_journal_occupancy().unwrap(),
+        sparrow_core::MAX_IMPORT_JOURNALS
+    );
+    assert!(sparrow_core::import_journals_occupied(
+        &store
+            .import_begin("blocked", "source", "opaque", 1, &payload, 0)
+            .unwrap_err()
+    ));
+    store
+        .import_begin("rollback-0", "source", "opaque", 1, &payload, 0)
+        .unwrap();
+    store.import_reclaim(3 * DAY).unwrap();
+    assert_eq!(store.import_journal_occupancy().unwrap(), 0);
+}
+
+#[test]
 fn source_time_registry_pressure_is_retryable_without_publishing_a_mapping() {
     use purrdf_lex::json::record::ToJson;
     let dir = tempfile::tempdir().unwrap();

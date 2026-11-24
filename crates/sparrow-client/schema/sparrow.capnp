@@ -351,6 +351,7 @@ struct Status {
   retiredClaimCount @66 :UInt32; maxRetiredClaims @67 :UInt32;
   producerProfiles @68 :List(Text);
   connectionLease @69 :ConnectionLeaseLimits;
+  importJournals @70 :ImportJournalStatus;
 }
 # What a store is for, fixed at creation from the `instance_role` configuration key. A sender
 # that must refuse the live store reads it from `Discovery`. `unspecified` is a store with no
@@ -406,6 +407,12 @@ struct TcpConnectionStatus {
 }
 struct ConnectionLeaseLimits {
   idleSeconds @0 :UInt64; tcpFirstInputSeconds @1 :UInt64; maxAgeSeconds @2 :UInt64;
+}
+struct ImportJournalLimits {
+  total @0 :UInt32; anonymousThreshold @1 :UInt32;
+}
+struct ImportJournalStatus {
+  limits @0 :ImportJournalLimits; active @1 :UInt32;
 }
 struct AdmissionStatus {
   # Operation permits no reader may hold, permits readers may hold, and how long a writer waits.
@@ -508,6 +515,7 @@ struct Discovery {
   # Zero when the server lacks conditional durable replay.
   sealedEventDeadlineMs @18 :UInt64;
   connectionLease @19 :ConnectionLeaseLimits;
+  importJournalLimits @20 :ImportJournalLimits;
 }
 
 enum PressurePhase { ready @0; requested @1; awaitingReclamation @2; blocked @3; awaitingArchive @4; }

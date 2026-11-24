@@ -50,6 +50,9 @@ pub struct ServerConfig {
     pub min_free_bytes: u64,
     /// Maximum records in a complete publication.
     pub max_records: usize,
+    /// Staged import journal capacity available to authenticated and local callers.
+    #[serde(default = "default_import_journals")]
+    pub max_import_journals: usize,
     /// Maximum direct members in a pin collection.
     pub max_pin_members: usize,
     /// Bound on simultaneous storage operations, shared with intake workers.
@@ -314,6 +317,10 @@ fn default_rpc_connections() -> usize {
     16
 }
 
+const fn default_import_journals() -> usize {
+    sparrow_core::DEFAULT_IMPORT_JOURNALS
+}
+
 fn default_ingest_connections() -> usize {
     16
 }
@@ -364,6 +371,7 @@ impl ServerConfig {
         if !(1..=256).contains(&config.max_rpc_connections) {
             return Err("max_rpc_connections must be 1..256".into());
         }
+        sparrow_core::validate_import_journal_limit(config.max_import_journals)?;
         if config.socket_path.parent() != Some(config.data_dir.as_path()) {
             return Err("socket_path must be directly inside the private data_dir".into());
         }
@@ -640,6 +648,7 @@ impl ServerConfig {
             maintenance_reserve: self.maintenance_reserve,
             min_free_bytes: self.min_free_bytes,
             max_records: self.max_records,
+            max_import_journals: self.max_import_journals,
             max_pin_members: self.max_pin_members,
             text_analyzer: sparrow_core::resolve_text_analyzer(&self.text_lexicon_dir)?,
             archive: self.archive.as_ref().map(ArchiveConfig::policy),
