@@ -508,7 +508,8 @@ impl Store {
         let mut event_evaluated = 0_u64;
         let mut event_outside = 0_u64;
         let mut event_fallback = 0_u64;
-        let time_basis = if query.event_interval.is_some() {
+        let event_clock = query.event_interval.is_some();
+        let time_basis = if event_clock {
             "event_time"
         } else {
             "received_at"
@@ -585,7 +586,7 @@ impl Store {
                 continue;
             };
             qualified += 1;
-            if query.event_interval.is_some()
+            if event_clock
                 && record.event_time.placement(record.received_at).basis
                     == crate::EventTimeBasis::Receipt
             {
@@ -599,7 +600,7 @@ impl Store {
             }
             if query.text.is_none() {
                 if let Some(stage) = stage.as_deref_mut() {
-                    let order = if query.event_interval.is_some() {
+                    let order = if event_clock {
                         Some((
                             record.event_time.placement(record.received_at).millis,
                             record.id.clone(),
@@ -608,16 +609,17 @@ impl Store {
                         None
                     };
                     stage.push(
-                        record_fields::matched_record_row(&record, fields)?.into(),
+                        record_fields::matched_record_row(&record, fields, event_clock)?.into(),
                         order,
                     )?;
                     continue;
                 }
-                if query.event_interval.is_some() || chronological.len() < row_limit {
-                    let row: Value = record_fields::matched_record_row(&record, fields)?.into();
+                if event_clock || chronological.len() < row_limit {
+                    let row: Value =
+                        record_fields::matched_record_row(&record, fields, event_clock)?.into();
                     capture_bytes += json::write_compact(&row).len();
                     if capture_bytes
-                        > if query.event_interval.is_some() && !capture {
+                        > if event_clock && !capture {
                             MATCH_MEMBERSHIP_BYTES
                         } else {
                             2 * 1024 * 1024
@@ -629,7 +631,7 @@ impl Store {
                         ));
                     }
                     chronological.push((
-                        if query.event_interval.is_some() {
+                        if event_clock {
                             record.event_time.placement(record.received_at).millis
                         } else {
                             record.received_at
@@ -839,6 +841,7 @@ impl Store {
                 witnesses.remove(id.as_str()).ok_or_else(|| {
                     Error::new("STORAGE_FAILURE", "captured field witnesses missing")
                 })?,
+                event_clock,
             )?
             .with("score", score.value.to_decimal_lexical())
             .with("evidence", Value::array(evidence))
