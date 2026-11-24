@@ -1,5 +1,5 @@
 VERSION "1.2"
-BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/80aa5d98013bcd268996e44a3d9e68717cf8cd348318342c5d052d134bc8714f>
+BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/0f86f64722f14c7df0cd8e9e995c5a235375a828feb5d49c3a409e470ae9da55>
 <> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#Ledger> .
 <> <https://blackcatinformatics.ca/raf/report/1#distinct> <#distinct/0> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/active-file-checkpoint-attachment> .
@@ -348,6 +348,7 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/80aa5d98013bcd
 <> <https://blackcatinformatics.ca/raf/report/1#maxFileBytes> "8388608"^^<http://www.w3.org/2001/XMLSchema#integer> .
 <> <https://blackcatinformatics.ca/raf/report/1#minTokens> "20"^^<http://www.w3.org/2001/XMLSchema#integer> .
 <> <https://blackcatinformatics.ca/raf/report/1#normalForm> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<> <https://blackcatinformatics.ca/raf/report/1#pattern> <#pattern/store-free-space-statvfs> .
 <> <https://blackcatinformatics.ca/raf/report/1#reportForm> "6"^^<http://www.w3.org/2001/XMLSchema#integer> .
 <> <https://blackcatinformatics.ca/raf/report/1#root> "." .
 <> <https://blackcatinformatics.ca/raf/report/1#root> "crates/sparrow-server/tests" .
@@ -3275,18 +3276,11 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/80aa5d98013bcd
 <#job/store-durability-telemetry> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/tests/rpc.rs" .
 <#job/store-free-space-floor> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
 <#job/store-free-space-floor> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
-<#job/store-free-space-floor> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::Writer::apply" .
-<#job/store-free-space-floor> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::recompression::Writer::rewrite_gate" .
-<#job/store-free-space-floor> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::space::SpaceFloor::check" .
-<#job/store-free-space-floor> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::space::SpaceFloor::shortfall" .
-<#job/store-free-space-floor> <https://blackcatinformatics.ca/raf/report/1#forbiddenName> "^(free_space_again|measure_free_space_again|statvfs_floor_again)$" .
-<#job/store-free-space-floor> <https://blackcatinformatics.ca/raf/report/1#homeSymbol> "sparrow_core::storage::space::SpaceFloor::shortfall_after" .
+<#job/store-free-space-floor> <https://blackcatinformatics.ca/raf/report/1#forbiddenPattern> "store-free-space-statvfs" .
+<#job/store-free-space-floor> <https://blackcatinformatics.ca/raf/report/1#homeSymbol> "sparrow_core::storage::space::SpaceFloor::free" .
 <#job/store-free-space-floor> <https://blackcatinformatics.ca/raf/report/1#jobId> "store-free-space-floor" .
 <#job/store-free-space-floor> <https://blackcatinformatics.ca/raf/report/1#specRef> "docs/deployment.md: min_free_bytes." .
-<#job/store-free-space-floor> <https://blackcatinformatics.ca/raf/report/1#summary> "One filesystem free-space floor refuses every store write before RocksDB can fail on a full disk, and tells daemon pause points a shortfall apart from a failed measurement." .
-<#job/store-free-space-floor> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-core/tests/storage.rs" .
-<#job/store-free-space-floor> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/src/syslog_listener.rs" .
-<#job/store-free-space-floor> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/tests/rpc.rs" .
+<#job/store-free-space-floor> <https://blackcatinformatics.ca/raf/report/1#summary> "Measure available bytes on the store filesystem through the shared free-space floor." .
 <#job/store-session-close> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
 <#job/store-session-close> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
 <#job/store-session-close> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_core::storage::Store::pending_durability_occurrences" .
@@ -4020,3 +4014,10 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/80aa5d98013bcd
 <#job/writer-priority-over-migration-pages> <https://blackcatinformatics.ca/raf/report/1#summary> "Every ordinary writer registers in the one writer queue while it waits for the catalog writer lock; before a migration page the maintenance worker waits on that queue's condition variable until no writer waits, bounded by the longer of 100 ms and the previous page's hold, in a blocking task it polls with its other duties so only the page waits. No polling of the queue and no second scheduler." .
 <#job/writer-priority-over-migration-pages> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-core/tests/storage.rs" .
 <#job/writer-priority-over-migration-pages> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/src/maintenance.rs" .
+<#pattern/store-free-space-statvfs> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#Pattern> .
+<#pattern/store-free-space-statvfs> <https://blackcatinformatics.ca/raf/report/1#includePath> "crates/sparrow-core/src" .
+<#pattern/store-free-space-statvfs> <https://blackcatinformatics.ca/raf/report/1#includePath> "crates/sparrow-server/src" .
+<#pattern/store-free-space-statvfs> <https://blackcatinformatics.ca/raf/report/1#patternId> "store-free-space-statvfs" .
+<#pattern/store-free-space-statvfs> <https://blackcatinformatics.ca/raf/report/1#shippingOnly> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+<#pattern/store-free-space-statvfs> <https://blackcatinformatics.ca/raf/report/1#summary> "Route production store free-space measurements through SpaceFloor." .
+<#pattern/store-free-space-statvfs> <https://blackcatinformatics.ca/raf/report/1#tokens> "rustix::fs::statvfs" .
