@@ -22451,7 +22451,7 @@ fn table_rewrite_resumes_after_reopen_and_runs_once() {
 }
 
 #[test]
-fn table_rewrite_stays_off_until_a_job_fits_the_allowance_and_floor() {
+fn table_rewrite_window_follows_the_allowance_and_floor() {
     // INVARIANT: native rewriting is turned on only while one job's headroom
     // fits both the data allowance and the free-space floor.
     use sparrow_core::RecompressionPhase;
@@ -22474,17 +22474,30 @@ fn table_rewrite_stays_off_until_a_job_fits_the_allowance_and_floor() {
     assert!(waiting.contains("data allowance"), "{waiting}");
     assert_eq!(rewrite_windows(&store.data_path().unwrap()), ["0", "0"]);
     drop(store);
+    let data_allowance = settings.disk_budget - settings.maintenance_reserve;
     let store = Store::open(dir.path(), settings).unwrap();
     // The first ungated step records the start; the window opens a settle later.
-    let started = store.recompress_step(wall_millis(), 1).unwrap();
+    let start = wall_millis();
+    let started = store.recompress_step(start, 1).unwrap();
     assert_eq!(started.phase, RecompressionPhase::Running);
     assert_eq!(rewrite_windows(&store.data_path().unwrap()), ["0", "0"]);
-    std::thread::sleep(std::time::Duration::from_millis(2100));
-    let running = store.recompress_step(wall_millis(), 1).unwrap();
+    let running = store.recompress_step(start + 2_000, 1).unwrap();
     assert_eq!(running.phase, RecompressionPhase::Running);
     assert_eq!(running.waiting, None);
-    let windows = rewrite_windows(&store.data_path().unwrap());
+    let data = store.data_path().unwrap();
+    let windows = rewrite_windows(&data);
     assert!(windows.iter().all(|window| window != "0"), "{windows:?}");
+
+    // Store accounting charges the sparse file's length without filling the host disk.
+    std::fs::File::create(data.join("table-rewrite-ballast"))
+        .unwrap()
+        .set_len(data_allowance)
+        .unwrap();
+    let paused = store.recompress_step(start + 3_000, 1).unwrap();
+    assert_eq!(paused.phase, RecompressionPhase::Paused);
+    let waiting = paused.waiting.unwrap();
+    assert!(waiting.contains("data allowance"), "{waiting}");
+    assert_eq!(rewrite_windows(&data), ["0", "0"]);
 }
 
 /// Run one governed SPARQL query, returning its complete rows and the host requests it read.
