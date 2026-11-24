@@ -2329,7 +2329,7 @@ impl wire::sparrow::Server for Rpc {
                         (request.clone(), source.clone(), payload.clone());
                     self.work_until(deadline, move |store, now| {
                         Ok((
-                            store.import_start_with_intake(
+                            store.import_start(
                                 &request, &source, kind, length, &payload, intake, now,
                             )?,
                             store.store_id()?,
@@ -3502,7 +3502,15 @@ impl wire::sparrow::Server for Rpc {
         let intake = self.intake;
         match self
             .work(move |store, now| {
-                store.ingest_with_intake(&request_id, &source, format, &bytes, intake, now, mode)
+                store.ingest_with_durability(
+                    &request_id,
+                    &source,
+                    format,
+                    &bytes,
+                    intake,
+                    now,
+                    mode,
+                )
             })
             .await
         {

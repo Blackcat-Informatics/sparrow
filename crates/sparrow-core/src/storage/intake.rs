@@ -112,7 +112,7 @@ pub(super) fn decode_member(value: &Value) -> Result<Option<Intake>, Error> {
 /// An import keeps the intake of the connection that began it. Only a caller with the
 /// same user identity (or, for an import begun without one, a caller without one) may
 /// continue it, so a resumed upload cannot change its provenance.
-pub fn admit_import(bound: Option<&Intake>, caller: Option<&Intake>) -> Result<(), Error> {
+pub(super) fn admit_import(bound: Option<&Intake>, caller: Option<&Intake>) -> Result<(), Error> {
     let uid = |intake: Option<&Intake>| intake.map(|intake| intake.credential().uid);
     if uid(bound) != uid(caller) {
         return Err(Error::new(
