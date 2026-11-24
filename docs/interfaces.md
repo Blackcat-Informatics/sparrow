@@ -3563,6 +3563,11 @@ MCP adapter and the `bytes`, `handoff` and `load` examples accept a leading
 `--secret-file PATH`; `load` requires it. MCP
 reconnects for each tool call and authenticates each connection.
 
+Calls queued on the promised session can reach the service after authentication
+succeeds. A refused exchange fails those queued calls before they return status
+or records. The RPC test `pipelined_calls_on_a_refused_session_reach_no_service`
+exercises both outcomes.
+
 CHAP authenticates only the start of a session. Traffic is not encrypted, the
 client does not authenticate the server, and an on-path attacker can observe or
 take over an authenticated connection. An observer of one exchange can test
