@@ -1474,6 +1474,17 @@ mod tests {
             }
         }));
         let status = ArchiveStatus::new();
+        // Each loop turn runs after the previous pass has finished and before the next pass
+        // can clear its failure, so the first failure seen here is the lost job's failure,
+        // whatever the later timing.
+        let captured: Arc<Mutex<Option<status::Failure>>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&captured);
+        let watched = status.clone();
+        faulted.loop_fault = Some(Arc::new(move || {
+            if let Some(failure) = watched.snapshot().failure {
+                sink.lock().unwrap().get_or_insert(failure);
+            }
+        }));
         let filesystem = Filesystem::start().unwrap();
         let worker = Worker::start_configured(
             &filesystem,
@@ -1485,22 +1496,25 @@ mod tests {
         )
         .unwrap();
         assert!(
-            wait_for(Duration::from_secs(30), || status
-                .snapshot()
-                .failure
+            wait_for(Duration::from_secs(30), || captured
+                .lock()
+                .unwrap()
                 .is_some()),
             "the lost job was never reported"
         );
-        let lost = status.snapshot().failure.unwrap();
+        let lost = captured.lock().unwrap().clone().unwrap();
         assert!(
             lost.reason.contains("archive filesystem worker"),
             "{lost:?}"
         );
+        // The watermark commits before the success path clears the reported failure, so the
+        // two are awaited together within the deadline.
         assert!(
             wait_for(Duration::from_secs(30), || {
                 through(&store).as_deref() == Some(segment.through.as_str())
+                    && status.snapshot().failure.is_none()
             }),
-            "the replacement filesystem thread did not archive the segment"
+            "the replacement filesystem thread did not archive the segment and clear the failure"
         );
         let snapshot = status.snapshot();
         assert_eq!(snapshot.restarts, 0);
