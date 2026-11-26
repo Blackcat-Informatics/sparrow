@@ -381,9 +381,8 @@ them with the digest its link quad names. To find a record's bytes, follow the l
 (predicate IRI `urn:sparrow:vocab:payloadBlake3`) to the blob with that digest. A file the
 reader refuses, or with no segment head, is a refusal and never a partial read.
 
-No reader detects duplicate segments: `list` and `verify` treat each file alone, and
-`extract` drops a repeated record id silently after sorting an artifact's records by byte
-position. The offline `sparrow-archive list|verify DIR` tool (crate `sparrow-archive`)
+No reader detects duplicate segments across files: `list` and `verify` treat each file alone,
+and `extract` decides a record repeated across segments by its record id (see below). The offline `sparrow-archive list|verify DIR` tool (crate `sparrow-archive`)
 walks `DIR` for `*.gts` files (it also skips a directory named `.staging`, which this
 format does not write), decodes each in memory through one decoder module, and
 prints one JSON line per segment with its record, artifact and blob counts. `verify`
@@ -400,15 +399,32 @@ segment under `DIR` in byte order, wherever they were archived, and writes them 
 only after every segment decoded with each record's bytes matching its link digest, the
 records contiguous in byte order and their total equal to the artifact's recorded
 `byteLength`. A damaged segment anywhere under `DIR` blocks extraction; to extract from the
-rest, point `DIR` at a directory without it. The decoder also refuses a segment with a payload link on a subject that is not a record
-and a segment holding a blob that no record links to. `extract` counts a record repeated across
-segments once when every copy is identical, and refuses copies that differ, artifact metadata
-that differs between segments, and a record whose source or receipt time differs from its
-artifact's. A damaged segment, an unknown id or an artifact with a
-missing record exits nonzero, names the file or artifact on stderr and writes nothing to
-stdout. A directory with no segment, or one that does not exist, fails the same way. Discovery reads
-regular `*.gts` files only: a symbolic link to a segment is not an archive member and is not
-followed. An artifact with no bytes holds no records, so no segment carries it and `extract`
-reports it as unknown. `extract` decodes one segment at a time, so its peak memory is the
-largest segment plus two copies of the artifact (its records and the joined result); it has no
-artifact size ceiling of its own. There is no restore into Sparrow.
+rest, point `DIR` at a directory without it. The decoder refuses a segment in which a payload link names a subject that is not a record, a
+segment holding a blob that no record links to, and an artifact that carries a record's digest
+link. `extract` counts a record repeated across segments once when every copy is identical. It
+refuses copies that differ in any field, naming the record; artifact metadata that differs
+between segments, naming the artifact; and a record whose source or receipt time differs from its
+artifact's. A damaged segment, an unknown id, a missing record or any of these refusals exits
+nonzero, names the file, artifact or record on stderr, and writes nothing to stdout. A directory
+with no segment, or one that does not exist, fails the same way. Discovery reads regular `*.gts`
+files only: a symbolic link to a segment is not an archive member and is not followed.
+
+Empty input has three outcomes, and they differ:
+
+- An empty `json` artifact archives no segment: the archive writes none for it, so `extract`
+  names the artifact as unknown and nothing is written.
+- An empty `opaque` artifact archives one zero-length record through the ordinary store and
+  archive encoder. `extract` writes nothing and succeeds, and `verify` reports one record.
+- A segment whose only record is zero-length, built by hand rather than by the archive, extracts
+  to empty stdout and verifies. This shows the reader accepts such a record; it does not describe
+  an archive outcome.
+
+`extract` decodes the segments one at a time. Each segment's file is read whole and decoded; the
+reader keeps from it only the artifact's metadata and its records, then drops the segment before
+the next. What it holds at the end is the artifact's metadata, the selected records (every record
+whose artifact id matches, with its bytes), and the joined output, which is buffered whole before
+anything is written to stdout. So the cost is bounded by the largest single segment (its file bytes
+and decoded records) plus the selected records and the joined output, and it does not grow with
+the number of segments except through those selected records. The implementation and the
+multi-segment fixtures establish this shape; the peak was not measured. The artifact has no size
+ceiling of its own. There is no restore into Sparrow.
