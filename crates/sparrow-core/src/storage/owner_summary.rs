@@ -419,6 +419,17 @@ pub(super) fn apply(db: &DB, batch: &mut WriteBatch) -> Result<(), Error> {
 fn advance(db: &DB, batch: &mut WriteBatch, id: &str, next: Option<&[u8]>) -> Result<(), Error> {
     let key = summary_key(id);
     let Some(stored) = db.get(&key)? else {
+        // Skipping is correct only for an artifact the migration has not reached: it reads
+        // the final retirement state when it does. For one it has passed, the row is lost.
+        let passed = match progress(|key| Ok(db.get(key)?))? {
+            Progress::Complete | Progress::Records(_) => true,
+            Progress::Artifacts(after) => after.is_some_and(|after| id <= after.as_str()),
+        };
+        if passed {
+            return Err(failure(format!(
+                "owner summary row of {id} is missing though the migration has passed it; restore the original catalog"
+            )));
+        }
         return Ok(());
     };
     let row = db.get(id)?.ok_or_else(|| {
@@ -662,6 +673,26 @@ mod tests {
         apply(&writer.db, &mut batch).unwrap();
         assert_eq!(writer_rows(&batch, &key), None);
         assert!(batch.len() >= 2);
+
+        // A retirement state for an artifact whose row is missing is refused once the
+        // migration has passed it, and left to the migration while it has not.
+        writer
+            .db
+            .put("artifact:b", row("artifact:b", &chunks))
+            .unwrap();
+        let mut batch = WriteBatch::default();
+        batch.put(retirement_key("artifact:b"), state);
+        assert_eq!(
+            apply(&writer.db, &mut batch).unwrap_err().code,
+            "STORAGE_FAILURE"
+        );
+        writer
+            .db
+            .put(CHECKPOINT, Progress::Artifacts(None).encode())
+            .unwrap();
+        let mut batch = WriteBatch::default();
+        batch.put(retirement_key("artifact:b"), state);
+        apply(&writer.db, &mut batch).unwrap();
 
         // A batch that brings its own row with an entry change is refused.
         let mut batch = WriteBatch::default();

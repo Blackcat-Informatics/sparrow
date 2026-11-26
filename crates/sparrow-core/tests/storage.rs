@@ -1042,11 +1042,17 @@ fn retention_metrics_refuse_native_reference_and_payload_corruption() {
 /// A retention account without its visit count, which differs between the owner summary and
 /// the entries it summarises, as text for an exact comparison.
 fn retention_totals(store: &Store, now: u64) -> String {
+    retention_account(store, now).0
+}
+
+/// The same account with the visit count apart: visits differ by path, and a store whose
+/// owners repeat a chunk visits fewer ownership references through the summary.
+fn retention_account(store: &Store, now: u64) -> (String, u64) {
     let mut report = store
         .retention_metrics(now, sparrow_core::RetentionReadLimits::default())
         .unwrap();
-    report.visits = 0;
-    format!("{report:?}")
+    let visits = std::mem::take(&mut report.visits);
+    (format!("{report:?}"), visits)
 }
 
 fn owner_summary_pending(store: &Store) -> bool {
@@ -1062,21 +1068,35 @@ fn owner_summary_pending(store: &Store) -> bool {
 /// The totals the owner summary answers, then the totals the entries answer once a downgrade
 /// leaves the summary pending, then the totals the rebuilt summary answers. Every pass
 /// reopens the store, which is what an operator's restart does.
-fn totals_both_ways(dir: &std::path::Path, now: u64) -> String {
+///
+/// With `repeats`, the store holds an owner that repeats a chunk, so the summary pass must
+/// visit fewer references than the entries pass: that shows which path answered each pass.
+fn totals_both_ways(dir: &std::path::Path, now: u64, repeats: bool) -> String {
     let store = Store::open(dir, config()).unwrap();
     while store.migrate_step().unwrap().is_some() {}
     assert!(!owner_summary_pending(&store));
-    let summarised = retention_totals(&store, now);
+    let (summarised, summary_visits) = retention_account(&store, now);
     drop(store);
     let db = catalog_db(dir).unwrap();
     sparrow_core::lower_owner_summary_for_legacy_fixture(&db).unwrap();
     drop(db);
     let store = Store::open(dir, config()).unwrap();
     assert!(owner_summary_pending(&store));
-    let from_entries = retention_totals(&store, now);
+    let (from_entries, entry_visits) = retention_account(&store, now);
     assert_eq!(summarised, from_entries);
+    if repeats {
+        assert!(
+            summary_visits < entry_visits,
+            "{summary_visits} summary visits, {entry_visits} entry visits"
+        );
+    }
     while store.migrate_step().unwrap().is_some() {}
-    assert_eq!(retention_totals(&store, now), summarised);
+    let (rebuilt, rebuilt_visits) = retention_account(&store, now);
+    assert_eq!(rebuilt, summarised);
+    assert_eq!(
+        rebuilt_visits, summary_visits,
+        "the rebuilt summary answers"
+    );
     let (stored, recomputed) = store.owner_summary_audit_for_tests().unwrap();
     assert_eq!(stored, recomputed);
     summarised
@@ -1107,21 +1127,34 @@ fn retention_totals_from_the_owner_summary_equal_the_totals_from_the_entries() {
     store
         .ingest("summary-gone", "metrics", "log", b"gone\n", 0)
         .unwrap();
+    // One live artifact repeats a chunk: three identical chunk-sized lines.
+    let mut line = vec![b'z'; 64 * 1024];
+    line[64 * 1024 - 1] = b'\n';
+    store
+        .ingest(
+            "summary-repeat",
+            "metrics",
+            "log",
+            &line.repeat(3),
+            10 * DAY,
+        )
+        .unwrap();
     drop(store);
     let now = 31 * DAY;
-    let published = totals_both_ways(dir.path(), now);
-    // Live: the late artifact and its record, and the pinned record. `shared` is live
-    // through the late owners, `solo` is held by the pin alone, `gone` is retirable.
+    let published = totals_both_ways(dir.path(), now, true);
+    // Live: the late and repeating artifacts with their records, and the pinned record.
+    // `shared` is live through the late owners, `solo` is held by the pin alone, `gone` is
+    // retirable, and the repeated chunk counts once.
     for expected in [
-        "live_records: 2,",
-        "live_artifacts: 1,",
+        "live_records: 5,",
+        "live_artifacts: 2,",
         "pinned_records: 1,",
         "pinned_artifacts: 0,",
-        "owned_payload_bytes: 17,",
-        "live_payload_bytes: 12,",
+        "owned_payload_bytes: 65553,",
+        "live_payload_bytes: 65548,",
         "pin_held_payload_bytes: 5,",
         "retirable_payload_bytes: 5,",
-        "payload_chunks: 3,",
+        "payload_chunks: 4,",
     ] {
         assert!(published.contains(expected), "{expected}: {published}");
     }
@@ -1129,11 +1162,11 @@ fn retention_totals_from_the_owner_summary_equal_the_totals_from_the_entries() {
     let store = Store::open(dir.path(), config()).unwrap();
     store.expire(now).unwrap();
     drop(store);
-    let expired = totals_both_ways(dir.path(), now);
+    let expired = totals_both_ways(dir.path(), now, true);
     for expected in [
-        "live_records: 2,",
-        "owned_payload_bytes: 12,",
-        "live_payload_bytes: 12,",
+        "live_records: 5,",
+        "owned_payload_bytes: 65548,",
+        "live_payload_bytes: 65548,",
         "retirable_payload_bytes: 0,",
     ] {
         assert!(expired.contains(expected), "{expected}: {expired}");
@@ -1144,7 +1177,32 @@ fn retention_totals_from_the_owner_summary_equal_the_totals_from_the_entries() {
         .evict_oldest(now, sparrow_core::EvictionLimits::default())
         .unwrap();
     drop(store);
-    totals_both_ways(dir.path(), now);
+    totals_both_ways(dir.path(), now, false);
+}
+
+/// INVARIANT: a record protected only by its parent artifact's pin is live and pinned on the
+/// summary path, as it is from the entries, because the summary stores the parent identity
+/// and the pin set is read at query time.
+#[test]
+fn a_parent_artifact_pin_protects_its_records_on_the_summary_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("summary-parent", "metrics", "log", b"parent\n", 0)
+        .unwrap();
+    store
+        .pin("summary-parent-pin", "metrics", &[artifact.id], 40, 0)
+        .unwrap();
+    drop(store);
+    let totals = totals_both_ways(dir.path(), 31 * DAY, false);
+    for expected in [
+        "live_records: 1,",
+        "pinned_records: 1,",
+        "live_artifacts: 1,",
+        "pinned_artifacts: 1,",
+    ] {
+        assert!(totals.contains(expected), "{expected}: {totals}");
+    }
 }
 
 /// INVARIANT: through publication, bounded expiry with partial manifest retirement and

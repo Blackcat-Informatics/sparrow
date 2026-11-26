@@ -1998,7 +1998,9 @@ consume or delete an owner entry without its row, and a crash cannot leave one
 without the other. A batch that rewrites an entry gets its row computed from the
 written entry; a deleted entry loses its row; a retirement state that advances
 without rewriting its entry subtracts the chunks it passes from the stored row,
-and a subtraction below zero is a `STORAGE_FAILURE`.
+and a subtraction below zero is a `STORAGE_FAILURE`. A retirement state for an
+artifact with no row is left to the migration while the migration has not reached
+the artifact, and is a `STORAGE_FAILURE` once it has.
 
 Retention metrics read the rows only while the summary is trusted: the
 `owner-summary` migration is complete and the store counters are seeded. The
@@ -2006,7 +2008,9 @@ query visits one row per owner and one visit per distinct digest the owner holds
 and refuses with `STORAGE_FAILURE` when the number of rows it reads disagrees
 with the `artifacts` and `records` store counters. Until the migration
 completes, the query reads the owner entries and returns the same totals, so no
-query ever reads an incomplete summary as complete.
+query ever reads an incomplete summary as complete. A complete summary is trusted as
+the entries wrote it: the query does not re-read the owner entries, so it does not
+re-validate a corrupt record entry that the summary row already summarises.
 
 Compatibility and rollback. The summary is a writer-format family: a store
 opened by this binary is lifted to `sparrow.store/572` through `626` (`627`

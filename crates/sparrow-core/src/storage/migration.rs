@@ -1,16 +1,16 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
-//! Online store migrations: the store counter seeding (#146), the owner-to-graph index
-//! build (#13), the per-source counters and artifact index (#14), the source-context
-//! cache rebuild (#149) and the per-owner payload summary that retention metrics read
+//! Online store migrations: the store counter seeding, the owner-to-graph index
+//! build, the per-source counters and artifact index, the source-context
+//! cache rebuild and the per-owner payload summary that retention metrics read
 //! ([`super::owner_summary`]). The receipt-time event fallback backfill of record metadata
-//! graphs (#20) is retired: readers derive those facts (see [`super::event_fallback_rdf`]).
+//! graphs is retired: readers derive those facts (see [`super::event_fallback_rdf`]).
 //!
 //! Opening a store fences older writers and seeds every checkpoint in one synchronized
 //! batch, then serves. The maintenance worker runs the migrations in
 //! [`Migration::RUN_ORDER`], the source summary directly after the counters, so the
-//! listings that pay for what it owes stop paying first (#176). Each migration resumes from
+//! listings that pay for what it owes stop paying first. Each migration resumes from
 //! its own checkpoint, so a store partway through under any order resumes correctly. The
 //! worker runs one page per admission through the writer's ordinary commit, so a page
 //! shares the write path's durability latch, free-space floor and data-write admission, and
@@ -49,17 +49,17 @@ const FAILURE_CHARS: usize = 1024;
 /// One online migration, in the fixed order `status` reports them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Migration {
-    /// The store counters `status` and migration progress read (#146). It runs first, so
+    /// The store counters `status` and migration progress read. It runs first, so
     /// the others report from counters while they run.
     StoreCounters,
-    /// The owner-to-graph index that bounds scoped SPARQL by its scope (#13).
+    /// The owner-to-graph index that bounds scoped SPARQL by its scope.
     OwnerGraphIndex,
-    /// Per-source counters, retained record counts and the per-source artifact index (#14).
+    /// Per-source counters, retained record counts and the per-source artifact index.
     SourceSummary,
     /// The source timeline cache record context reads, rebuilt only when the open found it
-    /// stale (#149).
+    /// stale.
     SourceContext,
-    /// The payload id index: one key per held artifact, from the digest of its bytes (#323).
+    /// The payload id index: one key per held artifact, from the digest of its bytes.
     PayloadIndex,
     /// The per-owner payload summary the retention metrics read (see [`super::owner_summary`]).
     OwnerSummary,
@@ -69,7 +69,7 @@ impl Migration {
     /// Every migration, in the order `status`, the latched failures and [`Migration::index`]
     /// use. The maintenance worker runs them in its own run order: the counters, the source
     /// summary, the payload index, the owner summary, the owner index, then the source
-    /// timeline cache (#176).
+    /// timeline cache.
     pub const ALL: [Self; 6] = [
         Self::StoreCounters,
         Self::OwnerGraphIndex,
@@ -82,7 +82,7 @@ impl Migration {
     /// The order the maintenance worker runs the migrations: the counters first, so the
     /// others report from counters while they run, then the source summary, whose unfinished
     /// state makes every `sources` and live `artifacts` listing read what it still owes
-    /// (#176), then the owner index, since its pages are few and cheap. The migrations are
+    ///, then the owner index, since its pages are few and cheap. The migrations are
     /// independent: each reads and checkpoints its own keys.
     pub(crate) const RUN_ORDER: [Self; 6] = [
         Self::StoreCounters,
