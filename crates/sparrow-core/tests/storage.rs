@@ -27658,13 +27658,20 @@ fn copy_store(from: &std::path::Path, to: &std::path::Path) {
 
 /// The entry-walk answer for the store in `dir`: a copy of it is lowered so its owner summary
 /// is pending, and the retention query then reads every owner entry.
-fn entry_walk_totals(dir: &std::path::Path, scratch: &std::path::Path, now: u64) -> String {
+fn entry_walk_totals(
+    dir: &std::path::Path,
+    scratch: &std::path::Path,
+    nows: &[u64],
+) -> Vec<String> {
     copy_store(dir, scratch);
     let db = catalog_db(scratch).unwrap();
     sparrow_core::lower_owner_summary_for_legacy_fixture(&db).unwrap();
     drop(db);
     let oracle = Store::open(scratch, config()).unwrap();
-    let totals = retention_result(&oracle, now);
+    let totals = nows
+        .iter()
+        .map(|now| retention_result(&oracle, *now))
+        .collect();
     drop(oracle);
     std::fs::remove_dir_all(scratch).unwrap();
     totals
@@ -27731,14 +27738,33 @@ fn retention_answer_from_the_summary_equals_the_entry_walk_through_random_mutati
         let mut pins: Vec<String> = Vec::new();
         let mut tail: Option<(String, u64)> = None;
         let mut trace: Vec<String> = Vec::new();
+        // Owner and pin deadlines, owner artifacts with theirs, a second stream choosing late
+        // pins, and instants the next comparison must include.
+        let mut deadlines: Vec<u64> = Vec::new();
+        let mut artifacts: Vec<(String, u64)> = Vec::new();
+        let mut late = Sequence(seed ^ 0xA5A5_5A5A);
+        let mut forced: Vec<u64> = Vec::new();
         for step in 0..STEPS {
             for _ in 0..=rng.next(2) {
                 serial += 1;
-                let op = rng.next(11);
+                let op = rng.next(16);
+                if op == 13 {
+                    // A rebuild: the older-writer path lowers the format and the migration
+                    // recomputes every owner row from its entry and retirement state.
+                    drop(store);
+                    let db = catalog_db(&path).unwrap();
+                    sparrow_core::lower_owner_summary_for_legacy_fixture(&db).unwrap();
+                    drop(db);
+                    store = Store::open(&path, config()).unwrap();
+                    while store.migrate_step().unwrap().is_some() {}
+                    trace.push(format!("step {step}: rebuild ok=true"));
+                    tally.entry("rebuild").or_default().0 += 1;
+                    continue;
+                }
                 let mut published: Option<Result<sparrow_core::Artifact, sparrow_core::Error>> =
                     None;
                 let (kind, outcome, ok) = match op {
-                    0..=2 => {
+                    0..=2 | 15 => {
                         let input: Vec<u8> = if op == 2 {
                             let mut line = vec![b'a' + rng.next(3) as u8; 64 * 1024];
                             line[64 * 1024 - 1] = b'\n';
@@ -27805,11 +27831,26 @@ fn retention_answer_from_the_summary_equals_the_entry_walk_through_random_mutati
                         ("tail", format!("tail append {input:?}"), ok)
                     }
                     5 | 6 if !owners.is_empty() => {
-                        let target = owners[rng.next(owners.len() as u64) as usize].clone();
-                        let days = 1 + rng.next(3);
+                        let mut target = owners[rng.next(owners.len() as u64) as usize].clone();
+                        let mut days = 1 + rng.next(3);
+                        let waiting: Vec<(String, u64)> = artifacts
+                            .iter()
+                            .filter(|(_, deadline)| *deadline > now)
+                            .cloned()
+                            .collect();
+                        if !waiting.is_empty() && late.next(2) == 0 {
+                            // Pin an artifact just before its deadline, so the pin outlives it.
+                            let (id, deadline) =
+                                waiting[late.next(waiting.len() as u64) as usize].clone();
+                            target = id;
+                            days = 3;
+                            now = now.max(deadline.saturating_sub(DAY));
+                            forced.extend([deadline, deadline + DAY / 2, deadline + 2 * DAY]);
+                        }
+                        let name = format!("name{}", rng.next(3));
                         let made = store.pin(
                             &format!("p{serial}"),
-                            "diff",
+                            &name,
                             std::slice::from_ref(&target),
                             days,
                             now,
@@ -27818,27 +27859,85 @@ fn retention_answer_from_the_summary_equals_the_entry_walk_through_random_mutati
                         if let Ok(pin) = made {
                             pins.push(pin.id);
                         }
-                        ("pin", format!("pin {target} for {days} days"), ok)
+                        if ok {
+                            deadlines.push(now + days * DAY);
+                        }
+                        let kind = if target.starts_with("artifact:") && days == 3 {
+                            "pin-artifact3"
+                        } else {
+                            "pin"
+                        };
+                        (kind, format!("pin {target} for {days} days"), ok)
                     }
                     7 if !pins.is_empty() => {
                         let pin = pins.swap_remove(rng.next(pins.len() as u64) as usize);
                         let ok = store.release(&pin).is_ok();
                         ("unpin", format!("unpin {pin}"), ok)
                     }
+                    11 if !pins.is_empty() => {
+                        let pin = pins[rng.next(pins.len() as u64) as usize].clone();
+                        let days = 1 + rng.next(3);
+                        let ok = store
+                            .renew_pin(&format!("n{serial}"), &pin, days, None, now)
+                            .is_ok();
+                        ("renew", format!("renew {pin} for {days} days"), ok)
+                    }
+                    12 => {
+                        // One record of eight chunks: eviction spends the whole payload
+                        // budget on the record, so the parent artifact is marked evicted
+                        // with no manifest chunk retired.
+                        let mut line = Vec::new();
+                        for chunk in 0..8_u64 {
+                            line.extend(vec![b'a' + ((chunk + rng.next(3)) % 5) as u8; 64 * 1024]);
+                        }
+                        let last = line.len() - 1;
+                        line[last] = b'\n';
+                        let made = store.ingest(&format!("w{serial}"), "diff", "log", &line, now);
+                        let ok = made.is_ok();
+                        published = Some(made);
+                        ("wide", "ingest one eight-chunk record".to_owned(), ok)
+                    }
                     8 => {
-                        now += (1 + rng.next(8)) * DAY / 2;
+                        // The repository does not enforce a monotone clock: move back too.
+                        if rng.next(4) == 0 {
+                            now = now.saturating_sub((1 + rng.next(4)) * DAY / 2).max(DAY);
+                        } else if rng.next(3) == 0 {
+                            // A jump past owner deadlines, so expiry and retirement run.
+                            now += (10 + rng.next(26)) * DAY;
+                        } else {
+                            now += (1 + rng.next(8)) * DAY / 2;
+                        }
                         ("clock", format!("clock to {now}"), true)
+                    }
+                    14 => {
+                        // More records than one 256-owner migration page.
+                        let input: String = (0..300)
+                            .map(|line| format!("bulk {serial} {line}\n"))
+                            .collect();
+                        let made = store.ingest(
+                            &format!("b{serial}"),
+                            "diff",
+                            "log",
+                            input.as_bytes(),
+                            now,
+                        );
+                        let ok = made.is_ok();
+                        published = Some(made);
+                        ("bulk", "ingest 300 lines".to_owned(), ok)
                     }
                     9 => {
                         let ok = store.expire_bounded(now, limits).is_ok();
                         ("expire", "expire".to_owned(), ok)
                     }
-                    _ => {
+                    10 if rng.next(2) == 0 => {
                         let ok = store.evict_oldest(now, limits).is_ok();
                         ("evict", "evict".to_owned(), ok)
                     }
+                    _ => ("none", "no operation".to_owned(), true),
                 };
                 if let Some(Ok(artifact)) = &published {
+                    artifacts.push((artifact.id.clone(), now + sparrow_core::RETENTION_MS));
+                    deadlines.push(now + sparrow_core::RETENTION_MS);
                     owners.push(artifact.id.clone());
                     owners.extend(artifact.record_ids.iter().cloned());
                 }
@@ -27850,7 +27949,24 @@ fn retention_answer_from_the_summary_equals_the_entry_walk_through_random_mutati
                 }
                 trace.push(format!("step {step}: {outcome} ok={ok}"));
             }
-            let live = retention_result(&store, now);
+            // The newest instant, then earlier ones: a pin or owner not yet expired at them.
+            let mut nows = vec![
+                now,
+                now.saturating_sub(DAY / 2),
+                now.saturating_sub(5 * DAY),
+            ];
+            nows.append(&mut forced);
+            for _ in 0..4 {
+                if !deadlines.is_empty() {
+                    let deadline = deadlines[rng.next(deadlines.len() as u64) as usize];
+                    nows.push([deadline - 1, deadline, deadline + DAY / 2][rng.next(3) as usize]);
+                }
+            }
+            let lives: Vec<String> = nows
+                .iter()
+                .map(|at| retention_result(&store, *at))
+                .collect();
+            let live = lives[0].clone();
             let live_visits = store
                 .retention_metrics(now, sparrow_core::RetentionReadLimits::default())
                 .map(|report| report.visits)
@@ -27862,11 +27978,16 @@ fn retention_answer_from_the_summary_equals_the_entry_walk_through_random_mutati
             }
             shapes.2 += u32::from(live_visits > 0);
             drop(store);
-            let walked = entry_walk_totals(&path, &copy, now);
+            let walked = entry_walk_totals(&path, &copy, &nows);
             store = Store::open(&path, config()).unwrap();
             let reopened = retention_result(&store, now);
             let context = format!("seed {seed:#x}, step {step}\n{}", trace.join("\n"));
-            assert_eq!(live, walked, "summary vs entry walk\n{context}");
+            if let Some(index) = (0..lives.len()).find(|index| lives[*index] != walked[*index]) {
+                panic!(
+                    "summary vs entry walk at now={}\nsummary: {}\nwalk:    {}\n{context}",
+                    nows[index], lives[index], walked[index]
+                );
+            }
             assert_eq!(live, reopened, "summary before vs after reopen\n{context}");
         }
     }
