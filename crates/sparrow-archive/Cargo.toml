@@ -25,6 +25,7 @@ sparrow-core = { path = "../sparrow-core" }
 purrdf.workspace = true
 
 [dev-dependencies]
+purrdf-hash.workspace = true
 sparrow-test-support = { path = "../sparrow-test-support" }
 tempfile = "3"
 

@@ -402,4 +402,9 @@ records contiguous in byte order and their total equal to the artifact's recorde
 `byteLength`. A damaged segment anywhere under `DIR` blocks extraction; to extract from the
 rest, point `DIR` at a directory without it. A damaged segment, an unknown id or an artifact with a
 missing record exits nonzero, names the file or artifact on stderr and writes nothing to
-stdout. There is no restore into Sparrow.
+stdout. A directory with no segment, or one that does not exist, fails the same way. Discovery reads
+regular `*.gts` files only: a symbolic link to a segment is not an archive member and is not
+followed. An artifact with no bytes holds no records, so no segment carries it and `extract`
+reports it as unknown. `extract` decodes one segment at a time, so its peak memory is the
+largest segment plus two copies of the artifact (its records and the joined result); it has no
+artifact size ceiling of its own. There is no restore into Sparrow.

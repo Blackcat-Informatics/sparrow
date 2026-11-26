@@ -1447,6 +1447,7 @@ name = "sparrow-archive"
 version = "0.1.0"
 dependencies = [
  "purrdf",
+ "purrdf-hash",
  "sparrow-core",
  "sparrow-test-support",
  "tempfile",
