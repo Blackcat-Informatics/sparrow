@@ -332,7 +332,7 @@ impl Writer {
     pub(super) fn archived(&self, received_at: u64, id: &str) -> bool {
         self.archive
             .as_ref()
-            .map_or(self.config.retire_without_archive, |state| {
+            .map_or(self.config.retire_without_archive.retires(), |state| {
                 state
                     .borrow()
                     .archived(position(received_at, id).as_bytes())
@@ -501,6 +501,7 @@ impl Store {
 mod tests {
     use super::*;
     use crate::Config;
+    use crate::UnarchivedRetirement;
 
     /// INVARIANT: the durable encodings round-trip and refuse truncation or foreign versions.
     #[test]
@@ -536,7 +537,7 @@ mod tests {
     fn a_store_with_no_archive_policy_expires_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let config = crate::Config {
-            retire_without_archive: false,
+            retire_without_archive: UnarchivedRetirement::HOLD,
             ..sparrow_test_support::storage_config!(Config)
         };
         let store = Store::open(dir.path(), config).unwrap();

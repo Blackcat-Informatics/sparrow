@@ -652,7 +652,7 @@ impl ServerConfig {
             max_pin_members: self.max_pin_members,
             text_analyzer: sparrow_core::resolve_text_analyzer(&self.text_lexicon_dir)?,
             archive: self.archive.as_ref().map(ArchiveConfig::policy),
-            retire_without_archive: false,
+            retire_without_archive: sparrow_core::UnarchivedRetirement::HOLD,
             instance_role: self.instance_role,
         };
         let store = match expected_id {
