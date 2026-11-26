@@ -27993,3 +27993,110 @@ fn retention_answer_from_the_summary_equals_the_entry_walk_through_random_mutati
     }
     eprintln!("ORACLE ops (ok, refused): {tally:?}; steps (empty, nonempty, answered): {shapes:?}");
 }
+
+fn pin_rows(dir: &std::path::Path) -> usize {
+    let db = catalog_db(dir).unwrap();
+    db.prefix_iterator(b"pin:")
+        .map(Result::unwrap)
+        .take_while(|(key, _)| key.starts_with(b"pin:"))
+        .count()
+}
+
+fn artifact_counts(store: &Store, now: u64) -> (u64, u64) {
+    let report = store
+        .retention_metrics(now, sparrow_core::RetentionReadLimits::default())
+        .unwrap();
+    (report.live_artifacts, report.pinned_artifacts)
+}
+
+/// INVARIANT: a pin whose deadline has passed protects nothing in the retention answer
+/// (`capture_pins` skips it at `expires_at <= now`), while its row stays stored until the
+/// expiry sweep runs.
+#[test]
+fn a_pin_past_its_deadline_is_skipped_by_capture_but_its_row_remains_until_the_sweep() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("pin-skip", "pins", "log", b"kept\n", 0)
+        .unwrap();
+    // The artifact expires at day 30; the pin is taken on day 29 for one day.
+    store
+        .pin("pin-skip-pin", "pins", &[artifact.id], 1, 29 * DAY)
+        .unwrap();
+    assert_eq!(artifact_counts(&store, 30 * DAY - 1), (1, 1));
+    assert_eq!(artifact_counts(&store, 30 * DAY), (0, 0));
+    drop(store);
+    assert_eq!(pin_rows(dir.path()), 1);
+}
+
+/// INVARIANT: renewing a pin raises its deadline (never lowers it), so an owner past its own
+/// deadline is live and pinned at an instant the unrenewed pin no longer covers.
+#[test]
+fn a_renewed_pin_protects_at_an_instant_the_unrenewed_pin_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("pin-renew", "pins", "log", b"kept\n", 0)
+        .unwrap();
+    let pin = store
+        .pin("pin-renew-pin", "pins", &[artifact.id], 1, 29 * DAY)
+        .unwrap();
+    let later = 31 * DAY;
+    assert_eq!(artifact_counts(&store, later), (0, 0));
+    let renewed = store
+        .renew_pin("pin-renew-renew", &pin.id, 3, None, 29 * DAY + DAY / 2)
+        .unwrap();
+    assert!(renewed.expires_at > pin.expires_at);
+    assert_eq!(artifact_counts(&store, later), (1, 1));
+    // A shorter renewal never moves the deadline back.
+    let shorter = store
+        .renew_pin("pin-renew-short", &pin.id, 1, None, 29 * DAY + DAY / 2)
+        .unwrap();
+    assert_eq!(shorter.expires_at, renewed.expires_at);
+}
+
+/// INVARIANT: the expiry pass deletes an expired pin row, and with the row gone no query,
+/// including one at an instant before the pin's deadline, sees its protection.
+#[test]
+fn the_expiry_sweep_removes_an_expired_pin_row_and_its_protection_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("pin-sweep", "pins", "log", b"kept\n", 0)
+        .unwrap();
+    store
+        .pin("pin-sweep-pin", "pins", &[artifact.id], 1, 29 * DAY)
+        .unwrap();
+    let before = 29 * DAY + DAY / 2;
+    assert_eq!(artifact_counts(&store, before), (1, 1));
+    store
+        .expire_bounded(30 * DAY + DAY / 2, sparrow_core::EvictionLimits::default())
+        .unwrap();
+    assert_eq!(artifact_counts(&store, before), (1, 0));
+    drop(store);
+    assert_eq!(pin_rows(dir.path()), 0);
+}
+
+/// INVARIANT: eviction clears a record's chunk list in the same write that marks it evicted,
+/// so a stored evicted record never lists chunks it no longer owns.
+#[test]
+fn eviction_clears_a_records_chunk_list_in_the_write_that_marks_it_evicted() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("evict-clear", "pins", "log", b"alpha\nbeta\n", 0)
+        .unwrap();
+    let row = |dir: &std::path::Path, id: &str| {
+        let db = catalog_db(dir).unwrap();
+        String::from_utf8(db.get(id).unwrap().unwrap()).unwrap()
+    };
+    store
+        .evict_oldest(DAY, sparrow_core::EvictionLimits::default())
+        .unwrap();
+    drop(store);
+    for id in &artifact.record_ids {
+        let stored = row(dir.path(), id);
+        assert!(stored.contains("\"evicted\":true"), "{stored}");
+        assert!(stored.contains("\"chunks\":[]"), "{stored}");
+    }
+}
