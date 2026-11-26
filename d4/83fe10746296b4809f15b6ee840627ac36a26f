@@ -1,0 +1,19 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: d4d54551da25e7d243c17496534d15bcee14802b
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 568
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/568
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 93d2e52ffdda4204472ca3fb55d52d06b7fbb405
+GhpRsq-Head-Ref: paudley/306-qualify-edge-cases-in-the-offline-gts
+GhpRsq-Head-OID: d4d54551da25e7d243c17496534d15bcee14802b
+GhpRsq-Result-Tree: b7d9beabd7fad377360e0040d1853796e6b24824
+GhpRsq-Result-Commit: d483fe10746296b4809f15b6ee840627ac36a26f
+GhpRsq-Parent-Hashes: d4d54551da25e7d243c17496534d15bcee14802b
+GhpRsq-Squash-Notes-SHA256: 406fe4e884f4fa62558a750af454da02871fa66dd20864d554c87a03bf987102
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
