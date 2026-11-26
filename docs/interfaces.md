@@ -1029,30 +1029,27 @@ its graph deferred is separate work.
 
 ### Projection term limit
 
-Each record's RDF projection encodes the record's value as an `xsd:string` term in
-canonical JSON. Projection refuses a record whose encoded term exceeds 65,536 bytes.
+Projection stores each scalar JSON value of a record as an RDF literal, and refuses a
+record whose encoded literal exceeds 65,536 bytes.
 
-- **Unit.** The byte length of the canonical JSON of the value's `xsd:string` term. Its
-  lexical form is the value's JSON-escaped text, so a quote or backslash in the value
-  costs extra bytes.
+- **Term.** Each JSON string, number, boolean and null value of a stored record becomes a
+  literal with datatype `xsd:string` and no language or direction. Its lexical form is the
+  value's source text exactly as written: for a string, the bytes between its quotes, with
+  escape sequences left undecoded.
+- **Unit.** The length in bytes of the term's canonical JSON, the compact encoding of its
+  kind, lexical form, datatype, language and direction. For a plain ASCII string this is
+  the source text's length plus 117 bytes. Each backslash in the source text is escaped
+  again in the canonical encoding, so an escape sequence costs more than its source length.
 - **Limit.** 65,536 bytes, inclusive. A term of exactly 65,536 bytes projects.
-- **Ingest.** Ingest does not check this limit. The record is stored and its projection
-  state is `failed`, with zero primary rows. `rdf` and `rdf_inspect` report
+- **Ingest.** Ingest does not check this limit. The record is stored with projection state
+  `failed` and zero primary rows. `rdf` and `rdf_inspect` report
   `PROJECTION_FAILURE: projection resource-limit error: canonical term JSON exceeds the 65536-byte artifact limit`.
-- **Measured boundaries.** On a scratch store, the largest accepted plain ASCII value is
-  65,419 bytes and the smallest refused is 65,420. A value of 65,415 characters followed by
-  one double quote is accepted, and 65,416 characters followed by one quote is refused.
-  Two-byte UTF-8 values follow the plain boundary in bytes.
-- **Inferred unit.** The stored term's bytes are not exposed by the CLI. The unit above is
-  inferred from these boundaries and from a canonical-JSON model that reproduces the
-  projected or failed state of every measured record. The pinning test in
-  `tests/storage.rs` checks the boundaries through the projection state, not through the
-  term bytes.
-- **What a sender must do.** Keep each value's canonical JSON within 65,536 bytes. For a
-  value that is a long plain string, keep its byte length at or below 65,419. For a value
-  with JSON-escaped characters, count each escaped character at its encoded length. Split
-  a longer value across records. Check `rdf_inspect` for `state` = `failed` to find a
-  record that did not project.
+- **Boundaries.** A plain ASCII value of 65,419 bytes projects and 65,420 does not. A value
+  of 65,415 characters followed by one double quote projects and 65,416 characters followed
+  by one quote does not. Two-byte UTF-8 values follow the plain boundary in bytes.
+- **What a sender must do.** Keep each value's source text, with escapes as written, so that
+  its canonical encoding stays within 65,536 bytes. Split a longer value across records.
+  Check `rdf_inspect` for `state` = `failed` to find a record that did not project.
 
 ### Archive worker status
 
