@@ -10360,6 +10360,64 @@ fn publish_staged(
     store.import_publish(&manifest.id, 0)
 }
 
+/// INVARIANT (#82): a record kept alone by its pin, after its parent artifact expires, owns its
+/// payload, and that ownership stays charged after the record's transient parse is released.
+/// Protects two failure modes at fixed allowances that hold for every record order:
+///
+/// - the admitted allowance keeps the transient parse of the last record and the forty
+///   persistent ownership entries, so a refund that releases the entries admits below it and
+///   refuses nothing; the refused allowance sits below the correct peak and above the refund
+///   peak, so that bug admits it and fails this test;
+/// - the admitted allowance covers the peak only when each parse charge is refunded, so an
+///   accumulated parse charge refuses it.
+///
+/// The allowances are measured for this fixture: pins charge 74,824 bytes, the last record's
+/// temporary parse charge is 59,400 to 59,432 bytes, and the correct peak lies between 154,704
+/// and 154,736 bytes for every order. Re-measure them when the charge function changes.
+#[test]
+fn record_only_ownership_stays_charged_after_transient_parse_refunds() {
+    use sparrow_core::RetentionReadLimits;
+    const RECORDS: usize = 40;
+    const REFUSED: usize = 150_000;
+    const ADMITTED: usize = 160_000;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input: String = (0..RECORDS).map(|line| format!("kept {line}\n")).collect();
+    let artifact = store
+        .ingest("file", "source", "log", input.as_bytes(), 0)
+        .unwrap();
+    assert_eq!(artifact.record_ids.len(), RECORDS);
+    store
+        .pin(
+            "pin-records",
+            "investigation",
+            &artifact.record_ids,
+            10,
+            29 * DAY,
+        )
+        .unwrap();
+    store.expire(30 * DAY).unwrap();
+    assert_eq!(
+        store.bytes(&artifact.id, 0, 1, 30 * DAY).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    let report = |catalog_bytes: usize| {
+        store.retention_metrics(
+            30 * DAY,
+            RetentionReadLimits {
+                catalog_bytes,
+                ..Default::default()
+            },
+        )
+    };
+    let admitted = report(ADMITTED).unwrap();
+    assert_eq!(admitted.live_records, RECORDS as u64);
+    assert_eq!(admitted.payload_chunks, RECORDS as u64);
+    assert_eq!(admitted.owned_payload_bytes, admitted.live_payload_bytes);
+    let refused = report(REFUSED).unwrap_err();
+    assert_eq!(refused.code, "RESOURCE_LIMIT");
+}
+
 #[test]
 fn import_ceiling_artifact_drains_through_expiry_and_eviction_and_one_chunk_more_is_refused() {
     let chunk = sparrow_core::IMPORT_CHUNK_BYTES;
