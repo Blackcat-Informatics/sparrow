@@ -396,6 +396,29 @@ impl From<purrdf_lex::allocation::StorageError> for Error {
     }
 }
 
+/// Whether a store with no archive policy may retire evidence. Only a test fixture can construct
+/// the permissive value, so shipped code can state the hold and cannot enable retirement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnarchivedRetirement(bool);
+
+impl UnarchivedRetirement {
+    /// The daemon's value: a store with no archive policy holds its evidence.
+    pub const HOLD: Self = Self(false);
+
+    /// A test fixture's value: the store retires evidence as if it were archived.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn fixture_retires() -> Self {
+        Self(true)
+    }
+
+    /// Whether unarchived evidence may be retired.
+    #[must_use]
+    pub const fn retires(self) -> bool {
+        self.0
+    }
+}
+
 /// Explicit, bounded storage admission configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -417,16 +440,24 @@ pub struct Config {
     pub text_analyzer: purrdf::text::Analyzer,
     /// Archive-before-delete policy. Once a store is fenced for archiving it requires one.
     pub archive: Option<archive::ArchivePolicy>,
-    /// Let a store with no archive policy retire evidence as if it were archived. For test
-    /// fixtures that exercise retention without an archive; the daemon never sets it, so a
-    /// production store with no policy holds its evidence.
-    pub retire_without_archive: bool,
+    /// Whether a store with no archive policy may retire evidence as if it were archived. The
+    /// daemon holds it; only a test fixture can set it.
+    pub retire_without_archive: UnarchivedRetirement,
     /// Role to record when the store is created, and to require of an existing store. `None`
     /// records nothing and accepts any store.
     pub instance_role: Option<instance_role::InstanceRole>,
 }
 
 impl Config {
+    /// The retirement value a test fixture's store configuration carries. Only test-support
+    /// builds have it, so shipped code cannot construct it.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn fixture_retirement() -> UnarchivedRetirement {
+        UnarchivedRetirement::fixture_retires()
+    }
+
     fn validate(&self) -> Result<(), Error> {
         if !(durability::MIN_FLUSH_INTERVAL_MS..=durability::MAX_FLUSH_INTERVAL_MS)
             .contains(&self.buffered_flush_interval_ms)

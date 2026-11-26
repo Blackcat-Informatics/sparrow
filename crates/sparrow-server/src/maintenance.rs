@@ -1180,7 +1180,7 @@ mod tests {
                 max_import_journals: config.max_import_journals,
                 text_analyzer: sparrow_core::resolve_text_analyzer(&config.text_lexicon_dir)?,
                 archive: None,
-                retire_without_archive: true,
+                retire_without_archive: sparrow_core::UnarchivedRetirement::fixture_retires(),
                 instance_role: config.instance_role,
             },
         )?)
