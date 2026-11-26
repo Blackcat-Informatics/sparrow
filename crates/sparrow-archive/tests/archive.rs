@@ -211,6 +211,26 @@ fn extract_writes_an_artifact_above_the_former_ingest_limit_byte_for_byte() {
     );
 }
 
+/// Value: an empty `opaque` artifact stores one zero-length record through the ordinary store
+/// and archive encoder; extraction writes nothing and succeeds, and `verify` accepts the segment.
+#[test]
+fn an_empty_opaque_artifact_archives_one_empty_record_and_extracts_nothing() {
+    let archive_dir = tempfile::tempdir().unwrap();
+    let (ids, paths) = archive(
+        archive_dir.path(),
+        ArchivePolicy::default(),
+        &[("req-opaque", "host-o", "opaque", b"", T1)],
+    );
+    assert_eq!(paths.len(), 1, "one segment carries the empty record");
+    let output = extract(archive_dir.path(), &ids[0]);
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stdout.is_empty());
+    let verified = run(&["verify", archive_dir.path().to_str().unwrap()]);
+    assert!(verified.status.success(), "{:?}", verified.stdout);
+    let text = String::from_utf8(verified.stdout).unwrap();
+    assert!(text.contains("\"records\":1"), "{text}");
+}
+
 /// Value (#327): an artifact whose records were archived into two segments extracts whole,
 /// byte for byte, from the directory holding both.
 #[test]
@@ -408,19 +428,37 @@ fn extract_accepts_identical_duplicates_and_refuses_conflicting_ones() {
 
     let differing = tempfile::tempdir().unwrap();
     fixture_segment(differing.path(), "one", &fixture);
+    // The artifact metadata is identical; only the repeated record's receipt time differs.
     fixture_segment(
         differing.path(),
         "two",
-        &SegmentFixture::new(b"bravo\n", b"bravo\n"),
+        &SegmentFixture {
+            record_received_at: T2,
+            ..SegmentFixture::new(b"alpha\n", b"alpha\n")
+        },
     );
     let output = extract(differing.path(), "artifact:aa");
     let error = String::from_utf8(output.stderr).unwrap();
     assert_eq!(output.status.code(), Some(1), "{error}");
     assert!(output.stdout.is_empty());
     assert!(
-        error.contains("artifact:aa") && error.contains("conflicts"),
+        error.contains("record record:bb appears in more than one segment"),
         "{error}"
     );
+
+    // Artifact metadata that differs between segments is refused as its own conflict.
+    let metadata = tempfile::tempdir().unwrap();
+    fixture_segment(metadata.path(), "one", &fixture);
+    fixture_segment(
+        metadata.path(),
+        "two",
+        &SegmentFixture::new(b"bravo\n", b"bravo\n"),
+    );
+    let output = extract(metadata.path(), "artifact:aa");
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{error}");
+    assert!(output.stdout.is_empty());
+    assert!(error.contains("metadata that conflicts"), "{error}");
 }
 
 /// Value: a record whose source or receipt time differs from its artifact's is refused with
