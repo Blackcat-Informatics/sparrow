@@ -734,4 +734,121 @@ mod tests {
         durability::observe_batch(batch, &mut last).unwrap();
         last.0
     }
+
+    /// One chunk payload and its digest: the content is the chunk's ordinal, so every ordinal
+    /// is a distinct digest and the payload stays small.
+    fn chunk(ordinal: u64) -> (String, Vec<u8>) {
+        let content = ordinal.to_be_bytes().to_vec();
+        let digest = hex::encode(purrdf_hash::blake3::hash(&content).as_bytes());
+        (digest, content)
+    }
+
+    /// Store the payloads and reference counters of `digests`, each referenced `owners`
+    /// times, in pages so no batch grows past the writer's admission.
+    fn store_chunks(writer: &crate::storage::Writer, ordinals: std::ops::Range<u64>, owners: u64) {
+        let cf = writer.db.cf_handle("payload").unwrap();
+        for page in ordinals.clone().step_by(20_000) {
+            let mut batch = WriteBatch::default();
+            for ordinal in page..ordinals.end.min(page + 20_000) {
+                let (digest, content) = chunk(ordinal);
+                batch.put_cf(cf, &digest, content);
+                batch.put(format!("ref:{digest}"), owners.to_be_bytes());
+            }
+            writer.commit(batch).unwrap();
+        }
+    }
+
+    /// Publish one artifact entry whose manifest lists the chunks of `ordinals`.
+    fn publish_owner(writer: &crate::storage::Writer, id: &str, ordinals: std::ops::Range<u64>) {
+        let chunks: Vec<String> = ordinals.map(|ordinal| chunk(ordinal).0).collect();
+        let row = format!(
+            r#"{{"chunks":{},"record_ids":["record:r"],"evicted":false,"payload_id":"blake3:{}","byte_length":"7","expires_at":"9","received_at":"1","format":"log","source":"s","id":"{id}"}}"#,
+            json_array(&chunks),
+            hex::encode(&[0; 32]),
+        );
+        let mut batch = WriteBatch::default();
+        batch.put(id, row);
+        writer.commit(batch).unwrap();
+    }
+
+    /// The owners, owner-digest entries and distinct digests the stored summary holds: the
+    /// quantities the summary path visits and charges.
+    fn summary_shape(store: &Store) -> (u64, u64, u64) {
+        let (stored, _) = store.owner_summary_audit_for_tests().unwrap();
+        let mut digests = std::collections::BTreeSet::new();
+        let mut entries = 0;
+        for (key, value) in &stored {
+            let summary = Summary::decode(key.as_bytes(), value).unwrap();
+            entries += summary.chunks.len() as u64;
+            digests.extend(summary.chunks.keys().copied());
+        }
+        (stored.len() as u64, entries, digests.len() as u64)
+    }
+
+    /// INVARIANT: at the published maximum admission the retention query either answers with
+    /// the exact totals or refuses with `RESOURCE_LIMIT`; it never answers with fewer owners
+    /// or digests than the catalog holds. An answer costs one visit per owner row, one per
+    /// owner-digest entry and one per distinct digest, so a catalog of many owners sharing
+    /// digests, and one owner of about 130,000 distinct chunks, exceed the visit or catalog
+    /// bound and refuse loudly.
+    #[test]
+    fn retention_metrics_at_maximum_admission_refuse_loudly_and_never_undercount() {
+        // (owners, distinct chunks per owner, whether the owners share one digest set)
+        let fixtures = [
+            (1_u64, 1_000_u64, false),
+            (1, 49_000, false),
+            (1, 130_000, false),
+            (370, 831, true),
+            (120, 831, false),
+        ];
+        for (owners, chunks, shared) in fixtures {
+            let dir = tempfile::tempdir().unwrap();
+            let store =
+                Store::open(dir.path(), sparrow_test_support::storage_config!(Config)).unwrap();
+            {
+                let writer = store.lock().unwrap();
+                if shared {
+                    store_chunks(&writer, 0..chunks, owners);
+                } else {
+                    store_chunks(&writer, 0..owners * chunks, 1);
+                }
+                for owner in 0..owners {
+                    let first = if shared { 0 } else { owner * chunks };
+                    publish_owner(
+                        &writer,
+                        &format!("artifact:max-{owner:04}"),
+                        first..first + chunks,
+                    );
+                }
+            }
+            let (rows, entries, distinct) = summary_shape(&store);
+            assert_eq!((rows, entries), (owners, owners * chunks));
+            assert_eq!(distinct, if shared { chunks } else { owners * chunks });
+            let visits = rows + entries + distinct;
+            let limits = crate::RetentionReadLimits {
+                max_visits: 100_000,
+                catalog_bytes: 32 * 1024 * 1024,
+                payload_bytes: 1024 * 1024 * 1024,
+            };
+            let answer = store.retention_metrics(5, limits);
+            match answer {
+                Ok(report) => {
+                    assert!(visits <= limits.max_visits as u64);
+                    assert_eq!(report.live_artifacts, owners);
+                    assert_eq!(report.payload_chunks, distinct);
+                    assert_eq!(report.visits, visits);
+                }
+                Err(refusal) => {
+                    // A refusal names a bound the account really exceeds: the visit
+                    // cap, or an ownership map past half the catalog allowance.
+                    assert_eq!(refusal.code, "RESOURCE_LIMIT", "{refusal:?}");
+                    assert!(
+                        visits > limits.max_visits as u64
+                            || distinct * 512 > limits.catalog_bytes as u64 / 2,
+                        "{visits} visits, {distinct} digests"
+                    );
+                }
+            }
+        }
+    }
 }
