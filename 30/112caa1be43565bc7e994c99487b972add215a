@@ -1,0 +1,19 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 30112caa1be43565bc7e994c99487b972add215a
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 573
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/573
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 1fb75423bba61ace88d0d542f44c74a3cb9c899d
+GhpRsq-Head-Ref: paudley/306-qualify-edge-cases-in-the-offline-gts
+GhpRsq-Head-OID: 30112caa1be43565bc7e994c99487b972add215a
+GhpRsq-Result-Tree: 4bcae426a5d8b0e24bd27c2e2bb9e2b622a856c6
+GhpRsq-Result-Commit: 4deb55ad259345254641eba55c4fb615cec9d9f2
+GhpRsq-Parent-Hashes: 30112caa1be43565bc7e994c99487b972add215a
+GhpRsq-Squash-Notes-SHA256: a91742e5803cedc2e35ecd213c5101599e96d67c50e3c77bd3ac40c50a102e5f
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
