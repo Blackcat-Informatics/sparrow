@@ -29,6 +29,10 @@ use std::{
 #[cfg(test)]
 type ReadbackHook = dyn Fn(&Path) + Send + Sync;
 
+/// A test point run with no state of the worker's own. It may panic to stand for a fault.
+#[cfg(test)]
+type FaultHook = dyn Fn() + Send + Sync;
+
 #[derive(Clone)]
 struct Timing {
     warn: Duration,
@@ -36,6 +40,12 @@ struct Timing {
     filesystem_root: PathBuf,
     #[cfg(test)]
     before_readback: Option<Arc<ReadbackHook>>,
+    /// Run at the top of each coordinator loop turn, outside any pass.
+    #[cfg(test)]
+    loop_fault: Option<Arc<FaultHook>>,
+    /// Run in the filesystem thread after a job's result is taken, outside its job guard.
+    #[cfg(test)]
+    job_fault: Option<Arc<FaultHook>>,
 }
 
 impl Timing {
@@ -46,6 +56,10 @@ impl Timing {
             filesystem_root: PathBuf::from("/"),
             #[cfg(test)]
             before_readback: None,
+            #[cfg(test)]
+            loop_fault: None,
+            #[cfg(test)]
+            job_fault: None,
         }
     }
 
@@ -737,7 +751,7 @@ fn segment_file_name(segment: &PreparedSegment) -> String {
 #[derive(Clone)]
 pub struct Filesystem {
     slot: Arc<Slot>,
-    jobs: mpsc::SyncSender<FilesystemJob>,
+    jobs: Arc<Mutex<mpsc::SyncSender<FilesystemJob>>>,
 }
 
 #[derive(Default)]
@@ -774,20 +788,50 @@ struct FilesystemJob {
     reply: mpsc::Sender<JobResult>,
 }
 
+/// Start one filesystem thread with a queue of one job, and return the queue's sender.
+fn spawn_filesystem_thread() -> io::Result<mpsc::SyncSender<FilesystemJob>> {
+    let (jobs, incoming) = mpsc::sync_channel::<FilesystemJob>(1);
+    thread::Builder::new()
+        .name("sparrow-archive-io".into())
+        .spawn(move || {
+            while let Ok(job) = incoming.recv() {
+                job.run();
+            }
+        })?;
+    Ok(jobs)
+}
+
+/// Wakes the coordinator waiting on a job when the job's guard ends, including on an unwind.
+struct WakeWaiter(Arc<Flight>);
+
+impl Drop for WakeWaiter {
+    fn drop(&mut self) {
+        self.0.waiter.unpark();
+    }
+}
+
 impl FilesystemJob {
     fn run(self) {
         let flight = Arc::clone(&self.reservation.flight);
+        // Locals drop in reverse declaration order. On an unwind the reservation and the reply
+        // are released before this guard wakes the coordinator, so it sees both gone.
+        let _wake = WakeWaiter(Arc::clone(&flight));
+        let reservation = self.reservation;
+        let reply = self.reply;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             write_and_verify(&flight, &self.root, &self.store_id, &self.segment)
         }))
         .unwrap_or_else(|panic| Err(ArchiveError::Panicked(panic_message(panic.as_ref()))))
         .map(|directory| (self.segment, directory));
+        #[cfg(test)]
+        if let Some(fault) = &flight.timing.job_fault {
+            fault();
+        }
         // The slot is released only after the native work has returned, even if the receiver
         // has already gone. No queued job can touch the old job's temporary names.
-        drop(self.reservation);
+        drop(reservation);
         // A deadline or shutdown deliberately drops this job's unique reply receiver.
-        drop(self.reply.send(result));
-        flight.waiter.unpark();
+        drop(reply.send(result));
     }
 }
 
@@ -795,17 +839,30 @@ impl Filesystem {
     /// Start the single filesystem worker. The process never joins it because a mount
     /// syscall can remain blocked after an archive or storage session stops.
     pub fn start() -> io::Result<Self> {
-        let (jobs, incoming) = mpsc::sync_channel::<FilesystemJob>(1);
-        thread::Builder::new()
-            .name("sparrow-archive-io".into())
-            .spawn(move || {
-                while let Ok(job) = incoming.recv() {
-                    job.run();
-                }
-            })?;
         Ok(Self {
             slot: Arc::new(Slot::default()),
-            jobs,
+            jobs: Arc::new(Mutex::new(spawn_filesystem_thread()?)),
+        })
+    }
+
+    /// Hand `job` to the filesystem thread. When that thread has ended outside its job guard,
+    /// start a replacement with the same one-job queue and give it the job, so the next pass
+    /// archives again. The single slot still bounds the work outstanding at any time.
+    fn submit(&self, job: FilesystemJob) -> Result<(), String> {
+        let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        let job = match jobs.try_send(job) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => {
+                return Err(
+                    "the process-owned archive worker cannot accept its reservation".into(),
+                );
+            }
+            Err(mpsc::TrySendError::Disconnected(job)) => job,
+        };
+        *jobs = spawn_filesystem_thread()
+            .map_err(|error| format!("the archive filesystem worker could not restart: {error}"))?;
+        jobs.try_send(job).map_err(|_| {
+            "the replacement archive filesystem worker cannot accept its reservation".to_owned()
         })
     }
 
@@ -844,6 +901,14 @@ impl Coordinator {
         self.stop.load(Ordering::Acquire)
     }
 
+    /// The point at the top of each loop turn, outside any pass. Production has no fault here.
+    fn loop_turn(&self) {
+        #[cfg(test)]
+        if let Some(fault) = &self.timing.loop_fault {
+            fault();
+        }
+    }
+
     fn write_and_wait(
         &self,
         reservation: Reservation,
@@ -860,17 +925,14 @@ impl Coordinator {
             io_at("run archive filesystem job", &self.root)(io::Error::other(error.to_owned()))
         };
         self.filesystem
-            .jobs
-            .try_send(FilesystemJob {
+            .submit(FilesystemJob {
                 reservation,
                 root: self.root.clone(),
                 store_id: store_id.to_owned(),
                 segment,
                 reply,
             })
-            .map_err(|_| {
-                unavailable("the process-owned archive worker cannot accept its reservation")
-            })?;
+            .map_err(|error| unavailable(&error))?;
         self.status.phase(Phase::Writing);
 
         loop {
@@ -1093,7 +1155,17 @@ impl Worker {
         };
         let coordinator = thread::Builder::new()
             .name("sparrow-archive".into())
-            .spawn(move || run(&owner.status, every, &owner.stop, || pass(&owner, &store)))?;
+            .spawn(move || {
+                supervise(&owner.status, every, &owner.stop, || {
+                    run(
+                        &owner.status,
+                        every,
+                        &owner.stop,
+                        || pass(&owner, &store),
+                        || owner.loop_turn(),
+                    );
+                });
+            })?;
         Ok(Self {
             stop,
             coordinator: Some(coordinator),
@@ -1178,27 +1250,55 @@ fn pass(owner: &Coordinator, store: &Store) -> Result<u64, String> {
         .map_err(|error| error.to_string())
 }
 
-/// Run `pass` until stopped, `every` apart.
+/// Run `pass` until stopped, `every` apart. `turn` runs at the top of each turn, outside
+/// `guarded_pass`, so a panic it raises escapes this function to [`supervise`].
 fn run(
     status: &ArchiveStatus,
     every: Duration,
     stop: &AtomicBool,
     mut pass: impl FnMut() -> Result<u64, String>,
+    turn: impl Fn(),
 ) {
     while !stop.load(Ordering::Acquire) {
+        turn();
         let outcome = guarded_pass(status, &mut pass);
         if let Err(cause) = outcome {
             eprintln!("sparrowd: archive pass failed; the watermark did not move: {cause}");
             tracing::error!(%cause, "archive pass failed; the watermark did not move");
         }
-        let started = Instant::now();
-        while !stop.load(Ordering::Acquire) {
-            let remaining = every.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                break;
-            }
-            thread::park_timeout(remaining);
+        park_until(Instant::now(), every, stop);
+    }
+}
+
+/// Wait until `every` after `started`, or until stopped.
+fn park_until(started: Instant, every: Duration, stop: &AtomicBool) {
+    while !stop.load(Ordering::Acquire) {
+        let remaining = every.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
         }
+        thread::park_timeout(remaining);
+    }
+}
+
+/// Run the coordinator loop until it is stopped. A panic that escapes the loop, which only
+/// happens outside a pass, is recorded as `ARCHIVE_PANIC`, counted as a restart, and the loop
+/// is entered again after `every`. Every pass starts from the store's durable watermark and
+/// intent, so the restart needs no recovery of its own.
+fn supervise(status: &ArchiveStatus, every: Duration, stop: &AtomicBool, mut body: impl FnMut()) {
+    while !stop.load(Ordering::Acquire) {
+        let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut body)) else {
+            return;
+        };
+        let cause = panic_message(panic.as_ref());
+        note_panic(status, &cause);
+        fail_pass(
+            status,
+            "ARCHIVE_PANIC",
+            format!("archive loop panicked: {cause}"),
+            crate::now().ok(),
+        );
+        park_until(Instant::now(), every, stop);
     }
 }
 
@@ -1258,15 +1358,21 @@ mod tests {
         let stop = AtomicBool::new(false);
         let mut passes = 0;
         let mut seen = None;
-        run(&status, Duration::ZERO, &stop, || {
-            passes += 1;
-            if passes == 1 {
-                panic!("an injected archive panic");
-            }
-            seen = Some(status.snapshot());
-            stop.store(true, Ordering::Release);
-            Ok(0)
-        });
+        run(
+            &status,
+            Duration::ZERO,
+            &stop,
+            || {
+                passes += 1;
+                if passes == 1 {
+                    panic!("an injected archive panic");
+                }
+                seen = Some(status.snapshot());
+                stop.store(true, Ordering::Release);
+                Ok(0)
+            },
+            || {},
+        );
         assert_eq!(passes, 2);
         let snapshot = seen.unwrap();
         assert_eq!(snapshot.restarts, 1);
@@ -1277,6 +1383,135 @@ mod tests {
             failure.reason.contains("an injected archive panic"),
             "{failure:?}"
         );
+    }
+
+    /// Wait up to `limit` for `done`, checking every few milliseconds. Used only to observe
+    /// another thread's status in these tests.
+    fn wait_for(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + limit;
+        while !done() {
+            if Instant::now() >= end {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// INVARIANT (#447): a coordinator loop that exits outside its guarded pass is restarted by
+    /// the supervisor, which records `ARCHIVE_PANIC` and counts the restart. The restarted loop
+    /// archives from the durable watermark: the segment committed before the fault is not
+    /// rewritten, and the next segment is written and advances the watermark.
+    #[test]
+    fn a_coordinator_that_exits_outside_its_pass_restarts_and_archives_from_the_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let (store, first) = archiving_store(&data);
+        let root = nas(dir.path(), &store.store_id().unwrap());
+        let first_file =
+            archive_segment(&timing(), &store, &root, &store.store_id().unwrap(), &first).unwrap();
+        let (first_name, _) = &first.files[0];
+        let first_bytes = fs::read(first_file.join(first_name)).unwrap();
+        store.ingest("r2", "source", "log", b"c\nd\n", 2).unwrap();
+        let second = store
+            .archive_prepare(LATER)
+            .unwrap()
+            .expect("the second artifact is due");
+        assert_ne!(second.through, first.through);
+
+        let mut faulted = timing();
+        let fault = Arc::new(AtomicBool::new(true));
+        let armed = Arc::clone(&fault);
+        faulted.loop_fault = Some(Arc::new(move || {
+            if armed.swap(false, Ordering::AcqRel) {
+                panic!("an injected coordinator exit outside its pass");
+            }
+        }));
+        let status = ArchiveStatus::new();
+        let worker = Worker::start_configured(
+            &Filesystem::start().unwrap(),
+            store.clone(),
+            root.clone(),
+            Duration::from_millis(10),
+            faulted,
+            status.clone(),
+        )
+        .unwrap();
+        assert!(
+            wait_for(Duration::from_secs(30), || {
+                through(&store).as_deref() == Some(second.through.as_str())
+            }),
+            "the restarted coordinator did not commit the next segment"
+        );
+        let snapshot = status.snapshot();
+        assert_eq!(snapshot.restarts, 1);
+        assert!(snapshot.failure.is_none(), "{:?}", snapshot.failure);
+        assert_eq!(fs::read(first_file.join(first_name)).unwrap(), first_bytes);
+        let (name, _) = &second.files[0];
+        decode::verify(&[(
+            name.clone(),
+            fs::read(root.join(store.store_id().unwrap()).join(name)).unwrap(),
+        )])
+        .unwrap();
+        drop(worker);
+    }
+
+    /// INVARIANT (#447): a filesystem thread that exits outside its job guard is replaced when
+    /// the next job arrives. The pass that lost its job reports the failure, the worker does not
+    /// count a restart, and the replacement archives the segment and advances the watermark.
+    #[test]
+    fn a_filesystem_thread_that_exits_outside_its_job_is_replaced_and_the_next_pass_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, segment) = archiving_store(&dir.path().join("store"));
+        let store_id = store.store_id().unwrap();
+        let root = nas(dir.path(), &store_id);
+        let mut faulted = timing();
+        let fault = Arc::new(AtomicBool::new(true));
+        let armed = Arc::clone(&fault);
+        faulted.job_fault = Some(Arc::new(move || {
+            if armed.swap(false, Ordering::AcqRel) {
+                panic!("an injected filesystem thread exit outside its job");
+            }
+        }));
+        let status = ArchiveStatus::new();
+        let filesystem = Filesystem::start().unwrap();
+        let worker = Worker::start_configured(
+            &filesystem,
+            store.clone(),
+            root.clone(),
+            Duration::from_millis(500),
+            faulted,
+            status.clone(),
+        )
+        .unwrap();
+        assert!(
+            wait_for(Duration::from_secs(30), || status
+                .snapshot()
+                .failure
+                .is_some()),
+            "the lost job was never reported"
+        );
+        let lost = status.snapshot().failure.unwrap();
+        assert!(
+            lost.reason.contains("archive filesystem worker"),
+            "{lost:?}"
+        );
+        assert!(
+            wait_for(Duration::from_secs(30), || {
+                through(&store).as_deref() == Some(segment.through.as_str())
+            }),
+            "the replacement filesystem thread did not archive the segment"
+        );
+        let snapshot = status.snapshot();
+        assert_eq!(snapshot.restarts, 0);
+        assert!(snapshot.failure.is_none(), "{:?}", snapshot.failure);
+        let (name, _) = &segment.files[0];
+        decode::verify(&[(
+            name.clone(),
+            fs::read(root.join(&store_id).join(name)).unwrap(),
+        )])
+        .unwrap();
+        drop(worker);
     }
 
     /// A time after every window and horizon, so the store reports its backlog due.
