@@ -1,0 +1,19 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 2fd7e70a4072ddcf15bab16052579ab4aea7dc2b
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 561
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/561
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 8c489427449aea3b871f3056c7b358b684f0a95a
+GhpRsq-Head-Ref: paudley/376-cruft-sender-s-open-points-on-the
+GhpRsq-Head-OID: 2fd7e70a4072ddcf15bab16052579ab4aea7dc2b
+GhpRsq-Result-Tree: 6bd4b60e9d4e0ede0d1bf06c02bd6323078ad81a
+GhpRsq-Result-Commit: facefce4672b5375fee279305d0b124c1dbc6d8f
+GhpRsq-Parent-Hashes: 2fd7e70a4072ddcf15bab16052579ab4aea7dc2b
+GhpRsq-Squash-Notes-SHA256: 6c249759abe925710cccefb26bbddcd5684860cb4526429e8fc1409a4f302f0c
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
