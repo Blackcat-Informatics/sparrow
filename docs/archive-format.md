@@ -419,12 +419,13 @@ Empty input has three outcomes, and they differ:
   to empty stdout and verifies. This shows the reader accepts such a record; it does not describe
   an archive outcome.
 
-`extract` decodes the segments one at a time. Each segment's file is read whole and decoded; the
-reader keeps from it only the artifact's metadata and its records, then drops the segment before
-the next. What it holds at the end is the artifact's metadata, the selected records (every record
-whose artifact id matches, with its bytes), and the joined output, which is buffered whole before
-anything is written to stdout. So the cost is bounded by the largest single segment (its file bytes
-and decoded records) plus the selected records and the joined output, and it does not grow with
-the number of segments except through those selected records. The implementation and the
+`extract` first lists every segment path under `DIR`, one path per segment. It then decodes the
+segments one at a time: each file is read whole and decoded, the reader keeps from it only the
+artifact's metadata and its matching records, and it drops the segment before the next. Across the
+run it holds the path list, one decoded segment, the selected records (every record whose artifact
+id matches, with its bytes), and the joined output, which is buffered whole before anything is
+written to stdout. The selected records and the joined output each hold a copy of the artifact's
+bytes. So the cost grows with the number of segments only through the path list, and with the
+artifact through the selected records and the joined output. The implementation and the
 multi-segment fixtures establish this shape; the peak was not measured. The artifact has no size
 ceiling of its own. There is no restore into Sparrow.
