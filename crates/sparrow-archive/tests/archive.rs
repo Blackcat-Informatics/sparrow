@@ -257,6 +257,68 @@ fn extract_refuses_an_artifact_with_a_missing_segment() {
     }
 }
 
+/// Value: a directory with no segment, and a directory that does not exist, are each refused
+/// with a message naming the cause and an empty stdout, so a misdirected root never reads as
+/// an archive that merely lacks the artifact silently.
+#[test]
+fn extract_refuses_an_empty_or_missing_root_by_name() {
+    let empty = tempfile::tempdir().unwrap();
+    let output = extract(empty.path(), "any-artifact");
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{error}");
+    assert!(output.stdout.is_empty());
+    assert!(error.contains("any-artifact"), "{error}");
+
+    let missing = empty.path().join("absent");
+    let output = extract(&missing, "any-artifact");
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{error}");
+    assert!(output.stdout.is_empty());
+    assert!(error.contains("absent"), "{error}");
+}
+
+/// Value: discovery reads regular `*.gts` files only. A symlink to a segment, and a segment
+/// under `.staging`, are not archive members, so the artifact they hold is reported unknown
+/// rather than read through a link.
+#[test]
+fn extract_does_not_follow_symlinks_or_read_staging() {
+    let source = tempfile::tempdir().unwrap();
+    let (ids, paths) = archive(
+        source.path(),
+        ArchivePolicy::default(),
+        &[("req-a", "host-a", "log", FIRST, T1)],
+    );
+    let root = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(&paths[0], root.path().join("linked.gts")).unwrap();
+    let staging = root.path().join(".staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::copy(&paths[0], staging.join("partial.gts")).unwrap();
+    let output = extract(root.path(), &ids[0]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    std::fs::copy(&paths[0], root.path().join("real.gts")).unwrap();
+    let output = extract(root.path(), &ids[0]);
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, FIRST);
+}
+
+/// Value: a source name with a quote, a backslash and a newline prints as one valid JSON
+/// line per segment, with the characters escaped rather than raw.
+#[test]
+fn list_escapes_quotes_backslashes_and_control_characters_in_source_names() {
+    let archive_dir = tempfile::tempdir().unwrap();
+    archive(
+        archive_dir.path(),
+        ArchivePolicy::default(),
+        &[("req-q", "ho\"st\\\n", "log", FIRST, T1)],
+    );
+    let output = run(&["list", archive_dir.path().to_str().unwrap()]);
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(text.contains(r#"ho\"st\\\u000a"#), "{text}");
+}
+
 /// Value (#327): an id no segment holds is a named error, with nothing on stdout.
 #[test]
 fn extract_names_an_unknown_artifact() {
