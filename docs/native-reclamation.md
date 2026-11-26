@@ -7,8 +7,8 @@ SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 Sparrow must demonstrate physical recovery after logical retirement, preserve
 pinned/shared bytes, expose native failures and admit the refused write again.
-The earlier proposal for a new bounded file-compaction API is withdrawn as an
-unproven prerequisite. No new upstream RocksDB work is required by this contract.
+A new bounded file-compaction API is not a prerequisite, and this contract requires no new
+upstream RocksDB work.
 
 ## Existing implementation and native controls
 
@@ -41,11 +41,11 @@ status. A caller must not relabel that return as success. This limitation alone
 does not establish that Sparrow needs selected-file compaction, paginated file
 metadata or a new binding. No alternative binding has been selected.
 
-## Forced compaction ends a stalled wait (#211)
+## Forced compaction ends a stalled wait
 
-Native controls alone left one state with no end: a retirement whose flush is no
+Native controls alone cannot end one state: a retirement whose flush is no
 smaller than what it freed queues no native compaction, so linked bytes never fall
-and the wait never ends. The pressure worker now forces one range compaction of each
+and the wait never ends. The pressure worker forces one range compaction of each
 family per wait, once nothing native is pending and linked bytes have not fallen. It
 runs on its own thread, outside the writer lock. The binding discards the native
 status, so only the measured linked bytes judge it; if they still have not fallen the
@@ -53,12 +53,11 @@ wait is released and the next pass retires more. The pass needs the maintenance 
 free on the filesystem and otherwise does nothing that writes; its retirement and wait-clear commits are admitted against that reserve, not the free-space floor, which ordinary writes keep. The interface
 document has the status fields and the states that cannot end in process.
 
-## A floor refusal requests reclamation (#267)
+## A floor refusal requests reclamation
 
-The free-space floor used to refuse writes without asking any reclaim avenue to run, and
-the pressure pass ignored the floor: with the store inside its budget it returned at once,
-and the status read `ready` while writes were refused. Now a write refused at the floor
-requests a pass once per episode, and the pass measures the floor itself.
+A write refused at the free-space floor requests a pressure pass once per episode, and
+the pass measures the floor itself. Without that request a store inside its budget would
+return at once and the status would read `ready` while writes were refused.
 
 The deficit is a free-space quantity and stays out of `requested_bytes`, which is compared
 with the disk budget: put there it would make `physical + requested <= limit` true on any
@@ -79,7 +78,7 @@ reopened over-allowance store already uses, never the deficit, so a reopen resto
 whose first pass clears it through the ready branch. When the measured deficit reaches zero
 the episode ends and the ordinary ready path removes the marker.
 
-Ageing out is the first avenue of a floor episode and runs below the floor (#267 part C).
+Ageing out is the first avenue of a floor episode and runs below the floor.
 A floor refusal wakes it with the pass. It runs through `Store::expire_below_floor`: the
 same bounded pass as ordinary expiry, but its commits are admitted against the maintenance
 reserve like the pass's own, it does not run import reclamation, and when free space is
@@ -114,18 +113,16 @@ refuses writes until space returns. `floorPause.writesRefused`, the pressure sta
 `floorRefusedWrites` and the `floor*` fields show it. A client that does not retry loses
 what it was refused, and the store cannot count that loss; it counts only the refusals.
 
-## A failed native compaction does not latch the pressure state (#218)
+## A failed native compaction does not latch the pressure state
 
 The binding's compaction call is `void` all the way down: the C function
 `rocksdb_compact_range_cf_opt` drops the status RocksDB returns, and no other binding
 entry point returns it. A failed compaction shows only as a rise in
 `rocksdb.background-errors`, which RocksDB raises for a compaction error through its
-error handler. That count is cumulative since open and cannot be cleared in place. The
-pressure worker used to treat any nonzero count as fatal, so one failed compaction on a
-filling disk failed every later pass, kept the wait marker, and left intake refused
-until a restart.
-
-Now the worker keeps a baseline of the summed count, taken at open, and fails a pass
+error handler. That count is cumulative since open and cannot be cleared in place. Treating
+any nonzero count as fatal would fail every later pass after one failed compaction on a
+filling disk, keep the wait marker, and leave intake refused until a restart. The worker
+therefore keeps a baseline of the summed count, taken at open, and fails a pass
 only on an error new since the last pass, as the table rewrite already does. That pass
 reports the error once (`failure`, a journal line, the `nativeErrors` counter), ends the
 wait in memory and on disk, and the next pass retires what the archive gate allows. The
