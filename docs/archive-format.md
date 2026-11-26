@@ -41,7 +41,7 @@ compatible archive configuration at the next writable open.
 
 Status reports the worker phase, watermark and last failure. The offline
 `sparrow-archive` command lists, verifies and extracts from GTS files.
-[Write protocol](#8-write-protocol) · [Offline commands](#10-readers)
+[Write protocol](#write-protocol) · [Offline commands](#readers)
 
 ## 1. Layout
 
@@ -299,6 +299,7 @@ archive policy fails with `INVALID_ARGUMENT`; a watermark without its fence, or
 a fence without its watermark, fails with `STORAGE_FAILURE`. Removing archiving
 from a store is not supported in this version.
 
+<a id="write-protocol"></a>
 ## 8. Write protocol
 
 The store worker, `sparrow-archive`, reserves the process's single archive filesystem
@@ -371,6 +372,7 @@ segment's record, artifact and blob counts and its artifacts' `id`, `source`, `r
 `byte_length` and `payload_id`. The store's own progress is in its catalog, not in the archive
 (section 7).
 
+<a id="readers"></a>
 ## 10. Readers
 
 PurRDF's GTS reader reads a segment directly and checks its frame hash chain; it does not
