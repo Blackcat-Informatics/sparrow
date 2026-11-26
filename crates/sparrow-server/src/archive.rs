@@ -1496,11 +1496,14 @@ mod tests {
             lost.reason.contains("archive filesystem worker"),
             "{lost:?}"
         );
+        // The watermark commits before the success path clears the reported failure, so the
+        // two are awaited together within the deadline.
         assert!(
             wait_for(Duration::from_secs(30), || {
                 through(&store).as_deref() == Some(segment.through.as_str())
+                    && status.snapshot().failure.is_none()
             }),
-            "the replacement filesystem thread did not archive the segment"
+            "the replacement filesystem thread did not archive the segment and clear the failure"
         );
         let snapshot = status.snapshot();
         assert_eq!(snapshot.restarts, 0);
