@@ -164,7 +164,7 @@ A consume watch splits an over-bound file into ordered parts when the daemon
 advertises the required limits. The watch keeps the claim and names the
 refusal in status if those limits are unavailable. The shipper may refuse an
 over-bound non-line file before it reaches the watch.
-[Part sets](interfaces.md#part-sets-for-consume-roots-280)
+[Part sets](interfaces.md#part-sets-for-consume-roots)
 
 `min_free_bytes` (default 4 GiB) is a floor on free space in the filesystem
 that holds `data_dir`. `disk_budget` bounds only the store's own bytes, while

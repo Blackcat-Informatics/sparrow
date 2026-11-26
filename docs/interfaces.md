@@ -147,7 +147,7 @@ is not the disk growth. A staged import starts a fresh write for each preparatio
 checkpoint and another for the artifact graph at publication, so earlier records count
 through the batch's pending writes only. A record whose own projection graph crosses
 the bound is not refused: it is stored without that graph (see
-[RDF staging refusals are counted and named](#rdf-staging-refusals-are-counted-and-named-340)).
+[RDF staging refusals are counted and named](#rdf-staging-refusals-are-counted-and-named)).
 A sender cannot compute the sum in advance: the rows and new terms come from the
 daemon's derivation of each record, and the pending writes depend on the other records
 of the batch. A sender therefore sets no size from this bound and does not predict the
@@ -233,7 +233,7 @@ it holds and asks.
   file that is cut into parts is found by its parts, each under its own payload
   id, and the whole file's hash is no artifact's payload id. A file is cut only
   where one artifact cannot hold it (the import bound, the record limit or the
-  joint retirement bound; see [Part sets for consume roots](#part-sets-for-consume-roots-280)),
+  joint retirement bound; see [Part sets for consume roots](#part-sets-for-consume-roots)),
   and a syslog file over the packet limit is cut too. A file below those limits,
   including a staged import above the 16 MiB inline bound, is one artifact found by
   the hash of all its bytes. A tail checkpoint's payload id is the hash of
@@ -858,7 +858,7 @@ Schema 63 adds the enum values `PressurePhase.awaitingArchive` and
 `awaiting_archive` and `archive_lag`. `Status.pressureStatus` reports `archiveConfigured` and `archiveHeld`
 (`PressureStatus` ordinals 36 and 37), and `Status` reports `archiveHalvings`
 (ordinal 63). `Status.archiveWorker` (ordinal 64) reports the worker; see
-[Archive worker status](#archive-worker-status-365). Backlog age, the last
+[Archive worker status](#archive-worker-status). Backlog age, the last
 segment and a listing of held entries are not in the schema. The daemon journals a failed
 pass and a held entry.
 
@@ -947,8 +947,9 @@ Continuation:
   skipped. A row the migration has copied since is listed once, and an artifact
   retired since is skipped, as the finished index omits it.
 
-While the migration is seeding, the `sources` inventory does not read the artifact index: it reads the per-source
-counter rows (see `sources_list` below) and remains one immutable capture.
+While the migration is seeding, a `sources` listing reads the per-source counter rows and adds the counts the
+migration still owes to them, from one immutable capture (see `sources_list` below). Its only read of the artifact
+index is the missing-row probe: a source with counted entries and no counter row fails with `STORAGE_FAILURE`.
 
 ### Large artifacts (schema 65)
 
