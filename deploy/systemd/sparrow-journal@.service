@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+
+# One forwarder per journal instance: sparrow-journal@system.service or
+# sparrow-journal@user.service. A user unit installed in ~/.config/systemd/user.
+[Unit]
+Description=Forward the %i systemd journal into Sparrow
+After=sparrow.service
+
+[Service]
+ExecStart=%h/.local/libexec/sparrow/sparrow-journal --config %h/.config/sparrow/journal.toml %i
+Restart=always
+RestartSec=10
+CPUQuota=25%
+MemoryMax=256M
+Nice=10
+
+[Install]
+WantedBy=default.target

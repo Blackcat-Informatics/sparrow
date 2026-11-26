@@ -24,7 +24,7 @@ local disks and initially under 10 GiB/day of uncompressed ingestion. Native
 RocksDB and compression dependencies are acceptable.
 
 The first version includes full JSON/JSONL and Markdown projection, structured
-and unstructured logs, live syslog, file/API imports, completed-file consumption,
+and unstructured logs, live syslog, systemd journal forwarding, file/API imports, completed-file consumption,
 active-log tailing, named pins, MCP, CLI, and a Rust logging client. These ship in
 the milestones below rather than as one undifferentiated implementation.
 

@@ -16,6 +16,10 @@ license.workspace = true
 name = "rpc"
 path = "rpc.rs"
 
+[[test]]
+name = "journal_forward"
+path = "journal_forward.rs"
+
 [[bin]]
 name = "sparrow-rpc-fixture"
 path = "../../sparrow-access/src/main.rs"

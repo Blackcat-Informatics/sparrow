@@ -628,6 +628,34 @@ entry. Verify each part through the payload lookup. Until all current parts
 are held, the shipper reports the original as `not yet acknowledged` on each
 run. Once they are held, the two-run deletion applies.
 
+## Forwarding the systemd journals
+
+`sparrow-journal` runs one forwarder per journal instance. Install the binary, the
+configuration and the user unit, then enable both instances:
+
+```sh
+install -D -m 0755 target/release/sparrow-journal ~/.local/libexec/sparrow/sparrow-journal
+install -D -m 0600 journal.toml ~/.config/sparrow/journal.toml
+install -D -m 0644 deploy/systemd/sparrow-journal@.service ~/.config/systemd/user/sparrow-journal@.service
+systemctl --user daemon-reload
+systemctl --user enable --now sparrow-journal@system.service sparrow-journal@user.service
+```
+
+The configuration names the private Sparrow socket and the state directory:
+
+```toml
+socket = "/var/lib/sparrow/store/rpc.sock"
+state_dir = "/home/example/.local/state/sparrow/journal"
+```
+
+The invoking account reads each journal it follows. `journalctl --system` must work for
+the account without `sudo`, or the `system` instance cannot start.
+
+Read the stats line with `journalctl --user -u sparrow-journal@system.service`. Its
+`held` field is `null` when delivery is running. The cursor file in each instance's
+state directory names the last entry the daemon confirmed. The forwarder restarts on
+failure after ten seconds, and it keeps spooling while the daemon is unreachable.
+
 ## Archive and backups
 
 Sparrow backs up nothing except the age-out to GTS files on a network share: the archive worker

@@ -133,6 +133,7 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/549e61494afc9a
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/ingestion-status-agent-test-parity> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/joined-daemon-maintenance> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/journal-export-import> .
+<> <https://blackcatinformatics.ca/raf/report/1#job> <#job/journal-export-stream> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/journal-lock-lifetime> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/json-occurrence-predicate> .
 <> <https://blackcatinformatics.ca/raf/report/1#job> <#job/json-rdf-projection> .
@@ -4036,3 +4037,11 @@ BASE <https://blackcatinformatics.ca/.well-known/genid/raf-report/549e61494afc9a
 <#pattern/store-free-space-statvfs> <https://blackcatinformatics.ca/raf/report/1#shippingOnly> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
 <#pattern/store-free-space-statvfs> <https://blackcatinformatics.ca/raf/report/1#summary> "Route production store free-space measurements through SpaceFloor." .
 <#pattern/store-free-space-statvfs> <https://blackcatinformatics.ca/raf/report/1#tokens> "rustix::fs::statvfs" .
+<#job/journal-export-stream> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://blackcatinformatics.ca/raf/report/1#LedgerJob> .
+<#job/journal-export-stream> <https://blackcatinformatics.ca/raf/report/1#enforced> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+<#job/journal-export-stream> <https://blackcatinformatics.ca/raf/report/1#entryPoint> "sparrow_server::journal_export::ExportParser::push" .
+<#job/journal-export-stream> <https://blackcatinformatics.ca/raf/report/1#homeSymbol> "sparrow_server::journal_export::ExportParser" .
+<#job/journal-export-stream> <https://blackcatinformatics.ca/raf/report/1#jobId> "journal-export-stream" .
+<#job/journal-export-stream> <https://blackcatinformatics.ca/raf/report/1#specRef> "docs/interfaces.md: Systemd journal forwarding." .
+<#job/journal-export-stream> <https://blackcatinformatics.ca/raf/report/1#summary> "Parse journald export text incrementally, in chunks of any size, and map each entry to a bounded producer event." .
+<#job/journal-export-stream> <https://blackcatinformatics.ca/raf/report/1#vectorPath> "crates/sparrow-server/tests/journal_forward.rs" .

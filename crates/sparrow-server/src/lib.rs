@@ -30,6 +30,8 @@ pub mod consumption;
 mod handoff;
 mod ingest_gate;
 pub mod ingest_socket;
+pub mod journal_export;
+pub mod journal_forward;
 mod pressure;
 pub mod pressure_wake;
 mod query_only;
