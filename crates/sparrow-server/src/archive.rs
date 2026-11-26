@@ -801,9 +801,23 @@ fn spawn_filesystem_thread() -> io::Result<mpsc::SyncSender<FilesystemJob>> {
     Ok(jobs)
 }
 
+/// Wakes the coordinator waiting on a job when the job's guard ends, including on an unwind.
+struct WakeWaiter(Arc<Flight>);
+
+impl Drop for WakeWaiter {
+    fn drop(&mut self) {
+        self.0.waiter.unpark();
+    }
+}
+
 impl FilesystemJob {
     fn run(self) {
         let flight = Arc::clone(&self.reservation.flight);
+        // Locals drop in reverse declaration order. On an unwind the reservation and the reply
+        // are released before this guard wakes the coordinator, so it sees both gone.
+        let _wake = WakeWaiter(Arc::clone(&flight));
+        let reservation = self.reservation;
+        let reply = self.reply;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             write_and_verify(&flight, &self.root, &self.store_id, &self.segment)
         }))
@@ -815,10 +829,9 @@ impl FilesystemJob {
         }
         // The slot is released only after the native work has returned, even if the receiver
         // has already gone. No queued job can touch the old job's temporary names.
-        drop(self.reservation);
+        drop(reservation);
         // A deadline or shutdown deliberately drops this job's unique reply receiver.
-        drop(self.reply.send(result));
-        flight.waiter.unpark();
+        drop(reply.send(result));
     }
 }
 
@@ -1466,7 +1479,7 @@ mod tests {
             &filesystem,
             store.clone(),
             root.clone(),
-            Duration::from_millis(10),
+            Duration::from_millis(500),
             faulted,
             status.clone(),
         )
