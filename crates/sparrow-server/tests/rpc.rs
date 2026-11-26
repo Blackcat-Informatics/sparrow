@@ -5800,7 +5800,7 @@ async fn copy_daemons_claim_nothing_query_only_refuses_writes_and_no_intake_migr
             assert_eq!(status["counts"].as_str(), Some("pending"));
             assert_eq!(status["live_records"].as_str(), Some("0"));
             let migrations = status["migrations"].as_array().unwrap();
-            assert_eq!(migrations.len(), 5, "{migrations:?}");
+            assert_eq!(migrations.len(), 6, "{migrations:?}");
             for migration in migrations {
                 assert_eq!(migration["done"].as_str(), Some("0"), "{migration:?}");
                 assert_eq!(

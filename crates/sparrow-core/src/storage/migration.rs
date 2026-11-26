@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
 //! Online store migrations: the store counter seeding (#146), the owner-to-graph index
-//! build (#13), the per-source counters and artifact index (#14), and the source-context
-//! cache rebuild (#149). The receipt-time event fallback backfill of record metadata
+//! build (#13), the per-source counters and artifact index (#14), the source-context
+//! cache rebuild (#149) and the per-owner payload summary that retention metrics read
+//! ([`super::owner_summary`]). The receipt-time event fallback backfill of record metadata
 //! graphs (#20) is retired: readers derive those facts (see [`super::event_fallback_rdf`]).
 //!
 //! Opening a store fences older writers and seeds every checkpoint in one synchronized
@@ -34,7 +35,7 @@
 
 use super::store_counters::{self, Counter, Positions, Reader};
 use super::{
-    Error, Store, Writer, catalog_upgrade, payload_index, rdf_index, source_context,
+    Error, Store, Writer, catalog_upgrade, owner_summary, payload_index, rdf_index, source_context,
     source_summary, writer_format,
 };
 use rocksdb::{DB, WriteBatch};
@@ -60,18 +61,22 @@ pub enum Migration {
     SourceContext,
     /// The payload id index: one key per held artifact, from the digest of its bytes (#323).
     PayloadIndex,
+    /// The per-owner payload summary the retention metrics read (see [`super::owner_summary`]).
+    OwnerSummary,
 }
 
 impl Migration {
     /// Every migration, in the order `status`, the latched failures and [`Migration::index`]
     /// use. The maintenance worker runs them in its own run order: the counters, the source
-    /// summary, the owner index, then the source timeline cache (#176).
-    pub const ALL: [Self; 5] = [
+    /// summary, the payload index, the owner summary, the owner index, then the source
+    /// timeline cache (#176).
+    pub const ALL: [Self; 6] = [
         Self::StoreCounters,
         Self::OwnerGraphIndex,
         Self::SourceSummary,
         Self::SourceContext,
         Self::PayloadIndex,
+        Self::OwnerSummary,
     ];
 
     /// The order the maintenance worker runs the migrations: the counters first, so the
@@ -79,10 +84,11 @@ impl Migration {
     /// state makes every `sources` and live `artifacts` listing read what it still owes
     /// (#176), then the owner index, since its pages are few and cheap. The migrations are
     /// independent: each reads and checkpoints its own keys.
-    pub(crate) const RUN_ORDER: [Self; 5] = [
+    pub(crate) const RUN_ORDER: [Self; 6] = [
         Self::StoreCounters,
         Self::SourceSummary,
         Self::PayloadIndex,
+        Self::OwnerSummary,
         Self::OwnerGraphIndex,
         Self::SourceContext,
     ];
@@ -96,6 +102,7 @@ impl Migration {
             Self::SourceSummary => "source-summary",
             Self::SourceContext => "source-context",
             Self::PayloadIndex => "payload-index",
+            Self::OwnerSummary => "owner-summary",
         }
     }
 
@@ -120,6 +127,7 @@ impl Migration {
             Self::SourceSummary => &[Counter::Artifacts, Counter::Records],
             Self::SourceContext => &[Counter::Records],
             Self::PayloadIndex => &[Counter::Artifacts],
+            Self::OwnerSummary => &[Counter::Artifacts, Counter::Records],
         }
     }
 }
@@ -211,7 +219,13 @@ pub(super) fn fence(db: &DB) -> Result<(), Error> {
             source_summary::reset(db, &mut batch)?;
             store_counters::reset(&mut batch, Counter::SourceSummaryDone);
         }
-        batch.put("store_format", writer_format::enable_source_bytes(&format)?);
+        format = writer_format::enable_source_bytes(&format)?.to_vec();
+        batch.put("store_format", &format);
+    }
+    // After the counters, whose zero rows it extends with its own. A store whose format
+    // does not know the family has its rows and checkpoint discarded and rebuilt.
+    if !writer_format::has_owner_summary(&format) {
+        owner_summary::fence(db, &format, &mut batch)?;
     }
     if !batch.is_empty() {
         catalog_upgrade::commit(db, batch)?;
@@ -272,6 +286,10 @@ pub(super) fn report(
                     values[&Counter::PayloadIndexDone],
                     payload_index::progress(|key| reader.get(key.as_bytes()))?.watermark(),
                 ),
+                Migration::OwnerSummary => (
+                    values[&Counter::OwnerSummaryDone],
+                    owner_summary::progress(|key| reader.get(key.as_bytes()))?.watermark(),
+                ),
             };
             // The source-context rebuild latches corrupt metadata durably, not per session.
             let failure = match (&failures[migration.index()], migration) {
@@ -320,6 +338,7 @@ impl Writer {
                 Migration::PayloadIndex => payload_index::progress(|key| Ok(self.db.get(key)?))?
                     .watermark()
                     .is_none(),
+                Migration::OwnerSummary => owner_summary::complete(|key| Ok(self.db.get(key)?))?,
             };
             if !complete {
                 return Ok(Some(*migration));
@@ -337,6 +356,7 @@ impl Writer {
             Migration::SourceSummary => source_summary::page(&self.db)?,
             Migration::SourceContext => source_context::page(&self.db)?,
             Migration::PayloadIndex => payload_index::page(&self.db)?,
+            Migration::OwnerSummary => owner_summary::page(&self.db)?,
         };
         let Some((batch, complete)) = staged else {
             return Ok(true);

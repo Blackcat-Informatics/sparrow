@@ -26,6 +26,8 @@ mod tracing_rdf;
 #[cfg(feature = "test-support")]
 pub use artifact_rdf::retire_artifact_rdf_for_legacy_fixture;
 #[cfg(feature = "test-support")]
+pub use owner_summary::{OwnerSummaryAudit, lower_owner_summary_for_legacy_fixture};
+#[cfg(feature = "test-support")]
 pub use payload_index::remove_payload_index_for_legacy_fixture;
 #[cfg(feature = "test-support")]
 pub use source_summary::{SourceCountAudit, remove_source_summary_for_legacy_fixture};
@@ -51,6 +53,7 @@ pub(crate) mod listing_build;
 pub(crate) mod log_time;
 mod manifest_retire;
 pub(crate) mod migration;
+mod owner_summary;
 pub(crate) mod payload_index;
 pub(crate) mod pin_read;
 pub(crate) mod pressure;
@@ -826,10 +829,27 @@ fn integer(value: &Value, name: &'static str) -> Result<u64, Error> {
 
 /// Whether `record` is retained at `now`: not evicted, and unexpired or protected.
 fn live_record(record: &Record, now: u64, protected: &BTreeSet<String>) -> bool {
-    !record.evicted
-        && (now < record.expires_at
-            || protected.contains(&record.id)
-            || protected.contains(&record.artifact_id))
+    record_eligible(
+        &record.id,
+        &record.artifact_id,
+        record.evicted,
+        record.expires_at,
+        now,
+        protected,
+    )
+}
+
+/// [`live_record`] over a record's retention scalars: the owner summary stores these, not
+/// the record.
+fn record_eligible(
+    id: &str,
+    artifact_id: &str,
+    evicted: bool,
+    expires_at: u64,
+    now: u64,
+    protected: &BTreeSet<String>,
+) -> bool {
+    !evicted && (now < expires_at || protected.contains(id) || protected.contains(artifact_id))
 }
 
 /// One record catalog entry by ID from `reader`, admitted against `remaining` before it is

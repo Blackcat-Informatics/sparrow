@@ -1585,7 +1585,7 @@ Opening a store that owes the schema 69 migrations applies the writer fences
 and seeds the checkpoints in one synchronized batch, then serves; the open does
 not wait for any job. The joined maintenance worker runs them as one duty,
 `store-counters` first (see "Store counters"), then `source-summary` (see
-"Per-source counters and artifact index"), `payload-index` (see "Payload id index"), `owner-graph-index`
+"Per-source counters and artifact index"), `payload-index` (see "Payload id index"), `owner-summary` (see "Per-owner payload summary"), `owner-graph-index`
 and `source-context` (see "Single context capture
 admission"), one page per admission. `source-summary` runs second because, until
 it completes, every `sources` and live `artifacts` listing first reads what the
@@ -1593,7 +1593,7 @@ migration still owes. The migrations are independent: each reads and
 checkpoints its own keys, so a store left part way through by an image that ran
 them in another order resumes each one from its own checkpoint. `status` lists
 them in a fixed order apart from the run order: `store-counters`,
-`owner-graph-index`, `source-summary`, `source-context`, `payload-index`.
+`owner-graph-index`, `source-summary`, `source-context`, `payload-index`, `owner-summary`.
 The migration duty is selected fairly with buffered synchronization, pressure
 maintenance, import reclamation, retention and the table rewrite. Below the
 free-space floor it is skipped, as import reclamation and retention are; buffered
@@ -1692,7 +1692,7 @@ big-endian 64-bit count, from one RocksDB snapshot:
 | `record-graphs` | `provenance-rdf:record:` markers, one per record metadata graph |
 | `payload-chunks`, `json-projections` | `ref:` and `projection-ref:` rows |
 | `payload-index` | `payload-id:` index keys, one per complete artifact (see "Payload id index") |
-| `done:owner-graph-index`, `done:source-summary`, `done:source-context`, `done:payload-index` | The migration's source entries at or before its checkpoint |
+| `done:owner-graph-index`, `done:source-summary`, `done:source-context`, `done:payload-index`, `done:owner-summary` | The migration's source entries at or before its checkpoint |
 
 Status `live_records` is `retained-records` and keeps its deadline meaning:
 records neither evicted nor retired by expiry. Expiry marks a record `retired`
@@ -1975,6 +1975,58 @@ exact whatever the checkpoint says; the migration puts the key of an entry it
 reaches again as a no-op. A restart resumes after the last committed page, and a
 failed page is retried, never skipped. `status` reports its done count and
 watermark with the other migrations.
+
+### Per-owner payload summary (store format)
+
+Retention metrics account each payload digest from a derived row per owner instead
+of one reference per chunk occurrence. The row `owner-summary:<owner id>` exists for
+every `artifact:` and `record:` entry. Its value holds the owner's receipt and
+deadline clocks, its evicted flag, the parent artifact of a record, and the
+remaining occurrences of each distinct chunk digest in ascending digest order.
+An artifact's chunks are those after its manifest retirement position, and its
+evicted flag comes from its entry or its retirement state; a record's chunks are
+its own. Whether the owner is live is not stored: it depends on the query instant
+and the pin set, so the query derives it per owner. An owner is live while it is
+not evicted and either unexpired or protected; a record is protected by its own pin
+or by its parent artifact's pin. A digest shared by several owners counts its
+bytes once in each category it belongs to, and owner identity is what makes
+that exact.
+
+One owner observes every write batch before it is written and adds the row changes
+to the same batch, so no writer can publish, ingest, import, expire, evict, retire,
+consume or delete an owner entry without its row, and a crash cannot leave one
+without the other. A batch that rewrites an entry gets its row computed from the
+written entry; a deleted entry loses its row; a retirement state that advances
+without rewriting its entry subtracts the chunks it passes from the stored row,
+and a subtraction below zero is a `STORAGE_FAILURE`.
+
+Retention metrics read the rows only while the summary is trusted: the
+`owner-summary` migration is complete and the store counters are seeded. The
+query visits one row per owner and one visit per distinct digest the owner holds,
+and refuses with `STORAGE_FAILURE` when the number of rows it reads disagrees
+with the `artifacts` and `records` store counters. Until the migration
+completes, the query reads the owner entries and returns the same totals, so no
+query ever reads an incomplete summary as complete.
+
+Compatibility and rollback. The summary is a writer-format family: a store
+opened by this binary is lifted to `sparrow.store/572` through `626` (`627`
+through `681` once sealed producer replay is also active), which no earlier binary
+knows, so an older binary refuses the store at open and cannot write an owner
+entry without its row. A store whose format does not carry the family, whether
+it predates the summary or an older writer has opened and written it, is fenced
+at open: every `owner-summary:` row and the checkpoint are discarded and the
+`owner-summary` migration is seeded again. Rows an older writer left behind are
+therefore never trusted. The migration walks artifact entries, then record
+entries, in id order, 256 owners or 32 MiB of entries per page, writing each
+owner's row and advancing the `owner-summary-upgrade` checkpoint in one batch
+through the ordinary write path, after the same wait for waiting writers as every
+migration page. A write during the migration maintains the row of every owner it
+writes; the migration recomputes an owner it reaches again from the same entry.
+A restart resumes after the last committed page, and a failed page is retried,
+never skipped. `done:owner-summary` counts the owner entries the migration has
+passed. The authoritative entries are never altered by the summary, so returning
+to an older binary means restoring a store image written before the lift; opening
+the current binary on any store restores a complete summary.
 
 ## 1. Common types and defaults
 

@@ -120,6 +120,12 @@ pub(super) fn evicted_flag(bytes: &[u8]) -> Result<bool, Error> {
     State::decode(bytes).map(|state| state.evicted)
 }
 
+/// The original chunk count, the retired position and the evicted flag an encoded manifest
+/// retirement state holds.
+pub(super) fn position(bytes: &[u8]) -> Result<(u64, u64, bool), Error> {
+    State::decode(bytes).map(|state| (state.total, state.retired, state.evicted))
+}
+
 /// Whether an encoded manifest retirement state has released any of its artifact's bytes: the
 /// complete artifact is evicted, or expiry or eviction has already retired chunks (their
 /// references are decremented and unreferenced payload deleted) while the entry stays.
@@ -305,6 +311,16 @@ pub(super) fn header(
 }
 
 impl Header {
+    /// The number of chunk identities the artifact row holds.
+    pub(super) fn chunk_count(&self) -> u64 {
+        self.chunks.count
+    }
+
+    /// The chunk identities read after the requested skip, up to the requested take.
+    pub(super) fn into_chunks(self) -> Vec<String> {
+        self.chunks.prefix
+    }
+
     /// Up to `take` of the artifact's record identities after the first `skip`, read from
     /// the same encoded row the header was read from.
     pub(super) fn record_ids(
