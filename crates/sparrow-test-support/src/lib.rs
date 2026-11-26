@@ -320,6 +320,8 @@ pub struct SegmentFixture<'a> {
     pub unreferenced_blob: Option<&'a [u8]>,
     /// Whether a payload link quad names a subject that is not a record.
     pub orphan_link: bool,
+    /// Whether the artifact itself carries a `payloadBlake3` link naming `claimed`.
+    pub artifact_digest_link: bool,
 }
 
 impl<'a> SegmentFixture<'a> {
@@ -335,6 +337,7 @@ impl<'a> SegmentFixture<'a> {
             record_received_at: 1_700_000_000_000,
             unreferenced_blob: None,
             orphan_link: false,
+            artifact_digest_link: false,
         }
     }
 }
@@ -436,6 +439,17 @@ pub fn segment_with(fixture: &SegmentFixture<'_>) -> Vec<u8> {
     builder
         .push_quad(artifact, payload_link, payload, None)
         .expect("fixture quad");
+    if fixture.artifact_digest_link {
+        let link = builder
+            .intern_iri(&format!("{NS}payloadBlake3"))
+            .expect("fixture link");
+        let digest = builder
+            .intern_literal(RdfLiteral::simple(digest_string(claimed)))
+            .expect("fixture literal");
+        builder
+            .push_quad(artifact, link, digest, None)
+            .expect("fixture quad");
+    }
     if fixture.orphan_link {
         let orphan = builder
             .intern_iri("urn:sparrow:record:orphan")

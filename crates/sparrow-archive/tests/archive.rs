@@ -345,6 +345,14 @@ fn a_segment_with_an_orphan_link_or_an_unreferenced_blob_is_refused() {
             "not a record",
         ),
         (
+            "artifact digest link naming a record's blob",
+            SegmentFixture {
+                artifact_digest_link: true,
+                ..SegmentFixture::new(b"alpha\n", b"alpha\n")
+            },
+            "not a record",
+        ),
+        (
             "unreferenced blob",
             SegmentFixture {
                 unreferenced_blob: Some(b"stray\n"),
@@ -369,6 +377,20 @@ fn a_segment_with_an_orphan_link_or_an_unreferenced_blob_is_refused() {
         assert_eq!(verified.status.code(), Some(1), "{label}: {text}");
         assert!(text.contains("\"ok\":false"), "{label}: {text}");
     }
+}
+
+/// Value: a record with no bytes is archived with its empty blob and link, and extraction
+/// writes nothing and succeeds, rather than refusing a record that is complete.
+#[test]
+fn extract_accepts_an_empty_record_with_its_empty_blob() {
+    use sparrow_test_support::SegmentFixture;
+    let root = tempfile::tempdir().unwrap();
+    fixture_segment(root.path(), "empty", &SegmentFixture::new(b"", b""));
+    let output = extract(root.path(), "artifact:aa");
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stdout.is_empty());
+    let verified = run(&["verify", root.path().to_str().unwrap()]);
+    assert!(verified.status.success(), "{:?}", verified.stdout);
 }
 
 /// Value: a record repeated across segments extracts once when the copies are identical, and
