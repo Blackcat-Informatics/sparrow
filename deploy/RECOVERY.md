@@ -48,7 +48,7 @@ Restore space on the store filesystem and observe the daemon's recovery.
 Below `min_free_bytes`, new writes receive a floor-labelled refusal and reads
 remain available. Consume watches keep their files. At startup, the open floor
 also includes space for replaying the WAL left by an unclean stop.
-[Free-space behavior](../docs/interfaces.md#the-free-space-pause-257)
+[Free-space behavior](../docs/interfaces.md#the-free-space-pause)
 
 ## Store latched: durability uncertain
 
@@ -132,7 +132,7 @@ for buffered occurrence IDs reported missing or still unverified.
   `sparrowd: refused to start: <reason>` and exits with status 78, which the
   unit lists in `RestartPreventExitStatus=`. The unit remains `failed` with
   `status=78/CONFIG`. Correct the cause (restore the image, lexicon or
-  configuration that wrote the store, see "Refused open"), then
+  configuration that wrote the store, see [Refused open](#refused-open)), then
   `sudo systemctl reset-failed sparrow.service && sudo deploy/start.sh`.
   Any other failure before the daemon serves (corruption or an I/O error at the
   open, a descriptor limit, a mount that has not come up) is not classified as
