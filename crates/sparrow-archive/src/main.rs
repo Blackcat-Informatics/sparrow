@@ -58,39 +58,114 @@ fn emit(line: &str) -> Result<(), ExitCode> {
     })
 }
 
+/// The store identity a root's `STORE_ID` names, `store:<hex>`, or none when the root has no
+/// `STORE_ID`. A `STORE_ID` of any other form refuses the whole root.
+fn store_binding(root: &Path) -> Result<Option<String>, String> {
+    let path = root.join("STORE_ID");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let id = text.strip_suffix('\n').unwrap_or(&text);
+    match id.strip_prefix("store:") {
+        Some(hex) if !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            Ok(Some(id.to_owned()))
+        }
+        _ => Err(format!("{}: not a store identity: {id:?}", path.display())),
+    }
+}
+
+/// Why a segment does not belong to the bound store: its directory is not the store's
+/// identity. With no `STORE_ID`, the root is unbound and nothing is refused on that ground.
+fn binding_refusal(path: &Path, store: Option<&str>) -> Option<String> {
+    let store = store?;
+    let directory = path.parent()?.file_name()?.to_str().unwrap_or_default();
+    (directory != store)
+        .then(|| format!("segment is in directory {directory:?} but STORE_ID names {store}"))
+}
+
 fn run(command: &str, root: &Path) -> Result<ExitCode, ExitCode> {
     let segments = list_segments(root).map_err(|error| {
         let _ = writeln!(std::io::stderr(), "sparrow-archive: {error}");
         ExitCode::FAILURE
     })?;
+    let store = if command == "verify" {
+        store_binding(root).map_err(|cause| {
+            let _ = writeln!(std::io::stderr(), "sparrow-archive: {cause}");
+            ExitCode::FAILURE
+        })?
+    } else {
+        None
+    };
     let mut corrupt = 0usize;
+    let mut duplicates = 0usize;
+    let mut first_of: std::collections::HashMap<String, std::path::PathBuf> =
+        std::collections::HashMap::new();
     for path in &segments {
         let name = Value::from(path.display().to_string().as_str());
-        match (command, open(path)) {
-            ("list", Ok((segment, summary))) => {
-                let mut members = vec![("path", name)];
+        if command == "verify" {
+            match open(path) {
+                Ok((segment, summary)) => {
+                    if let Some(refusal) = binding_refusal(path, store.as_deref()) {
+                        corrupt += 1;
+                        emit(&line(vec![
+                            ("path", name),
+                            ("ok", false.into()),
+                            ("error", Value::from(refusal.as_str())),
+                        ]))?;
+                    } else if let Some(original) = first_of.get(segment.digest()) {
+                        duplicates += 1;
+                        let mut members = vec![
+                            ("path", name),
+                            ("ok", true.into()),
+                            (
+                                "duplicate_of",
+                                Value::from(original.display().to_string().as_str()),
+                            ),
+                        ];
+                        members.extend(counts(summary));
+                        emit(&line(members))?;
+                    } else {
+                        first_of.insert(segment.digest().to_owned(), path.clone());
+                        let mut members = vec![("path", name), ("ok", true.into())];
+                        members.extend(counts(summary));
+                        emit(&line(members))?;
+                    }
+                }
+                Err(error) => {
+                    corrupt += 1;
+                    emit(&line(vec![
+                        ("path", name),
+                        ("ok", false.into()),
+                        ("error", Value::from(error.to_string().as_str())),
+                    ]))?;
+                }
+            }
+            continue;
+        }
+        match open(path) {
+            Ok((segment, summary)) => {
+                let mut members = vec![
+                    ("path", name),
+                    (
+                        "store_dir",
+                        Value::from(
+                            path.parent()
+                                .and_then(Path::file_name)
+                                .and_then(|n| n.to_str())
+                                .unwrap_or_default(),
+                        ),
+                    ),
+                ];
                 members.extend(counts(summary));
                 members.push(("entries", entries(&segment)));
                 emit(&line(members))?;
             }
-            ("verify", Ok((_, summary))) => {
-                let mut members = vec![("path", name), ("ok", true.into())];
-                members.extend(counts(summary));
-                emit(&line(members))?;
-            }
-            ("verify", Err(error)) => {
-                corrupt += 1;
-                emit(&line(vec![
-                    ("path", name),
-                    ("ok", false.into()),
-                    ("error", Value::from(error.to_string().as_str())),
-                ]))?;
-            }
-            (_, Err(error)) => {
+            Err(error) => {
                 let _ = writeln!(std::io::stderr(), "sparrow-archive: {error}");
                 return Ok(ExitCode::FAILURE);
             }
-            _ => return Err(ExitCode::from(2)),
         }
     }
     if command == "verify" {
@@ -98,6 +173,7 @@ fn run(command: &str, root: &Path) -> Result<ExitCode, ExitCode> {
             ("segments", segments.len().into()),
             ("ok", (segments.len() - corrupt).into()),
             ("corrupt", corrupt.into()),
+            ("duplicates", duplicates.into()),
         ]))?;
     }
     Ok(if corrupt == 0 {
