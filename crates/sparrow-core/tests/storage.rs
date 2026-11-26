@@ -24416,7 +24416,18 @@ fn a_live_artifact_window_build_re_bases_onto_a_newer_snapshot_mid_migration() {
     let open = hold_listing_builds(&store);
     let first = read(None);
     let cursor = first.next_cursor.clone().expect("the build's cursor");
-    let owed = first.build.and_then(|build| build.total).unwrap();
+    // The build worker publishes the total it owes when it starts, which can follow the
+    // first call's wait on a loaded host; following the cursor resumes the same build.
+    let mut owed = first.build.and_then(|build| build.total);
+    for _ in 0..600 {
+        if owed.is_some() {
+            break;
+        }
+        owed = read(Some(cursor.clone()))
+            .build
+            .and_then(|build| build.total);
+    }
+    let owed = owed.expect("the build reports the entries it owes");
     // Run pages until the migration's `done` leads the held build's snapshot by more than
     // 2 x 4,096 entries, past the re-base lead plus what the build reads before its first
     // check, short of completing.
