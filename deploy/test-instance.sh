@@ -196,7 +196,14 @@ CONFIG
             printf '%s\n' "$archive_dir" >"$ARCHIVE_RECORD"
             read_write_paths="$read_write_paths $archive_dir"
         fi
-        SPARROW_DESTDIR=$ROOT "$DEPLOY_DIR/install.sh" --no-enable
+        # The scratch layout this setup wrote: install.sh checks the staged server.toml against
+        # it instead of the production example, so the production store-move guard stays as it is.
+        expect=$SCRATCH/expected-layout.toml
+        cat >"$expect" <<EXPECT
+data_dir = "$DATA/store"
+socket_path = "$DATA/store/rpc.sock"
+EXPECT
+        SPARROW_LAYOUT_EXPECT=$expect SPARROW_DESTDIR=$ROOT "$DEPLOY_DIR/install.sh" --no-enable
         chmod 0700 -- "$ROOT"
         install -d -m 0700 -- "$UNIT_DIR"
         sed -E \

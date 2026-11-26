@@ -50,12 +50,19 @@ fi
 # refusal leaves the host as it was. A substitution is captured before use, because a die inside
 # <(...) or inside a command's arguments would end only a subshell.
 problems=()
-if ! layout_check=$(python3 -I - "$DEST/etc/sparrow" "$DEPLOY_DIR/config" <<'PY'
+if [[ -n ${SPARROW_LAYOUT_EXPECT:-} && -z $DEST ]]; then
+    die "SPARROW_LAYOUT_EXPECT names a test instance's layout and needs SPARROW_DESTDIR; it never applies to a host install"
+fi
+if ! layout_check=$(SPARROW_LAYOUT_EXPECT=${SPARROW_LAYOUT_EXPECT:-} python3 -I - "$DEST/etc/sparrow" "$DEPLOY_DIR/config" <<'PY'
 from pathlib import Path
+import os
 import sys
 import tomllib
 
 installed, examples = map(Path, sys.argv[1:])
+# A staged test instance names its own expected server.toml (data_dir, socket_path) under its
+# isolated root. Without it, the stock example is the expected layout, as for a host install.
+expect = os.environ.get("SPARROW_LAYOUT_EXPECT", "")
 layouts = {
     "server.toml": ("data_dir", "socket_path"),
     "ship.toml": ("intake_root", "state_dir"),
@@ -68,7 +75,10 @@ try:
         if not path.exists():
             continue
         config = tomllib.loads(path.read_text())
-        example = tomllib.loads((examples / (name + ".example")).read_text())
+        if expect and name == "server.toml":
+            example = tomllib.loads(Path(expect).read_text())
+        else:
+            example = tomllib.loads((examples / (name + ".example")).read_text())
         expected = {key: example[key] for key in keys}
         if name == "ship.toml" and "socket" in config:
             expected["socket"] = server["socket_path"]
