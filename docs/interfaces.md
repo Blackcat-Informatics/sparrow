@@ -1027,6 +1027,33 @@ panicking, because it is written while the store's writer lock is held, and a fa
 stderr write is dropped (the counter still holds the fact). Whether to stage an artifact's RDF in pieces or store it with
 its graph deferred is separate work.
 
+### Projection term limit
+
+Each record's RDF projection encodes the record's value as an `xsd:string` term in
+canonical JSON. Projection refuses a record whose encoded term exceeds 65,536 bytes.
+
+- **Unit.** The byte length of the canonical JSON of the value's `xsd:string` term. Its
+  lexical form is the value's JSON-escaped text, so a quote or backslash in the value
+  costs extra bytes.
+- **Limit.** 65,536 bytes, inclusive. A term of exactly 65,536 bytes projects.
+- **Ingest.** Ingest does not check this limit. The record is stored and its projection
+  state is `failed`, with zero primary rows. `rdf` and `rdf_inspect` report
+  `PROJECTION_FAILURE: projection resource-limit error: canonical term JSON exceeds the 65536-byte artifact limit`.
+- **Measured boundaries.** On a scratch store, the largest accepted plain ASCII value is
+  65,419 bytes and the smallest refused is 65,420. A value of 65,415 characters followed by
+  one double quote is accepted, and 65,416 characters followed by one quote is refused.
+  Two-byte UTF-8 values follow the plain boundary in bytes.
+- **Inferred unit.** The stored term's bytes are not exposed by the CLI. The unit above is
+  inferred from these boundaries and from a canonical-JSON model that reproduces the
+  projected or failed state of every measured record. The pinning test in
+  `tests/storage.rs` checks the boundaries through the projection state, not through the
+  term bytes.
+- **What a sender must do.** Keep each value's canonical JSON within 65,536 bytes. For a
+  value that is a long plain string, keep its byte length at or below 65,419. For a value
+  with JSON-escaped characters, count each escaped character at its encoded length. Split
+  a longer value across records. Check `rdf_inspect` for `state` = `failed` to find a
+  record that did not project.
+
 ### Archive worker status
 
 `Status.archiveWorker` (field 64, additive; a reader that does not know it sees no change) is
