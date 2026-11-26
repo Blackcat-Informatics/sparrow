@@ -41,7 +41,7 @@ compatible archive configuration at the next writable open.
 
 Status reports the worker phase, watermark and last failure. The offline
 `sparrow-archive` command lists, verifies and extracts from GTS files.
-[Write protocol](#8-write-protocol) · [Offline commands](#10-readers)
+[Write protocol](#write-protocol) · [Offline commands](#readers)
 
 ## 1. Layout
 
@@ -99,7 +99,7 @@ segment is still empty. An entry whose bytes alone exceed the target therefore
 forms a segment of its own, and the segment is never split inside a record.
 
 `max_segment_quads` bounds the memory a segment costs while it is encoded, which is
-up to 390 bytes a quad (measured, #336): 3,000,000 quads is 1.17 GB, and with the
+up to 390 bytes a quad (measured): 3,000,000 quads is 1.17 GB, and with the
 daemon's own 100 MB that is 59 per cent of a 2 GiB soft limit. A record's quads are
 counted before encoding, as an upper bound: twice the rows of its stored graph manifests
 (each row is a quad in its named graph and again in the default graph) and two link
@@ -119,9 +119,7 @@ the segment's GTS files like any other record's.
 The GTS writer holds the whole segment in memory and costs about three times a
 record while it writes (measured at 128 MiB). A record whose bytes exceed 128 MiB
 is therefore not written. Only records from layouts before 2026-11-02 can be that
-large. The format for large payloads is undecided and with the operator, and
-nothing is built for them. Until it is decided, such a record is held: it is
-neither archived nor deleted. Selection
+large. Such a record is held: it is neither archived nor deleted. Selection
 stops before it, so the watermark never passes an unarchived record, and the
 writer reports it by identity and size in a structured warning.
 A record whose content projection failed at ingest is held the same way, because
@@ -138,9 +136,9 @@ no graph, blob or link quad. The count of held records and the bytes waiting beh
 scanned, because that would read every record row on each pass.
 
 The 256 MiB ceiling and the hold bound apply to Sparrow's use of PurRDF's
-in-memory GTS writer. Adopting PurRDF's streaming writer for single oversized
-records is tracked in #301. Qualifying a larger segment target, including its
-peak memory and verified readback, is tracked in #125.
+in-memory GTS writer. PurRDF's streaming writer is not adopted for single oversized
+records. A larger segment target is not qualified: its peak memory and verified
+readback are not measured.
 Encoding needs memory of roughly three to four times the segment size. That
 figure is an estimate to measure.
 
@@ -301,6 +299,7 @@ archive policy fails with `INVALID_ARGUMENT`; a watermark without its fence, or
 a fence without its watermark, fails with `STORAGE_FAILURE`. Removing archiving
 from a store is not supported in this version.
 
+<a id="write-protocol"></a>
 ## 8. Write protocol
 
 The store worker, `sparrow-archive`, reserves the process's single archive filesystem
@@ -342,7 +341,7 @@ leave one copy), the watermark stays and the intent
 stays. The next pass rebuilds the range; bytes of another identity replace the intent and take
 the freed name, and the same bytes are refused again. A valid file a crash left under the
 range's name, followed by a rebuild under another identity, fails the byte-equal check; the
-journal line names the file, and the operator moves it aside. Configure NFS
+journal line names the file, and the file is moved aside. Configure NFS
 exports for synchronous writes (`sync`) so a successful fsync certifies
 the committed bytes.
 
@@ -373,6 +372,7 @@ segment's record, artifact and blob counts and its artifacts' `id`, `source`, `r
 `byte_length` and `payload_id`. The store's own progress is in its catalog, not in the archive
 (section 7).
 
+<a id="readers"></a>
 ## 10. Readers
 
 PurRDF's GTS reader reads a segment directly and checks its frame hash chain; it does not
