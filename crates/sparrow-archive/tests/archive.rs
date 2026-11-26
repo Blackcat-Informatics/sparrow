@@ -413,6 +413,59 @@ fn extract_accepts_an_empty_record_with_its_empty_blob() {
     assert!(verified.status.success(), "{:?}", verified.stdout);
 }
 
+/// INVARIANT (#17): a root that names its store with `STORE_ID` accepts a segment only in the
+/// directory named for that store. A segment under another store's directory is refused by
+/// `verify` as corrupt, with the store it belongs to named, and the root exits nonzero.
+#[test]
+fn verify_refuses_a_segment_under_another_stores_directory() {
+    use sparrow_test_support::SegmentFixture;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("STORE_ID"), "store:aa\n").unwrap();
+    let bytes = sparrow_test_support::segment_with(&SegmentFixture::new(b"alpha\n", b"alpha\n"));
+    let wrong = root.path().join("store:bb");
+    std::fs::create_dir_all(&wrong).unwrap();
+    std::fs::write(wrong.join("0-1.gts"), &bytes).unwrap();
+    let output = run(&["verify", root.path().to_str().unwrap()]);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("STORE_ID names store:aa"), "{text}");
+    assert!(text.contains("\"corrupt\":1"), "{text}");
+
+    let right = root.path().join("store:aa");
+    std::fs::create_dir_all(&right).unwrap();
+    std::fs::write(right.join("0-1.gts"), &bytes).unwrap();
+    std::fs::remove_dir_all(&wrong).unwrap();
+    let output = run(&["verify", root.path().to_str().unwrap()]);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains("\"segments\":1,\"ok\":1,\"corrupt\":0"),
+        "{text}"
+    );
+}
+
+/// INVARIANT (#17): an intact copy of a segment is reported as a duplicate of the first copy,
+/// counted under `duplicates`, and is not corruption: the root still exits zero.
+#[test]
+fn verify_reports_an_intact_copy_as_a_duplicate_not_corruption() {
+    use sparrow_test_support::SegmentFixture;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("STORE_ID"), "store:aa\n").unwrap();
+    let directory = root.path().join("store:aa");
+    std::fs::create_dir_all(&directory).unwrap();
+    let bytes = sparrow_test_support::segment_with(&SegmentFixture::new(b"alpha\n", b"alpha\n"));
+    std::fs::write(directory.join("0-1.gts"), &bytes).unwrap();
+    std::fs::write(directory.join("0-1-copy.gts"), &bytes).unwrap();
+    let output = run(&["verify", root.path().to_str().unwrap()]);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("\"duplicate_of\""), "{text}");
+    assert!(
+        text.contains("\"segments\":2,\"ok\":2,\"corrupt\":0,\"duplicates\":1"),
+        "{text}"
+    );
+}
+
 /// Value: a record repeated across segments extracts once when the copies are identical, and
 /// is refused by name when the copies differ in bytes or in the artifact's metadata.
 #[test]

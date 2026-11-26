@@ -393,7 +393,7 @@ To take one artifact out of the archive with only the NAS directory and the bina
 `sparrow-archive list DIR` prints one JSON line per segment, whose `entries` array gives
 each artifact's `id`, `source`, `received_at` (Unix milliseconds), `byte_length` and
 `payload_id` (the BLAKE3 hash of the artifact's whole bytes, `blake3:` and 64 hex digits, read from the artifact's graph);
-`sparrow-archive verify DIR` checks every segment; and
+`sparrow-archive verify DIR` checks every segment, refusing a segment that is not in the directory of the store its root's `STORE_ID` names (a root without `STORE_ID` is unbound and not refused on that ground), and reports an intact copy of a segment, one with the same bytes as an earlier one, as `duplicate_of` and under `duplicates` in its totals, which is not corruption; and
 `sparrow-archive extract DIR ARTIFACT_ID > file` joins the artifact's records from every
 segment under `DIR` in byte order, wherever they were archived, and writes them to stdout
 only after every segment decoded with each record's bytes matching its link digest, the
