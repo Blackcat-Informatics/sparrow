@@ -104,14 +104,21 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded, String> {
                     ));
                 }
             }
-            Kind::Artifact => artifacts.push(ArchivedArtifact {
-                source: need(facts.source, "sourceName")?,
-                format: need(facts.format, "format")?,
-                received_at: instant(&id, &need(facts.received_at, "receivedAt")?)?,
-                byte_length: integer(&id, "byteLength", facts.byte_length)?,
-                payload_id: payload_id(&id, facts.artifact_payload)?,
-                id,
-            }),
+            Kind::Artifact => {
+                if facts.payload.is_some() {
+                    return Err(format!(
+                        "{id} carries a payloadBlake3 link but is not a record"
+                    ));
+                }
+                artifacts.push(ArchivedArtifact {
+                    source: need(facts.source, "sourceName")?,
+                    format: need(facts.format, "format")?,
+                    received_at: instant(&id, &need(facts.received_at, "receivedAt")?)?,
+                    byte_length: integer(&id, "byteLength", facts.byte_length)?,
+                    payload_id: payload_id(&id, facts.artifact_payload)?,
+                    id,
+                })
+            }
             Kind::Record => {
                 let digest = need(facts.payload, "payloadBlake3 link")?;
                 linked.insert(digest.clone());
