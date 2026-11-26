@@ -52,14 +52,16 @@ Read [the architecture](docs/architecture.md) and
 
 Prerequisites:
 
-- Rust 1.98.1 or newer with rustfmt and Clippy. The helper census requires
-  Rust 1.98.1.
+- Rust 1.98 or newer with rustfmt and Clippy, as declared by the workspace
+  `rust-version`.
 - `capnp` (the Cap'n Proto compiler) and libclang, for the RPC schema and the
   RocksDB bindings
 - Git 2.54 or newer, Python 3.11 or newer, `b3sum` and `tar`
 - A sibling PurRDF checkout at `../purrdf` that contains the revision pinned
   in [`registry/compatibility.toml`](registry/compatibility.toml). The tests
-  read its text lexicons and the census archives its source at that revision.
+  read its text lexicons, which `tools/purrdf-lexicons.sh` extracts with
+  `git archive` at that revision. The helper census reads the committed objects
+  at that revision from the sibling checkout.
 
 ```bash
 git clone https://github.com/Blackcat-Informatics/purrdf ../purrdf
