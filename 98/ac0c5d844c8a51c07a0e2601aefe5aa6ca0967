@@ -1,0 +1,19 @@
+ghprsq structured squash audit metadata
+
+parent_hashes: 4af3b2cb1901a282c7db08ad1d701ec06afe8504
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 577
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/577
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 8a0780a0c8d3a2ae957f59c2316e04a5be72fbea
+GhpRsq-Head-Ref: paudley/82-make-retention-metrics-answer-on-stores
+GhpRsq-Head-OID: 4af3b2cb1901a282c7db08ad1d701ec06afe8504
+GhpRsq-Result-Tree: 417ef219452248649894f8f4926031aaf6bd50a6
+GhpRsq-Result-Commit: 98ac0c5d844c8a51c07a0e2601aefe5aa6ca0967
+GhpRsq-Parent-Hashes: 4af3b2cb1901a282c7db08ad1d701ec06afe8504
+GhpRsq-Squash-Notes-SHA256: 104435ffec4e9a2c5bc4a7de4fc90bcb936be330fa93fad2cdea3a6fc3759b54
+GhpRsq-Defect-Class: none
+GhpRsq-Stage-Evidence: none
