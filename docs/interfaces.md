@@ -1374,6 +1374,28 @@ reports the refusal after expiry. A completed journal returns the same
 original receipt on repetition, while each artifact remains subject to the
 store's independent retention rules.
 
+### Receipt intake on replayed publications
+
+The SDK's `ArtifactReceipt` has no `intake` field. An accepted wire artifact carries
+optional intake provenance, which the SDK drops when it decodes the reply. Two paths
+build the receipt, and they do not share that value:
+
+- Initial publication of an ordered file takes the intake from the import manifest
+  (`ImportManifest.intake`).
+- A replay of a completed ordered file rebuilds the receipt from the SDK's local
+  completion certificate. That certificate has a strict schema and holds no intake
+  provenance. An older client rejects unknown certificate fields, so the certificate
+  cannot gain the field without a compatible journal change.
+
+The daemon's accepted-ingest retry rebuilds its receipt from the saved ingest receipt,
+which also omits the manifest's intake. It compares the saved producer, tail and receiver
+provenance with the retried request and returns `CONFLICT` on a mismatch. It does not
+compare intake.
+
+A receipt that carries intake would therefore differ between initial publication and
+replay. Adding the field to `ArtifactReceipt` requires that the certificate and the saved
+ingest receipt both store intake, so that every path reads the same value.
+
 Run `sparrow SOCKET parts verify SOURCE MANIFEST_ARTIFACT_ID` for a
 `sparrow.parts/1` manifest. It checks each member against the current artifact
 listing and reports its ordinal and ID with a status of available, missing,
