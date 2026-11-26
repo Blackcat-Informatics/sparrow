@@ -52,8 +52,8 @@ Read [the architecture](docs/architecture.md) and
 
 Prerequisites:
 
-- Rust 1.98 or newer with rustfmt and Clippy, as declared by the workspace
-  `rust-version`.
+- Rust 1.98.1 or newer with rustfmt and Clippy. The helper census requires
+  Rust 1.98.1.
 - `capnp` (the Cap'n Proto compiler) and libclang, for the RPC schema and the
   RocksDB bindings
 - Git 2.54 or newer, Python 3.11 or newer, `b3sum` and `tar`

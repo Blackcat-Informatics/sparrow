@@ -184,7 +184,7 @@ ingestion; successful raw import is sufficient to consume a completed source.
 
 ## Contributing
 
-Use Rust 1.98 or newer with rustfmt and Clippy for verification. The gate
+Use Rust 1.98.1 or newer with rustfmt and Clippy for verification. The gate
 uses Git 2.54 or newer, `b3sum`, and the same sibling PurRDF checkout as the
 quickstart. Install the helper census and commit hook before running it.
 
