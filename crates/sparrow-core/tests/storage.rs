@@ -10360,6 +10360,55 @@ fn publish_staged(
     store.import_publish(&manifest.id, 0)
 }
 
+/// INVARIANT (#82): the retention catalog allowance keeps every distinct payload owner charged
+/// after each row's transient parse is released. Protects: the least allowance that admits the
+/// report is at least 512 bytes per distinct payload, and one byte less refuses with
+/// `RESOURCE_LIMIT`.
+#[test]
+fn retention_metrics_keep_ownership_entries_charged_after_parse_refunds() {
+    use sparrow_core::RetentionReadLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    for index in 0..16 {
+        store
+            .ingest(
+                &format!("owner-{index}"),
+                "metrics",
+                "log",
+                format!("distinct {index}\n").as_bytes(),
+                1,
+            )
+            .unwrap();
+    }
+    let now = 2 * DAY;
+    let admits = |catalog_bytes: usize| {
+        store.retention_metrics(
+            now,
+            RetentionReadLimits {
+                catalog_bytes,
+                ..Default::default()
+            },
+        )
+    };
+    let distinct = admits(32 * 1024 * 1024).unwrap().payload_chunks;
+    assert_eq!(distinct, 16);
+    let (mut low, mut high) = (1_usize, 32 * 1024 * 1024);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if admits(middle).is_ok() {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    assert!(
+        low >= 512 * distinct as usize,
+        "least admitted allowance {low} is below the owner entries"
+    );
+    let refused = admits(low - 1).unwrap_err();
+    assert_eq!(refused.code, "RESOURCE_LIMIT");
+}
+
 #[test]
 fn import_ceiling_artifact_drains_through_expiry_and_eviction_and_one_chunk_more_is_refused() {
     let chunk = sparrow_core::IMPORT_CHUNK_BYTES;

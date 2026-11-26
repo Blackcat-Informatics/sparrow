@@ -238,6 +238,7 @@ impl Store {
                     .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
                 match prefix {
                     b"artifact:" => {
+                        let before_envelope = admission.remaining;
                         let artifact = manifest_retire::Envelope::read(
                             &writer,
                             id,
@@ -271,11 +272,19 @@ impl Store {
                                 add(report.pinned_artifacts, u64::from(pinned))?;
                             report.observe(artifact.received_at)?;
                         }
+                        let envelope_charge = before_envelope - admission.remaining;
                         admission.owners(&mut owners, &artifact.prefix, live, live && pinned)?;
+                        // The envelope is dropped here. Its parse cost bounds the peak while
+                        // it is held, so it is refunded; only the ownership entries added
+                        // above outlive it and keep their own charge.
+                        admission.remaining += envelope_charge;
                     }
                     b"record:" => {
+                        let shape_before = admission.remaining;
                         Writer::charge_catalog_shape(&mut admission.remaining, bytes)?;
                         let record: Record = writer.decode_evidence(key, bytes)?;
+                        // The transient parse charge, measured before ownership entries are added.
+                        let shape_charge = shape_before - admission.remaining;
                         writer.validate_event_record(&record)?;
                         if record.expires_at <= record.received_at
                             || record.byte_end < record.byte_start
@@ -296,6 +305,8 @@ impl Store {
                             report.observe(record.received_at)?;
                         }
                         admission.owners(&mut owners, &record.chunks, live, live && pinned)?;
+                        // The decoded record is dropped here, so only its shape charge is released.
+                        admission.remaining += shape_charge;
                     }
                     _ => {
                         let digest = id.strip_prefix("ref:").ok_or_else(|| {
