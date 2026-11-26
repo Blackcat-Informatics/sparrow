@@ -587,8 +587,6 @@ mod inject {
     }
 }
 
-/// Skipped-duty counts of the test running on this thread, so a test waits for the skip it
-/// exercises as an event instead of sleeping.
 /// One structured line for an expiry pass that retired or held evidence. The counts are the
 /// pass's own; `archive_waiting` is the due entry the archive gate held back.
 fn journal_expiry(report: &ExpiryReport, floor_paused: bool) {
@@ -618,8 +616,9 @@ fn journal_expiry(report: &ExpiryReport, floor_paused: bool) {
     );
 }
 
-/// One structured line per eviction pass that retired evidence. The status repeats its last
-/// pass until another runs, so `seen` holds the pass count already journaled.
+/// One structured line per new eviction pass, including a pass that retired nothing because the
+/// archive lagged. The status repeats its last pass until another runs, so `seen` holds the pass
+/// count already journaled.
 fn journal_eviction(status: &PressureStatus, seen: &mut u64) {
     if status.passes == *seen {
         return;
@@ -652,6 +651,8 @@ fn journal_eviction(status: &PressureStatus, seen: &mut u64) {
     );
 }
 
+/// Skipped-duty counts of the test running on this thread, so a test waits for the skip it
+/// exercises as an event instead of sleeping.
 #[cfg(test)]
 mod skips {
     use super::Job;
