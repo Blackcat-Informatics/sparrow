@@ -185,8 +185,10 @@ ingestion; successful raw import is sufficient to consume a completed source.
 ## Contributing
 
 Use Rust 1.98.1 or newer with rustfmt and Clippy for verification. The gate
-uses Git 2.54 or newer, `b3sum`, and the same sibling PurRDF checkout as the
-quickstart. Install the helper census and commit hook before running it.
+uses Git 2.54 or newer and the same sibling PurRDF checkout as the quickstart.
+`b3sum` is not a gate prerequisite: the shipper (`deploy/libexec/sparrow-ship`)
+and CI (`.github/workflows/ci-lane.yaml`) use it. Install the helper census and
+commit hook before running the gate.
 
 ```bash
 make install-census
