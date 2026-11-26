@@ -23,6 +23,7 @@ path = "src/main.rs"
 [dependencies]
 sparrow-core = { path = "../sparrow-core" }
 purrdf.workspace = true
+purrdf-lex.workspace = true
 
 [dev-dependencies]
 purrdf-hash.workspace = true
