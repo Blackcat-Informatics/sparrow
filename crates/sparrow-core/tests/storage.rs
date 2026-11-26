@@ -27641,3 +27641,234 @@ fn open_and_expiry_refuse_malformed_timed_record_metadata() {
     assert!(db.get(&key).unwrap().is_none());
     assert!(index_rows(&db).is_empty());
 }
+
+/// Copy a closed store directory.
+fn copy_store(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_store(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// The entry-walk answer for the store in `dir`: a copy of it is lowered so its owner summary
+/// is pending, and the retention query then reads every owner entry.
+fn entry_walk_totals(dir: &std::path::Path, scratch: &std::path::Path, now: u64) -> String {
+    copy_store(dir, scratch);
+    let db = catalog_db(scratch).unwrap();
+    sparrow_core::lower_owner_summary_for_legacy_fixture(&db).unwrap();
+    drop(db);
+    let oracle = Store::open(scratch, config()).unwrap();
+    let totals = retention_result(&oracle, now);
+    drop(oracle);
+    std::fs::remove_dir_all(scratch).unwrap();
+    totals
+}
+
+fn retention_result(store: &Store, now: u64) -> String {
+    match store.retention_metrics(now, sparrow_core::RetentionReadLimits::default()) {
+        Ok(mut report) => {
+            report.visits = 0;
+            format!("{report:?}")
+        }
+        Err(error) => format!("refused {}: {}", error.code, error.message),
+    }
+}
+
+/// Deterministic xorshift generator for the differential sequences.
+struct Sequence(u64);
+
+impl Sequence {
+    fn next(&mut self, bound: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % bound
+    }
+}
+
+/// INVARIANT: after every step of a random sequence of publication, import, tail
+/// consumption, pin, unpin, clock advance (owner and pin expiry), bounded expiry, eviction and
+/// reopen, the retention answer from the owner summary equals the answer from the owner
+/// entries, and the summary answer is unchanged by a reopen. Fixed seeds keep it
+/// deterministic.
+#[test]
+fn retention_answer_from_the_summary_equals_the_entry_walk_through_random_mutations() {
+    use sparrow_core::{EvictionLimits, TailStart};
+    const SEEDS: [u64; 12] = [
+        0x9E37_79B9_7F4A_7C15,
+        0xD1B5_4A32_D192_ED03,
+        7,
+        0x5851_F42D_4C95_7E2D,
+        11,
+        13,
+        0x2545_F491_4F6C_DD1D,
+        99,
+        1234,
+        0xDEAD_BEEF,
+        31337,
+        0x1234_5678_9ABC_DEF1,
+    ];
+    const STEPS: usize = 30;
+    let limits = EvictionLimits {
+        max_payload_refs: 8,
+        ..EvictionLimits::default()
+    };
+    let mut tally: std::collections::BTreeMap<&str, (u32, u32)> = Default::default();
+    let mut shapes = (0_u32, 0_u32, 0_u32);
+    for seed in SEEDS {
+        let mut rng = Sequence(seed);
+        let (dir, scratch) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (path, copy) = (dir.path().to_path_buf(), scratch.path().join("copy"));
+        let mut store = Store::open(&path, config()).unwrap();
+        let (mut now, mut serial) = (DAY, 0_u64);
+        let mut owners: Vec<String> = Vec::new();
+        let mut pins: Vec<String> = Vec::new();
+        let mut tail: Option<(String, u64)> = None;
+        let mut trace: Vec<String> = Vec::new();
+        for step in 0..STEPS {
+            for _ in 0..=rng.next(2) {
+                serial += 1;
+                let op = rng.next(11);
+                let mut published: Option<Result<sparrow_core::Artifact, sparrow_core::Error>> =
+                    None;
+                let (kind, outcome, ok) = match op {
+                    0..=2 => {
+                        let input: Vec<u8> = if op == 2 {
+                            let mut line = vec![b'a' + rng.next(3) as u8; 64 * 1024];
+                            line[64 * 1024 - 1] = b'\n';
+                            line.repeat(2 + rng.next(13) as usize)
+                        } else {
+                            let words = ["alpha", "beta", "gamma"];
+                            (0..1 + rng.next(3))
+                                .map(|_| format!("{}\n", words[rng.next(3) as usize]))
+                                .collect::<String>()
+                                .into_bytes()
+                        };
+                        let made = store.ingest(&format!("r{serial}"), "diff", "log", &input, now);
+                        let ok = made.is_ok();
+                        published = Some(made);
+                        (
+                            "ingest",
+                            format!(
+                                "ingest {} bytes starting {:?}",
+                                input.len(),
+                                &input[..input.len().min(6)]
+                            ),
+                            ok,
+                        )
+                    }
+                    3 => {
+                        let made = publish_staged(
+                            &store,
+                            &format!("i{serial}"),
+                            &log_lines(128 * 1024, 64 * 1024),
+                        );
+                        let ok = made.is_ok();
+                        published = Some(made);
+                        ("import", "import 128 KiB".to_owned(), ok)
+                    }
+                    4 => {
+                        let (id, offset) = tail.get_or_insert_with(|| {
+                            let generation = store
+                                .tail_start(
+                                    &TailStart {
+                                        request_id: format!("t{seed}"),
+                                        watch: "tail".into(),
+                                        watch_revision: 1,
+                                        directories: CONSUMPTION_DIRECTORIES,
+                                        path: b"active.log".to_vec(),
+                                        source: "diff-tail".into(),
+                                        format: "log".into(),
+                                        device: 7,
+                                        inode: 42,
+                                    },
+                                    now,
+                                )
+                                .unwrap();
+                            (generation.id, 0)
+                        });
+                        let input = format!("tail {serial}\n");
+                        let made = store.tail_append(id, *offset, input.as_bytes(), false, now);
+                        let ok = made.is_ok();
+                        if let Ok(done) = made {
+                            *offset = done.source_end;
+                            if let Some(artifact) = done.artifact {
+                                published = Some(Ok(artifact));
+                            }
+                        }
+                        ("tail", format!("tail append {input:?}"), ok)
+                    }
+                    5 | 6 if !owners.is_empty() => {
+                        let target = owners[rng.next(owners.len() as u64) as usize].clone();
+                        let days = 1 + rng.next(3);
+                        let made = store.pin(
+                            &format!("p{serial}"),
+                            "diff",
+                            std::slice::from_ref(&target),
+                            days,
+                            now,
+                        );
+                        let ok = made.is_ok();
+                        if let Ok(pin) = made {
+                            pins.push(pin.id);
+                        }
+                        ("pin", format!("pin {target} for {days} days"), ok)
+                    }
+                    7 if !pins.is_empty() => {
+                        let pin = pins.swap_remove(rng.next(pins.len() as u64) as usize);
+                        let ok = store.release(&pin).is_ok();
+                        ("unpin", format!("unpin {pin}"), ok)
+                    }
+                    8 => {
+                        now += (1 + rng.next(8)) * DAY / 2;
+                        ("clock", format!("clock to {now}"), true)
+                    }
+                    9 => {
+                        let ok = store.expire_bounded(now, limits).is_ok();
+                        ("expire", "expire".to_owned(), ok)
+                    }
+                    _ => {
+                        let ok = store.evict_oldest(now, limits).is_ok();
+                        ("evict", "evict".to_owned(), ok)
+                    }
+                };
+                if let Some(Ok(artifact)) = &published {
+                    owners.push(artifact.id.clone());
+                    owners.extend(artifact.record_ids.iter().cloned());
+                }
+                let entry = tally.entry(kind).or_default();
+                if ok {
+                    entry.0 += 1;
+                } else {
+                    entry.1 += 1;
+                }
+                trace.push(format!("step {step}: {outcome} ok={ok}"));
+            }
+            let live = retention_result(&store, now);
+            let live_visits = store
+                .retention_metrics(now, sparrow_core::RetentionReadLimits::default())
+                .map(|report| report.visits)
+                .unwrap_or(0);
+            if live.contains("live_records: 0,") && live.contains("live_artifacts: 0,") {
+                shapes.0 += 1;
+            } else {
+                shapes.1 += 1;
+            }
+            shapes.2 += u32::from(live_visits > 0);
+            drop(store);
+            let walked = entry_walk_totals(&path, &copy, now);
+            store = Store::open(&path, config()).unwrap();
+            let reopened = retention_result(&store, now);
+            let context = format!("seed {seed:#x}, step {step}\n{}", trace.join("\n"));
+            assert_eq!(live, walked, "summary vs entry walk\n{context}");
+            assert_eq!(live, reopened, "summary before vs after reopen\n{context}");
+        }
+    }
+    eprintln!("ORACLE ops (ok, refused): {tally:?}; steps (empty, nonempty, answered): {shapes:?}");
+}
