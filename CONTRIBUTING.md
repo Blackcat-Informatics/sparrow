@@ -59,7 +59,9 @@ Prerequisites:
 - Git 2.54 or newer, Python 3.11 or newer, `b3sum` and `tar`
 - A sibling PurRDF checkout at `../purrdf` that contains the revision pinned
   in [`registry/compatibility.toml`](registry/compatibility.toml). The tests
-  read its text lexicons and the census archives its source at that revision.
+  read its text lexicons, which `tools/purrdf-lexicons.sh` extracts with
+  `git archive` at that revision. The helper census reads the committed objects
+  at that revision from the sibling checkout.
 
 ```bash
 git clone https://github.com/Blackcat-Informatics/purrdf ../purrdf
