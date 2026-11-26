@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::error::ArchiveError;
@@ -14,31 +15,54 @@ use crate::segment::{ArchivedArtifact, ArchivedRecord, Segment};
 /// written anywhere.
 ///
 /// Every segment is decoded, so a damaged segment fails the call by name even when it does
-/// not hold the artifact: it might have held a piece of it.
+/// not hold the artifact: it might have held a piece of it. A record that repeats in several
+/// segments counts once when every copy is identical; copies that differ, artifact metadata
+/// that differs between segments, and a record whose source or receipt time differs from its
+/// artifact's each fail the call.
 ///
 /// # Errors
 /// A segment that cannot be read or decoded, an `artifact_id` no segment holds, or an
 /// artifact whose records are not all present or whose bytes do not add up to its recorded
 /// length; the last two name the artifact, and never return partial bytes.
 pub fn extract(paths: &[PathBuf], artifact_id: &str) -> Result<Vec<u8>, ArchiveError> {
-    let mut artifact: Option<ArchivedArtifact> = None;
-    let mut records: Vec<ArchivedRecord> = Vec::new();
-    for path in paths {
-        let segment = Segment::open(path)?;
-        if let Some(found) = segment.artifacts().iter().find(|a| a.id == artifact_id) {
-            artifact = Some(found.clone());
-        }
-        records.extend(
-            segment
-                .records()
-                .iter()
-                .filter(|record| record.artifact_id == artifact_id)
-                .cloned(),
-        );
-    }
     let incomplete = |reason: String| ArchiveError::Incomplete {
         reason: format!("artifact {artifact_id}: {reason}"),
     };
+    let mut artifact: Option<ArchivedArtifact> = None;
+    let mut held: BTreeMap<String, ArchivedRecord> = BTreeMap::new();
+    for path in paths {
+        let segment = Segment::open(path)?;
+        for found in segment.artifacts().iter().filter(|a| a.id == artifact_id) {
+            match &artifact {
+                Some(first) if first != found => {
+                    return Err(incomplete(format!(
+                        "{} holds metadata that conflicts with another segment's",
+                        path.display()
+                    )));
+                }
+                _ => artifact = Some(found.clone()),
+            }
+        }
+        for found in segment
+            .records()
+            .iter()
+            .filter(|record| record.artifact_id == artifact_id)
+        {
+            match held.get(&found.id) {
+                Some(first) if first != found => {
+                    return Err(incomplete(format!(
+                        "record {} appears in more than one segment with different contents",
+                        found.id
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    held.insert(found.id.clone(), found.clone());
+                }
+            }
+        }
+    }
+    let mut records: Vec<ArchivedRecord> = held.into_values().collect();
     let Some(artifact) = artifact else {
         return Err(if records.is_empty() {
             ArchiveError::NotFound {
@@ -48,8 +72,15 @@ pub fn extract(paths: &[PathBuf], artifact_id: &str) -> Result<Vec<u8>, ArchiveE
             incomplete("the segments hold its records but not its metadata".to_owned())
         });
     };
+    if let Some(record) = records.iter().find(|record| {
+        record.source != artifact.source || record.received_at != artifact.received_at
+    }) {
+        return Err(incomplete(format!(
+            "record {} disagrees with the artifact on its source or receipt time",
+            record.id
+        )));
+    }
     records.sort_by_key(|record| record.byte_start);
-    records.dedup_by(|a, b| a.id == b.id);
     let mut bytes = Vec::new();
     for record in &records {
         if record.byte_start != bytes.len() as u64

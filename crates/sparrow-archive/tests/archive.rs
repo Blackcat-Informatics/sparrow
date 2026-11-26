@@ -302,21 +302,132 @@ fn extract_does_not_follow_symlinks_or_read_staging() {
     assert_eq!(output.stdout, FIRST);
 }
 
-/// Value: a source name with a quote, a backslash and a newline prints as one valid JSON
-/// line per segment, with the characters escaped rather than raw.
+/// Value: a source name with a quote, a backslash and a newline prints as one JSON line per
+/// segment that reads back to the exact name, through the supplier's writer.
 #[test]
-fn list_escapes_quotes_backslashes_and_control_characters_in_source_names() {
+fn list_quotes_source_names_so_the_line_reads_back_exactly() {
     let archive_dir = tempfile::tempdir().unwrap();
+    let source = "ho\"st\\\n\u{7}";
     archive(
         archive_dir.path(),
         ArchivePolicy::default(),
-        &[("req-q", "ho\"st\\\n", "log", FIRST, T1)],
+        &[("req-q", source, "log", FIRST, T1)],
     );
     let output = run(&["list", archive_dir.path().to_str().unwrap()]);
     assert!(output.status.success(), "{:?}", output.stderr);
     let text = String::from_utf8(output.stdout).unwrap();
     assert_eq!(text.lines().count(), 1, "{text}");
-    assert!(text.contains(r#"ho\"st\\\u000a"#), "{text}");
+    let value = purrdf_lex::json::read_slice(text.as_bytes(), purrdf_lex::json::Limits::default())
+        .expect("one valid JSON line");
+    assert_eq!(value["entries"][0]["source"].as_str(), Some(source));
+}
+
+/// A one-record segment from `fixture`, written as `<root>/segments/<name>.gts`.
+fn fixture_segment(root: &Path, name: &str, fixture: &sparrow_test_support::SegmentFixture<'_>) {
+    let path = root.join("segments").join(format!("{name}.gts"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, sparrow_test_support::segment_with(fixture)).unwrap();
+}
+
+/// Value: a segment the decoder cannot call consistent is refused whole, by `verify` as
+/// `"ok":false` and by `extract` with the file named and nothing on stdout: a payload link
+/// on a subject that is no record, and a blob no record links to.
+#[test]
+fn a_segment_with_an_orphan_link_or_an_unreferenced_blob_is_refused() {
+    use sparrow_test_support::SegmentFixture;
+    let cases = [
+        (
+            "orphan link",
+            SegmentFixture {
+                orphan_link: true,
+                ..SegmentFixture::new(b"alpha\n", b"alpha\n")
+            },
+            "not a record",
+        ),
+        (
+            "unreferenced blob",
+            SegmentFixture {
+                unreferenced_blob: Some(b"stray\n"),
+                ..SegmentFixture::new(b"alpha\n", b"alpha\n")
+            },
+            "linked by no record",
+        ),
+    ];
+    for (label, fixture, reason) in cases {
+        let root = tempfile::tempdir().unwrap();
+        fixture_segment(root.path(), "forged", &fixture);
+        let output = extract(root.path(), "artifact:aa");
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{label}: {error}");
+        assert!(output.stdout.is_empty(), "{label}");
+        assert!(
+            error.contains("forged.gts") && error.contains(reason),
+            "{label}: {error}"
+        );
+        let verified = run(&["verify", root.path().to_str().unwrap()]);
+        let text = String::from_utf8(verified.stdout).unwrap();
+        assert_eq!(verified.status.code(), Some(1), "{label}: {text}");
+        assert!(text.contains("\"ok\":false"), "{label}: {text}");
+    }
+}
+
+/// Value: a record repeated across segments extracts once when the copies are identical, and
+/// is refused by name when the copies differ in bytes or in the artifact's metadata.
+#[test]
+fn extract_accepts_identical_duplicates_and_refuses_conflicting_ones() {
+    use sparrow_test_support::SegmentFixture;
+    let same = tempfile::tempdir().unwrap();
+    let fixture = SegmentFixture::new(b"alpha\n", b"alpha\n");
+    fixture_segment(same.path(), "one", &fixture);
+    fixture_segment(same.path(), "two", &fixture);
+    let output = extract(same.path(), "artifact:aa");
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"alpha\n");
+
+    let differing = tempfile::tempdir().unwrap();
+    fixture_segment(differing.path(), "one", &fixture);
+    fixture_segment(
+        differing.path(),
+        "two",
+        &SegmentFixture::new(b"bravo\n", b"bravo\n"),
+    );
+    let output = extract(differing.path(), "artifact:aa");
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{error}");
+    assert!(output.stdout.is_empty());
+    assert!(
+        error.contains("artifact:aa") && error.contains("conflicts"),
+        "{error}"
+    );
+}
+
+/// Value: a record whose source or receipt time differs from its artifact's is refused with
+/// both named, and nothing reaches stdout.
+#[test]
+fn extract_refuses_a_record_that_disagrees_with_its_artifact() {
+    use sparrow_test_support::SegmentFixture;
+    let cases = [
+        SegmentFixture {
+            record_source: "other-host",
+            ..SegmentFixture::new(b"alpha\n", b"alpha\n")
+        },
+        SegmentFixture {
+            record_received_at: T2,
+            ..SegmentFixture::new(b"alpha\n", b"alpha\n")
+        },
+    ];
+    for fixture in cases {
+        let root = tempfile::tempdir().unwrap();
+        fixture_segment(root.path(), "skewed", &fixture);
+        let output = extract(root.path(), "artifact:aa");
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{error}");
+        assert!(output.stdout.is_empty());
+        assert!(
+            error.contains("artifact:aa") && error.contains("disagrees"),
+            "{error}"
+        );
+    }
 }
 
 /// Value (#327): an id no segment holds is a named error, with nothing on stdout.

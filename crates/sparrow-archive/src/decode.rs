@@ -6,7 +6,7 @@
 //! artifacts; replacing the format replaces this module only. Listing, naming and
 //! extraction never see the format.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use purrdf::gts::writer::digest_string;
 
@@ -34,7 +34,7 @@ pub(crate) struct Decoded {
 
 /// Decode one segment file. The reader checks the frame hash chain; it does not hash a
 /// blob's decompressed bytes, so each record's bytes are hashed here and compared with the
-/// digest its link quad names. Any digest mismatch, any diagnostic, or a file with no segment head, is a refusal, never a partial read.
+/// digest its link quad names. Any digest mismatch, any diagnostic, a link quad on a subject that is not a record, a blob no record links to, or a file with no segment head, is a refusal, never a partial read.
 pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded, String> {
     let mut graph = purrdf::gts::reader::read(bytes, false, None);
     if let Some(first) = graph.diagnostics.first() {
@@ -88,6 +88,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded, String> {
     }
     let mut records = Vec::new();
     let mut artifacts = Vec::new();
+    let mut linked: BTreeSet<String> = BTreeSet::new();
     for (iri, facts) in facts {
         let id = iri
             .strip_prefix(vocabulary::ENTITY)
@@ -96,7 +97,13 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded, String> {
         let need =
             |value: Option<String>, what: &str| value.ok_or_else(|| format!("{id} has no {what}"));
         match facts.kind {
-            Kind::Other => {}
+            Kind::Other => {
+                if facts.payload.is_some() {
+                    return Err(format!(
+                        "{id} carries a payloadBlake3 link but is not a record"
+                    ));
+                }
+            }
             Kind::Artifact => artifacts.push(ArchivedArtifact {
                 source: need(facts.source, "sourceName")?,
                 format: need(facts.format, "format")?,
@@ -107,6 +114,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded, String> {
             }),
             Kind::Record => {
                 let digest = need(facts.payload, "payloadBlake3 link")?;
+                linked.insert(digest.clone());
                 let bytes = graph
                     .blob_bytes_cloned(&digest)
                     .map_err(|error| format!("record {id}: blob {digest}: {error}"))?
@@ -131,6 +139,13 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded, String> {
                 });
             }
         }
+    }
+    if let Some((digest, _)) = graph
+        .blobs
+        .iter()
+        .find(|(digest, _)| !linked.contains(digest))
+    {
+        return Err(format!("blob {digest} is linked by no record"));
     }
     Ok(Decoded {
         records,

@@ -10,50 +10,39 @@ use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
+use purrdf_lex::json::{self, Value};
+
 use sparrow_archive::{ArchiveError, Segment, Summary, extract, list_segments};
 
 const USAGE: &str = "usage: sparrow-archive list|verify DIR | extract DIR ARTIFACT_ID";
 
-fn quote(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 2);
-    out.push('"');
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
+/// One output line: `members` as a compact JSON object, quoted by the supplier's writer so
+/// a path or an error detail with a quote, a backslash or a control character stays valid.
+fn line(members: Vec<(&str, Value)>) -> String {
+    json::write_compact(&Value::object(members))
 }
 
-fn counts(summary: Summary) -> String {
-    format!(
-        "\"records\":{},\"artifacts\":{},\"blobs\":{}",
-        summary.records, summary.artifacts, summary.blobs
-    )
+/// The record, artifact and blob counts of a decoded segment, as object members.
+fn counts(summary: Summary) -> [(&'static str, Value); 3] {
+    [
+        ("records", summary.records.into()),
+        ("artifacts", summary.artifacts.into()),
+        ("blobs", summary.blobs.into()),
+    ]
 }
 
 /// The segment's artifacts, so a person can find an artifact id, or match content by its
 /// payload id, and extract it.
-fn entries(segment: &Segment) -> String {
-    let items: Vec<String> = segment
-        .artifacts()
-        .iter()
-        .map(|artifact| {
-            format!(
-                "{{\"id\":{},\"source\":{},\"received_at\":{},\"byte_length\":{},\"payload_id\":{}}}",
-                quote(&artifact.id),
-                quote(&artifact.source),
-                artifact.received_at,
-                artifact.byte_length,
-                quote(&artifact.payload_id)
-            )
-        })
-        .collect();
-    format!("[{}]", items.join(","))
+fn entries(segment: &Segment) -> Value {
+    Value::array(segment.artifacts().iter().map(|artifact| {
+        Value::object([
+            ("id", Value::from(artifact.id.as_str())),
+            ("source", Value::from(artifact.source.as_str())),
+            ("received_at", Value::from(artifact.received_at)),
+            ("byte_length", Value::from(artifact.byte_length)),
+            ("payload_id", Value::from(artifact.payload_id.as_str())),
+        ])
+    }))
 }
 
 fn open(path: &Path) -> Result<(Segment, Summary), ArchiveError> {
@@ -76,27 +65,26 @@ fn run(command: &str, root: &Path) -> Result<ExitCode, ExitCode> {
     })?;
     let mut corrupt = 0usize;
     for path in &segments {
-        let name = quote(&path.display().to_string());
+        let name = Value::from(path.display().to_string().as_str());
         match (command, open(path)) {
             ("list", Ok((segment, summary))) => {
-                emit(&format!(
-                    "{{\"path\":{name},{},\"entries\":{}}}",
-                    counts(summary),
-                    entries(&segment)
-                ))?;
+                let mut members = vec![("path", name)];
+                members.extend(counts(summary));
+                members.push(("entries", entries(&segment)));
+                emit(&line(members))?;
             }
             ("verify", Ok((_, summary))) => {
-                emit(&format!(
-                    "{{\"path\":{name},\"ok\":true,{}}}",
-                    counts(summary)
-                ))?;
+                let mut members = vec![("path", name), ("ok", true.into())];
+                members.extend(counts(summary));
+                emit(&line(members))?;
             }
             ("verify", Err(error)) => {
                 corrupt += 1;
-                emit(&format!(
-                    "{{\"path\":{name},\"ok\":false,\"error\":{}}}",
-                    quote(&error.to_string())
-                ))?;
+                emit(&line(vec![
+                    ("path", name),
+                    ("ok", false.into()),
+                    ("error", Value::from(error.to_string().as_str())),
+                ]))?;
             }
             (_, Err(error)) => {
                 let _ = writeln!(std::io::stderr(), "sparrow-archive: {error}");
@@ -106,11 +94,11 @@ fn run(command: &str, root: &Path) -> Result<ExitCode, ExitCode> {
         }
     }
     if command == "verify" {
-        emit(&format!(
-            "{{\"segments\":{},\"ok\":{},\"corrupt\":{corrupt}}}",
-            segments.len(),
-            segments.len() - corrupt
-        ))?;
+        emit(&line(vec![
+            ("segments", segments.len().into()),
+            ("ok", (segments.len() - corrupt).into()),
+            ("corrupt", corrupt.into()),
+        ]))?;
     }
     Ok(if corrupt == 0 {
         ExitCode::SUCCESS

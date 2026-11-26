@@ -400,7 +400,11 @@ segment under `DIR` in byte order, wherever they were archived, and writes them 
 only after every segment decoded with each record's bytes matching its link digest, the
 records contiguous in byte order and their total equal to the artifact's recorded
 `byteLength`. A damaged segment anywhere under `DIR` blocks extraction; to extract from the
-rest, point `DIR` at a directory without it. A damaged segment, an unknown id or an artifact with a
+rest, point `DIR` at a directory without it. The decoder also refuses a segment with a payload link on a subject that is not a record
+and a segment holding a blob that no record links to. `extract` counts a record repeated across
+segments once when every copy is identical, and refuses copies that differ, artifact metadata
+that differs between segments, and a record whose source or receipt time differs from its
+artifact's. A damaged segment, an unknown id or an artifact with a
 missing record exits nonzero, names the file or artifact on stderr and writes nothing to
 stdout. A directory with no segment, or one that does not exist, fails the same way. Discovery reads
 regular `*.gts` files only: a symbolic link to a segment is not an archive member and is not
