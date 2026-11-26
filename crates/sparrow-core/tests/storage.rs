@@ -10360,52 +10360,54 @@ fn publish_staged(
     store.import_publish(&manifest.id, 0)
 }
 
-/// INVARIANT (#82): the retention catalog allowance keeps every distinct payload owner charged
-/// after each row's transient parse is released. Protects: the least allowance that admits the
-/// report is at least 512 bytes per distinct payload, and one byte less refuses with
-/// `RESOURCE_LIMIT`.
+/// INVARIANT (#82): a record kept alone by its pin, after its parent artifact expires, owns its
+/// payload, and that ownership stays charged after the record's transient parse is released.
+/// Protects: at the fixed allowance the report admits with correct totals, and one byte less is
+/// refused. A refund that also releases the forty ownership entries lowers the admitted
+/// allowance by their 20,480-byte sum, so it admits the byte this test refuses.
+///
+/// The fixed allowance is the least one that admits this fixture under the current charge
+/// function. Re-measure it when that function changes.
 #[test]
-fn retention_metrics_keep_ownership_entries_charged_after_parse_refunds() {
+fn record_only_ownership_stays_charged_after_transient_parse_refunds() {
     use sparrow_core::RetentionReadLimits;
+    const RECORDS: usize = 40;
+    const LEAST_ADMITTED: usize = 154_736;
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
-    for index in 0..16 {
-        store
-            .ingest(
-                &format!("owner-{index}"),
-                "metrics",
-                "log",
-                format!("distinct {index}\n").as_bytes(),
-                1,
-            )
-            .unwrap();
-    }
-    let now = 2 * DAY;
-    let admits = |catalog_bytes: usize| {
+    let input: String = (0..RECORDS).map(|line| format!("kept {line}\n")).collect();
+    let artifact = store
+        .ingest("file", "source", "log", input.as_bytes(), 0)
+        .unwrap();
+    assert_eq!(artifact.record_ids.len(), RECORDS);
+    store
+        .pin(
+            "pin-records",
+            "investigation",
+            &artifact.record_ids,
+            10,
+            29 * DAY,
+        )
+        .unwrap();
+    store.expire(30 * DAY).unwrap();
+    assert_eq!(
+        store.bytes(&artifact.id, 0, 1, 30 * DAY).unwrap_err().code,
+        "EVIDENCE_UNAVAILABLE"
+    );
+    let report = |catalog_bytes: usize| {
         store.retention_metrics(
-            now,
+            30 * DAY,
             RetentionReadLimits {
                 catalog_bytes,
                 ..Default::default()
             },
         )
     };
-    let distinct = admits(32 * 1024 * 1024).unwrap().payload_chunks;
-    assert_eq!(distinct, 16);
-    let (mut low, mut high) = (1_usize, 32 * 1024 * 1024);
-    while low < high {
-        let middle = low + (high - low) / 2;
-        if admits(middle).is_ok() {
-            high = middle;
-        } else {
-            low = middle + 1;
-        }
-    }
-    assert!(
-        low >= 512 * distinct as usize,
-        "least admitted allowance {low} is below the owner entries"
-    );
-    let refused = admits(low - 1).unwrap_err();
+    let admitted = report(LEAST_ADMITTED).unwrap();
+    assert_eq!(admitted.live_records, RECORDS as u64);
+    assert_eq!(admitted.payload_chunks, RECORDS as u64);
+    assert_eq!(admitted.owned_payload_bytes, admitted.live_payload_bytes);
+    let refused = report(LEAST_ADMITTED - 1).unwrap_err();
     assert_eq!(refused.code, "RESOURCE_LIMIT");
 }
 
