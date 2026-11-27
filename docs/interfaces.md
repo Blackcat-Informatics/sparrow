@@ -1367,6 +1367,62 @@ For larger imports, split the export on entry boundaries so each normalized
 file fits the daemon's staged import limits, and give each completed file its
 own request ID. Retry the same completed export with the original request ID.
 
+
+### Systemd journal forwarding
+
+`sparrow-journal --config FILE system|user` follows one systemd journal instance and
+sends each entry to Sparrow through lossless-confirmed delivery. The `system` instance
+writes source `journal.system`, and the `user` instance writes `journal.user`. The
+configuration file is strict TOML with three keys: `socket` and `state_dir`, both
+absolute, and `spool_max_bytes`, the spool budget, which defaults to 1 GiB. Each instance
+keeps its spool in `state_dir/<instance>/spool` and its cursor file in
+`state_dir/<instance>/cursor`.
+
+Each entry is one producer event named `journal_entry`, with the source as its target.
+Its time is `__REALTIME_TIMESTAMP` in milliseconds. Its level comes from `PRIORITY`:
+0 to 3 are `Error`, 4 is `Warn`, 5 and 6 are `Info`, and 7 is `Debug`. An entry without
+`PRIORITY` is `Info`. The fields follow this order:
+
+| Position | Field | Content |
+| --- | --- | --- |
+| 0 | `service` | `_SYSTEMD_USER_UNIT`, then `_SYSTEMD_UNIT`, then `SYSLOG_IDENTIFIER`, then `_COMM` |
+| 1 | `host` | `_HOSTNAME` |
+| 2 | `severity` | The `PRIORITY` name, from `emerg` to `debug` |
+| 3 | `message` | `MESSAGE`, as text or bytes |
+| 4 | `journal_cursor` | `__CURSOR` |
+
+The remaining fields follow in export order, without `MESSAGE` and `__CURSOR`, up to
+128 fields in total. Each field is text when journald exported it as text and holds
+valid UTF-8, and bytes otherwise.
+
+An event over the 64 KiB bound keeps its fixed fields. Its message is cut to the longest
+prefix that fits, at a UTF-8 boundary for text. The event then carries `message_truncated`
+(true), `message_bytes` (the full length) and `message_blake3` (the BLAKE3 digest of the
+full message). Fields that do not fit are left out and counted. Entries from a
+`sparrow-journal@` unit are not forwarded and are counted as skipped.
+
+The forwarder resumes after the spool's accepted cursor. With no spool, it resumes after
+the cursor file. With neither, it starts at the journal's tail, and it does not import
+earlier history. The cursor file holds the daemon's confirmed cursor and is replaced
+atomically at most once a second, so it never names an entry the daemon has not
+confirmed.
+
+On each start, the forwarder defines the source's diagnostic mapping with
+`service` at `/fields/0/value`, `host` at `/fields/1/value` and `severity` at
+`/fields/2/value`. The definition is idempotent. The forwarder retries until the daemon
+accepts it, and it reads no entries before then.
+
+When the spool has no room, the forwarder waits and offers the same event again, so it
+never drops an entry. It exits with a nonzero status on a malformed or oversized journal
+entry, an entry it cannot map, a refused spool, a held delivery, or the end of the
+`journalctl` output. Each failure names the step that failed, and a restart resumes from
+the cursor.
+
+Every minute the forwarder writes one JSON line to stderr with the counts since its start:
+`instance`, `read`, `spooled`, `confirmed`, `skipped_own`, `truncated`, `omitted_fields`,
+`spool_bytes` and `held`. `held` is `null` or the message of the failure holding the
+delivery.
+
 ### CLI ingestion and verification of ordered part sets
 
 `sparrow SOCKET ingest REQUEST_ID SOURCE FORMAT FILE` returns the ordinary
