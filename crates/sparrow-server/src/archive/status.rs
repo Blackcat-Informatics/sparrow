@@ -210,3 +210,79 @@ impl ArchiveStatus {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wire copy of a status, read back the way a client reads it.
+    fn encoded(status: &ArchiveStatus) -> (String, String, String, String, u64, u64) {
+        let mut message = capnp::message::Builder::new_default();
+        status.encode(message.init_root::<wire::archive_worker_status::Builder<'_>>());
+        let reader = message
+            .get_root_as_reader::<wire::archive_worker_status::Reader<'_>>()
+            .unwrap();
+        (
+            reader
+                .get_held_record_id()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            reader
+                .get_held_reason()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            reader
+                .get_last_marked_record_id()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            reader
+                .get_last_marked_reason()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            reader.get_last_segment_marked(),
+            reader.get_marked_total(),
+        )
+    }
+
+    /// INVARIANT: status names the record a hold stands on, and counts marks per committed
+    /// segment and in total, naming the last marked record. Until a mark or hold exists, the
+    /// wire fields are empty or zero.
+    #[test]
+    fn status_reports_holds_and_marks_through_the_wire() {
+        let status = ArchiveStatus::new();
+        let before = encoded(&status);
+        assert_eq!(before.0, "");
+        assert_eq!(before.4, 0);
+        assert_eq!(before.5, 0);
+
+        status.held(Some(RecordReason {
+            record_id: "urn:sparrow:record:big".to_owned(),
+            reason: "oversized",
+        }));
+        status.committed_marks(&["urn:sparrow:record:a".to_owned()]);
+        status.committed_marks(&[
+            "urn:sparrow:record:b".to_owned(),
+            "urn:sparrow:record:c".to_owned(),
+        ]);
+        let (held_id, held_reason, marked_id, marked_reason, last, total) = encoded(&status);
+        assert_eq!(
+            (held_id.as_str(), held_reason.as_str()),
+            ("urn:sparrow:record:big", "oversized")
+        );
+        assert_eq!(last, 2, "the last committed segment marked two records");
+        assert_eq!(total, 3, "one plus two across committed segments");
+        assert_eq!(marked_id, "urn:sparrow:record:c");
+        assert_eq!(marked_reason, MARK_PROJECTION_FAILED);
+
+        status.held(None);
+        assert_eq!(encoded(&status).0, "", "a free head clears the hold");
+    }
+}
