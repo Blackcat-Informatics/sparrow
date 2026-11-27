@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
-//! `sparrow-archive list|verify DIR` and `extract DIR ARTIFACT_ID`: offline, read-only.
-//! `list` and `verify` print one JSON line per segment on stdout; `extract` prints one
-//! artifact's bytes, and only after they are verified. Diagnostics go to stderr, and any
-//! failure exits nonzero.
+//! `sparrow-archive list|verify DIR`, `extract DIR ARTIFACT_ID` and `find DIR PAYLOAD_ID`:
+//! offline, read-only. `list` and `verify` print one JSON line per segment on stdout;
+//! `extract` prints one artifact's bytes, and only after they are verified; `find` prints one
+//! JSON line naming the artifacts that hold the payload, and whether any does. Diagnostics go
+//! to stderr, and any failure exits nonzero.
 
 use std::io::Write;
 use std::path::Path;
@@ -12,9 +13,10 @@ use std::process::ExitCode;
 
 use purrdf_lex::json::{self, Value};
 
-use sparrow_archive::{ArchiveError, Segment, Summary, extract, list_segments};
+use sparrow_archive::{ArchiveError, Segment, Summary, extract, find_payload, list_segments};
 
-const USAGE: &str = "usage: sparrow-archive list|verify DIR | extract DIR ARTIFACT_ID";
+const USAGE: &str =
+    "usage: sparrow-archive list|verify DIR | extract DIR ARTIFACT_ID | find DIR PAYLOAD_ID";
 
 /// One output line: `members` as a compact JSON object, quoted by the supplier's writer so
 /// a path or an error detail with a quote, a backslash or a control character stays valid.
@@ -204,12 +206,48 @@ fn take(root: &Path, artifact_id: &str) -> ExitCode {
     }
 }
 
+/// One JSON line: whether any segment holds the payload, and each artifact that does with
+/// the file whose metadata names it. An absent payload is a normal answer, not a failure.
+fn find(root: &Path, payload_id: &str) -> ExitCode {
+    let found = list_segments(root)
+        .and_then(|paths| find_payload(&paths, payload_id))
+        .map_err(|error| {
+            let _ = writeln!(std::io::stderr(), "sparrow-archive: {error}");
+            ExitCode::FAILURE
+        });
+    let matches = match found {
+        Ok(matches) => matches,
+        Err(code) => return code,
+    };
+    let found = !matches.is_empty();
+    let matches = Value::array(matches.iter().map(|hit| {
+        Value::object([
+            ("artifact_id", Value::from(hit.artifact_id.as_str())),
+            ("path", Value::from(hit.path.display().to_string().as_str())),
+        ])
+    }));
+    let report = line(vec![
+        ("payload_id", Value::from(payload_id)),
+        ("found", found.into()),
+        ("matches", matches),
+    ]);
+    match emit(&report) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(code) => code,
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let [command, root, artifact_id] = args.as_slice()
         && command == "extract"
     {
         return take(Path::new(root), artifact_id);
+    }
+    if let [command, root, payload_id] = args.as_slice()
+        && command == "find"
+    {
+        return find(Path::new(root), payload_id);
     }
     let [command, root] = args.as_slice() else {
         let _ = writeln!(std::io::stderr(), "{USAGE}");

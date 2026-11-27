@@ -1557,6 +1557,30 @@ mod tests {
         root
     }
 
+    #[test]
+    fn a_payload_lookup_names_its_artifact_and_segment_or_reports_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("store");
+        let (store, segment) = archiving_store(&data);
+        let store_id = store.store_id().unwrap();
+        let root = nas(dir.path(), &store_id);
+        let directory = archive_segment(&timing(), &store, &root, &store_id, &segment).unwrap();
+        let segments = sparrow_archive::list_segments(&root).unwrap();
+        let payload = purrdf::gts::writer::digest_string(b"a\nb\n");
+
+        let found = sparrow_archive::find_payload(&segments, &payload).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, directory.join(&segment.files[0].0));
+        assert!(found[0].artifact_id.starts_with("artifact:"), "{found:?}");
+
+        let absent = format!("blake3:{}", "0".repeat(64));
+        assert!(
+            sparrow_archive::find_payload(&segments, &absent)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     fn timing() -> Timing {
         // `/proc` is a device of its own, so a test directory is never on the "root" device.
         Timing::new(Duration::from_secs(120), Duration::from_secs(900)).rooted_at("/proc")
