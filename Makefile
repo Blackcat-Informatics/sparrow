@@ -60,7 +60,7 @@ check-shipped:
 	cargo clippy --locked --release -p sparrow-client --lib -- -D warnings
 	cargo clippy --locked --release -p sparrow-server --lib --bins -- -D warnings
 
-CENSUS_VERSION := 0.8.0
+CENSUS_VERSION := 0.9.0
 CENSUS := cargo-raf-census --workspace "$(CURDIR)"
 CENSUS_PIN := --reference-pin-file registry/compatibility.toml --reference-pin-key supplier.purrdf.git_revision
 CENSUS_REPOSITORY = $$(python3 -c 'import tomllib; print(tomllib.load(open("registry/compatibility.toml", "rb"))["supplier"]["purrdf"]["repository"])')
