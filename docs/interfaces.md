@@ -1066,6 +1066,15 @@ hung mount still reports where it stopped.
 | `intentInFlight` | 2 | A prepared segment is recorded and not yet committed. |
 | `failure` | 3 | `OptionalArchiveFailure`: absent, or the last failed pass. |
 | `restarts` | 4 | Passes that panicked since the daemon started. The worker journals each, records it as the `ARCHIVE_PANIC` failure with the panic message, and starts the next pass from the store's durable watermark. |
+| `heldRecordId` | 5 | The record a hold stands on, from the last pass that reached its hold check; empty when the head is free. |
+| `heldReason` | 6 | The hold's reason: `oversized` (the record's stored bytes exceed the segment bound). Empty when no record is held. |
+| `lastSegmentMarked` | 7 | Records the last committed segment marked as projection absent (their RDF projection failed). Zero before the first commit. |
+| `markedTotal` | 8 | Records marked across committed segments since the daemon started. |
+| `lastMarkedRecordId` | 9 | The last record marked in a committed segment since the daemon started; empty before the first mark. |
+| `lastMarkedReason` | 10 | The mark's reason, `projection_failed`; empty before the first mark. |
+
+The fields at ordinals 5 to 10 are read from the copy the worker publishes; they reset to empty or zero
+when the daemon restarts, like `restarts`.
 
 `ArchiveFailure` carries `code` (ordinal 0: `ARCHIVE_VERIFY`, `ARCHIVE_IO`, `ARCHIVE_ROOT`,
 `ARCHIVE_NOT_ON_MOUNT`, `ARCHIVE_OVERRAN`, `ARCHIVE_PANIC`, `INVALID_ARGUMENT`, or the store's own code such as
@@ -1076,8 +1085,10 @@ segment keep failing; absent while the clock could not be read, and filled in on
 that reads it). A pass that ends without error clears
 the failure and returns the phase to `idle`. CLI and MCP status render the field as
 `archive_worker` with `phase`, `through`, `intent_in_flight`, `failure` (`code`, `segment`,
-`reason`, `since` as an instant or null, or the whole failure null) and `restarts` as a decimal
-string.
+`reason`, `since` as an instant or null, or the whole failure null), `restarts` as a decimal
+string, `held` (`record_id` and `reason`, or null when no record is held) and `marked`
+(`last_segment` and `total` as decimal strings, and `last` as `record_id` and `reason`, or null
+before the first mark).
 
 ### Instance role
 

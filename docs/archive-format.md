@@ -256,8 +256,8 @@ unreported:
   before it, so the watermark never passes it and nothing after it is archived or deleted
   until it is resolved. `Store::archive_held` reports the held record and the reason when it
   is the first unarchived entry; the worker journals it and status names it. This is a known
-  hold: the record is neither archived nor deleted, no space behind it is freed, and it leaves
-  the store only by a decision that a person makes, because expiry stops at it. Ingest is refused with
+  hold: the record is neither archived nor deleted, and no space behind it is freed. No code
+  path releases it: expiry and pressure eviction stop at it. Ingest is refused with
   `STORAGE_PRESSURE` once the budget is reached behind it.
 - A record whose content projection failed at ingest is not held. It is archived with its
   exact bytes and both digests, and the segment marks it projection absent (section 4). A

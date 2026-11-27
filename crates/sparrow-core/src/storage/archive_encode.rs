@@ -91,7 +91,6 @@ const BASE_REQUESTS: u64 = 10_000;
 /// Fixed row-visit allowance for the scope's own setup.
 const BASE_ROWS: u64 = 2_000;
 
-/// One record's link quads: its identity and the two digests of its bytes.
 /// The projection-absent mark's predicate, in the vocabulary namespace.
 const PROJECTION_ABSENT: &str = "urn:sparrow:vocab:projectionAbsent";
 
@@ -118,6 +117,7 @@ fn push_marks(builder: &mut purrdf::RdfDatasetBuilder, marks: &[String]) -> Resu
     Ok(())
 }
 
+/// One record's link quads: its identity and the two digests of its bytes.
 fn push_links(
     builder: &mut purrdf::RdfDatasetBuilder,
     links: &[(String, String, String)],
