@@ -1,0 +1,3 @@
+{"source":"systemd-manager","priority":6,"realtime_usec":1795785000000000,"time":"2026-11-27T13:10:00Z","unit":"example-sync.service","manager":"systemd","message":"Stopping example-sync.service..."}
+{"source":"systemd-manager","priority":6,"realtime_usec":1795785002000000,"time":"2026-11-27T13:10:02Z","unit":"example-sync.service","manager":"other","message":"line from a unit whose name extends ours"}
+{"source":"systemd-manager","priority":6,"realtime_usec":1795785003000000,"time":"2026-11-27T13:10:03Z","unit":"example-sync.service","manager":"systemd","message":"Main process exited, code=exited, status=1/FAILURE"}
