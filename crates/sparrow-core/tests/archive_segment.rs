@@ -109,6 +109,18 @@ fn a_failed_projection_at_the_head_does_not_hold_a_later_record() {
         vec![head_id],
         "the segment reports the marked head"
     );
+    // Crash recovery rebuilds a prepared segment; the rebuild must match the bytes already
+    // written, marks included.
+    let again = store
+        .archive_prepare(2 + 30 * DAY * 3 / 4)
+        .unwrap()
+        .expect("the rebuilt segment is still due");
+    assert_eq!(again.segment_id, segment.segment_id);
+    assert_eq!(again.marked, segment.marked);
+    assert!(
+        again.files == segment.files,
+        "the rebuilt segment's bytes match the prepared segment's bytes"
+    );
 }
 
 /// INVARIANT: a marked record is retired by expiry only after its segment commits. While the
