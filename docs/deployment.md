@@ -762,11 +762,13 @@ may not yet hold; whether to remove them is a separate decision, made outside th
 #### Moving an existing spool unit to the tracked program
 
 An existing spool unit may run an untracked copy of an earlier program that reads the journal with
-`journalctl --cursor-file=CURSOR --follow`. journalctl writes that cursor file when it ends by SIGTERM or SIGINT and
-when its output pipe closes, and writes nothing on SIGKILL. Entries journalctl has printed but the spool has not
+`journalctl --cursor-file=CURSOR --follow`. journalctl writes that cursor file when it ends by SIGTERM or SIGINT, and
+when its output pipe closes while SIGPIPE is ignored, as a systemd service has it by default. It writes nothing on
+SIGKILL. Entries journalctl has printed but the spool has not
 appended when it ends this way are lost from the spool. A SIGKILL replays from the last written cursor instead, so
 it duplicates entries rather than losing them. The `--help` and man page text say only that the cursor is written at
-the end; the signal and closed-pipe cases come from running journalctl, not from its documentation.
+the end; the signal and closed-pipe cases come from running journalctl, not from its documentation. The stop step
+below uses SIGTERM, so it does not depend on the closed-pipe case.
 
 The tracked program writes its cursor after each append, so a stop or crash never skips an entry it has not
 appended: the next run resumes after the last appended entry. The two programs store the same journal cursor
@@ -820,8 +822,8 @@ authorization for the window in which it is run. Placeholders: `EXISTING_UNIT` i
    step 5 and renamed into place.
    a. Set `rule = "settled"` for SOURCE, unless step 0 recorded it as settled already. The old files are no longer
       appended to, so a settled rule ships the newest one; a daily rule would hold it indefinitely. Check: after a
-      shipper run that reports no further queued files for SOURCE, every name matching `OLD_PATTERN` in `EXISTING_DIR`
-      is in the ledger, by its path: `ls EXISTING_DIR/OLD_PATTERN | xargs -n1 basename` against
+      shipper run that reports no further queued files for SOURCE and neither a per-run file limit nor a full queue, every
+      name matching `OLD_PATTERN` in `EXISTING_DIR` is in the ledger, by its path: `ls EXISTING_DIR/OLD_PATTERN | xargs -n1 basename` against
       `cut -f2 ~/.local/state/sparrow/ship/SOURCE.ledger`.
       Undo: write the candidate with the rule step 0 recorded, `OLD_RULE`.
    b. Set `pattern = "unit-spool-*.jsonl"` and `rule = "daily"` for SOURCE, two lines in one candidate. The daily rule
@@ -831,8 +833,8 @@ authorization for the window in which it is run. Placeholders: `EXISTING_UNIT` i
       prints it with N = 0.
       Undo: write one candidate with the pattern step 0 recorded, `OLD_PATTERN_IN_SOURCE`, and the rule `OLD_RULE`.
 
-Each undo changes the recorded lines one at a time by a candidate, never by restoring a saved whole file, so a later
-change to the configuration survives.
+Each undo changes the recorded lines by a candidate (step 5b changes two lines together, and its undo does the same),
+never by restoring a saved whole file, so a later change to the configuration survives.
 
 Until step 5b is complete, the new files are not shipped; the old files are shipped by the old pattern. A file
 under both names is never shipped twice, because each name is matched by one pattern only.
