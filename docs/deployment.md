@@ -71,8 +71,8 @@ For an explicit drain, run the `sparrow-client` example
 writer releases the directory. Inspect its final JSON progress and exit code.
 
 Schema 74 rebuilds the derived source summaries in resumable pages. Opening
-a store selects writer family 462 through 516 without a sealed receipt
-watermark, or 517 through 571 with one. The first eligible sealed request
+a store selects writer family 572 through 626 without a sealed receipt
+watermark, or 627 through 681 with one. The first eligible sealed request
 activates the watermark and advances the writer family within those ranges.
 During the rebuild, source listings combine rebuilt rows with totals from the
 remaining catalog entries. See [publication and durability](architecture.md#61-publication-and-durability).

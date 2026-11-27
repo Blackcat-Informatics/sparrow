@@ -45,7 +45,7 @@ fn native_log_time_profiles_preserve_byte_ranges_event_order_and_immutable_histo
         .unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/473")
+        Some("sparrow.store/583")
     );
     assert_eq!(
         store
@@ -231,12 +231,12 @@ fn native_log_time_profiles_preserve_byte_ranges_event_order_and_immutable_histo
         .unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/473")
+        Some("sparrow.store/583")
     );
     store.watch_registry_replace(None, b"registered").unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/475")
+        Some("sparrow.store/585")
     );
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
@@ -300,7 +300,7 @@ fn native_log_time_refusals_do_not_publish_records_or_guess_optional_captures() 
         assert!(store.time_profile("invalid-log-map").unwrap().is_none());
         assert_eq!(
             store.properties().unwrap()["store_format"].as_str(),
-            Some("sparrow.store/462")
+            Some("sparrow.store/572")
         );
     }
     store
@@ -575,7 +575,7 @@ fn tracing_relationships_keep_instance_and_occurrence_evidence_through_backfill_
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/462")
+        Some("sparrow.store/572")
     );
     assert!(migrate(&store) > 0);
     // The reader derived the receipt-time facts and wrote no source eventTime.
@@ -1039,6 +1039,373 @@ fn retention_metrics_refuse_native_reference_and_payload_corruption() {
     }
 }
 
+/// A retention account without its visit count, which differs between the owner summary and
+/// the entries it summarises, as text for an exact comparison.
+fn retention_totals(store: &Store, now: u64) -> String {
+    retention_account(store, now).0
+}
+
+/// The same account with the visit count apart: visits differ by path, and a store whose
+/// owners repeat a chunk visits fewer ownership references through the summary.
+fn retention_account(store: &Store, now: u64) -> (String, u64) {
+    let mut report = store
+        .retention_metrics(now, sparrow_core::RetentionReadLimits::default())
+        .unwrap();
+    let visits = std::mem::take(&mut report.visits);
+    (format!("{report:?}"), visits)
+}
+
+fn owner_summary_pending(store: &Store) -> bool {
+    !store
+        .migrations()
+        .unwrap()
+        .into_iter()
+        .find(|migration| migration.name == "owner-summary")
+        .unwrap()
+        .complete()
+}
+
+/// The totals the owner summary answers, then the totals the entries answer once a downgrade
+/// leaves the summary pending, then the totals the rebuilt summary answers. Every pass
+/// reopens the store, which is what an operator's restart does.
+///
+/// With `repeats`, the store holds an owner that repeats a chunk, so the summary pass must
+/// visit fewer references than the entries pass: that shows which path answered each pass.
+fn totals_both_ways(dir: &std::path::Path, now: u64, repeats: bool) -> String {
+    let store = Store::open(dir, config()).unwrap();
+    while store.migrate_step().unwrap().is_some() {}
+    assert!(!owner_summary_pending(&store));
+    let (summarised, summary_visits) = retention_account(&store, now);
+    drop(store);
+    let db = catalog_db(dir).unwrap();
+    sparrow_core::lower_owner_summary_for_legacy_fixture(&db).unwrap();
+    drop(db);
+    let store = Store::open(dir, config()).unwrap();
+    assert!(owner_summary_pending(&store));
+    let (from_entries, entry_visits) = retention_account(&store, now);
+    assert_eq!(summarised, from_entries);
+    if repeats {
+        assert!(
+            summary_visits < entry_visits,
+            "{summary_visits} summary visits, {entry_visits} entry visits"
+        );
+    }
+    while store.migrate_step().unwrap().is_some() {}
+    let (rebuilt, rebuilt_visits) = retention_account(&store, now);
+    assert_eq!(rebuilt, summarised);
+    assert_eq!(
+        rebuilt_visits, summary_visits,
+        "the rebuilt summary answers"
+    );
+    let (stored, recomputed) = store.owner_summary_audit_for_tests().unwrap();
+    assert_eq!(stored, recomputed);
+    summarised
+}
+
+/// INVARIANT: the summary totals equal the owner-row totals after publication, expiry and
+/// eviction, for a digest shared by two artifacts with differing expiries and for a record
+/// kept only by its own pin. A shared digest counts once in each category it belongs to,
+/// whichever owner makes it live or pinned.
+#[test]
+fn retention_totals_from_the_owner_summary_equal_the_totals_from_the_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    // Two artifacts share `shared`; the first expires before the second does.
+    store
+        .ingest("summary-early", "metrics", "log", b"shared\n", 0)
+        .unwrap();
+    store
+        .ingest("summary-late", "metrics", "log", b"shared\n", 10 * DAY)
+        .unwrap();
+    // `solo` survives its expired parent through a pin on its record alone.
+    let solo = store
+        .ingest("summary-solo", "metrics", "log", b"solo\n", 0)
+        .unwrap();
+    store
+        .pin("summary-pin", "metrics", &solo.record_ids, 40, 0)
+        .unwrap();
+    store
+        .ingest("summary-gone", "metrics", "log", b"gone\n", 0)
+        .unwrap();
+    // One live artifact repeats a chunk: three identical chunk-sized lines.
+    let mut line = vec![b'z'; 64 * 1024];
+    line[64 * 1024 - 1] = b'\n';
+    store
+        .ingest(
+            "summary-repeat",
+            "metrics",
+            "log",
+            &line.repeat(3),
+            10 * DAY,
+        )
+        .unwrap();
+    drop(store);
+    let now = 31 * DAY;
+    let published = totals_both_ways(dir.path(), now, true);
+    // Live: the late and repeating artifacts with their records, and the pinned record.
+    // `shared` is live through the late owners, `solo` is held by the pin alone, `gone` is
+    // retirable, and the repeated chunk counts once.
+    for expected in [
+        "live_records: 5,",
+        "live_artifacts: 2,",
+        "pinned_records: 1,",
+        "pinned_artifacts: 0,",
+        "owned_payload_bytes: 65553,",
+        "live_payload_bytes: 65548,",
+        "pin_held_payload_bytes: 5,",
+        "retirable_payload_bytes: 5,",
+        "payload_chunks: 4,",
+    ] {
+        assert!(published.contains(expected), "{expected}: {published}");
+    }
+
+    let store = Store::open(dir.path(), config()).unwrap();
+    store.expire(now).unwrap();
+    drop(store);
+    let expired = totals_both_ways(dir.path(), now, true);
+    for expected in [
+        "live_records: 5,",
+        "owned_payload_bytes: 65548,",
+        "live_payload_bytes: 65548,",
+        "retirable_payload_bytes: 0,",
+    ] {
+        assert!(expired.contains(expected), "{expected}: {expired}");
+    }
+
+    let store = Store::open(dir.path(), config()).unwrap();
+    store
+        .evict_oldest(now, sparrow_core::EvictionLimits::default())
+        .unwrap();
+    drop(store);
+    totals_both_ways(dir.path(), now, false);
+}
+
+/// INVARIANT: a record protected only by its parent artifact's pin is live and pinned on the
+/// summary path, as it is from the entries, because the summary stores the parent identity
+/// and the pin set is read at query time.
+#[test]
+fn a_parent_artifact_pin_protects_its_records_on_the_summary_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("summary-parent", "metrics", "log", b"parent\n", 0)
+        .unwrap();
+    store
+        .pin("summary-parent-pin", "metrics", &[artifact.id], 40, 0)
+        .unwrap();
+    drop(store);
+    let totals = totals_both_ways(dir.path(), 31 * DAY, false);
+    for expected in [
+        "live_records: 1,",
+        "pinned_records: 1,",
+        "live_artifacts: 1,",
+        "pinned_artifacts: 1,",
+    ] {
+        assert!(totals.contains(expected), "{expected}: {totals}");
+    }
+}
+
+/// INVARIANT: through publication, bounded expiry with partial manifest retirement and
+/// eviction, the stored summary row of every owner is exactly the row recomputed from that
+/// owner's entry and retirement state, so a partial retirement never
+/// leaves a chunk counted that the catalog has released.
+#[test]
+fn owner_summary_rows_follow_every_partial_retirement_step() {
+    let limits = sparrow_core::EvictionLimits {
+        max_payload_refs: 8,
+        ..sparrow_core::EvictionLimits::default()
+    };
+    // Forty chunk-sized lines, thirty distinct: ten chunk digests occur twice in the one
+    // artifact, and each record owns a single chunk.
+    let input: Vec<u8> = (0..40_u8)
+        .flat_map(|line| {
+            let mut bytes = vec![b'a' + line % 30; 64 * 1024];
+            bytes[64 * 1024 - 1] = b'\n';
+            bytes
+        })
+        .collect();
+    for eviction in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), config()).unwrap();
+        store
+            .ingest("summary-chunks", "metrics", "log", &input, 0)
+            .unwrap();
+        let audit = |store: &Store| {
+            let (stored, recomputed) = store.owner_summary_audit_for_tests().unwrap();
+            assert_eq!(stored, recomputed);
+            stored.len()
+        };
+        let owners = audit(&store);
+        assert!(owners >= 1);
+        // Bounded passes retire the manifest a prefix at a time; each pass subtracts exactly
+        // the chunks it passes from the stored row.
+        let mut steps = 0;
+        for _ in 0..1000 {
+            let continuation = if eviction {
+                let report = store.evict_oldest(1, limits).unwrap();
+                report.continuation || report.pending_manifest_refs != 0
+            } else {
+                store.expire_bounded(30 * DAY, limits).unwrap().continuation
+            };
+            steps += 1;
+            audit(&store);
+            if !continuation {
+                break;
+            }
+        }
+        assert!(steps > 1, "{steps} retirement steps");
+        // Expired entries stay, empty of chunks, until a day past their deadline.
+        let (stored, _) = store.owner_summary_audit_for_tests().unwrap();
+        assert!(eviction || stored.len() == owners, "{stored:?}");
+        store.expire_bounded(32 * DAY, limits).unwrap();
+        let (stored, recomputed) = store.owner_summary_audit_for_tests().unwrap();
+        assert_eq!(stored, recomputed);
+        assert!(eviction || stored.is_empty(), "{stored:?}");
+    }
+}
+
+/// INVARIANT: a query never reads an incomplete summary as if it were complete. While
+/// the rebuild is partway, the rows cover only some owners, and the query still returns the
+/// exact totals from the entries; a restart between pages resumes from the checkpoint
+/// without repeating or skipping an owner, and the finished summary answers the same totals.
+#[test]
+fn an_incomplete_owner_summary_is_never_read_and_the_rebuild_resumes_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let input: String = (0..300).map(|line| format!("line {line}\n")).collect();
+    store
+        .ingest("summary-partial", "metrics", "log", input.as_bytes(), 0)
+        .unwrap();
+    let now = DAY;
+    let expected = retention_totals(&store, now);
+    assert!(expected.contains("live_records: 300"), "{expected}");
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    sparrow_core::lower_owner_summary_for_legacy_fixture(&db).unwrap();
+    drop(db);
+
+    let store = Store::open(dir.path(), config()).unwrap();
+    let progress = |store: &Store| {
+        store
+            .migrations()
+            .unwrap()
+            .into_iter()
+            .find(|migration| migration.name == "owner-summary")
+            .unwrap()
+    };
+    assert_eq!(progress(&store).watermark.as_deref(), Some("start"));
+    assert_eq!(retention_totals(&store, now), expected);
+    // The artifact page, then the first page of records: 257 of 301 owners are summarised.
+    for _ in 0..2 {
+        assert!(!store.migrate_step().unwrap().unwrap().complete);
+    }
+    let partway = progress(&store);
+    assert!(!partway.complete(), "{partway:?}");
+    assert_eq!(partway.done, 257);
+    let (stored, recomputed) = store.owner_summary_audit_for_tests().unwrap();
+    assert_eq!(stored.len(), 257);
+    assert_eq!(recomputed.len(), 301);
+    assert_eq!(retention_totals(&store, now), expected);
+    drop(store);
+
+    let store = Store::open(dir.path(), config()).unwrap();
+    let resumed = progress(&store);
+    assert_eq!(
+        (resumed.done, &resumed.watermark),
+        (257, &partway.watermark)
+    );
+    assert!(store.migrate_step().unwrap().unwrap().complete);
+    assert!(store.migrate_step().unwrap().is_none());
+    assert!(progress(&store).complete());
+    assert_eq!(retention_totals(&store, now), expected);
+    let (stored, recomputed) = store.owner_summary_audit_for_tests().unwrap();
+    assert_eq!(stored, recomputed);
+}
+
+/// INVARIANT: a store an older writer has written is rebuilt, never trusted. The older
+/// writer knows nothing of the summary: the rows it leaves describe the catalog before its
+/// writes. Opening the store again discards every row, and the totals come from the entries
+/// until the rebuilt summary completes, where an older summary read as current would still
+/// count the record the older writer expired.
+#[test]
+fn a_downgrade_rebuild_discards_the_rows_an_older_writer_left_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let kept = store
+        .ingest("summary-kept", "metrics", "log", b"kept\n", 0)
+        .unwrap();
+    let older = store
+        .ingest("summary-older", "metrics", "log", b"older\n", 0)
+        .unwrap();
+    let format = store.properties().unwrap()["store_format"]
+        .as_str()
+        .map(str::to_owned);
+    let now = 10 * DAY;
+    assert!(retention_totals(&store, now).contains("live_records: 2"));
+    drop(store);
+
+    // The older writer opens the store (its family lower than the summary's), moves the
+    // record's deadline into the past as an expiry would, and maintains no summary row.
+    let db = catalog_db(dir.path()).unwrap();
+    sparrow_core::lower_owner_summary_for_legacy_fixture(&db).unwrap();
+    let key = older.record_ids[0].clone();
+    let row = String::from_utf8(db.get(&key).unwrap().unwrap()).unwrap();
+    let live = format!("\"expires_at\":\"{}\"", 30 * DAY);
+    assert!(row.contains(&live), "{row}");
+    db.put(&key, row.replacen(&live, "\"expires_at\":\"1\"", 1))
+        .unwrap();
+    assert!(
+        db.get(format!("owner-summary:{key}")).unwrap().is_some(),
+        "the older writer leaves the stale row in place"
+    );
+    drop(db);
+
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(
+        store.properties().unwrap()["store_format"].as_str(),
+        format.as_deref()
+    );
+    assert!(owner_summary_pending(&store));
+    let (stored, _) = store.owner_summary_audit_for_tests().unwrap();
+    assert!(
+        stored.is_empty(),
+        "stale rows survived the open: {stored:?}"
+    );
+    // One record is live from the entries; the stale summary would have counted two.
+    let rebuilt_from_entries = retention_totals(&store, now);
+    assert!(
+        rebuilt_from_entries.contains("live_records: 1"),
+        "{rebuilt_from_entries}"
+    );
+    while store.migrate_step().unwrap().is_some() {}
+    assert_eq!(retention_totals(&store, now), rebuilt_from_entries);
+    let (stored, recomputed) = store.owner_summary_audit_for_tests().unwrap();
+    assert_eq!(stored, recomputed);
+    assert!(stored.contains_key(&format!("owner-summary:{}", kept.record_ids[0])));
+}
+
+/// INVARIANT: a complete summary that lost an owner's row is refused as inconsistent
+/// with the catalog entry counts instead of answering totals that omit the owner.
+#[test]
+fn a_complete_owner_summary_missing_a_row_is_refused_not_undercounted() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("summary-lost", "metrics", "log", b"lost\n", 0)
+        .unwrap();
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    db.delete(format!("owner-summary:{}", artifact.record_ids[0]))
+        .unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
+    assert!(!owner_summary_pending(&store));
+    let refused = store
+        .retention_metrics(1, sparrow_core::RetentionReadLimits::default())
+        .unwrap_err();
+    assert_eq!(refused.code, "STORAGE_FAILURE");
+}
+
 #[test]
 fn json_capture_refusals_identify_the_exhausted_request_budget_without_publishing() {
     use sparrow_core::{JsonQuery, JsonRead};
@@ -1262,7 +1629,7 @@ fn receiver_observations_commit_with_packets_and_outlive_summary_only_under_pins
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.status(12).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/470")
+        Some("sparrow.store/580")
     );
     assert_eq!(
         store.watch_registry().unwrap().as_deref(),
@@ -1444,7 +1811,7 @@ fn receiver_registry_admission_and_fence_corruption_are_hard_failures() {
     let intact = db.get("syslog-receiver-registry").unwrap().unwrap();
     assert_eq!(
         db.get("store_format").unwrap().as_deref(),
-        Some(b"sparrow.store/469".as_slice())
+        Some(b"sparrow.store/579".as_slice())
     );
     db.delete("syslog-receiver-registry").unwrap();
     drop(db);
@@ -1815,7 +2182,7 @@ fn completed_tail_claim_preserves_original_publication_after_checkpoint_expiry()
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/466")
+        Some("sparrow.store/576")
     );
     assert_eq!(
         store
@@ -1949,7 +2316,7 @@ fn completed_tail_claim_preserves_original_publication_after_checkpoint_expiry()
         .unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/466")
+        Some("sparrow.store/576")
     );
     drop(store);
     let store = Store::open(dir.path(), config()).unwrap();
@@ -2530,7 +2897,7 @@ fn current_tail_writer_upgrade_preserves_checkpoints_and_refuses_missing_or_unfe
         let store = Store::open(dir.path(), config()).unwrap();
         assert_eq!(
             store.properties().unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", legacy + 437).as_str())
+            Some(format!("sparrow.store/{}", legacy + 547).as_str())
         );
         assert_eq!(store.tail_generation(&generation.id).unwrap(), original);
         assert_eq!(store.bytes(&first.record_ids[0], 0, 2, 3).unwrap(), b"n\n");
@@ -3031,7 +3398,7 @@ fn syslog_format_upgrade_preserves_existing_producer_windows_and_watch_fences() 
         }
         assert_eq!(
             store.status(2).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", current + 429).as_str())
+            Some(format!("sparrow.store/{}", current + 539).as_str())
         );
         let state = store.producer_stream(&id, 2).unwrap();
         assert_eq!(state.accepted_events, 2);
@@ -3597,7 +3964,7 @@ fn producer_writer_upgrade_preserves_diagnostic_and_watch_authority_without_anno
         assert_eq!(store.store_id().unwrap(), identity);
         assert_eq!(
             store.status(2).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", current + 429).as_str())
+            Some(format!("sparrow.store/{}", current + 539).as_str())
         );
         let record = store.record(&a.record_ids[0]).unwrap();
         assert!(record.producer.is_none());
@@ -4249,7 +4616,7 @@ fn staged_diagnostics_capture_absence_once_and_format_upgrade_preserves_fences()
         assert_eq!(store.store_id().unwrap(), id);
         assert_eq!(
             store.status(0).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", version + 453).as_str())
+            Some(format!("sparrow.store/{}", version + 563).as_str())
         );
         if version >= 11 {
             assert_eq!(
@@ -4784,7 +5151,7 @@ fn legacy_recordless_upgrade_preserves_each_existing_writer_fence_and_identity()
         assert_eq!(store.store_id().unwrap(), identity);
         assert_eq!(
             store.status(3).unwrap()["store_format"].as_str(),
-            Some(format!("sparrow.store/{}", current + 429).as_str())
+            Some(format!("sparrow.store/{}", current + 539).as_str())
         );
         assert_eq!(
             store.bytes(&populated.id, 0, 10, 3).unwrap(),
@@ -5268,7 +5635,7 @@ fn manifest_retirement_survives_reopen_without_rewriting_original_catalog_or_rec
     let root = db.get(&original.id).unwrap().unwrap();
     assert_eq!(
         db.get("store_format").unwrap().as_deref(),
-        Some(b"sparrow.store/471".as_slice())
+        Some(b"sparrow.store/581".as_slice())
     );
     let position = db
         .get(format!("artifact-retirement:{}", original.id))
@@ -5346,7 +5713,7 @@ fn manifest_retirement_fences_later_writers_and_rejects_corrupt_state() {
         .unwrap();
     assert_eq!(
         store.status(3).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/472")
+        Some("sparrow.store/582")
     );
     drop(store);
     let db = catalog_db(dir.path()).unwrap();
@@ -5954,7 +6321,7 @@ fn pressure_retirement_wait_survives_reopen_without_retiring_more_evidence() {
     // Force a strictly larger linked footprint: this is no native recovery observation.
     assert_eq!(
         store.status(4).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/471")
+        Some("sparrow.store/581")
     );
     file.set_len(15 * 1024 * 1024).unwrap();
     drop(file);
@@ -6008,21 +6375,21 @@ fn pressure_retirement_wait_survives_reopen_without_retiring_more_evidence() {
     assert!(db.get("pressure-reclamation-wait").unwrap().is_none());
     assert_eq!(
         db.get("store_format").unwrap().as_deref(),
-        Some(b"sparrow.store/471".as_slice())
+        Some(b"sparrow.store/581".as_slice())
     );
     drop(db);
     let store = Store::open(dir.path(), config()).unwrap();
     store.watch_registry_replace(None, b"registered").unwrap();
     assert_eq!(
         store.status(6).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/472")
+        Some("sparrow.store/582")
     );
     store
         .watch_registry_replace(Some(b"registered"), b"updated")
         .unwrap();
     assert_eq!(
         store.status(6).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/472")
+        Some("sparrow.store/582")
     );
 }
 
@@ -8260,7 +8627,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/464")
+        Some("sparrow.store/574")
     );
     store
         .watch_registry_replace(Some(b"catalog-one"), b"catalog-two")
@@ -8275,7 +8642,7 @@ fn durable_watch_registry_compare_and_set_fences_writers_and_survives_reopen() {
     assert_eq!(store.consumption_get(&journal.import_id).unwrap(), journal);
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/464")
+        Some("sparrow.store/574")
     );
 }
 
@@ -8975,7 +9342,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     let identity = store.store_id().unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/462")
+        Some("sparrow.store/572")
     );
     let digest = format!(
         "blake3:{}",
@@ -9001,7 +9368,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/463")
+        Some("sparrow.store/573")
     );
     assert_eq!(
         store
@@ -9037,7 +9404,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
     );
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/465")
+        Some("sparrow.store/575")
     );
     // Catalog updates must never downgrade the handoff writer fence.
     let selector = IngestSelector::Handoff(handoff.request_id.clone());
@@ -9054,7 +9421,7 @@ fn consumption_recovery_preserves_original_publication_beyond_retry_and_retentio
         .unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/465")
+        Some("sparrow.store/575")
     );
     assert_eq!(
         store
@@ -9348,7 +9715,7 @@ fn explicit_handoff_admission_is_atomic_bounded_and_conflicting_retries_never_re
     assert!(store.consumption_pending().unwrap().is_empty());
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/464")
+        Some("sparrow.store/574")
     );
     let reserved = store
         .consumption_handoff_reserve(&intent, "source", "log", CONSUMPTION_DIRECTORIES, 0)
@@ -10360,7 +10727,7 @@ fn publish_staged(
     store.import_publish(&manifest.id, 0)
 }
 
-/// INVARIANT (#82): a record kept alone by its pin, after its parent artifact expires, owns its
+/// INVARIANT: a record kept alone by its pin, after its parent artifact expires, owns its
 /// payload, and that ownership stays charged after the record's transient parse is released.
 /// Protects two failure modes at fixed allowances that hold for every record order:
 ///
@@ -10371,14 +10738,14 @@ fn publish_staged(
 /// - the admitted allowance covers the peak only when each parse charge is refunded, so an
 ///   accumulated parse charge refuses it.
 ///
-/// The allowances are measured for this fixture: pins charge 74,824 bytes, the last record's
-/// temporary parse charge is 59,400 to 59,432 bytes, and the correct peak lies between 154,704
-/// and 154,736 bytes for every order. Re-measure them when the charge function changes.
+/// The allowances are measured for this fixture, with each owner entry charged 256 bytes: the
+/// correct peak is 144,480 bytes, found by bisection, and a peak without the entries is 10,240
+/// bytes lower. Re-measure them when the charge function changes.
 #[test]
 fn record_only_ownership_stays_charged_after_transient_parse_refunds() {
     use sparrow_core::RetentionReadLimits;
     const RECORDS: usize = 40;
-    const REFUSED: usize = 150_000;
+    const REFUSED: usize = 140_000;
     const ADMITTED: usize = 160_000;
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
@@ -10401,6 +10768,13 @@ fn record_only_ownership_stays_charged_after_transient_parse_refunds() {
         store.bytes(&artifact.id, 0, 1, 30 * DAY).unwrap_err().code,
         "EVIDENCE_UNAVAILABLE"
     );
+    // The allowances below are measured for the owner entries, which the query reads while
+    // the owner summary is pending, so an older writer's open leaves the summary pending.
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    sparrow_core::lower_owner_summary_for_legacy_fixture(&db).unwrap();
+    drop(db);
+    let store = Store::open(dir.path(), config()).unwrap();
     let report = |catalog_bytes: usize| {
         store.retention_metrics(
             30 * DAY,
@@ -15186,7 +15560,7 @@ fn rdf_profile_identity_is_required_and_drift_refuses_reopen() {
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.status(0).unwrap()["store_format"].as_str(),
-        Some("sparrow.store/462")
+        Some("sparrow.store/572")
     );
     assert_eq!(
         store.status(0).unwrap()["rdf_profile"]
@@ -22269,8 +22643,8 @@ fn archive_fence_refuses_unconfigured_open_and_older_writers() {
             .parse::<u32>()
             .unwrap()
     };
-    assert!((484..=494).contains(&number(&fenced)), "{fenced}");
-    assert_eq!(number(&fenced) - 484, (number(&unfenced) - 33) % 11);
+    assert!((594..=604).contains(&number(&fenced)), "{fenced}");
+    assert_eq!(number(&fenced) - 594, (number(&unfenced) - 33) % 11);
     assert_eq!(
         store.archive_state().unwrap(),
         Some(sparrow_core::ArchiveState::default())
@@ -22281,7 +22655,7 @@ fn archive_fence_refuses_unconfigured_open_and_older_writers() {
         .as_str()
         .unwrap()
         .to_owned();
-    assert!((484..=494).contains(&number(&watched)), "{watched}");
+    assert!((594..=604).contains(&number(&watched)), "{watched}");
     drop(store);
     let mut db = catalog_db(dir.path()).unwrap();
     db.drop_cf("rdf_reverse").unwrap();
@@ -22975,7 +23349,7 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
     let store = Store::open(dir.path(), config()).unwrap();
     assert_eq!(
         store.properties().unwrap()["store_format"].as_str(),
-        Some("sparrow.store/462")
+        Some("sparrow.store/572")
     );
     let pending = store.migrations().unwrap();
     assert_eq!(
@@ -22985,7 +23359,8 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
             "owner-graph-index",
             "source-summary",
             "source-context",
-            "payload-index"
+            "payload-index",
+            "owner-summary"
         ]
     );
     // The source timeline cache stays complete. The byte-accounting upgrade rebuilds the
@@ -23067,6 +23442,7 @@ fn open_serves_before_the_schema_69_migrations_and_direct_migrate_steps_finish_t
         sparrow_core::Migration::StoreCounters
             | sparrow_core::Migration::SourceSummary
             | sparrow_core::Migration::PayloadIndex
+            | sparrow_core::Migration::OwnerSummary
     ) {
         page = store.migrate_step().unwrap().unwrap();
     }
@@ -23814,6 +24190,7 @@ fn the_worker_runs_the_source_summary_migration_directly_after_the_store_counter
             Migration::StoreCounters,
             Migration::SourceSummary,
             Migration::PayloadIndex,
+            Migration::OwnerSummary,
             Migration::OwnerGraphIndex,
             Migration::SourceContext,
         ]
@@ -24097,7 +24474,18 @@ fn a_live_artifact_window_build_re_bases_onto_a_newer_snapshot_mid_migration() {
     let open = hold_listing_builds(&store);
     let first = read(None);
     let cursor = first.next_cursor.clone().expect("the build's cursor");
-    let owed = first.build.and_then(|build| build.total).unwrap();
+    // The build worker publishes the total it owes when it starts, which can follow the
+    // first call's wait on a loaded host; following the cursor resumes the same build.
+    let mut owed = first.build.and_then(|build| build.total);
+    for _ in 0..600 {
+        if owed.is_some() {
+            break;
+        }
+        owed = read(Some(cursor.clone()))
+            .build
+            .and_then(|build| build.total);
+    }
+    let owed = owed.expect("the build reports the entries it owes");
     // Run pages until the migration's `done` leads the held build's snapshot by more than
     // 2 x 4,096 entries, past the re-base lead plus what the build reads before its first
     // check, short of completing.
@@ -25123,14 +25511,14 @@ fn source_index_migration_seeds_exact_counters_and_fences_older_writers() {
             .parse::<u32>()
             .unwrap()
     };
-    assert!((462..=516).contains(&number(&fenced)), "{fenced}");
+    assert!((572..=626).contains(&number(&fenced)), "{fenced}");
     drop(store);
     // Before the source summaries the store carried the owner-graph family.
     let db = catalog_db(dir.path()).unwrap();
     sparrow_test_support::pending_source_summary_migration(&db).unwrap();
     let legacy = String::from_utf8(db.get("store_format").unwrap().unwrap()).unwrap();
     // The fixture lowers the byte counters, payload index, store counters and source summary.
-    assert_eq!(number(&legacy), number(&fenced) - 275);
+    assert_eq!(number(&legacy), number(&fenced) - 385);
     let entries = [b"artifact:".as_slice(), b"record:"]
         .into_iter()
         .map(|prefix| {
@@ -25576,7 +25964,7 @@ fn sources_report_exact_retained_payload_bytes_through_retirement_and_upgrade() 
     let db = catalog_db(dir.path()).unwrap();
     assert_eq!(
         db.get("store_format").unwrap().as_deref(),
-        Some(b"sparrow.store/471".as_slice())
+        Some(b"sparrow.store/581".as_slice())
     );
     db.put("store_format", b"sparrow.store/361").unwrap();
     // The prior writer used an eight-byte record count followed by a mode byte.
@@ -27298,5 +27686,661 @@ fn a_jsonl_value_projects_at_the_term_limit_and_one_byte_more_is_refused() {
                 "{name}: {inspection}"
             );
         }
+    }
+}
+
+/// Copy a closed store directory.
+fn copy_store(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_store(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// The entry-walk answers for the store in `dir`, at each instant. A copy of the store is
+/// lowered so its owner summary is pending, and the retention query then reads every owner
+/// entry. `walk` is the streamed walk's answer with its visits, `reference` the frozen walk's
+/// answer with its visits, and `totals` the streamed walk's answer with visits zeroed, for the
+/// comparison with the summary path, which visits differently.
+struct EntryWalk {
+    totals: Vec<String>,
+    walk: Vec<String>,
+    reference: Vec<String>,
+}
+
+fn entry_walk_totals(dir: &std::path::Path, scratch: &std::path::Path, nows: &[u64]) -> EntryWalk {
+    copy_store(dir, scratch);
+    let db = catalog_db(scratch).unwrap();
+    sparrow_core::lower_owner_summary_for_legacy_fixture(&db).unwrap();
+    drop(db);
+    let oracle = Store::open(scratch, config()).unwrap();
+    let limits = sparrow_core::RetentionReadLimits::default();
+    let mut entry = EntryWalk {
+        totals: Vec::new(),
+        walk: Vec::new(),
+        reference: Vec::new(),
+    };
+    for now in nows {
+        let walked = oracle.retention_metrics(*now, limits);
+        let frozen = oracle.retention_metrics_entry_walk_reference_for_tests(*now, limits);
+        entry.totals.push(match &walked {
+            Ok(report) => format!("{:?}", zero_visits(report.clone())),
+            Err(error) => format!("refused {}: {}", error.code, error.message),
+        });
+        entry.walk.push(retention_outcome(walked));
+        entry.reference.push(retention_outcome(frozen));
+    }
+    drop(oracle);
+    std::fs::remove_dir_all(scratch).unwrap();
+    entry
+}
+
+/// The account with its visits, or the refusal code: what the walk and its reference must agree
+/// on exactly. Refusal messages are not compared, since they name the bound that refused.
+fn retention_outcome(
+    result: Result<sparrow_core::RetentionMetrics, sparrow_core::Error>,
+) -> String {
+    match result {
+        Ok(report) => format!("{report:?}"),
+        Err(error) => format!("refused {}", error.code),
+    }
+}
+
+fn zero_visits(mut report: sparrow_core::RetentionMetrics) -> sparrow_core::RetentionMetrics {
+    report.visits = 0;
+    report
+}
+
+fn retention_result(store: &Store, now: u64) -> String {
+    match store.retention_metrics(now, sparrow_core::RetentionReadLimits::default()) {
+        Ok(report) => format!("{:?}", zero_visits(report)),
+        Err(error) => format!("refused {}: {}", error.code, error.message),
+    }
+}
+
+/// Deterministic `SplitMix64` generator (the shared `purrdf_hash::mix` helper) for the
+/// differential sequences.
+struct Sequence(u64);
+
+impl Sequence {
+    fn next(&mut self, bound: u64) -> u64 {
+        purrdf_hash::mix::splitmix64_next(&mut self.0) % bound
+    }
+}
+
+/// INVARIANT: after every step of a random sequence of publication, import, tail
+/// consumption, pin, unpin, clock advance (owner and pin expiry), bounded expiry, eviction and
+/// reopen, the retention answer from the owner summary equals the answer from the owner
+/// entries, and the summary answer is unchanged by a reopen. Fixed seeds keep it
+/// deterministic.
+#[test]
+fn retention_answer_from_the_summary_equals_the_entry_walk_through_random_mutations() {
+    use sparrow_core::{EvictionLimits, TailStart};
+    const SEEDS: [u64; 12] = [
+        purrdf_hash::mix::GOLDEN_GAMMA,
+        0xD1B5_4A32_D192_ED03,
+        7,
+        0x5851_F42D_4C95_7E2D,
+        11,
+        13,
+        0x2545_F491_4F6C_DD1D,
+        99,
+        1234,
+        0xDEAD_BEEF,
+        31337,
+        0x1234_5678_9ABC_DEF1,
+    ];
+    const STEPS: usize = 30;
+    let limits = EvictionLimits {
+        max_payload_refs: 8,
+        ..EvictionLimits::default()
+    };
+    let mut tally: std::collections::BTreeMap<&str, (u32, u32)> = Default::default();
+    let mut shapes = (0_u32, 0_u32, 0_u32);
+    for seed in SEEDS {
+        let mut rng = Sequence(seed);
+        let (dir, scratch) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (path, copy) = (dir.path().to_path_buf(), scratch.path().join("copy"));
+        let mut store = Store::open(&path, config()).unwrap();
+        let (mut now, mut serial) = (DAY, 0_u64);
+        let mut owners: Vec<String> = Vec::new();
+        let mut pins: Vec<String> = Vec::new();
+        // Deadlines of pins created or renewed, for evicting an owner after its pin lapsed.
+        let mut pin_ends: Vec<u64> = Vec::new();
+        let mut wide: Vec<String> = Vec::new();
+        let mut tail: Option<(String, u64)> = None;
+        let mut trace: Vec<String> = Vec::new();
+        // Owner and pin deadlines, owner artifacts with theirs, a second stream choosing late
+        // pins, and instants the next comparison must include.
+        let mut deadlines: Vec<u64> = Vec::new();
+        let mut artifacts: Vec<(String, u64)> = Vec::new();
+        let mut late = Sequence(seed ^ 0xA5A5_5A5A);
+        let mut forced: Vec<u64> = Vec::new();
+        // Deterministic in every seed: a record retired by expiry and still undeleted. Queried
+        // at an instant before its deadline it is live in the walk (the retired flag is not
+        // read) and keeps its owner-summary row.
+        store
+            .ingest("retire-probe", "diff", "log", b"retire me\n", now)
+            .unwrap();
+        store
+            .expire_bounded(now + 30 * DAY + DAY / 2, limits)
+            .unwrap();
+        let retired_probe = now + 10 * DAY;
+        for step in 0..STEPS {
+            // Fixed case, drawing nothing from the generator: at the first step of the first
+            // seed, an eight-chunk artifact is evicted while it is live, so the instant queried
+            // next must not count it as live. Eviction records its state in the retirement row.
+            if step == 0 && seed == SEEDS[0] {
+                let mut line = Vec::new();
+                for chunk in 0..8_u8 {
+                    line.extend(vec![b'a' + chunk; 64 * 1024]);
+                }
+                let last = line.len() - 1;
+                line[last] = b'\n';
+                let target = store
+                    .ingest("retire-state", "diff", "log", &line, now)
+                    .unwrap()
+                    .id;
+                for _ in 0..64 {
+                    let report = store.evict_oldest(now, limits).unwrap();
+                    if report.artifacts.contains(&target) || !report.continuation {
+                        break;
+                    }
+                }
+                trace.push(format!("step {step}: evict {target} ok=true"));
+            }
+            for _ in 0..=rng.next(2) {
+                serial += 1;
+                let op = rng.next(20);
+                if op == 13 {
+                    // A rebuild: the older-writer path lowers the format and the migration
+                    // recomputes every owner row from its entry and retirement state.
+                    drop(store);
+                    let db = catalog_db(&path).unwrap();
+                    sparrow_core::lower_owner_summary_for_legacy_fixture(&db).unwrap();
+                    drop(db);
+                    store = Store::open(&path, config()).unwrap();
+                    while store.migrate_step().unwrap().is_some() {}
+                    trace.push(format!("step {step}: rebuild ok=true"));
+                    tally.entry("rebuild").or_default().0 += 1;
+                    continue;
+                }
+                let mut published: Option<Result<sparrow_core::Artifact, sparrow_core::Error>> =
+                    None;
+                let (kind, outcome, ok) = match op {
+                    0..=2 | 15 => {
+                        let input: Vec<u8> = if op == 2 {
+                            let mut line = vec![b'a' + rng.next(3) as u8; 64 * 1024];
+                            line[64 * 1024 - 1] = b'\n';
+                            line.repeat(2 + rng.next(13) as usize)
+                        } else {
+                            let words = ["alpha", "beta", "gamma"];
+                            (0..1 + rng.next(3))
+                                .map(|_| format!("{}\n", words[rng.next(3) as usize]))
+                                .collect::<String>()
+                                .into_bytes()
+                        };
+                        let made = store.ingest(&format!("r{serial}"), "diff", "log", &input, now);
+                        let ok = made.is_ok();
+                        published = Some(made);
+                        (
+                            "ingest",
+                            format!(
+                                "ingest {} bytes starting {:?}",
+                                input.len(),
+                                &input[..input.len().min(6)]
+                            ),
+                            ok,
+                        )
+                    }
+                    3 => {
+                        let made = publish_staged(
+                            &store,
+                            &format!("i{serial}"),
+                            &log_lines(128 * 1024, 64 * 1024),
+                        );
+                        let ok = made.is_ok();
+                        published = Some(made);
+                        ("import", "import 128 KiB".to_owned(), ok)
+                    }
+                    4 => {
+                        let (id, offset) = tail.get_or_insert_with(|| {
+                            let generation = store
+                                .tail_start(
+                                    &TailStart {
+                                        request_id: format!("t{seed}"),
+                                        watch: "tail".into(),
+                                        watch_revision: 1,
+                                        directories: CONSUMPTION_DIRECTORIES,
+                                        path: b"active.log".to_vec(),
+                                        source: "diff-tail".into(),
+                                        format: "log".into(),
+                                        device: 7,
+                                        inode: 42,
+                                    },
+                                    now,
+                                )
+                                .unwrap();
+                            (generation.id, 0)
+                        });
+                        let input = format!("tail {serial}\n");
+                        let made = store.tail_append(id, *offset, input.as_bytes(), false, now);
+                        let ok = made.is_ok();
+                        if let Ok(done) = made {
+                            *offset = done.source_end;
+                            if let Some(artifact) = done.artifact {
+                                published = Some(Ok(artifact));
+                            }
+                        }
+                        ("tail", format!("tail append {input:?}"), ok)
+                    }
+                    5 | 6 if !owners.is_empty() => {
+                        let mut target = owners[rng.next(owners.len() as u64) as usize].clone();
+                        let mut days = 1 + rng.next(3);
+                        let waiting: Vec<(String, u64)> = artifacts
+                            .iter()
+                            .filter(|(_, deadline)| *deadline > now)
+                            .cloned()
+                            .collect();
+                        if !waiting.is_empty() && late.next(2) == 0 {
+                            // Pin an artifact just before its deadline, so the pin outlives it.
+                            let (id, deadline) =
+                                waiting[late.next(waiting.len() as u64) as usize].clone();
+                            target = id;
+                            days = 3;
+                            now = now.max(deadline.saturating_sub(DAY));
+                            forced.extend([deadline, deadline + DAY / 2, deadline + 2 * DAY]);
+                        }
+                        let name = format!("name{}", rng.next(3));
+                        let made = store.pin(
+                            &format!("p{serial}"),
+                            &name,
+                            std::slice::from_ref(&target),
+                            days,
+                            now,
+                        );
+                        let ok = made.is_ok();
+                        if let Ok(pin) = made {
+                            pin_ends.push(pin.expires_at);
+                            pins.push(pin.id);
+                        }
+                        if ok {
+                            deadlines.push(now + days * DAY);
+                        }
+                        let kind = if target.starts_with("artifact:") && days == 3 {
+                            "pin-artifact3"
+                        } else {
+                            "pin"
+                        };
+                        (kind, format!("pin {target} for {days} days"), ok)
+                    }
+                    16 => {
+                        // One import batch whose records and artifact share their digests.
+                        let mut line = vec![b'q'; 64 * 1024];
+                        line[64 * 1024 - 1] = b'\n';
+                        let made = publish_staged(&store, &format!("s{serial}"), &line.repeat(4));
+                        let ok = made.is_ok();
+                        published = Some(made);
+                        (
+                            "import-shared",
+                            "import four identical chunk lines".to_owned(),
+                            ok,
+                        )
+                    }
+                    18 | 19 if !wide.is_empty() => {
+                        // Pin an eight-chunk artifact for a day, let the pin lapse, then evict:
+                        // the artifact is evicted with chunks unretired and is still covered by
+                        // the pin at the instants before it lapsed.
+                        let target = wide[rng.next(wide.len() as u64) as usize].clone();
+                        let ok = match store.pin(
+                            &format!("w{serial}"),
+                            "wide",
+                            std::slice::from_ref(&target),
+                            1,
+                            now,
+                        ) {
+                            Ok(pin) => {
+                                let end = pin.expires_at;
+                                pins.push(pin.id);
+                                pin_ends.push(end);
+                                now = end + DAY / 2;
+                                forced.extend([end - 1, end - DAY / 2]);
+                                // Pass by pass, stopping on the pass that evicts the artifact:
+                                // its record spends the whole budget, so no chunk is retired yet.
+                                let mut ok = false;
+                                for _ in 0..64 {
+                                    match store.evict_oldest(now, limits) {
+                                        Ok(report) => {
+                                            ok = true;
+                                            if report.artifacts.contains(&target)
+                                                || !report.continuation
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                                ok
+                            }
+                            Err(_) => false,
+                        };
+                        (
+                            "wide-lapse",
+                            format!("pin {target} one day, lapse, evict at {now}"),
+                            ok,
+                        )
+                    }
+                    17 if pin_ends.iter().any(|end| *end > now) => {
+                        // Evict after a pin lapsed, then query where it was still active: an
+                        // owner that is evicted and, at those instants, covered by its pin.
+                        let end = *pin_ends.iter().filter(|end| **end > now).min().unwrap();
+                        now = end + DAY / 2;
+                        forced.extend([end - 1, end - DAY / 2]);
+                        let ok = store.evict_oldest(now, limits).is_ok();
+                        (
+                            "evict-lapsed",
+                            format!("evict at {now} after a pin ending {end}"),
+                            ok,
+                        )
+                    }
+                    7 if !pins.is_empty() => {
+                        let pin = pins.swap_remove(rng.next(pins.len() as u64) as usize);
+                        let ok = store.release(&pin).is_ok();
+                        ("unpin", format!("unpin {pin}"), ok)
+                    }
+                    11 if !pins.is_empty() => {
+                        let pin = pins[rng.next(pins.len() as u64) as usize].clone();
+                        let days = 1 + rng.next(3);
+                        let ok = store
+                            .renew_pin(&format!("n{serial}"), &pin, days, None, now)
+                            .is_ok();
+                        ("renew", format!("renew {pin} for {days} days"), ok)
+                    }
+                    12 => {
+                        // One record of eight chunks: eviction spends the whole payload
+                        // budget on the record, so the parent artifact is marked evicted
+                        // with no manifest chunk retired.
+                        let mut line = Vec::new();
+                        for chunk in 0..8_u64 {
+                            line.extend(vec![b'a' + ((chunk + rng.next(3)) % 5) as u8; 64 * 1024]);
+                        }
+                        let last = line.len() - 1;
+                        line[last] = b'\n';
+                        let made = store.ingest(&format!("w{serial}"), "diff", "log", &line, now);
+                        let ok = made.is_ok();
+                        if let Ok(artifact) = &made {
+                            wide.push(artifact.id.clone());
+                        }
+                        published = Some(made);
+                        ("wide", "ingest one eight-chunk record".to_owned(), ok)
+                    }
+                    8 => {
+                        // The repository does not enforce a monotone clock: move back too.
+                        if rng.next(4) == 0 {
+                            now = now.saturating_sub((1 + rng.next(4)) * DAY / 2).max(DAY);
+                        } else if rng.next(3) == 0 {
+                            // A jump past owner deadlines, so expiry and retirement run.
+                            now += (10 + rng.next(26)) * DAY;
+                        } else {
+                            now += (1 + rng.next(8)) * DAY / 2;
+                        }
+                        ("clock", format!("clock to {now}"), true)
+                    }
+                    14 => {
+                        // More records than one 256-owner migration page.
+                        let input: String = (0..300)
+                            .map(|line| format!("bulk {serial} {line}\n"))
+                            .collect();
+                        let made = store.ingest(
+                            &format!("b{serial}"),
+                            "diff",
+                            "log",
+                            input.as_bytes(),
+                            now,
+                        );
+                        let ok = made.is_ok();
+                        published = Some(made);
+                        ("bulk", "ingest 300 lines".to_owned(), ok)
+                    }
+                    9 => {
+                        let ok = store.expire_bounded(now, limits).is_ok();
+                        ("expire", "expire".to_owned(), ok)
+                    }
+                    10 if rng.next(2) == 0 => {
+                        let ok = store.evict_oldest(now, limits).is_ok();
+                        ("evict", "evict".to_owned(), ok)
+                    }
+                    _ => ("none", "no operation".to_owned(), true),
+                };
+                if let Some(Ok(artifact)) = &published {
+                    artifacts.push((artifact.id.clone(), now + sparrow_core::RETENTION_MS));
+                    deadlines.push(now + sparrow_core::RETENTION_MS);
+                    owners.push(artifact.id.clone());
+                    owners.extend(artifact.record_ids.iter().cloned());
+                }
+                let entry = tally.entry(kind).or_default();
+                if ok {
+                    entry.0 += 1;
+                } else {
+                    entry.1 += 1;
+                }
+                trace.push(format!("step {step}: {outcome} ok={ok}"));
+            }
+            // The newest instant, then earlier ones: a pin or owner not yet expired at them.
+            let mut nows = vec![
+                now,
+                now.saturating_sub(DAY / 2),
+                now.saturating_sub(5 * DAY),
+            ];
+            nows.push(retired_probe);
+            nows.append(&mut forced);
+            for _ in 0..4 {
+                if !deadlines.is_empty() {
+                    let deadline = deadlines[rng.next(deadlines.len() as u64) as usize];
+                    nows.push([deadline - 1, deadline, deadline + DAY / 2][rng.next(3) as usize]);
+                }
+            }
+            let lives: Vec<String> = nows
+                .iter()
+                .map(|at| retention_result(&store, *at))
+                .collect();
+            let live = lives[0].clone();
+            let live_visits = store
+                .retention_metrics(now, sparrow_core::RetentionReadLimits::default())
+                .map(|report| report.visits)
+                .unwrap_or(0);
+            if live.contains("live_records: 0,") && live.contains("live_artifacts: 0,") {
+                shapes.0 += 1;
+            } else {
+                shapes.1 += 1;
+            }
+            shapes.2 += u32::from(live_visits > 0);
+            drop(store);
+            let walked = entry_walk_totals(&path, &copy, &nows);
+            store = Store::open(&path, config()).unwrap();
+            let reopened = retention_result(&store, now);
+            let context = format!("seed {seed:#x}, step {step}\n{}", trace.join("\n"));
+            if let Some(index) =
+                (0..lives.len()).find(|index| lives[*index] != walked.totals[*index])
+            {
+                panic!(
+                    "summary vs entry walk at now={}\nsummary: {}\nwalk:    {}\n{context}",
+                    nows[index], lives[index], walked.totals[index]
+                );
+            }
+            // The streamed walk must agree with the frozen pre-change walk on the account, its
+            // visits and the refusal code at every instant.
+            if let Some(index) =
+                (0..nows.len()).find(|index| walked.walk[*index] != walked.reference[*index])
+            {
+                panic!(
+                    "entry walk vs frozen reference at now={}\nwalk:      {}\nreference: {}\n{context}",
+                    nows[index], walked.walk[index], walked.reference[index]
+                );
+            }
+            assert_eq!(live, reopened, "summary before vs after reopen\n{context}");
+        }
+    }
+    eprintln!("ORACLE ops (ok, refused): {tally:?}; steps (empty, nonempty, answered): {shapes:?}");
+}
+
+/// INVARIANT: an artifact whose chunks expiry has partly retired is accounted from its retirement
+/// position. The entry walk starts after the retired chunks, so it counts only the chunks still
+/// owned; it agrees with the frozen pre-change walk on the account, its visits and the refusal,
+/// and with the owner summary on the totals.
+#[test]
+fn the_entry_walk_accounts_an_artifact_from_its_partial_retirement_position() {
+    use sparrow_core::EvictionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let mut input = Vec::new();
+    for chunk in 0..6_u8 {
+        let mut line = vec![b'a' + chunk; 64 * 1024];
+        line[64 * 1024 - 1] = b'\n';
+        input.extend(line);
+    }
+    let artifact = store.ingest("partial", "diff", "log", &input, DAY).unwrap();
+    let after = DAY + sparrow_core::RETENTION_MS + DAY / 2;
+    // Two payload references is fewer than the artifact's chunks, so retirement stops mid-array.
+    store
+        .expire_bounded(
+            after,
+            EvictionLimits {
+                max_payload_refs: 2,
+                ..EvictionLimits::default()
+            },
+        )
+        .unwrap();
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    let state = db
+        .get(format!("artifact-retirement:{}", artifact.id))
+        .unwrap()
+        .expect("the partly retired artifact keeps a retirement state");
+    let total = u64::from_be_bytes(state[..8].try_into().unwrap());
+    let retired = u64::from_be_bytes(state[8..16].try_into().unwrap());
+    assert!(
+        0 < retired && retired < total,
+        "retired {retired} of {total}"
+    );
+    drop(db);
+    let walked = entry_walk_totals(dir.path(), &scratch.path().join("copy"), &[after, DAY]);
+    assert_eq!(walked.walk, walked.reference);
+    let oracle = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(walked.totals[0], retention_result(&oracle, after));
+}
+
+fn pin_rows(dir: &std::path::Path) -> usize {
+    let db = catalog_db(dir).unwrap();
+    db.prefix_iterator(b"pin:")
+        .map(Result::unwrap)
+        .take_while(|(key, _)| key.starts_with(b"pin:"))
+        .count()
+}
+
+fn artifact_counts(store: &Store, now: u64) -> (u64, u64) {
+    let report = store
+        .retention_metrics(now, sparrow_core::RetentionReadLimits::default())
+        .unwrap();
+    (report.live_artifacts, report.pinned_artifacts)
+}
+
+/// INVARIANT: a pin whose deadline has passed protects nothing in the retention answer
+/// (`capture_pins` skips it at `expires_at <= now`), while its row stays stored until the
+/// expiry sweep runs.
+#[test]
+fn a_pin_past_its_deadline_is_skipped_by_capture_but_its_row_remains_until_the_sweep() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("pin-skip", "pins", "log", b"kept\n", 0)
+        .unwrap();
+    // The artifact expires at day 30; the pin is taken on day 29 for one day.
+    store
+        .pin("pin-skip-pin", "pins", &[artifact.id], 1, 29 * DAY)
+        .unwrap();
+    assert_eq!(artifact_counts(&store, 30 * DAY - 1), (1, 1));
+    assert_eq!(artifact_counts(&store, 30 * DAY), (0, 0));
+    drop(store);
+    assert_eq!(pin_rows(dir.path()), 1);
+}
+
+/// INVARIANT: renewing a pin raises its deadline (never lowers it), so an owner past its own
+/// deadline is live and pinned at an instant the unrenewed pin no longer covers.
+#[test]
+fn a_renewed_pin_protects_at_an_instant_the_unrenewed_pin_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("pin-renew", "pins", "log", b"kept\n", 0)
+        .unwrap();
+    let pin = store
+        .pin("pin-renew-pin", "pins", &[artifact.id], 1, 29 * DAY)
+        .unwrap();
+    let later = 31 * DAY;
+    assert_eq!(artifact_counts(&store, later), (0, 0));
+    let renewed = store
+        .renew_pin("pin-renew-renew", &pin.id, 3, None, 29 * DAY + DAY / 2)
+        .unwrap();
+    assert!(renewed.expires_at > pin.expires_at);
+    assert_eq!(artifact_counts(&store, later), (1, 1));
+    // A shorter renewal never moves the deadline back.
+    let shorter = store
+        .renew_pin("pin-renew-short", &pin.id, 1, None, 29 * DAY + DAY / 2)
+        .unwrap();
+    assert_eq!(shorter.expires_at, renewed.expires_at);
+}
+
+/// INVARIANT: the expiry pass deletes an expired pin row, and with the row gone no query,
+/// including one at an instant before the pin's deadline, sees its protection.
+#[test]
+fn the_expiry_sweep_removes_an_expired_pin_row_and_its_protection_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("pin-sweep", "pins", "log", b"kept\n", 0)
+        .unwrap();
+    store
+        .pin("pin-sweep-pin", "pins", &[artifact.id], 1, 29 * DAY)
+        .unwrap();
+    let before = 29 * DAY + DAY / 2;
+    assert_eq!(artifact_counts(&store, before), (1, 1));
+    store
+        .expire_bounded(30 * DAY + DAY / 2, sparrow_core::EvictionLimits::default())
+        .unwrap();
+    assert_eq!(artifact_counts(&store, before), (1, 0));
+    drop(store);
+    assert_eq!(pin_rows(dir.path()), 0);
+}
+
+/// INVARIANT: eviction clears a record's chunk list in the same write that marks it evicted,
+/// so a stored evicted record never lists chunks it no longer owns.
+#[test]
+fn eviction_clears_a_records_chunk_list_in_the_write_that_marks_it_evicted() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let artifact = store
+        .ingest("evict-clear", "pins", "log", b"alpha\nbeta\n", 0)
+        .unwrap();
+    let row = |dir: &std::path::Path, id: &str| {
+        let db = catalog_db(dir).unwrap();
+        String::from_utf8(db.get(id).unwrap().unwrap()).unwrap()
+    };
+    store
+        .evict_oldest(DAY, sparrow_core::EvictionLimits::default())
+        .unwrap();
+    drop(store);
+    for id in &artifact.record_ids {
+        let stored = row(dir.path(), id);
+        assert!(stored.contains("\"evicted\":true"), "{stored}");
+        assert!(stored.contains("\"chunks\":[]"), "{stored}");
     }
 }
