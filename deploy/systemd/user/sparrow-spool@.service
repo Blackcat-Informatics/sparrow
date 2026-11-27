@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+#
+# Spools the journal lines of one system unit for sparrow-ship. The instance is the unit's name without
+# ".service": sparrow-spool@UNIT.service spools UNIT.service. The instance is used verbatim (%i); the
+# unescaping specifier (%I) would turn the hyphens of a unit name into slashes.
+#
+# A user unit for the account that runs the spool; that account reads the system journal. It is
+# installed beside any other spool units (docs/deployment.md, "Spooling one unit's journal lines"), with
+# the install and removal steps in that section. Installing the template starts nothing.
+#
+# The program is the tracked copy, installed under its own name (sparrow-unit-spool). The template never
+# changes or replaces another spool program in ~/.local/libexec/sparrow, such as one an existing spool
+# unit runs. The unit's own lines are kept (SPARROW_UNIT_SPOOL_OWN_LINES=keep): a system unit logs through
+# stdout and stderr to the default journal.
+[Unit]
+Description=Spool %i.service journal lines for Sparrow
+
+[Service]
+Type=exec
+Environment="SPARROW_UNIT_SPOOL_OWN_LINES=keep"
+ExecStart=%h/.local/libexec/sparrow/sparrow-unit-spool %i.service %S/sparrow/unit-spool/%i.service %S/sparrow/unit-spool/%i.service.cursor
+Restart=always
+RestartSec=10
+RestartPreventExitStatus=2
+Nice=10
+MemoryMax=256M
+
+[Install]
+WantedBy=default.target
