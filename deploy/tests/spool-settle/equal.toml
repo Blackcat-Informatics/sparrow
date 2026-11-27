@@ -1,4 +1,4 @@
-# Settling at exactly the quiet period is not strictly later than it, so the source is refused.
+# Settling only as long as the quiet period is less than the margin required, so the source is refused.
 [[source]]
 name = "unit-spool"
 dir = "/var/lib/sparrow/spool/units"

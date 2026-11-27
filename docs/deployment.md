@@ -576,8 +576,8 @@ A bucket closes once its file has gone unwritten for 600 seconds (`SPOOL_QUIET_S
 appended to: a line that is not newer than it starts the bucket of the current time, or the bucket after the newest
 one when the clock is behind it.
 
-Every shipper source that reads these files must settle strictly later than the spool's quiet period:
-`settle_seconds` greater than 600, with `rule = "settled"`. Then a file is shipped only after it has closed, and an
+Every shipper source that reads these files must settle at least 300 seconds after the spool's quiet period:
+`settle_seconds` of 900 or more, with `rule = "settled"`. Then a file is shipped only after it has closed, and an
 accepted file does not change. `deploy/tests/spool-settle.sh SHIP_CONFIG` checks a shipper configuration and exits 1
 for a source that breaks this. Without an argument it checks its own fixtures.
 Each record carries `source`, `unit`, `time`, `realtime_usec`, `priority`, `message`, and `manager` when the
@@ -729,8 +729,8 @@ A. Back up the configuration next to the live file.
    Undo: `rm -f ~/.config/sparrow/ship.toml.pre-SOURCE-settled`
 
 B. Write a candidate beside the live file, with two lines changed in the `[[source]]` block whose name is
-   `SOURCE`: `rule` becomes `"settled"` and `settle_seconds` becomes `900`, which is greater than the spool's
-   600-second quiet period. No other line changes.
+   `SOURCE`: `rule` becomes `"settled"` and `settle_seconds` becomes `900`, which is at least 300 seconds
+   after the spool's 600-second quiet period. No other line changes.
    Validate it with the loader command of install step 5.
    Undo: `rm -f ~/.config/sparrow/ship.toml.candidate`
 

@@ -25,8 +25,8 @@
 # comes from the entry's timestamp, except that a line never joins a bucket older than the newest bucket already
 # in SPOOL_DIR. While that newest file is open, a late line joins it. Once it has gone unwritten for
 # SPOOL_QUIET_SECONDS it is closed, and a line that is not newer than it starts a new bucket instead, so this
-# program never appends to a closed file. The shipper must settle a spool source strictly later than
-# SPOOL_QUIET_SECONDS (see docs/deployment.md). SPARROW_UNIT_SPOOL_NOW, when set, replaces the system clock
+# program never appends to a closed file. The shipper must settle a spool source at least
+# SPOOL_SETTLE_MARGIN_SECONDS later than SPOOL_QUIET_SECONDS (see docs/deployment.md). SPARROW_UNIT_SPOOL_NOW, when set, replaces the system clock
 # (seconds since the epoch) for the closing decision; the tests use it to set exact ages.
 #
 # The cursor file is written after each record is appended, so it never runs ahead of the spool. A
@@ -59,9 +59,13 @@ esac
 (umask 077 && mkdir -p -- "$dir" "$(dirname -- "$cursor")")
 
 # A bucket is closed once its file has gone unwritten for this many seconds. A closed bucket is never
-# appended to again. Every shipper source fed by this spool must settle strictly later than this period
-# (settle_seconds greater than SPOOL_QUIET_SECONDS), so a file is shipped only after it has closed.
+# appended to again. Every shipper source fed by this spool must settle at least
+# SPOOL_SETTLE_MARGIN_SECONDS after this period (settle_seconds >= SPOOL_QUIET_SECONDS + margin), so a file is
+# shipped only after it has closed, with room for a spool stall between its check and its append.
 SPOOL_QUIET_SECONDS=600
+# Read by deploy/tests/spool-settle.sh, which checks shipper settle_seconds against this margin.
+# shellcheck disable=SC2034
+SPOOL_SETTLE_MARGIN_SECONDS=300
 readonly SPOOL_QUIET_SECONDS
 
 # The newest bucket already in the spool directory, printed as YYYYMMDDTHHMM, or nothing when there is none.

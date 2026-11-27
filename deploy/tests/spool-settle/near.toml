@@ -1,0 +1,9 @@
+# One second short of the minimum (quiet 600 plus margin 300): refused.
+[[source]]
+name = "unit-spool"
+dir = "/var/lib/sparrow/spool/units"
+pattern = "unit-spool-*.jsonl"
+rule = "settled"
+format = "jsonl"
+settle_seconds = 899
+exclude = []
