@@ -1397,6 +1397,7 @@ impl Store {
             now,
             limits,
             None,
+            true,
             |view, _| operation(view),
         )
     }
@@ -1425,6 +1426,7 @@ impl Store {
         now: u64,
         limits: RdfReadLimits,
         allowance: Option<RowAllowance>,
+        strict_projections: bool,
         operation: impl FnOnce(&StoredRdfView<'_>, &[String]) -> T,
     ) -> Result<T, ReadError> {
         if ids.is_empty() && artifacts.is_empty() {
@@ -1443,6 +1445,7 @@ impl Store {
             limits,
             renewal: slot.lease(),
             allowance,
+            strict_projections,
             expired: None,
         };
         let expired = match self.capture_scope(&scope, &mut operation)? {
@@ -1475,6 +1478,7 @@ impl Store {
             renewal,
             allowance,
             expired,
+            ..
         } = *scope;
         // The one writer hold: pin the snapshot and read the pins protecting the known
         // expired targets, which must be as of the same moment.
@@ -1578,7 +1582,12 @@ impl Store {
                     "RDF selection contains expired evidence",
                 )));
             }
-            view.include_record(&record, layers, true, &mut RdfScopeCoverage::default())?;
+            view.include_record(
+                &record,
+                layers,
+                scope.strict_projections,
+                &mut RdfScopeCoverage::default(),
+            )?;
         }
         let mut absent = Vec::new();
         for id in artifacts {
@@ -1617,6 +1626,8 @@ struct ScopeCapture<'a> {
     /// How the read's lease ends, which its slot decides.
     renewal: LeaseRenewal,
     allowance: Option<RowAllowance>,
+    /// Whether a record whose projection failed is refused (`true`) or read without content.
+    strict_projections: bool,
     expired: Option<&'a BTreeSet<String>>,
 }
 

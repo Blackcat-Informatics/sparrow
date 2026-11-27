@@ -5,7 +5,7 @@
 
 use purrdf::gts::reader;
 use purrdf::gts::writer::digest_string;
-use sparrow_core::{ArchivePolicy, Config, Store};
+use sparrow_core::{ArchivePolicy, Config, HoldReason, Store};
 
 const DAY: u64 = 24 * 60 * 60 * 1000;
 
@@ -37,6 +37,114 @@ fn archive_prepare_selects_at_three_quarters_of_the_window() {
     assert_eq!(again.segment_id, segment.segment_id);
     store.archive_commit(&segment.segment_id).unwrap();
     assert!(store.archive_prepare(bound).unwrap().is_none());
+}
+
+/// A store whose head record (received at 1 ms) has a failed RDF projection and whose tail
+/// record (received at 2 ms) is healthy. Both are archive-eligible at the bound 2 ms + 3/4 of
+/// the window. Returns the store and the head record's id.
+fn store_with_failed_head(dir: &std::path::Path) -> (Store, String) {
+    let store = Store::open(dir, archiving(ArchivePolicy::default())).unwrap();
+    let head = store
+        .ingest("head", "source", "markdown", b"# alpha\n", 1)
+        .unwrap();
+    let head_id = head.record_ids[0].clone();
+    drop(store);
+    let db = sparrow_test_support::catalog_db(dir).unwrap();
+    let mut failed = 0;
+    for entry in db.iterator(rocksdb::IteratorMode::Start) {
+        let (key, value) = entry.unwrap();
+        if !key.starts_with(b"rdf:state:") {
+            continue;
+        }
+        let text = String::from_utf8(value.to_vec()).unwrap();
+        if text.contains("\"state\":\"complete\"") {
+            let failed_text = text.replace("\"state\":\"complete\"", "\"state\":\"failed\"");
+            db.put(&key, failed_text).unwrap();
+            failed += 1;
+        }
+    }
+    assert_eq!(
+        failed, 1,
+        "the head record has one projection state to fail"
+    );
+    drop(db);
+    let store = Store::open(dir, archiving(ArchivePolicy::default())).unwrap();
+    store
+        .ingest("tail", "source", "markdown", b"# beta\n", 2)
+        .unwrap();
+    (store, head_id)
+}
+
+/// INVARIANT: a record whose RDF projection failed does not hold the archive watermark. A
+/// healthy record behind it is selected into the same segment, and the failed record is
+/// archived with its exact bytes and one projection-absent mark.
+#[test]
+fn a_failed_projection_at_the_head_does_not_hold_a_later_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, head_id) = store_with_failed_head(dir.path());
+    // The tail was received one millisecond after the head, so both are due at this instant.
+    let bound = 2 + 30 * DAY * 3 / 4;
+    let segment = store
+        .archive_prepare(bound)
+        .unwrap()
+        .expect("a healthy record behind a failed projection is due");
+    assert_eq!((segment.records, segment.artifacts), (2, 0));
+    // The failed head is marked: exactly one projection-absent mark, naming the head record.
+    let (_, bytes) = &segment.files[0];
+    let graph = reader::read(bytes, false, None);
+    let marks: Vec<String> = graph
+        .quad_terms()
+        .filter(|quad| {
+            quad.predicate.value.as_deref() == Some("urn:sparrow:vocab:projectionAbsent")
+        })
+        .filter_map(|quad| quad.subject.value.clone())
+        .collect();
+    assert_eq!(
+        marks,
+        vec![format!("urn:sparrow:{head_id}")],
+        "the one mark names the failed head"
+    );
+    assert_eq!(
+        segment.marked,
+        vec![head_id],
+        "the segment reports the marked head"
+    );
+    // Crash recovery rebuilds a prepared segment; the rebuild must match the bytes already
+    // written, marks included.
+    let again = store
+        .archive_prepare(2 + 30 * DAY * 3 / 4)
+        .unwrap()
+        .expect("the rebuilt segment is still due");
+    assert_eq!(again.segment_id, segment.segment_id);
+    assert_eq!(again.marked, segment.marked);
+    assert!(
+        again.files == segment.files,
+        "the rebuilt segment's bytes match the prepared segment's bytes"
+    );
+}
+
+/// INVARIANT: a marked record is retired by expiry only after its segment commits. While the
+/// segment is prepared and uncommitted, expiry past both records' deadlines retires neither and
+/// reports them waiting on the archive; after the commit it retires both.
+#[test]
+fn a_marked_record_retires_by_expiry_only_after_its_segment_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = store_with_failed_head(dir.path());
+    let segment = store
+        .archive_prepare(2 + 30 * DAY * 3 / 4)
+        .unwrap()
+        .expect("both records are due");
+    let past_deadlines = 2 + 31 * DAY;
+    let waiting = store
+        .expire_bounded(past_deadlines, sparrow_core::EvictionLimits::default())
+        .unwrap();
+    assert_eq!(waiting.records, 0, "nothing retires before the commit");
+    assert!(waiting.archive_waiting >= 1);
+    store.archive_commit(&segment.segment_id).unwrap();
+    let retired = store
+        .expire_bounded(past_deadlines, sparrow_core::EvictionLimits::default())
+        .unwrap();
+    assert_eq!(retired.records, 2, "both records retire once archived");
 }
 
 /// INVARIANT: PurRDF's reader decodes a prepared segment back to every record's exact
@@ -129,21 +237,98 @@ fn committed_segment_holds_every_covered_graph_by_id() {
     assert_eq!(fact("byteLength").as_deref(), Some("11"));
 }
 
-/// INVARIANT: a record whose content projection failed is held, named and not archived: the
-/// range does not move past it and the failure is not a silent retry loop.
+/// INVARIANT: a record whose content projection failed does not hold the archive range. It is
+/// prepared with its exact bytes and a projection-absent mark, and the watermark moves past it
+/// once the segment commits. Nothing is held: `archive_held` reports no hold.
 #[test]
-fn a_record_with_a_failed_projection_is_held_and_named() {
+fn a_record_with_a_failed_projection_is_archived_bytes_only() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), archiving(ArchivePolicy::default())).unwrap();
     let broken = store
-        .ingest("held-a", "source", "json", b"{not json\n", 1)
+        .ingest("marked-a", "source", "json", b"{not json\n", 1)
         .unwrap();
     let now = 1 + 30 * DAY;
-    assert!(store.archive_prepare(now).unwrap().is_none());
-    let held = store.archive_held().unwrap().expect("held");
-    assert_eq!(held.record_id, broken.record_ids[0]);
-    assert_eq!(held.reason, sparrow_core::HoldReason::ProjectionFailed);
-    assert!(store.archive_state().unwrap().unwrap().through.is_none());
+    let segment = store
+        .archive_prepare(now)
+        .unwrap()
+        .expect("a failed projection is not a hold");
+    assert_eq!(segment.records, 1);
+    assert!(store.archive_held().unwrap().is_none());
+    store.archive_commit(&segment.segment_id).unwrap();
+    assert!(store.archive_state().unwrap().unwrap().through.is_some());
+    assert_eq!(
+        segment.marked,
+        vec![broken.record_ids[0].clone()],
+        "the failed record is the one marked"
+    );
+    // The record is archived with its exact bytes, though its projection is absent.
+    let (_, bytes) = &segment.files[0];
+    let mut graph = reader::read(bytes, false, None);
+    assert_eq!(
+        graph.blob_bytes(&digest_string(b"{not json\n")).unwrap(),
+        Some(&b"{not json\n"[..]),
+        "the marked record's bytes are archived exactly"
+    );
+}
+
+/// Replaces the value of one string field in a compact JSON catalog row, or `None` when the
+/// field is absent.
+fn with_string_field(text: &str, field: &str, value: &str) -> Option<String> {
+    let marker = format!("\"{field}\":\"");
+    let start = text.find(&marker)? + marker.len();
+    let end = start + text[start..].find('"')?;
+    Some(format!("{}{value}{}", &text[..start], &text[end..]))
+}
+
+/// INVARIANT: a record whose stored bytes exceed the segment bound holds the archive watermark.
+/// Prepare selects nothing, `archive_held` names the record with `TooLarge`, and `archive:through`
+/// does not move. The record's span is widened in the catalog, because no ingest path can write
+/// a record above the bound.
+#[test]
+fn a_record_over_the_segment_bound_holds_the_watermark() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), archiving(ArchivePolicy::default())).unwrap();
+    let ingested = store
+        .ingest("oversized", "source", "log", b"line\n", 1)
+        .unwrap();
+    let record_id = ingested.record_ids[0].clone();
+    drop(store);
+    let db = sparrow_test_support::catalog_db(dir.path()).unwrap();
+    let mut widened = 0;
+    for entry in db.iterator(rocksdb::IteratorMode::Start) {
+        let (key, value) = entry.unwrap();
+        // Binary rows cannot name the record in JSON; only JSON rows are candidates.
+        let Ok(text) = String::from_utf8(value.to_vec()) else {
+            continue;
+        };
+        if !text.contains(&format!("\"id\":\"{record_id}\"")) {
+            continue;
+        }
+        let Some(wide) = with_string_field(&text, "byte_start", "0").and_then(|text| {
+            with_string_field(&text, "byte_end", &(128 * 1024 * 1024 + 1).to_string())
+        }) else {
+            continue;
+        };
+        db.put(&key, wide).unwrap();
+        widened += 1;
+    }
+    assert_eq!(widened, 1, "one record row names the record");
+    drop(db);
+    let store = Store::open(dir.path(), archiving(ArchivePolicy::default())).unwrap();
+    assert!(
+        store.archive_prepare(1 + 30 * DAY).unwrap().is_none(),
+        "an oversized record is not selected"
+    );
+    let held = store.archive_held().unwrap().expect("the record is held");
+    assert_eq!(held.record_id, record_id);
+    assert_eq!(held.reason, HoldReason::TooLarge);
+    assert!(
+        store
+            .archive_state()
+            .unwrap()
+            .is_none_or(|state| state.through.is_none()),
+        "the watermark does not move behind a held record"
+    );
 }
 
 /// INVARIANT: an artifact sorts before its own records, so a segment can end between them

@@ -322,6 +322,9 @@ pub struct SegmentFixture<'a> {
     pub orphan_link: bool,
     /// Whether the artifact itself carries a `payloadBlake3` link naming `claimed`.
     pub artifact_digest_link: bool,
+    /// The reason of a projection-absent mark on the record, when the record's projection is
+    /// absent from the segment.
+    pub projection_absent: Option<&'a str>,
 }
 
 impl<'a> SegmentFixture<'a> {
@@ -338,6 +341,7 @@ impl<'a> SegmentFixture<'a> {
             unreferenced_blob: None,
             orphan_link: false,
             artifact_digest_link: false,
+            projection_absent: None,
         }
     }
 }
@@ -448,6 +452,17 @@ pub fn segment_with(fixture: &SegmentFixture<'_>) -> Vec<u8> {
             .expect("fixture literal");
         builder
             .push_quad(artifact, link, digest, None)
+            .expect("fixture quad");
+    }
+    if let Some(reason) = fixture.projection_absent {
+        let mark = builder
+            .intern_iri(&format!("{NS}projectionAbsent"))
+            .expect("fixture mark");
+        let reason = builder
+            .intern_literal(RdfLiteral::simple(reason))
+            .expect("fixture literal");
+        builder
+            .push_quad(record, mark, reason, None)
             .expect("fixture quad");
     }
     if fixture.orphan_link {
