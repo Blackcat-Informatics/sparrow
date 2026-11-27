@@ -84,7 +84,7 @@ impl JournalEntry {
 }
 
 /// A refused export stream. Both variants name the last complete entry before the fault, so
-/// the operator can restart from that cursor.
+/// a restart can resume from that cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     /// A field name, binary length or terminator does not match the export format.
