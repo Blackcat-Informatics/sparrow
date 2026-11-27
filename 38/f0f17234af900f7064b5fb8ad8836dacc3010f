@@ -1,0 +1,18 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 38f0f17234af900f7064b5fb8ad8836dacc3010f
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 587
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/587
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: dc51256533ff09f23cf5920262d324fe429ced16
+GhpRsq-Head-Ref: paudley/586-advance-the-census-pin-to-cargo-raf
+GhpRsq-Head-OID: 38f0f17234af900f7064b5fb8ad8836dacc3010f
+GhpRsq-Result-Tree: 07e4a9ce0ea0c35db0636187e13e30aa8eaf7037
+GhpRsq-Result-Commit: 7bd307936494e935a9c37e55c780a69eadae0108
+GhpRsq-Parent-Hashes: 38f0f17234af900f7064b5fb8ad8836dacc3010f
+GhpRsq-Squash-Notes-SHA256: 2cc47b9f7250c713496e1323aacac336cbf54d3c0c2352261ab30ee83dabb699
+GhpRsq-Stage-Evidence: none
