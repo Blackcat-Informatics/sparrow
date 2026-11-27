@@ -27736,6 +27736,9 @@ fn retention_answer_from_the_summary_equals_the_entry_walk_through_random_mutati
         let (mut now, mut serial) = (DAY, 0_u64);
         let mut owners: Vec<String> = Vec::new();
         let mut pins: Vec<String> = Vec::new();
+        // Deadlines of pins created or renewed, for evicting an owner after its pin lapsed.
+        let mut pin_ends: Vec<u64> = Vec::new();
+        let mut wide: Vec<String> = Vec::new();
         let mut tail: Option<(String, u64)> = None;
         let mut trace: Vec<String> = Vec::new();
         // Owner and pin deadlines, owner artifacts with theirs, a second stream choosing late
@@ -27744,10 +27747,20 @@ fn retention_answer_from_the_summary_equals_the_entry_walk_through_random_mutati
         let mut artifacts: Vec<(String, u64)> = Vec::new();
         let mut late = Sequence(seed ^ 0xA5A5_5A5A);
         let mut forced: Vec<u64> = Vec::new();
+        // Deterministic in every seed: a record retired by expiry and still undeleted. Queried
+        // at an instant before its deadline it is live in the walk (the retired flag is not
+        // read) and keeps its owner-summary row.
+        store
+            .ingest("retire-probe", "diff", "log", b"retire me\n", now)
+            .unwrap();
+        store
+            .expire_bounded(now + 30 * DAY + DAY / 2, limits)
+            .unwrap();
+        let retired_probe = now + 10 * DAY;
         for step in 0..STEPS {
             for _ in 0..=rng.next(2) {
                 serial += 1;
-                let op = rng.next(16);
+                let op = rng.next(20);
                 if op == 13 {
                     // A rebuild: the older-writer path lowers the format and the migration
                     // recomputes every owner row from its entry and retirement state.
@@ -27857,6 +27870,7 @@ fn retention_answer_from_the_summary_equals_the_entry_walk_through_random_mutati
                         );
                         let ok = made.is_ok();
                         if let Ok(pin) = made {
+                            pin_ends.push(pin.expires_at);
                             pins.push(pin.id);
                         }
                         if ok {
@@ -27868,6 +27882,76 @@ fn retention_answer_from_the_summary_equals_the_entry_walk_through_random_mutati
                             "pin"
                         };
                         (kind, format!("pin {target} for {days} days"), ok)
+                    }
+                    16 => {
+                        // One import batch whose records and artifact share their digests.
+                        let mut line = vec![b'q'; 64 * 1024];
+                        line[64 * 1024 - 1] = b'\n';
+                        let made = publish_staged(&store, &format!("s{serial}"), &line.repeat(4));
+                        let ok = made.is_ok();
+                        published = Some(made);
+                        (
+                            "import-shared",
+                            "import four identical chunk lines".to_owned(),
+                            ok,
+                        )
+                    }
+                    18 | 19 if !wide.is_empty() => {
+                        // Pin an eight-chunk artifact for a day, let the pin lapse, then evict:
+                        // the artifact is evicted with chunks unretired and is still covered by
+                        // the pin at the instants before it lapsed.
+                        let target = wide[rng.next(wide.len() as u64) as usize].clone();
+                        let ok = match store.pin(
+                            &format!("w{serial}"),
+                            "wide",
+                            std::slice::from_ref(&target),
+                            1,
+                            now,
+                        ) {
+                            Ok(pin) => {
+                                let end = pin.expires_at;
+                                pins.push(pin.id);
+                                pin_ends.push(end);
+                                now = end + DAY / 2;
+                                forced.extend([end - 1, end - DAY / 2]);
+                                // Pass by pass, stopping on the pass that evicts the artifact:
+                                // its record spends the whole budget, so no chunk is retired yet.
+                                let mut ok = false;
+                                for _ in 0..64 {
+                                    match store.evict_oldest(now, limits) {
+                                        Ok(report) => {
+                                            ok = true;
+                                            if report.artifacts.contains(&target)
+                                                || !report.continuation
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                                ok
+                            }
+                            Err(_) => false,
+                        };
+                        (
+                            "wide-lapse",
+                            format!("pin {target} one day, lapse, evict at {now}"),
+                            ok,
+                        )
+                    }
+                    17 if pin_ends.iter().any(|end| *end > now) => {
+                        // Evict after a pin lapsed, then query where it was still active: an
+                        // owner that is evicted and, at those instants, covered by its pin.
+                        let end = *pin_ends.iter().filter(|end| **end > now).min().unwrap();
+                        now = end + DAY / 2;
+                        forced.extend([end - 1, end - DAY / 2]);
+                        let ok = store.evict_oldest(now, limits).is_ok();
+                        (
+                            "evict-lapsed",
+                            format!("evict at {now} after a pin ending {end}"),
+                            ok,
+                        )
                     }
                     7 if !pins.is_empty() => {
                         let pin = pins.swap_remove(rng.next(pins.len() as u64) as usize);
@@ -27894,6 +27978,9 @@ fn retention_answer_from_the_summary_equals_the_entry_walk_through_random_mutati
                         line[last] = b'\n';
                         let made = store.ingest(&format!("w{serial}"), "diff", "log", &line, now);
                         let ok = made.is_ok();
+                        if let Ok(artifact) = &made {
+                            wide.push(artifact.id.clone());
+                        }
                         published = Some(made);
                         ("wide", "ingest one eight-chunk record".to_owned(), ok)
                     }
@@ -27955,6 +28042,7 @@ fn retention_answer_from_the_summary_equals_the_entry_walk_through_random_mutati
                 now.saturating_sub(DAY / 2),
                 now.saturating_sub(5 * DAY),
             ];
+            nows.push(retired_probe);
             nows.append(&mut forced);
             for _ in 0..4 {
                 if !deadlines.is_empty() {
