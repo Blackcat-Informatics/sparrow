@@ -1,0 +1,26 @@
+ghprsq source head backlink metadata
+
+parent_hashes: 001cd25e7b7cc3854bf89a61e92b4e6b2503186c
+
+GhpRsq-Schema: 1
+GhpRsq-Merge-Style: structured-squash-head-backlink
+GhpRsq-GitHub-Repo: fleet/sparrow
+GhpRsq-GitHub-Pull-Request: 602
+GhpRsq-GitHub-PR-URL: http://lillith:7555/fleet/sparrow/pulls/602
+GhpRsq-Base-Ref: main
+GhpRsq-Base-OID: 93ccbe6138f438cdea4275734b8081a2d5f85d76
+GhpRsq-Head-Ref: paudley/593-settled-rule-re-ships-katamari-bucket
+GhpRsq-Head-OID: 001cd25e7b7cc3854bf89a61e92b4e6b2503186c
+GhpRsq-Result-Tree: 8f24cad86cce86f391c009cd3bed3f598f05dcff
+GhpRsq-Result-Commit: 7710cbff20f65cda33a6d352531732d538e33839
+GhpRsq-Parent-Hashes: 001cd25e7b7cc3854bf89a61e92b4e6b2503186c
+GhpRsq-Squash-Notes-SHA256: be5ca25532cfd9695d8b417bf0ff40cb20a8a7e04f342362ffc7e6aacdff0145
+GhpRsq-Stage-Evidence: none
+GhpRsq-Gate-Command: make check
+GhpRsq-Gate-Commit: 7710cbff20f65cda33a6d352531732d538e33839
+GhpRsq-Gate-Tree: 8f24cad86cce86f391c009cd3bed3f598f05dcff
+GhpRsq-Gate-Exit: 0
+GhpRsq-Gate-Started: 2026-11-27T21:12:13Z
+GhpRsq-Gate-Ended: 2026-11-27T21:23:13Z
+GhpRsq-Gate-Log-SHA256: 436a44737a89d55dc8d03357ba97f552b06d15a41fffad9cffa76de1bccab03b
+GhpRsq-Gate-Reused: no
