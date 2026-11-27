@@ -194,6 +194,18 @@ Two link quads tie a record to its blob, one carrying the SHA-256 of the record'
 <urn:sparrow:record:HEX> <urn:sparrow:vocab:payloadBlake3> "blake3:64 hex digits" <urn:sparrow:graph:archive-links> .
 ```
 
+A record whose RDF projection could not be built is archived with its exact bytes and its two
+link quads, and its projection graph is absent. One mark quad in `urn:sparrow:graph:archive-links`
+records that absence:
+
+```text
+<urn:sparrow:record:HEX> <urn:sparrow:vocab:projectionAbsent> "REASON" <urn:sparrow:graph:archive-links> .
+```
+
+`REASON` is the projection failure's label, for example `projection_failed`. The mark is present
+only for such a record. Its bytes and both digests are exact, and a query over the projection
+cannot find the record.
+
 Artifact bytes are not copied separately. Every byte of an artifact with records
 belongs to one of its records, and a recordless artifact has no bytes. A reader
 rebuilds an artifact by joining its records' blobs in source order. `sparrow-archive`
