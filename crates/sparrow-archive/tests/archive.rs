@@ -689,10 +689,12 @@ fn find_names_the_artifact_and_segment_of_a_payload_and_reports_absence() {
     assert!(text.contains("\"found\":false"), "{text}");
     assert!(text.contains("\"matches\":[]"), "{text}");
 
-    let malformed = run(&["find", root, "blake3:ABC"]);
+    let not_a_root = archive_dir.path().join("no-such-directory");
+    let malformed = run(&["find", not_a_root.to_str().unwrap(), "blake3:ABC"]);
+    let stderr = String::from_utf8(malformed.stderr).unwrap();
     assert_eq!(malformed.status.code(), Some(1));
     assert!(malformed.stdout.is_empty());
-    assert!(!malformed.stderr.is_empty());
+    assert!(stderr.contains("is not a payload id"), "{stderr}");
 }
 
 /// A damaged segment never disappears from a lookup. `find` fails and names
