@@ -765,8 +765,8 @@ An existing spool unit may run an untracked copy of an earlier program that read
 `journalctl --cursor-file=CURSOR --follow`. journalctl writes that cursor file when it ends by SIGTERM or SIGINT and
 when its output pipe closes, and writes nothing on SIGKILL. Entries journalctl has printed but the spool has not
 appended when it ends this way are lost from the spool. A SIGKILL replays from the last written cursor instead, so
-it duplicates entries rather than losing them. This is journalctl's documented cursor-file behavior; the loss under
-a stop was not measured.
+it duplicates entries rather than losing them. The `--help` and man page text say only that the cursor is written at
+the end; the signal and closed-pipe cases come from running journalctl, not from its documentation.
 
 The tracked program writes its cursor after each append, so a stop or crash never skips an entry it has not
 appended: the next run resumes after the last appended entry. The two programs store the same journal cursor
@@ -781,12 +781,12 @@ authorization for the window in which it is run. Placeholders: `EXISTING_UNIT` i
 
 0. Record the state, read-only: `systemctl --user is-active EXISTING_UNIT`, `ls EXISTING_DIR | tail -n 3`,
    `cat EXISTING_CURSOR`, and the source's current `rule` and `pattern` lines from the shipper configuration. Check:
-   the values are recorded in the task record before any step below. Undo: none.
+   the values are recorded in the task record before step 1. Undo: none.
 
-   Stop before step 5 if `pattern` in SOURCE matches files other than `OLD_PATTERN`, or if `EXISTING_DIR` is shared
+   Stop before step 1 if `pattern` in SOURCE matches files other than `OLD_PATTERN`, or if `EXISTING_DIR` is shared
    with another forwarder. The tracked program writes `unit-spool-*.jsonl`, which the existing pattern does not
    match, so step 5 would stop shipping those other files. That case needs a decision on the shipper configuration
-   before any step below, and this move does not make it.
+   before step 1, and this move does not make it.
 
 1. Back up the unit file and the cursor file.
    `cp -p UNIT_FILE UNIT_FILE.pre-move` and `cp -p EXISTING_CURSOR EXISTING_CURSOR.pre-move`
@@ -816,18 +816,20 @@ authorization for the window in which it is run. Placeholders: `EXISTING_UNIT` i
    Undo: `systemctl --user stop EXISTING_UNIT`
 
 5. Let the old files finish shipping, then move the source to the new file pattern. Two candidate writes, each
-   changing one line of the `[[source]]` entry, each validated by the loader command of the install's step 5 and
-   renamed into place.
+   changing the `[[source]]` entry's lines named below, each candidate validated by the loader command of the install's
+   step 5 and renamed into place.
    a. Set `rule = "settled"` for SOURCE, unless step 0 recorded it as settled already. The old files are no longer
       appended to, so a settled rule ships the newest one; a daily rule would hold it indefinitely. Check: after a
-      shipper run past `settle_seconds`, every name matching `OLD_PATTERN` in `EXISTING_DIR` is in the ledger, by
-      its path: `ls EXISTING_DIR/OLD_PATTERN | xargs -n1 basename` against
+      shipper run that reports no further queued files for SOURCE, every name matching `OLD_PATTERN` in `EXISTING_DIR`
+      is in the ledger, by its path: `ls EXISTING_DIR/OLD_PATTERN | xargs -n1 basename` against
       `cut -f2 ~/.local/state/sparrow/ship/SOURCE.ledger`.
       Undo: write the candidate with the rule step 0 recorded, `OLD_RULE`.
-   b. Set `pattern = "unit-spool-*.jsonl"` and `rule = "daily"` for SOURCE. Check: after a shipper run past the first
-      new file's settle time, the ledger names a `unit-spool-*.jsonl` file. The run's `SOURCE: queued N` line alone
-      does not prove this, because the shipper prints it with N = 0.
-      Undo: write the candidate with the pattern step 0 recorded, `OLD_PATTERN_IN_SOURCE`, and the rule `OLD_RULE`.
+   b. Set `pattern = "unit-spool-*.jsonl"` and `rule = "daily"` for SOURCE, two lines in one candidate. The daily rule
+      holds the newest matching file, so the check needs a second `unit-spool-*.jsonl` file in `EXISTING_DIR`, and
+      the first one past its settle time. Check: after a shipper run past that point, the ledger names the first
+      `unit-spool-*.jsonl` file. The run's `SOURCE: queued N` line alone does not prove this, because the shipper
+      prints it with N = 0.
+      Undo: write one candidate with the pattern step 0 recorded, `OLD_PATTERN_IN_SOURCE`, and the rule `OLD_RULE`.
 
 Each undo changes the recorded lines one at a time by a candidate, never by restoring a saved whole file, so a later
 change to the configuration survives.

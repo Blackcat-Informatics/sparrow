@@ -94,7 +94,7 @@ DOUBLE
 chmod +x "$endless/journalctl"
 mkdir -p "$work/stalled" && mkdir "$work/stalled/unit-spool-20261127T1310.jsonl"
 rc=0
-PATH=$endless:$PATH timeout 30 bash "$script" "$unit" "$work/stalled" "$work/stalled.cursor" >/dev/null 2>&1 || rc=$?
+PATH=$endless:$PATH env --default-signal=PIPE timeout 30 bash "$script" "$unit" "$work/stalled" "$work/stalled.cursor" >/dev/null 2>&1 || rc=$?
 [[ $rc -ne 124 && $rc -ne 0 ]] || fail "a failed append did not end the spool (exit $rc)"
 
 # Bad settings refuse to start.
