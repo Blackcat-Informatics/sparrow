@@ -1,0 +1,9 @@
+# Settling before the spool closes a bucket ships a file that is still appended to.
+[[source]]
+name = "unit-spool"
+dir = "/var/lib/sparrow/spool/units"
+pattern = "unit-spool-*.jsonl"
+rule = "settled"
+format = "jsonl"
+settle_seconds = 300
+exclude = []

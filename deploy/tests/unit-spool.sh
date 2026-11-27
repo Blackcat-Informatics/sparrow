@@ -112,6 +112,39 @@ cmp -s "$work/late.expected" "$late/unit-spool-20261127T1400.jsonl" \
     || fail "late records did not join the newest bucket after its earlier line"
 [[ $(ls -1 -- "$late" | wc -l) -eq 2 ]] || fail "the spool created a bucket other than the newest"
 
+# Closing, on a fake clock. A newest file unwritten for 599 seconds is still open: a late line joins it.
+base=$(date -u -d '2026-11-27 14:00:00' +%s)
+open=$work/open
+mkdir -p "$open"
+printf '%s\n' '{"message":"earlier"}' > "$open/unit-spool-20261127T1400.jsonl"
+touch -d "@$base" "$open/unit-spool-20261127T1400.jsonl"
+SPARROW_UNIT_SPOOL_NOW=$((base + 599)) SPARROW_UNIT_SPOOL_OWN_LINES=keep bash "$script" "$unit" "$open" "$work/open.cursor"
+{ printf '%s\n' '{"message":"earlier"}'; cat -- "$fixtures/keep.jsonl"; } > "$work/open.expected"
+cmp -s "$work/open.expected" "$open/unit-spool-20261127T1400.jsonl" || fail "an open bucket (599 seconds quiet) did not take the late lines"
+[[ $(ls -1 -- "$open" | wc -l) -eq 1 ]] || fail "an open bucket gained a file"
+
+# At 601 seconds the same bucket is closed: its bytes stay, and the late lines start the current bucket (14:10).
+closed=$work/closed
+mkdir -p "$closed"
+printf '%s\n' '{"message":"earlier"}' > "$closed/unit-spool-20261127T1400.jsonl"
+touch -d "@$base" "$closed/unit-spool-20261127T1400.jsonl"
+cp -- "$closed/unit-spool-20261127T1400.jsonl" "$work/closed-old.before"
+SPARROW_UNIT_SPOOL_NOW=$((base + 601)) SPARROW_UNIT_SPOOL_OWN_LINES=keep bash "$script" "$unit" "$closed" "$work/closed.cursor"
+cmp -s "$closed/unit-spool-20261127T1400.jsonl" "$work/closed-old.before" || fail "a closed bucket (601 seconds quiet) was appended to"
+cmp -s "$closed/unit-spool-20261127T1410.jsonl" "$fixtures/keep.jsonl" || fail "late lines after a closed bucket did not start the current bucket"
+[[ $(ls -1 -- "$closed" | wc -l) -eq 2 ]] || fail "a closed bucket produced more than one new file"
+
+# A clock behind the newest bucket: the closed file is 2099-12-31 23:50, the clock says 14:10 on 2026-11-27,
+# so the late lines start the bucket after it (2100-01-01 00:00), and the closed file keeps its bytes.
+behind=$work/behind
+mkdir -p "$behind"
+printf '%s\n' '{"message":"earlier"}' > "$behind/unit-spool-20991231T2350.jsonl"
+touch -d "@$base" "$behind/unit-spool-20991231T2350.jsonl"
+cp -- "$behind/unit-spool-20991231T2350.jsonl" "$work/behind-old.before"
+SPARROW_UNIT_SPOOL_NOW=$((base + 601)) SPARROW_UNIT_SPOOL_OWN_LINES=keep bash "$script" "$unit" "$behind" "$work/behind.cursor"
+cmp -s "$behind/unit-spool-20991231T2350.jsonl" "$work/behind-old.before" || fail "a closed bucket was appended to with a clock behind it"
+cmp -s "$behind/unit-spool-21000101T0000.jsonl" "$fixtures/keep.jsonl" || fail "a clock behind the newest bucket did not start the bucket after it"
+
 # Bad settings refuse to start.
 if SPARROW_UNIT_SPOOL_OWN_LINES=maybe bash "$script" "$unit" "$work/x" "$work/x.cursor" 2>/dev/null; then
     fail "an unknown OWN_LINES value was accepted"

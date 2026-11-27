@@ -1,0 +1,9 @@
+# A unit-spool source settles after the spool's quiet period (600 seconds).
+[[source]]
+name = "unit-spool"
+dir = "/var/lib/sparrow/spool/units"
+pattern = "unit-spool-*.jsonl"
+rule = "settled"
+format = "jsonl"
+settle_seconds = 900
+exclude = []

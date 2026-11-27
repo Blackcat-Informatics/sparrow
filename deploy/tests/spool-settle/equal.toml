@@ -1,0 +1,9 @@
+# Settling at exactly the quiet period is not strictly later than it, so the source is refused.
+[[source]]
+name = "unit-spool"
+dir = "/var/lib/sparrow/spool/units"
+pattern = "unit-spool-*.jsonl"
+rule = "settled"
+format = "jsonl"
+settle_seconds = 600
+exclude = []

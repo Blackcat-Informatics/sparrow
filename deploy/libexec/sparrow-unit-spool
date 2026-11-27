@@ -23,8 +23,11 @@
 #     from the unit's own process, so a reader can tell the two apart.
 # The bucket name is a transport grouping, not the time of the entry; each record keeps its own time. A bucket
 # comes from the entry's timestamp, except that a line never joins a bucket older than the newest bucket already
-# in SPOOL_DIR: a late line joins that newest bucket. Once a newer bucket exists, this program never appends to
-# an older one.
+# in SPOOL_DIR. While that newest file is open, a late line joins it. Once it has gone unwritten for
+# SPOOL_QUIET_SECONDS it is closed, and a line that is not newer than it starts a new bucket instead, so this
+# program never appends to a closed file. The shipper must settle a spool source strictly later than
+# SPOOL_QUIET_SECONDS (see docs/deployment.md). SPARROW_UNIT_SPOOL_NOW, when set, replaces the system clock
+# (seconds since the epoch) for the closing decision; the tests use it to set exact ages.
 #
 # The cursor file is written after each record is appended, so it never runs ahead of the spool. A
 # process crash between the append and the cursor write spools that record again on the next run: across
@@ -55,6 +58,12 @@ case $own_lines in
 esac
 (umask 077 && mkdir -p -- "$dir" "$(dirname -- "$cursor")")
 
+# A bucket is closed once its file has gone unwritten for this many seconds. A closed bucket is never
+# appended to again. Every shipper source fed by this spool must settle strictly later than this period
+# (settle_seconds greater than SPOOL_QUIET_SECONDS), so a file is shipped only after it has closed.
+SPOOL_QUIET_SECONDS=600
+readonly SPOOL_QUIET_SECONDS
+
 # The newest bucket already in the spool directory, printed as YYYYMMDDTHHMM, or nothing when there is none.
 newest_bucket() {
     local LC_ALL=C files=("$1"/unit-spool-*.jsonl) newest
@@ -63,10 +72,47 @@ newest_bucket() {
     printf '%s\n' "${newest%.jsonl}"
 }
 
+# The start of bucket NAME (YYYYMMDDTHHMM, UTC) in seconds since the epoch.
+bucket_epoch() {
+    local n=$1
+    date -u -d "${n:0:4}-${n:4:2}-${n:6:2} ${n:9:2}:${n:11:2}:00" +%s
+}
+
+# The name of the ten-minute bucket that holds the UTC instant EPOCH.
+epoch_bucket() {
+    date -u -d "@$(( $1 - $1 % 600 ))" +%Y%m%dT%H%M
+}
+
+# The bucket a line goes into, given the bucket its timestamp names, the newest bucket so far and the
+# newest file's age. A late line joins the newest bucket while it is open. Once it is closed, a line that is
+# not newer than it starts the bucket of the current time, or the bucket after the newest one when the clock
+# has gone backwards, so the closed file is never appended to.
+route_bucket() {
+    local LC_ALL=C bucket=$1 newest=$2 age=$3 now=$4 target
+    if [[ -z $newest ]]; then
+        printf '%s\n' "$bucket"
+        return
+    fi
+    if (( age < SPOOL_QUIET_SECONDS )); then
+        [[ $bucket < $newest ]] && bucket=$newest
+        printf '%s\n' "$bucket"
+        return
+    fi
+    if [[ $bucket > $newest ]]; then
+        printf '%s\n' "$bucket"
+        return
+    fi
+    target=$(epoch_bucket "$now")
+    if [[ $target < $newest || $target == "$newest" ]]; then
+        target=$(epoch_bucket "$(( $(bucket_epoch "$newest") + 600 ))")
+    fi
+    printf '%s\n' "$target"
+}
+
 # JSON entries on stdin, spooled into SPOOL_DIR. $1 is the cursor file to advance after each record
 # is appended, or empty for the backfill pass, which writes its cursor once it has finished.
 spool() {
-    local LC_ALL=C cursor_out=$1 bucket cur line newest
+    local LC_ALL=C cursor_out=$1 bucket cur line newest now age
     newest=$(newest_bucket "$dir")
     jq -r --unbuffered --arg unit "$unit" --argjson keep "$keep" '
 (._SYSTEMD_UNIT == $unit or ._SYSTEMD_USER_UNIT == $unit) as $own
@@ -88,12 +134,13 @@ spool() {
 | ((($us / 1000000 | floor) / 600 | floor) * 600 | strftime("%Y%m%dT%H%M")) as $bucket
 | "\($bucket)\t\($cursor)\t\(tojson)"' |
         while IFS=$'\t' read -r bucket cur line; do
-            # A bucket older than the newest one is never appended to: a late line joins the newest bucket.
-            if [[ -n $newest ]] && [[ $bucket < $newest ]]; then
-                bucket=$newest
-            else
-                newest=$bucket
+            now=${SPARROW_UNIT_SPOOL_NOW:-$(date +%s)}
+            age=0
+            if [[ -n $newest ]]; then
+                age=$(( now - $(stat -c %Y -- "$dir/unit-spool-$newest.jsonl") ))
             fi
+            bucket=$(route_bucket "$bucket" "$newest" "$age" "$now")
+            newest=$bucket
             printf '%s\n' "$line" >> "$dir/unit-spool-$bucket.jsonl"
             if [[ -n $cursor_out ]]; then
                 printf '%s\n' "$cur" > "$cursor_out.tmp"
