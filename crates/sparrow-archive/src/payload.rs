@@ -28,10 +28,11 @@ fn is_payload_id(value: &str) -> bool {
 
 /// Every artifact among the segments at `paths` whose payload identity is `payload_id`, one
 /// match per segment that names it, in the order of `paths`. An empty result means no
-/// segment holds that payload. Nothing is written anywhere, and no artifact's bytes are read.
+/// segment holds that payload. Nothing is written anywhere.
 ///
-/// Every segment is decoded, as [`crate::extract`] does, so a damaged segment fails the call
-/// by name even when it does not hold the payload.
+/// Every segment is decoded in memory, as [`crate::extract`] does, so a damaged segment fails
+/// the call by name even when it does not hold the payload. No index exists, so each call
+/// reads the whole archive directory.
 ///
 /// # Errors
 /// A `payload_id` that is not `blake3:` followed by 64 lower-case hex digits, or a segment

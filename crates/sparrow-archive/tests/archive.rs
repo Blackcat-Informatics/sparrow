@@ -653,3 +653,44 @@ fn an_artifact_is_found_by_payload_id_live_and_in_the_archive() {
     assert!(output.status.success(), "{:?}", output.stderr);
     assert_eq!(output.stdout, FIRST);
 }
+
+/// Value (#588): a person finds the artifact and segment file that hold one payload with only
+/// the directory and the binary. `find` names that artifact and no other, reports an absent
+/// payload as `found:false` with exit 0, and refuses a payload id that is not in canonical
+/// form with a nonzero exit and nothing on stdout.
+#[test]
+fn find_names_the_artifact_and_segment_of_a_payload_and_reports_absence() {
+    let archive_dir = tempfile::tempdir().unwrap();
+    let root = archive_dir.path().to_str().unwrap();
+    let (ids, path) = archive_two(archive_dir.path());
+    let payload = purrdf::gts::writer::digest_string(FIRST);
+
+    let found = run(&["find", root, &payload]);
+    let text = String::from_utf8(found.stdout).unwrap();
+    assert_eq!(found.status.code(), Some(0), "{text}");
+    assert!(text.contains("\"found\":true"), "{text}");
+    assert!(
+        text.contains(&format!("\"artifact_id\":\"{}\"", ids[0])),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("\"path\":\"{}\"", path.display())),
+        "{text}"
+    );
+    assert!(
+        !text.contains(&ids[1]),
+        "the lookup names only the payload's artifact: {text}"
+    );
+
+    let absent = format!("blake3:{}", "0".repeat(64));
+    let missing = run(&["find", root, &absent]);
+    let text = String::from_utf8(missing.stdout).unwrap();
+    assert_eq!(missing.status.code(), Some(0), "{text}");
+    assert!(text.contains("\"found\":false"), "{text}");
+    assert!(text.contains("\"matches\":[]"), "{text}");
+
+    let malformed = run(&["find", root, "blake3:ABC"]);
+    assert_eq!(malformed.status.code(), Some(1));
+    assert!(malformed.stdout.is_empty());
+    assert!(!malformed.stderr.is_empty());
+}
