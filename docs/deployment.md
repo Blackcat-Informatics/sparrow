@@ -709,9 +709,9 @@ the spool's files are kept.
 
 #### Arrival check
 
-After step 6, expect nothing in the store for the first minutes. The first line reaches the store only after its
-ten-minute bucket file is complete, which needs the next bucket file to exist, and then one shipper run: up to
-about ten minutes plus one run, so about 15 to 20 minutes for the first arrival. Silence in that time is not a failure.
+After step 6, expect nothing in the store for the first minutes. A bucket reaches the store `settle_seconds` (900)
+after its last write, plus one shipper run, so the first arrival takes about 15 minutes. Silence in that time is not a
+failure.
 
 - In the spool, for one unit's lines: `jq -c 'select(.unit == "UNIT.service")' ~/.local/state/sparrow/unit-spool/UNIT.service/*.jsonl`
 - In the store: `sparrow SOCKET records --text UNIT.service`. Its `total_items` grows as lines arrive. A stored
@@ -720,13 +720,13 @@ about ten minutes plus one run, so about 15 to 20 minutes for the first arrival.
 
 #### Separate step: the bucket rule of a source whose files grow
 
-This step is declined independently of the install above. It changes one line of the shipper configuration and is
+This step is declined independently of the install above. It changes two lines of the shipper configuration and is
 made only after install steps 0 to 6 have held.
 
 A. Back up the configuration next to the live file.
-   `cp -p ~/.config/sparrow/ship.toml ~/.config/sparrow/ship.toml.pre-SOURCE-daily`
+   `cp -p ~/.config/sparrow/ship.toml ~/.config/sparrow/ship.toml.pre-SOURCE-settled`
    Check: `cmp` of the two files prints nothing.
-   Undo: `rm -f ~/.config/sparrow/ship.toml.pre-SOURCE-daily`
+   Undo: `rm -f ~/.config/sparrow/ship.toml.pre-SOURCE-settled`
 
 B. Write a candidate beside the live file, with two lines changed in the `[[source]]` block whose name is
    `SOURCE`: `rule` becomes `"settled"` and `settle_seconds` becomes `900`, which is greater than the spool's
@@ -736,9 +736,9 @@ B. Write a candidate beside the live file, with two lines changed in the `[[sour
 
 C. Rename the candidate into place: `mv -f ~/.config/sparrow/ship.toml.candidate ~/.config/sparrow/ship.toml`.
    Check: the next timer run logs `SOURCE: queued` in `journalctl --user -u sparrow-ship.service`. After that
-   run, each bucket file that is not the newest appears in the ledger exactly once, and the repeated-path
+   run, each bucket file settled past `settle_seconds` appears in the ledger exactly once, and the repeated-path
    count does not grow: `cut -f2 ~/.local/state/sparrow/ship/SOURCE.ledger | sort | uniq -d | wc -l`.
-   Undo: `cp -p ~/.config/sparrow/ship.toml.pre-SOURCE-daily ~/.config/sparrow/ship.toml.restore && mv -f ~/.config/sparrow/ship.toml.restore ~/.config/sparrow/ship.toml`
+   Undo: `cp -p ~/.config/sparrow/ship.toml.pre-SOURCE-settled ~/.config/sparrow/ship.toml.restore && mv -f ~/.config/sparrow/ship.toml.restore ~/.config/sparrow/ship.toml`
 
 Under the settled rule with `settle_seconds = 900`, the newest bucket reaches Sparrow about 15 minutes after its
 last line, whether or not a newer bucket exists. That delay is the expected behaviour, not a fault.
