@@ -14,7 +14,9 @@ use std::process::ExitCode;
 
 use purrdf_lex::json::{self, Value};
 
-use sparrow_archive::{ArchiveError, Segment, Summary, extract, find_payload, list_segments};
+use sparrow_archive::{
+    ArchiveError, Segment, Summary, extract, find_payload, list_segments, validate_payload_id,
+};
 
 const USAGE: &str =
     "usage: sparrow-archive list|verify DIR | extract DIR ARTIFACT_ID | find DIR PAYLOAD_ID";
@@ -212,6 +214,10 @@ fn take(root: &Path, artifact_id: &str) -> ExitCode {
 /// Each call decodes every segment under `root`, because the archive keeps no payload index;
 /// a damaged segment fails the call by name, wherever the payload is.
 fn find(root: &Path, payload_id: &str) -> ExitCode {
+    if let Err(error) = validate_payload_id(payload_id) {
+        let _ = writeln!(std::io::stderr(), "sparrow-archive: {error}");
+        return ExitCode::FAILURE;
+    }
     let found = list_segments(root)
         .and_then(|paths| find_payload(&paths, payload_id))
         .map_err(|error| {

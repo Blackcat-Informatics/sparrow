@@ -15,15 +15,25 @@ pub struct PayloadMatch {
     pub path: PathBuf,
 }
 
-/// Whether `value` has the payload identity form the archive writes: `blake3:` followed by
-/// exactly 64 lower-case hex digits.
-fn is_payload_id(value: &str) -> bool {
-    value.strip_prefix("blake3:").is_some_and(|hex| {
+/// Check that `value` has the payload identity form the archive writes: `blake3:` followed
+/// by exactly 64 lower-case hex digits.
+///
+/// # Errors
+/// [`ArchiveError::InvalidPayloadId`] when `value` has any other form.
+pub fn validate_payload_id(value: &str) -> Result<(), ArchiveError> {
+    let canonical = value.strip_prefix("blake3:").is_some_and(|hex| {
         hex.len() == 64
             && hex
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    })
+    });
+    if canonical {
+        Ok(())
+    } else {
+        Err(ArchiveError::InvalidPayloadId {
+            value: value.to_owned(),
+        })
+    }
 }
 
 /// Every artifact among the segments at `paths` whose payload identity is `payload_id`, one
@@ -41,11 +51,7 @@ pub fn find_payload(
     paths: &[PathBuf],
     payload_id: &str,
 ) -> Result<Vec<PayloadMatch>, ArchiveError> {
-    if !is_payload_id(payload_id) {
-        return Err(ArchiveError::InvalidPayloadId {
-            value: payload_id.to_owned(),
-        });
-    }
+    validate_payload_id(payload_id)?;
     let mut matches = Vec::new();
     for path in paths {
         let segment = Segment::open(path)?;

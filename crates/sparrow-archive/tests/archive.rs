@@ -654,7 +654,7 @@ fn an_artifact_is_found_by_payload_id_live_and_in_the_archive() {
     assert_eq!(output.stdout, FIRST);
 }
 
-/// Value (#588): a person finds the artifact and segment file that hold one payload with only
+/// A person finds the artifact and segment file that hold one payload with only
 /// the directory and the binary. `find` names that artifact and no other, reports an absent
 /// payload as `found:false` with exit 0, and refuses a payload id that is not in canonical
 /// form with a nonzero exit and nothing on stdout.
@@ -695,7 +695,7 @@ fn find_names_the_artifact_and_segment_of_a_payload_and_reports_absence() {
     assert!(!malformed.stderr.is_empty());
 }
 
-/// Value (#588): a damaged segment never disappears from a lookup. `find` fails and names
+/// A damaged segment never disappears from a lookup. `find` fails and names
 /// the damaged file even when the payload sits in an intact segment, because a skipped
 /// segment could report the payload absent when it is present. Nothing reaches stdout.
 #[test]
