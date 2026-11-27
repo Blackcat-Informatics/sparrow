@@ -276,7 +276,8 @@ pub(super) fn report(
                 ),
                 Migration::SourceSummary => (
                     values[&Counter::SourceSummaryDone],
-                    source_summary::progress(|key| reader.get(key.as_bytes()))?.watermark(),
+                    source_summary::progress(|key| reader.get(key.as_bytes()))?
+                        .watermark(source_summary::RECORD_START_WATERMARK),
                 ),
                 Migration::SourceContext => (
                     values[&Counter::SourceContextDone],
@@ -288,7 +289,8 @@ pub(super) fn report(
                 ),
                 Migration::OwnerSummary => (
                     values[&Counter::OwnerSummaryDone],
-                    owner_summary::progress(|key| reader.get(key.as_bytes()))?.watermark(),
+                    owner_summary::progress(|key| reader.get(key.as_bytes()))?
+                        .watermark(owner_summary::RECORD_START_WATERMARK),
                 ),
             };
             // The source-context rebuild latches corrupt metadata durably, not per session.
@@ -331,7 +333,7 @@ impl Writer {
                 }
                 Migration::SourceSummary => {
                     source_summary::progress(|key| Ok(self.db.get(key)?))?
-                        .watermark()
+                        .watermark(source_summary::RECORD_START_WATERMARK)
                         .is_none()
                 }
                 Migration::SourceContext => !source_context::pending(&self.db)?,

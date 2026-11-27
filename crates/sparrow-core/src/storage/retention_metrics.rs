@@ -77,16 +77,29 @@ struct Ownership {
     pinned: bool,
 }
 
-struct Admission<'a> {
-    limits: RetentionReadLimits,
-    visits: u64,
-    remaining: usize,
-    payload: u64,
-    cancellation: &'a QueryCancellation,
+/// Catalog bytes charged for each distinct digest the entry walk's ownership map holds: a
+/// worst-case bound, not a typical size. The map is a `BTreeMap<String, Ownership>` whose keys
+/// are 64-byte digests. Each non-root B-tree node holds at least 5 keys, and an internal node is
+/// 552 B (allocated as 560 B), so a key costs at most 112 B of node; its heap key is a 64-byte
+/// request, 80 B under glibc malloc. That is 192 B. The charge rounds it up to 256 B to cover
+/// allocator rounding. The bound holds for a map of seven or more entries. A root node is
+/// allocated whole, so a map of one or two entries can exceed its charge by up to 288 B in total.
+/// That moves the refusal point only, never the answer.
+const OWNER_ENTRY_CHARGE: usize = 256;
+
+/// The admission state of one account: its visit count, catalog budget, payload budget and
+/// cancellation. The frozen reference walk shares it, so visits are counted by one body.
+pub(super) struct Admission<'a> {
+    pub(super) limits: RetentionReadLimits,
+    pub(super) visits: u64,
+    pub(super) remaining: usize,
+    pub(super) payload: u64,
+    pub(super) cancellation: &'a QueryCancellation,
 }
 
 impl Admission<'_> {
-    fn visit(&mut self) -> Result<(), Error> {
+    /// Count one catalog row or ownership reference, or fail on cancellation or `max_visits`.
+    pub(super) fn visit(&mut self) -> Result<(), Error> {
         self.cancellation.checkpoint()?;
         if self.visits >= self.limits.max_visits as u64 {
             return Err(Error::new(
@@ -98,6 +111,40 @@ impl Admission<'_> {
         Ok(())
     }
 
+    /// Fold one occurrence of `digest` into the ownership map: one visit, the canonical
+    /// identity check, the charge for a new digest, then the owner's counts and flags.
+    fn owner(
+        &mut self,
+        map: &mut BTreeMap<String, Ownership>,
+        digest: &str,
+        live: bool,
+        pinned: bool,
+    ) -> Result<(), Error> {
+        self.visit()?;
+        if hex::decode_32_canonical(digest).is_none() {
+            return Err(Error::new(
+                "STORAGE_FAILURE",
+                "retention ownership has a noncanonical payload identity",
+            ));
+        }
+        if !map.contains_key(digest) {
+            self.remaining = self
+                .remaining
+                .checked_sub(OWNER_ENTRY_CHARGE)
+                .ok_or_else(|| {
+                    Error::new(
+                        "RESOURCE_LIMIT",
+                        "retention ownership map exceeds catalog_bytes",
+                    )
+                })?;
+        }
+        let owner = map.entry(digest.to_owned()).or_default();
+        owner.published = add(owner.published, 1)?;
+        owner.live |= live;
+        owner.pinned |= pinned;
+        Ok(())
+    }
+
     fn owners(
         &mut self,
         map: &mut BTreeMap<String, Ownership>,
@@ -106,25 +153,7 @@ impl Admission<'_> {
         pinned: bool,
     ) -> Result<(), Error> {
         for digest in chunks {
-            self.visit()?;
-            if hex::decode_32_canonical(digest).is_none() {
-                return Err(Error::new(
-                    "STORAGE_FAILURE",
-                    "retention ownership has a noncanonical payload identity",
-                ));
-            }
-            if !map.contains_key(digest) {
-                self.remaining = self.remaining.checked_sub(512).ok_or_else(|| {
-                    Error::new(
-                        "RESOURCE_LIMIT",
-                        "retention ownership map exceeds catalog_bytes",
-                    )
-                })?;
-            }
-            let owner = map.entry(digest.clone()).or_default();
-            owner.published = add(owner.published, 1)?;
-            owner.live |= live;
-            owner.pinned |= pinned;
+            self.owner(map, digest, live, pinned)?;
         }
         Ok(())
     }
@@ -181,13 +210,15 @@ fn summaries_ready(writer: &Writer) -> Result<bool, Error> {
     Ok(positions.seeded() && owner_summary::complete(|key| reader.get(key.as_bytes()))?)
 }
 
-fn add(left: u64, right: u64) -> Result<u64, Error> {
+/// Checked accounting addition; overflow is a storage failure, never a wrapped total.
+pub(super) fn add(left: u64, right: u64) -> Result<u64, Error> {
     left.checked_add(right)
         .ok_or_else(|| Error::new("STORAGE_FAILURE", "retention accounting overflow"))
 }
 
 impl RetentionMetrics {
-    fn observe(&mut self, received: u64) -> Result<(), Error> {
+    /// Fold one eligible receipt into the oldest receipt; a receipt later than `as_of` fails.
+    pub(super) fn observe(&mut self, received: u64) -> Result<(), Error> {
         if received > self.as_of {
             return Err(Error::new(
                 "STORAGE_FAILURE",
@@ -399,20 +430,14 @@ impl Store {
                     .map_err(|e| Error::new("STORAGE_FAILURE", e.to_string()))?;
                 match prefix {
                     b"artifact:" => {
-                        let before_envelope = admission.remaining;
-                        let artifact = manifest_retire::Envelope::read(
-                            &writer,
+                        let before_row = admission.remaining;
+                        let artifact = manifest_retire::Row::read(
+                            &writer.db,
                             id,
                             bytes,
-                            limits.max_visits,
                             &mut admission.remaining,
+                            |_, _, _| Ok(()),
                         )?;
-                        if artifact.pending() != artifact.prefix.len() as u64 {
-                            return Err(Error::new(
-                                "RESOURCE_LIMIT",
-                                "retention manifest ownership exceeds max_visits",
-                            ));
-                        }
                         let pinned = protected.contains(&artifact.id);
                         if artifact.expires_at <= artifact.received_at {
                             return Err(Error::new(
@@ -433,12 +458,16 @@ impl Store {
                                 add(report.pinned_artifacts, u64::from(pinned))?;
                             report.observe(artifact.received_at)?;
                         }
-                        let envelope_charge = before_envelope - admission.remaining;
-                        admission.owners(&mut owners, &artifact.prefix, live, live && pinned)?;
-                        // The envelope is dropped here. Its parse cost bounds the peak while
-                        // it is held, so it is refunded; only the ownership entries added
-                        // above outlive it and keep their own charge.
-                        admission.remaining += envelope_charge;
+                        let row_charge = before_row - admission.remaining;
+                        // The chunks are folded in a second pass over the same row: its scalars
+                        // may follow its chunk array, so `live` is known only after the first.
+                        artifact.fold(bytes, |digest, _| {
+                            admission.owner(&mut owners, digest, live, live && pinned)
+                        })?;
+                        // The row is dropped here. Its read cost bounds the peak while it is
+                        // held, so it is refunded; the ownership entries added above keep
+                        // their own charge.
+                        admission.remaining += row_charge;
                     }
                     b"record:" => {
                         let shape_before = admission.remaining;

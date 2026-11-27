@@ -245,6 +245,9 @@ fn record_summary(id: &str, row: &[u8]) -> Result<Summary, Error> {
     })
 }
 
+/// The status watermark of the record phase's start in the owner summary migration.
+pub(super) const RECORD_START_WATERMARK: &str = "record: start";
+
 /// Committed migration position.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Progress {
@@ -256,7 +259,7 @@ pub(super) enum Progress {
 }
 
 impl Progress {
-    fn encode(&self) -> Vec<u8> {
+    pub(super) fn encode(&self) -> Vec<u8> {
         match self {
             Self::Complete => vec![0],
             Self::Artifacts(after) => {
@@ -266,13 +269,14 @@ impl Progress {
         }
     }
 
-    /// Opaque status watermark; absent once complete.
-    pub(super) fn watermark(&self) -> Option<String> {
+    /// Opaque status watermark; absent once complete. `record_start` is the label of the record
+    /// phase's start, which each migration reports under its own shipped string.
+    pub(super) fn watermark(&self, record_start: &str) -> Option<String> {
         match self {
             Self::Complete => None,
             Self::Artifacts(None) => Some("start".to_owned()),
             Self::Artifacts(Some(id)) | Self::Records(Some(id)) => Some(id.clone()),
-            Self::Records(None) => Some("record: start".to_owned()),
+            Self::Records(None) => Some(record_start.to_owned()),
         }
     }
 }
@@ -850,5 +854,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// INVARIANT: with the owner summary incomplete, the entry walk answers one artifact of
+    /// 49,000 distinct chunks, and its account equals the summary account of the same store.
+    /// Its payload totals equal the sum of the published chunks (each 8 bytes), and its visits
+    /// are one per artifact row, one per chunk occurrence and one per reference row.
+    #[test]
+    fn entry_walk_answers_one_artifact_of_49000_chunks_with_its_summary_totals() {
+        const CHUNKS: u64 = 49_000;
+        let limits = crate::RetentionReadLimits {
+            max_visits: 100_000,
+            catalog_bytes: 32 * 1024 * 1024,
+            payload_bytes: 1024 * 1024 * 1024,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), sparrow_test_support::storage_config!(Config)).unwrap();
+        {
+            let writer = store.lock().unwrap();
+            store_chunks(&writer, 0..CHUNKS, 1);
+            publish_owner(&writer, "artifact:max-0000", 0..CHUNKS);
+        }
+        let summary_complete = {
+            let writer = store.lock().unwrap();
+            let reader = Reader::db(&writer.db);
+            complete(|key| reader.get(key.as_bytes())).unwrap()
+        };
+        assert!(summary_complete);
+        let summary = store.retention_metrics(5, limits).unwrap();
+        drop(store);
+        let store = Store::open(dir.path(), sparrow_test_support::storage_config!(Config)).unwrap();
+        {
+            let writer = store.lock().unwrap();
+            lower_owner_summary_for_legacy_fixture(&writer.db).unwrap();
+        }
+        drop(store);
+        let store = Store::open(dir.path(), sparrow_test_support::storage_config!(Config)).unwrap();
+        {
+            let writer = store.lock().unwrap();
+            let reader = Reader::db(&writer.db);
+            assert!(!complete(|key| reader.get(key.as_bytes())).unwrap());
+        }
+        let walk = store.retention_metrics(5, limits).unwrap();
+        let published_bytes = CHUNKS * 8;
+        assert_eq!(walk.live_artifacts, 1);
+        assert_eq!(walk.payload_chunks, CHUNKS);
+        assert_eq!(walk.owned_payload_bytes, published_bytes);
+        assert_eq!(walk.live_payload_bytes, published_bytes);
+        assert_eq!(walk.visits, 1 + 2 * CHUNKS);
+        assert_eq!(format!("{walk:?}"), format!("{summary:?}"));
     }
 }

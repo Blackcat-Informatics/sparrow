@@ -5712,6 +5712,33 @@ and preserves worker admission through retirement. The SDK checks store identity
 wire size, counts, ownership bounds and clock/window agreement before agents
 render the result. `UInt64` counters use decimal strings in CLI/MCP JSON.
 
+While the owner summary is incomplete, the account comes from the owner entries
+(the entry walk). Each artifact row is read twice: once for its identity, deadlines
+and retirement state, then again to fold its chunk identities after the retired
+position, so an artifact's retired chunks are never counted. The row is charged
+once while it is read, and each distinct digest in the ownership map is charged
+256 catalog bytes, a worst-case bound. A walk that answers is exact and counts
+every chunk its rows own. It never undercounts. Its visits are one per pin seek,
+one per artifact or record row, one per chunk occurrence in an artifact or record
+row, and one per `ref:` row. Each bound that does not fit makes the walk refuse
+with `RESOURCE_LIMIT` and publish no account, and the message names that bound:
+`retention metrics exceed max_visits` for `max_visits`,
+`retention ownership map exceeds catalog_bytes` and
+`manifest retirement exceeds catalog admission` for `catalog_bytes`, and
+`payload verification exceeds operation admission` for `payload_bytes`. The
+refusal is deterministic: the same store at the same limits refuses again until
+the store or the limits change.
+
+With R record rows, A chunk occurrences in artifact rows, B chunk occurrences in
+record rows, D `ref:` rows and P pin seeks, the visits are 1 + R + A + B + D + P
+(the 1 is the artifact row). An artifact of N distinct chunks with no record row
+needs 2N + 1 visits, so it answers only while 2N + 1 fits `max_visits`: up to
+49,999 chunks at the maximum of 100,000, and up to 4,999 at the default of 10,000.
+That 49,999 figure is the no-record case. An artifact whose records hold N chunk
+occurrences in total, as ingested evidence does, needs 3N + R + 1 visits and so
+reaches fewer chunks. The payload bytes bound applies as well: at full 64 KiB
+chunks the 1 GiB maximum `payload_bytes` cap refuses at 16,385 chunks.
+
 This read does not advance intake, synchronize buffered writes, retire evidence,
 renew pins or run compaction. Logical retirement eligibility never certifies
 physical bytes freed or recovery of storage admission. Forced bounded physical

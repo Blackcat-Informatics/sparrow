@@ -10727,7 +10727,7 @@ fn publish_staged(
     store.import_publish(&manifest.id, 0)
 }
 
-/// INVARIANT (#82): a record kept alone by its pin, after its parent artifact expires, owns its
+/// INVARIANT: a record kept alone by its pin, after its parent artifact expires, owns its
 /// payload, and that ownership stays charged after the record's transient parse is released.
 /// Protects two failure modes at fixed allowances that hold for every record order:
 ///
@@ -10738,14 +10738,14 @@ fn publish_staged(
 /// - the admitted allowance covers the peak only when each parse charge is refunded, so an
 ///   accumulated parse charge refuses it.
 ///
-/// The allowances are measured for this fixture: pins charge 74,824 bytes, the last record's
-/// temporary parse charge is 59,400 to 59,432 bytes, and the correct peak lies between 154,704
-/// and 154,736 bytes for every order. Re-measure them when the charge function changes.
+/// The allowances are measured for this fixture, with each owner entry charged 256 bytes: the
+/// correct peak is 144,480 bytes, found by bisection, and a peak without the entries is 10,240
+/// bytes lower. Re-measure them when the charge function changes.
 #[test]
 fn record_only_ownership_stays_charged_after_transient_parse_refunds() {
     use sparrow_core::RetentionReadLimits;
     const RECORDS: usize = 40;
-    const REFUSED: usize = 150_000;
+    const REFUSED: usize = 140_000;
     const ADMITTED: usize = 160_000;
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), config()).unwrap();
@@ -27656,46 +27656,74 @@ fn copy_store(from: &std::path::Path, to: &std::path::Path) {
     }
 }
 
-/// The entry-walk answer for the store in `dir`: a copy of it is lowered so its owner summary
-/// is pending, and the retention query then reads every owner entry.
-fn entry_walk_totals(
-    dir: &std::path::Path,
-    scratch: &std::path::Path,
-    nows: &[u64],
-) -> Vec<String> {
+/// The entry-walk answers for the store in `dir`, at each instant. A copy of the store is
+/// lowered so its owner summary is pending, and the retention query then reads every owner
+/// entry. `walk` is the streamed walk's answer with its visits, `reference` the frozen walk's
+/// answer with its visits, and `totals` the streamed walk's answer with visits zeroed, for the
+/// comparison with the summary path, which visits differently.
+struct EntryWalk {
+    totals: Vec<String>,
+    walk: Vec<String>,
+    reference: Vec<String>,
+}
+
+fn entry_walk_totals(dir: &std::path::Path, scratch: &std::path::Path, nows: &[u64]) -> EntryWalk {
     copy_store(dir, scratch);
     let db = catalog_db(scratch).unwrap();
     sparrow_core::lower_owner_summary_for_legacy_fixture(&db).unwrap();
     drop(db);
     let oracle = Store::open(scratch, config()).unwrap();
-    let totals = nows
-        .iter()
-        .map(|now| retention_result(&oracle, *now))
-        .collect();
+    let limits = sparrow_core::RetentionReadLimits::default();
+    let mut entry = EntryWalk {
+        totals: Vec::new(),
+        walk: Vec::new(),
+        reference: Vec::new(),
+    };
+    for now in nows {
+        let walked = oracle.retention_metrics(*now, limits);
+        let frozen = oracle.retention_metrics_entry_walk_reference_for_tests(*now, limits);
+        entry.totals.push(match &walked {
+            Ok(report) => format!("{:?}", zero_visits(report.clone())),
+            Err(error) => format!("refused {}: {}", error.code, error.message),
+        });
+        entry.walk.push(retention_outcome(walked));
+        entry.reference.push(retention_outcome(frozen));
+    }
     drop(oracle);
     std::fs::remove_dir_all(scratch).unwrap();
-    totals
+    entry
+}
+
+/// The account with its visits, or the refusal code: what the walk and its reference must agree
+/// on exactly. Refusal messages are not compared, since they name the bound that refused.
+fn retention_outcome(
+    result: Result<sparrow_core::RetentionMetrics, sparrow_core::Error>,
+) -> String {
+    match result {
+        Ok(report) => format!("{report:?}"),
+        Err(error) => format!("refused {}", error.code),
+    }
+}
+
+fn zero_visits(mut report: sparrow_core::RetentionMetrics) -> sparrow_core::RetentionMetrics {
+    report.visits = 0;
+    report
 }
 
 fn retention_result(store: &Store, now: u64) -> String {
     match store.retention_metrics(now, sparrow_core::RetentionReadLimits::default()) {
-        Ok(mut report) => {
-            report.visits = 0;
-            format!("{report:?}")
-        }
+        Ok(report) => format!("{:?}", zero_visits(report)),
         Err(error) => format!("refused {}: {}", error.code, error.message),
     }
 }
 
-/// Deterministic xorshift generator for the differential sequences.
+/// Deterministic `SplitMix64` generator (the shared `purrdf_hash::mix` helper) for the
+/// differential sequences.
 struct Sequence(u64);
 
 impl Sequence {
     fn next(&mut self, bound: u64) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0 % bound
+        purrdf_hash::mix::splitmix64_next(&mut self.0) % bound
     }
 }
 
@@ -27708,7 +27736,7 @@ impl Sequence {
 fn retention_answer_from_the_summary_equals_the_entry_walk_through_random_mutations() {
     use sparrow_core::{EvictionLimits, TailStart};
     const SEEDS: [u64; 12] = [
-        0x9E37_79B9_7F4A_7C15,
+        purrdf_hash::mix::GOLDEN_GAMMA,
         0xD1B5_4A32_D192_ED03,
         7,
         0x5851_F42D_4C95_7E2D,
@@ -27758,6 +27786,28 @@ fn retention_answer_from_the_summary_equals_the_entry_walk_through_random_mutati
             .unwrap();
         let retired_probe = now + 10 * DAY;
         for step in 0..STEPS {
+            // Fixed case, drawing nothing from the generator: at the first step of the first
+            // seed, an eight-chunk artifact is evicted while it is live, so the instant queried
+            // next must not count it as live. Eviction records its state in the retirement row.
+            if step == 0 && seed == SEEDS[0] {
+                let mut line = Vec::new();
+                for chunk in 0..8_u8 {
+                    line.extend(vec![b'a' + chunk; 64 * 1024]);
+                }
+                let last = line.len() - 1;
+                line[last] = b'\n';
+                let target = store
+                    .ingest("retire-state", "diff", "log", &line, now)
+                    .unwrap()
+                    .id;
+                for _ in 0..64 {
+                    let report = store.evict_oldest(now, limits).unwrap();
+                    if report.artifacts.contains(&target) || !report.continuation {
+                        break;
+                    }
+                }
+                trace.push(format!("step {step}: evict {target} ok=true"));
+            }
             for _ in 0..=rng.next(2) {
                 serial += 1;
                 let op = rng.next(20);
@@ -28070,16 +28120,75 @@ fn retention_answer_from_the_summary_equals_the_entry_walk_through_random_mutati
             store = Store::open(&path, config()).unwrap();
             let reopened = retention_result(&store, now);
             let context = format!("seed {seed:#x}, step {step}\n{}", trace.join("\n"));
-            if let Some(index) = (0..lives.len()).find(|index| lives[*index] != walked[*index]) {
+            if let Some(index) =
+                (0..lives.len()).find(|index| lives[*index] != walked.totals[*index])
+            {
                 panic!(
                     "summary vs entry walk at now={}\nsummary: {}\nwalk:    {}\n{context}",
-                    nows[index], lives[index], walked[index]
+                    nows[index], lives[index], walked.totals[index]
+                );
+            }
+            // The streamed walk must agree with the frozen pre-change walk on the account, its
+            // visits and the refusal code at every instant.
+            if let Some(index) =
+                (0..nows.len()).find(|index| walked.walk[*index] != walked.reference[*index])
+            {
+                panic!(
+                    "entry walk vs frozen reference at now={}\nwalk:      {}\nreference: {}\n{context}",
+                    nows[index], walked.walk[index], walked.reference[index]
                 );
             }
             assert_eq!(live, reopened, "summary before vs after reopen\n{context}");
         }
     }
     eprintln!("ORACLE ops (ok, refused): {tally:?}; steps (empty, nonempty, answered): {shapes:?}");
+}
+
+/// INVARIANT: an artifact whose chunks expiry has partly retired is accounted from its retirement
+/// position. The entry walk starts after the retired chunks, so it counts only the chunks still
+/// owned; it agrees with the frozen pre-change walk on the account, its visits and the refusal,
+/// and with the owner summary on the totals.
+#[test]
+fn the_entry_walk_accounts_an_artifact_from_its_partial_retirement_position() {
+    use sparrow_core::EvictionLimits;
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let mut input = Vec::new();
+    for chunk in 0..6_u8 {
+        let mut line = vec![b'a' + chunk; 64 * 1024];
+        line[64 * 1024 - 1] = b'\n';
+        input.extend(line);
+    }
+    let artifact = store.ingest("partial", "diff", "log", &input, DAY).unwrap();
+    let after = DAY + sparrow_core::RETENTION_MS + DAY / 2;
+    // Two payload references is fewer than the artifact's chunks, so retirement stops mid-array.
+    store
+        .expire_bounded(
+            after,
+            EvictionLimits {
+                max_payload_refs: 2,
+                ..EvictionLimits::default()
+            },
+        )
+        .unwrap();
+    drop(store);
+    let db = catalog_db(dir.path()).unwrap();
+    let state = db
+        .get(format!("artifact-retirement:{}", artifact.id))
+        .unwrap()
+        .expect("the partly retired artifact keeps a retirement state");
+    let total = u64::from_be_bytes(state[..8].try_into().unwrap());
+    let retired = u64::from_be_bytes(state[8..16].try_into().unwrap());
+    assert!(
+        0 < retired && retired < total,
+        "retired {retired} of {total}"
+    );
+    drop(db);
+    let walked = entry_walk_totals(dir.path(), &scratch.path().join("copy"), &[after, DAY]);
+    assert_eq!(walked.walk, walked.reference);
+    let oracle = Store::open(dir.path(), config()).unwrap();
+    assert_eq!(walked.totals[0], retention_result(&oracle, after));
 }
 
 fn pin_rows(dir: &std::path::Path) -> usize {
