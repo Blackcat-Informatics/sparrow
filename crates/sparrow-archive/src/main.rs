@@ -4,8 +4,9 @@
 //! `sparrow-archive list|verify DIR`, `extract DIR ARTIFACT_ID` and `find DIR PAYLOAD_ID`:
 //! offline, read-only. `list` and `verify` print one JSON line per segment on stdout;
 //! `extract` prints one artifact's bytes, and only after they are verified; `find` prints one
-//! JSON line naming the artifacts that hold the payload, and whether any does. Diagnostics go
-//! to stderr, and any failure exits nonzero.
+//! JSON line naming the artifacts that hold the payload, and whether any does. `find` reads
+//! every segment under the directory on each call, since the archive has no payload index.
+//! Diagnostics go to stderr, and any failure exits nonzero.
 
 use std::io::Write;
 use std::path::Path;
@@ -208,6 +209,8 @@ fn take(root: &Path, artifact_id: &str) -> ExitCode {
 
 /// One JSON line: whether any segment holds the payload, and each artifact that does with
 /// the file whose metadata names it. An absent payload is a normal answer, not a failure.
+/// Each call decodes every segment under `root`, because the archive keeps no payload index;
+/// a damaged segment fails the call by name, wherever the payload is.
 fn find(root: &Path, payload_id: &str) -> ExitCode {
     let found = list_segments(root)
         .and_then(|paths| find_payload(&paths, payload_id))

@@ -694,3 +694,22 @@ fn find_names_the_artifact_and_segment_of_a_payload_and_reports_absence() {
     assert!(malformed.stdout.is_empty());
     assert!(!malformed.stderr.is_empty());
 }
+
+/// Value (#588): a damaged segment never disappears from a lookup. `find` fails and names
+/// the damaged file even when the payload sits in an intact segment, because a skipped
+/// segment could report the payload absent when it is present. Nothing reaches stdout.
+#[test]
+fn find_fails_by_name_on_a_damaged_segment_even_when_another_holds_the_payload() {
+    let archive_dir = tempfile::tempdir().unwrap();
+    let root = archive_dir.path().to_str().unwrap();
+    archive_two(archive_dir.path());
+    let damaged = archive_dir.path().join("segments").join("zz-damaged.gts");
+    std::fs::write(&damaged, b"not a segment").unwrap();
+    let payload = purrdf::gts::writer::digest_string(FIRST);
+
+    let output = run(&["find", root, &payload]);
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{error}");
+    assert!(output.stdout.is_empty());
+    assert!(error.contains(&damaged.display().to_string()), "{error}");
+}
