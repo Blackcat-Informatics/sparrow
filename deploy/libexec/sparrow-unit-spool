@@ -21,7 +21,10 @@
 #     changed file again whole);
 #   * for every record, a "source" of "systemd-manager" for a manager line and "systemd-unit" for a line
 #     from the unit's own process, so a reader can tell the two apart.
-# The bucket comes from the entry's own timestamp, so a backfill lands in the right files.
+# The bucket name is a transport grouping, not the time of the entry; each record keeps its own time. A bucket
+# comes from the entry's timestamp, except that a line never joins a bucket older than the newest bucket already
+# in SPOOL_DIR: a late line joins that newest bucket. Once a newer bucket exists, this program never appends to
+# an older one.
 #
 # The cursor file is written after each record is appended, so it never runs ahead of the spool. A
 # process crash between the append and the cursor write spools that record again on the next run: across
@@ -52,10 +55,19 @@ case $own_lines in
 esac
 (umask 077 && mkdir -p -- "$dir" "$(dirname -- "$cursor")")
 
+# The newest bucket already in the spool directory, printed as YYYYMMDDTHHMM, or nothing when there is none.
+newest_bucket() {
+    local LC_ALL=C files=("$1"/unit-spool-*.jsonl) newest
+    [[ -e ${files[0]} ]] || return 0
+    newest=${files[-1]##*/unit-spool-}
+    printf '%s\n' "${newest%.jsonl}"
+}
+
 # JSON entries on stdin, spooled into SPOOL_DIR. $1 is the cursor file to advance after each record
 # is appended, or empty for the backfill pass, which writes its cursor once it has finished.
 spool() {
-    local cursor_out=$1 bucket cur line
+    local LC_ALL=C cursor_out=$1 bucket cur line newest
+    newest=$(newest_bucket "$dir")
     jq -r --unbuffered --arg unit "$unit" --argjson keep "$keep" '
 (._SYSTEMD_UNIT == $unit or ._SYSTEMD_USER_UNIT == $unit) as $own
 # Exact name match: a unit whose name is a prefix of this one does not match.
@@ -76,6 +88,12 @@ spool() {
 | ((($us / 1000000 | floor) / 600 | floor) * 600 | strftime("%Y%m%dT%H%M")) as $bucket
 | "\($bucket)\t\($cursor)\t\(tojson)"' |
         while IFS=$'\t' read -r bucket cur line; do
+            # A bucket older than the newest one is never appended to: a late line joins the newest bucket.
+            if [[ -n $newest ]] && [[ $bucket < $newest ]]; then
+                bucket=$newest
+            else
+                newest=$bucket
+            fi
             printf '%s\n' "$line" >> "$dir/unit-spool-$bucket.jsonl"
             if [[ -n $cursor_out ]]; then
                 printf '%s\n' "$cur" > "$cursor_out.tmp"
