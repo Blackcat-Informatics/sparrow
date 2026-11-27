@@ -97,6 +97,18 @@ rc=0
 PATH=$endless:$PATH env --default-signal=PIPE timeout 30 bash "$script" "$unit" "$work/stalled" "$work/stalled.cursor" >/dev/null 2>&1 || rc=$?
 [[ $rc -ne 124 && $rc -ne 0 ]] || fail "a failed append did not end the spool (exit $rc)"
 
+# A late line never joins a bucket older than the newest one in the spool. With a newer bucket already present,
+# every kept record joins that bucket after its earlier line, and no older bucket is created.
+late=$work/late
+mkdir -p "$late"
+printf '%s\n' '{"message":"earlier"}' > "$late/unit-spool-20261127T1400.jsonl"
+SPARROW_UNIT_SPOOL_OWN_LINES=keep bash "$script" "$unit" "$late" "$work/late.cursor"
+[[ ! -e $late/unit-spool-20261127T1310.jsonl ]] || fail "a late record created an older bucket"
+{ printf '%s\n' '{"message":"earlier"}'; cat -- "$fixtures/keep.jsonl"; } > "$work/late.expected"
+cmp -s "$work/late.expected" "$late/unit-spool-20261127T1400.jsonl" \
+    || fail "late records did not join the newest bucket after its earlier line"
+[[ $(ls -1 -- "$late" | wc -l) -eq 1 ]] || fail "the spool created a bucket other than the newest"
+
 # Bad settings refuse to start.
 if SPARROW_UNIT_SPOOL_OWN_LINES=maybe bash "$script" "$unit" "$work/x" "$work/x.cursor" 2>/dev/null; then
     fail "an unknown OWN_LINES value was accepted"
