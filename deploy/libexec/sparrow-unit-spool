@@ -21,9 +21,10 @@
 #     changed file again whole);
 #   * for every record, a "source" of "systemd-manager" for a manager line and "systemd-unit" for a line
 #     from the unit's own process, so a reader can tell the two apart.
-# The bucket comes from the entry's own timestamp, except that a line never joins a bucket older than the
-# newest bucket already in SPOOL_DIR: a late line joins that newest bucket. Once a bucket is no longer
-# the newest, the spool never appends to it again, so a shipped file is not changed by this program.
+# The bucket name is a transport grouping, not the time of the entry; each record keeps its own time. A bucket
+# comes from the entry's timestamp, except that a line never joins a bucket older than the newest bucket already
+# in SPOOL_DIR: a late line joins that newest bucket. Once a newer bucket exists, this program never appends to
+# an older one.
 #
 # The cursor file is written after each record is appended, so it never runs ahead of the spool. A
 # process crash between the append and the cursor write spools that record again on the next run: across

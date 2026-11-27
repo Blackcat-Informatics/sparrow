@@ -570,6 +570,9 @@ its producer finishes a file, not as it is written.
 
 `deploy/libexec/sparrow-unit-spool UNIT SPOOL_DIR CURSOR_FILE` follows the default system journal
 for one unit and writes JSON Lines in ten-minute files, `SPOOL_DIR/unit-spool-YYYYMMDDTHHMM.jsonl`.
+The file name is a transport grouping, not the time of the entry: a record carries its own `time` and
+`realtime_usec`. A line that arrives after a newer bucket exists joins the newest bucket, so a file is never
+appended to once a newer file exists.
 Each record carries `source`, `unit`, `time`, `realtime_usec`, `priority`, `message`, and `manager` when the
 entry names a command. Lines the service manager writes about the unit (stops, exits, OOM kills) have
 `"source":"systemd-manager"`. The unit's own process lines are dropped by default. With
