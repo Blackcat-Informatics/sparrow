@@ -72,7 +72,7 @@ source the producer names; the source is the item's lasting address in queries.
   `ingest`, not to imports; a larger input goes through the staged import;
 - `max_records`, the records in one artifact;
 - `MAX_IMPORT_BYTES`, 8515420160 bytes (129935 chunks, about 7.93 GiB), a fixed
-  bound on one `import_begin` until the v2 store format (#5). A larger input is
+  bound on one `import_begin` until the v2 store format. A larger input is
   split into parts of at most that many bytes, each imported as its own
   request, and then the manifest is imported;
 - the cost of the form sent (see below): an item sent as `jsonl` can be
@@ -135,7 +135,7 @@ prepared records until reclaim removes them and can drive `physical_bytes` to
 `STORAGE_PRESSURE`; the lockout clears when compaction returns space. The
 workload logs leave the RDF staging lockout, occupancy at the tested sixteen-row
 journal limit, the exact staging threshold, and reclamation to zero after the
-60,000-record refusal unmeasured. Issue #389 tracks the fault.
+60,000-record refusal unmeasured.
 
 **The staging bound and senders.** The daemon refuses an RDF write when its
 anticipated staged writes exceed 64 MiB. The anticipated size is the sum of the
@@ -147,7 +147,7 @@ is not the disk growth. A staged import starts a fresh write for each preparatio
 checkpoint and another for the artifact graph at publication, so earlier records count
 through the batch's pending writes only. A record whose own projection graph crosses
 the bound is not refused: it is stored without that graph (see
-[RDF staging refusals are counted and named](#rdf-staging-refusals-are-counted-and-named-340)).
+[RDF staging refusals are counted and named](#rdf-staging-refusals-are-counted-and-named)).
 A sender cannot compute the sum in advance: the rows and new terms come from the
 daemon's derivation of each record, and the pending writes depend on the other records
 of the batch. A sender therefore sets no size from this bound and does not predict the
@@ -211,8 +211,9 @@ it holds and asks.
 - **Archive.** `sparrow-archive list DIR` prints one JSON line per segment with an
   `entries` array; each entry gives the artifact `id`, `source`, `received_at`,
   `byte_length` and `payload_id` (`blake3:` form, the same string `payloadLookup`
-  takes). The reader matches the payload id, or the artifact id from the ingest
-  receipt as the second route, then runs `sparrow-archive extract DIR ARTIFACT_ID`,
+  takes). The reader runs `sparrow-archive find DIR PAYLOAD_ID`, which names the
+  artifact and the segment file holding the payload, or matches the artifact id from
+  the ingest receipt as the second route; then it runs `sparrow-archive extract DIR ARTIFACT_ID`,
   which writes the artifact's verified bytes to stdout. The reader hashes the
   output and compares it with the payload id, since `extract` checks each record
   and the total length, not the whole-file hash. `sparrow-archive verify DIR`
@@ -233,7 +234,7 @@ it holds and asks.
   file that is cut into parts is found by its parts, each under its own payload
   id, and the whole file's hash is no artifact's payload id. A file is cut only
   where one artifact cannot hold it (the import bound, the record limit or the
-  joint retirement bound; see [Part sets for consume roots](#part-sets-for-consume-roots-280)),
+  joint retirement bound; see [Part sets for consume roots](#part-sets-for-consume-roots)),
   and a syslog file over the packet limit is cut too. A file below those limits,
   including a staged import above the 16 MiB inline bound, is one artifact found by
   the hash of all its bytes. A tail checkpoint's payload id is the hash of
@@ -418,7 +419,7 @@ indexes from two in-memory cursors, one that retires at the deadline
 (`received_at + RETENTION_MS`) and one that deletes a day later, and stops at the
 first key whose deadline has not arrived, so its cost follows the due work and
 never the store size. Scanning the whole catalog under the writer lock made
-reads wait on the same lock for over 30 seconds on a 10 GB store (#183). Entries a
+reads wait on the same lock for over 30 seconds on a 10 GB store. Entries a
 pin holds are skipped, not retired, and are not read again until a pin ends. A
 restart re-walks at most about a day of retired rows. Expiry already applies to
 reads, so only physical retirement waits.
@@ -500,7 +501,7 @@ until durable pressure retirement requires the new invariant. Missing space,
 native failures and malformed or oversized recovery markers remain failures;
 logical retirement does not certify native physical reclamation.
 
-#### The wait for reclamation ends (#211)
+#### The wait for reclamation ends
 
 `awaitingReclamation` used to end only when linked bytes fell below their value at
 the retirement. A retirement whose flush is no smaller than what it freed, bytes in
@@ -520,7 +521,7 @@ and says so (`waitingOn`, `stalledPasses`); a pin release or archive commit wake
 pass at once. These cannot end in process by design: the pin and the archive
 gate are protections that outrank intake, and RocksDB's background-error count
 is cumulative since open and cannot be cleared in place. A background error fails
-only the pass that first sees it (#218): the wait ends, the error is counted in
+only the pass that first sees it: the wait ends, the error is counted in
 `nativeErrors` and journaled, and the next pass goes on, so an error never holds intake
 until a restart.
 
@@ -529,7 +530,7 @@ small beside the maintenance reserve the budget withholds for them, so the pass 
 below the free-space floor, where it is what frees space, but needs the reserve itself
 free on the filesystem; with less it does nothing that writes and reports why. Its two commits, the retirement batch and the clearing of the wait marker (and only those), are admitted against that reserve instead of the floor; every ordinary write keeps the floor.
 
-Ageing out and the read-lease purge also run below the floor (#267). Ageing out is
+Ageing out and the read-lease purge also run below the floor. Ageing out is
 retention that was only delayed: it retires evidence past its deadline in the same small
 bounded batches as the pressure retirement, so its commits run under the same reserve
 admission, and it never retires an unarchived entry or a pinned one. It does not run
@@ -565,20 +566,19 @@ episode's other avenues to say what is left.
 The worker no longer retries every second and discards the result. After a pass that
 made progress it looks again after a second; each pass that made none doubles the delay
 to a ceiling of 30 seconds, and a pin release, an archive commit or the end of a forced
-compaction, the floor's resume, and a refused write that requests a pass run a pass at once
-(#247). The delay is the one observer of native RocksDB flush and compaction state: the store
+compaction, the floor's resume, and a refused write that requests a pass run a pass at once. The delay is the one observer of native RocksDB flush and compaction state: the store
 has no completion hook for it, so the pass reads the pending counts itself, and waiting less
 cannot change what native work does. The daemon journals every entry to and exit from a
 non-ready phase, and, at most once a minute, the passes that made no progress.
 
-### The free-space pause (#257)
+### The free-space pause
 
 Below `min_free_bytes` the daemon keeps working; only writes wait.
 
 - Accepting. The private socket, ingest socket, public TCP and syslog TCP keep
   accepting. Unix listeners require a connection slot before accepting, and the
   RPC transport deadlines apply during the pause. A syslog TCP frame refused
-  for the floor is held unread past (#243) whether
+  for the floor is held unread, whether
   or not its connection was accepted before or during the pause. Syslog UDP is held by
   its own hold (below): datagrams queue in the daemon up to `hold_bytes`, then in the
   kernel buffer. Consume watches keep discovering candidates while claims and
@@ -654,7 +654,7 @@ Below `min_free_bytes` the daemon keeps working; only writes wait.
   error or a reader error), and on an unclean daemon exit (see the UDP hold section); every other source holds at the producer (client queue, ship queue, source
   file, sender socket).
 
-### A floor refusal requests reclamation (#267)
+### A floor refusal requests reclamation
 
 The refusal stays immediate and typed; it now also leaves a pass in motion. A write
 refused at the floor (every commit path, and the intake fence) records that someone was
@@ -720,11 +720,11 @@ pass's clock), `linkedBytes`, `episodeSince` (intake refused since), `phaseSince
 `forcedCompactions`, `waitsReleased`, `stalledPasses`, `refusedWrites` (data writes
 answered `STORAGE_PRESSURE` at physical admission), `waitingOn` (why the last pass could
 do no more), and for the free-space floor `floorPausedSince`, `floorPauses`,
-`floorResumes` and `floorRefusedWrites`. #218 adds `forcedCompactionMs` (wall time of the
+`floorResumes` and `floorRefusedWrites`. Status also carries `forcedCompactionMs` (wall time of the
 last forced compaction), `forcedCompactionFamilies` (a list of `family`, `beforeBytes` and
 `afterBytes`, the table and blob file bytes of each family around it), `forcedFailures` (forced
 compactions that ended in a panic or a raised native error) and `nativeErrors` (new RocksDB
-background errors the pressure passes saw); again no version change. #267 adds
+background errors the pressure passes saw). The pressure status also carries
 `floorRequests` (episodes in which a refused write asked for reclamation),
 `floorRequestedBytes` (bytes below the floor at the last pass, zero when none),
 `floorPasses` (retirement passes run while the floor was the reason) and
@@ -733,7 +733,7 @@ CLI and MCP render them under `free_space_floor` as `reclaim_requests`, `request
 `passes` and `freed_bytes`. CLI and MCP render ages as `wait_age_ms`,
 `episode_age_ms` and `phase_age_ms`, measured to `observedAt`. Counters are session-local
 and the clocks of an episode or wait restored at open start at the first pass; the
-stored wait marker is unchanged. #298 adds `diskBudget`, `maintenanceReserve`,
+stored wait marker is unchanged. Status also carries `diskBudget`, `maintenanceReserve`,
 `archiveConfigured`, `archiveHeld` and `reserveHeadroom` at ordinals 34 to 38. CLI and MCP
 render them under `pressure` as `disk_budget`, `maintenance_reserve`, `archive_configured`,
 `archive_held` and `reserve_headroom`, with `linked_bytes` the physical bytes. `archive_held`
@@ -859,7 +859,7 @@ Schema 63 adds the enum values `PressurePhase.awaitingArchive` and
 `awaiting_archive` and `archive_lag`. `Status.pressureStatus` reports `archiveConfigured` and `archiveHeld`
 (`PressureStatus` ordinals 36 and 37), and `Status` reports `archiveHalvings`
 (ordinal 63). `Status.archiveWorker` (ordinal 64) reports the worker; see
-[Archive worker status](#archive-worker-status-365). Backlog age, the last
+[Archive worker status](#archive-worker-status). Backlog age, the last
 segment and a listing of held entries are not in the schema. The daemon journals a failed
 pass and a held entry.
 
@@ -948,15 +948,9 @@ Continuation:
   skipped. A row the migration has copied since is listed once, and an artifact
   retired since is skipped, as the finished index omits it.
 
-For live listings only, this section supersedes four groups of statements. The
-first is the replay and "never creates another handle" statements under
-cursor-only continuation. The second is the schema 27 statements that page
-coverage is identical across continuation, that `total_items` counts captured
-proven rows, and that continuation serves the immutable capture. The third is
-the schema 24 receipt with a fixed store, snapshot and as-of. The fourth is
-the earlier MCP descriptions of `artifacts_list` and `result_next`. The
-`sources` inventory does not read the artifact index: it reads the per-source
-counter rows (see `sources_list` below) and remains one immutable capture.
+While the migration is seeding, a `sources` listing reads the per-source counter rows and adds the counts the
+migration still owes to them, from one immutable capture (see `sources_list` below). Its only read of the artifact
+index is the missing-row probe: a source with counted entries and no counter row fails with `STORAGE_FAILURE`.
 
 ### Large artifacts (schema 65)
 
@@ -966,7 +960,7 @@ the key. The disk budget, the maintenance reserve and the free-space floor still
 bound what the store admits, and `max_records` still bounds the records in one
 artifact.
 
-One fixed bound remains until the v2 store format (#5). It is the smaller of
+One fixed bound remains until the v2 store format. It is the smaller of
 two limits, and `MAX_IMPORT_BYTES` is derived from both, with a compile-time
 assertion that ties the admitted chunk count to each:
 
@@ -995,10 +989,10 @@ Layout preparation then refuses it with a non-retryable `RESOURCE_LIMIT` when it
 exceed the retirement pass, and publication
 checks again for layouts prepared earlier and refuses record rows that would
 exceed the batch. An inline `ingest` is held to the same retirement check.
-Format #5 replaces the whole-row read and the single batch, and with them this
+The v2 store format replaces the whole-row read and the single batch, and with them this
 bound.
 
-### RDF staging refusals are counted and named (#340)
+### RDF staging refusals are counted and named
 
 An intake stages its RDF in memory before commit: at most 32 MiB of new dictionary
 terms and 64 MiB of anticipated writes per batch (the RDF index rows and manifest, plus
@@ -1034,7 +1028,31 @@ panicking, because it is written while the store's writer lock is held, and a fa
 stderr write is dropped (the counter still holds the fact). Whether to stage an artifact's RDF in pieces or store it with
 its graph deferred is separate work.
 
-### Archive worker status (#365)
+### Projection term limit
+
+Projection stores each scalar JSON value of a record as an RDF literal, and refuses a
+record whose encoded literal exceeds 65,536 bytes.
+
+- **Term.** Each JSON string, number, boolean and null value of a stored record becomes a
+  literal with datatype `xsd:string` and no language or direction. Its lexical form is the
+  value's source text exactly as written: for a string, the bytes between its quotes, with
+  escape sequences left undecoded.
+- **Unit.** The length in bytes of the term's canonical JSON, the compact encoding of its
+  kind, lexical form, datatype, language and direction. For a plain ASCII string this is
+  the source text's length plus 117 bytes. Each backslash in the source text is escaped
+  again in the canonical encoding, so an escape sequence costs more than its source length.
+- **Limit.** 65,536 bytes, inclusive. A term of exactly 65,536 bytes projects.
+- **Ingest.** Ingest does not check this limit. The record is stored with projection state
+  `failed` and zero primary rows. `rdf` and `rdf_inspect` report
+  `PROJECTION_FAILURE: projection resource-limit error: canonical term JSON exceeds the 65536-byte artifact limit`.
+- **Boundaries.** A plain ASCII value of 65,419 bytes projects and 65,420 does not. A value
+  of 65,415 characters followed by one double quote projects and 65,416 characters followed
+  by one quote does not. Two-byte UTF-8 values follow the plain boundary in bytes.
+- **What a sender must do.** Keep each value's source text, with escapes as written, so that
+  its canonical encoding stays within 65,536 bytes. Split a longer value across records.
+  Check `rdf_inspect` for `state` = `failed` to find a record that did not project.
+
+### Archive worker status
 
 `Status.archiveWorker` (field 64, additive; a reader that does not know it sees no change) is
 an `ArchiveWorkerStatus`, a copy the worker publishes as each step ends. `status` reads the
@@ -1061,7 +1079,7 @@ the failure and returns the phase to `idle`. CLI and MCP status render the field
 `reason`, `since` as an instant or null, or the whole failure null) and `restarts` as a decimal
 string.
 
-### Instance role (#371)
+### Instance role
 
 A store records whether it is the live store or a scratch one in one metadata
 row, `instance_role`, holding `production` or `scratch`. No record or segment
@@ -1086,7 +1104,7 @@ operator step, the offline `sparrow-stamp` tool
 ([deployment](deployment.md#stamp-the-role)); the daemon never performs it. A daemon without the key accepts
 any store.
 
-### Archive prepare halvings and the daemon's library warnings (#324)
+### Archive prepare halvings and the daemon's library warnings
 
 `Status.archiveHalvings` (field 63, additive; a reader that does not know it sees no
 change) counts the times an archive prepare halved its range after an encode error since
@@ -1167,7 +1185,7 @@ blocks become reclaimable after their certified range receipt is on disk.
 Run `cargo run -p sparrow-client --example bulk -- ENDPOINT ABSOLUTE_SPOOL JOB_ID [FILE]`
 for a completed file or a new input arriving on stdin.
 
-### Part sets for consume roots (#280)
+### Part sets for consume roots
 
 A consume-root file above what one artifact can hold is published as a part set.
 Discovery and status report the configured `maxRecordsPerArtifact`. Consume roots
@@ -1292,7 +1310,7 @@ Stores laid out before this change keep their records; only new layouts split.
 No step holds more than 16 MiB of an artifact's bytes in memory. Sealing,
 layout and publication of an input of many GiB each run as one call, so they
 can outlast the 45-second consumption deadline; resumable steps are also part
-of #5.
+of the v2 store format.
 
 One inline `ingest` message, and the single write batch behind it, carries at
 most 16 MiB. That fixed bound protects the daemon's memory. A larger inline
@@ -1429,6 +1447,28 @@ occurrence. An unresolved final manifest publication keeps its ticket and
 reports the refusal after expiry. A completed journal returns the same
 original receipt on repetition, while each artifact remains subject to the
 store's independent retention rules.
+
+### Receipt intake on replayed publications
+
+The SDK's `ArtifactReceipt` has no `intake` field. An accepted wire artifact carries
+optional intake provenance, which the SDK drops when it decodes the reply. Two paths
+build the receipt, and they do not share that value:
+
+- Initial publication of an ordered file takes the intake from the import manifest
+  (`ImportManifest.intake`).
+- A replay of a completed ordered file rebuilds the receipt from the SDK's local
+  completion certificate. That certificate has a strict schema and holds no intake
+  provenance. An older client rejects unknown certificate fields, so the certificate
+  cannot gain the field without a compatible journal change.
+
+The daemon's accepted-ingest retry rebuilds its receipt from the saved ingest receipt,
+which also omits the manifest's intake. It compares the saved producer, tail and receiver
+provenance with the retried request and returns `CONFLICT` on a mismatch. It does not
+compare intake.
+
+A receipt that carries intake would therefore differ between initial publication and
+replay. Adding the field to `ArtifactReceipt` requires that the certificate and the saved
+ingest receipt both store intake, so that every path reads the same value.
 
 Run `sparrow SOCKET parts verify SOURCE MANIFEST_ARTIFACT_ID` for a
 `sparrow.parts/1` manifest. It checks each member against the current artifact
@@ -1581,13 +1621,13 @@ An event-time records read reports top-level `event_time_fallback` as a decimal
 string. Correlation profile `sparrow-correlation/2` and the RDF vocabulary below
 carry the same law.
 
-Receipt-time fallback triples are derived at read time and are not stored (#193).
+Receipt-time fallback triples are derived at read time and are not stored.
 A reader serves `eventTimeFallback` (the record's `received_at`) and
 `eventTimeBasis` from each selected record metadata graph that has no source
 `eventTime` and whose stored rows lack `eventTimeFallback`, so a graph written
 without them answers exactly as one that stores them. Ingest writes none. The
 online backfill that once rewrote every retained record graph to store them
-(`event-fallback-rdf-upgrade`, #20) is removed: it cost about 190 key writes per
+(`event-fallback-rdf-upgrade`) is removed: it cost about 190 key writes per
 graph and the compaction debt behind them, and the derivation it duplicated is
 the one reading path. Graphs that already carry the facts, from the backfill or
 an earlier writer, keep them and are served as stored; nothing is rewritten or
@@ -1595,7 +1635,7 @@ deleted. The store format keeps its fallback writer family, `sparrow.store/132`
 to `/186`, which lifts each tracing, log time, archive and intake family by 55
 and keeps its switches, so binaries older than schema 69 still refuse the store
 rather than publish graphs without the facts. The switch is one-way: the schema 71
-image before #193 opens the store, does not derive the facts for graphs written
+image that predates the derivation opens the store, does not derive the facts for graphs written
 without them, and so serves such graphs without the receipt-time facts. Opening a store that
 carries the backfill's checkpoint, finished or pending, applies no migration
 and rewrites nothing; the checkpoint and its counter row stay as inert keys.
@@ -1626,15 +1666,15 @@ Opening a store that owes the schema 69 migrations applies the writer fences
 and seeds the checkpoints in one synchronized batch, then serves; the open does
 not wait for any job. The joined maintenance worker runs them as one duty,
 `store-counters` first (see "Store counters"), then `source-summary` (see
-"Per-source counters and artifact index"), `payload-index` (see "Payload id index"), `owner-graph-index`
+"Per-source counters and artifact index"), `payload-index` (see "Payload id index"), `owner-summary` (see "Per-owner payload summary"), `owner-graph-index`
 and `source-context` (see "Single context capture
 admission"), one page per admission. `source-summary` runs second because, until
 it completes, every `sources` and live `artifacts` listing first reads what the
-migration still owes (#176). The migrations are independent: each reads and
+migration still owes. The migrations are independent: each reads and
 checkpoints its own keys, so a store left part way through by an image that ran
 them in another order resumes each one from its own checkpoint. `status` lists
 them in a fixed order apart from the run order: `store-counters`,
-`owner-graph-index`, `source-summary`, `source-context`, `payload-index`.
+`owner-graph-index`, `source-summary`, `source-context`, `payload-index`, `owner-summary`.
 The migration duty is selected fairly with buffered synchronization, pressure
 maintenance, import reclamation, retention and the table rewrite. Below the
 free-space floor it is skipped, as import reclamation and retention are; buffered
@@ -1654,7 +1694,7 @@ that wait ended while another duty ran, or the page is the first after a retry,
 writers may have arrived since, so the worker waits again immediately before the
 page, inline. A failed page commits nothing, sets that migration's `failure` and
 is retried every 60 seconds until it succeeds; a page skipped below the free-space floor
-is not a failure and runs when the floor resumes (#247). Nothing is skipped. The daemon
+is not a failure and runs when the floor resumes. Nothing is skipped. The daemon
 logs `sparrowd: migration NAME start pages=1 done=D total=T` at a migration's
 first committed page of the session,
 `sparrowd: migration NAME progress pages=P done=D total=T watermark=W elapsed_seconds=S`
@@ -1681,7 +1721,7 @@ exactly the keys through the `store-counters` watermark, and each migration's
 of them is a total. A pending `total` is 0 on the wire and `counting` in CLI and
 MCP. The `store-counters` migration's `done` and `watermark` report the seeding's
 progress. Status answers from the seeding checkpoint and never counts the
-unseeded keys, so its cost is the same at any store size (#158). A query-only
+unseeded keys, so its cost is the same at any store size. A query-only
 daemon never runs a page, so its counts stay pending until a writable daemon
 seeds them.
 
@@ -1733,7 +1773,7 @@ big-endian 64-bit count, from one RocksDB snapshot:
 | `record-graphs` | `provenance-rdf:record:` markers, one per record metadata graph |
 | `payload-chunks`, `json-projections` | `ref:` and `projection-ref:` rows |
 | `payload-index` | `payload-id:` index keys, one per complete artifact (see "Payload id index") |
-| `done:owner-graph-index`, `done:source-summary`, `done:source-context`, `done:payload-index` | The migration's source entries at or before its checkpoint |
+| `done:owner-graph-index`, `done:source-summary`, `done:source-context`, `done:payload-index`, `done:owner-summary` | The migration's source entries at or before its checkpoint |
 
 Status `live_records` is `retained-records` and keeps its deadline meaning:
 records neither evicted nor retired by expiry. Expiry marks a record `retired`
@@ -2016,6 +2056,62 @@ exact whatever the checkpoint says; the migration puts the key of an entry it
 reaches again as a no-op. A restart resumes after the last committed page, and a
 failed page is retried, never skipped. `status` reports its done count and
 watermark with the other migrations.
+
+### Per-owner payload summary (store format)
+
+Retention metrics account each payload digest from a derived row per owner instead
+of one reference per chunk occurrence. The row `owner-summary:<owner id>` exists for
+every `artifact:` and `record:` entry. Its value holds the owner's receipt and
+deadline clocks, its evicted flag, the parent artifact of a record, and the
+remaining occurrences of each distinct chunk digest in ascending digest order.
+An artifact's chunks are those after its manifest retirement position, and its
+evicted flag comes from its entry or its retirement state; a record's chunks are
+its own. Whether the owner is live is not stored: it depends on the query instant
+and the pin set, so the query derives it per owner. An owner is live while it is
+not evicted and either unexpired or protected; a record is protected by its own pin
+or by its parent artifact's pin. A digest shared by several owners counts its
+bytes once in each category it belongs to, and owner identity is what makes
+that exact.
+
+One owner observes every write batch before it is written and adds the row changes
+to the same batch, so no writer can publish, ingest, import, expire, evict, retire,
+consume or delete an owner entry without its row, and a crash cannot leave one
+without the other. A batch that rewrites an entry gets its row computed from the
+written entry; a deleted entry loses its row; a retirement state that advances
+without rewriting its entry subtracts the chunks it passes from the stored row,
+and a subtraction below zero is a `STORAGE_FAILURE`. A retirement state for an
+artifact with no row is left to the migration while the migration has not reached
+the artifact, and is a `STORAGE_FAILURE` once it has.
+
+Retention metrics read the rows only while the summary is trusted: the
+`owner-summary` migration is complete and the store counters are seeded. The
+query visits one row per owner and one visit per distinct digest the owner holds,
+and refuses with `STORAGE_FAILURE` when the number of rows it reads disagrees
+with the `artifacts` and `records` store counters. Until the migration
+completes, the query reads the owner entries and returns the same totals, so no
+query ever reads an incomplete summary as complete. A complete summary is trusted as
+the entries wrote it: the query does not re-read the owner entries, so it does not
+re-validate a corrupt record entry that the summary row already summarises.
+
+Compatibility and rollback. The summary is a writer-format family: a store
+opened by this binary is lifted to `sparrow.store/572` through `626` (`627`
+through `681` once sealed producer replay is also active), which no earlier binary
+knows, so an older binary refuses the store at open and cannot write an owner
+entry without its row. A store whose format does not carry the family, whether
+it predates the summary or an older writer has opened and written it, is fenced
+at open: every `owner-summary:` row and the checkpoint are discarded and the
+`owner-summary` migration is seeded again. Rows an older writer left behind are
+therefore never trusted. The migration walks artifact entries, then record
+entries, in id order, 256 owners or 32 MiB of entries per page, writing each
+owner's row and advancing the `owner-summary-upgrade` checkpoint in one batch
+through the ordinary write path, after the same wait for waiting writers as every
+migration page. A write during the migration maintains the row of every owner it
+writes; the migration recomputes an owner it reaches again from the same entry.
+A restart resumes after the last committed page, and a failed page is retried,
+never skipped. `done:owner-summary` counts the owner entries the migration has
+passed. The authoritative entries are never altered by the summary, so returning
+to an older binary means restoring a store image written before the lift; opening
+the current binary on any store restores a complete summary.
 
 ## 1. Common types and defaults
 
@@ -2721,7 +2817,7 @@ generation, no reconstruction failure is latched and the job checkpoint
 decodes. Otherwise the open resets it in the migration fence batch: one range
 deletion of the whole family, the marker, a checkpoint at `start` and a zero
 `done:source-context` row. It writes no point tombstone per entry. Images
-before #149 rebuilt the cache on every open by deleting its entries in key
+that rebuilt the cache on every open by deleting its entries in key
 order; their first deletion batch removes the marker, so a cache such an image
 touched, or left half cleared, is reset at the next open. The `source-context`
 online migration then rebuilds the cache with the shared bounded catalog pager,
@@ -3320,11 +3416,11 @@ or delete producer files. Reusing a declaration preserves its generation and
 current checkpoint; changing it conflicts. The stored registry holds at most 64 generations
 and 512 KiB of encoded checkpoint metadata; every shipped reader refuses a longer
 value, so raising either bound is a stored-format change that rides the next one
-(tracked in #230, with the persistence of the counts below).
+, together with the persistence of the counts below.
 Active entries consume this quota; terminal summaries expire 30 days after
 completion/discontinuity.
 
-A full registry never turns a file away (#224). `tail_start` first drops expired
+A full registry never turns a file away. `tail_start` first drops expired
 rows, then retires the one oldest finished row that nothing can still need,
 counted, and stores the new row. Only a complete row is retirable, and only when
 it finished at least two days ago (the retry window) and no active consumption
@@ -3573,7 +3669,7 @@ reports the path, group, ceiling, active connections and refused connections,
 which now counts only a peer whose credentials the kernel cannot report; a peer
 over the ceiling waits (see Admission waits).
 
-### Admission waits (#246)
+### Admission waits
 
 Three limits that used to refuse at once now wait, and every wait is counted.
 
@@ -3716,10 +3812,10 @@ stream or discards a frame:
   On daemon shutdown a frame in flight is published as a malformed packet and
   counted `framing_failure`; bytes still unread in the socket cannot be counted.
 - When the store answers a TCP frame with `STORAGE_PRESSURE`, the frame is held,
-  not discarded, and the connection stays open (#243). The listener offers the
+  not discarded, and the connection stays open. The listener offers the
   same bytes again and reads no further frame, so the sender's TCP window closes and
   the sender holds the rest. Pressure can last as long as reclamation takes. A held
-  frame blocks on a wake, the stop and nothing else (#247): it owns no timer and
+  frame blocks on a wake, the stop and nothing else: it owns no timer and
   never retries on a clock. A frame waiting for an operation permit blocks on the
   permit and on the observer tick below, which only lets the journal announce a wait that
   outlasts its report interval; the wait keeps its place in the queue. Every ending the
@@ -3755,7 +3851,7 @@ stream or discards a frame:
   frame per connection: at most 65536 bytes plus its 4096-byte read buffer, so
   at most 16 connections times that per listener. Arrivals the listener does not
   accept wait in the kernel backlog only at the connection ceiling; the free-space
-  floor no longer stops the listener accepting (#257), and a held frame does not
+  floor no longer stops the listener accepting, and a held frame does not
   depend on accepting. On shutdown a hold ends: the frame gets one last
   attempt and, if the store still refuses it for pressure, is spilled to
   `syslog-spill/` beside `data_dir`, one file per TCP listener, and is
@@ -3779,11 +3875,10 @@ stream or discards a frame:
   `refused_writes`) count attempts and rise by one per offer; the listener's
   held counters count frames.
   Refusals that no retry can change (`RESOURCE_LIMIT`) are not held; they keep
-  their counted discard. A full receiver-window registry is not a refusal at all
-  (#215): the packet is stored without a window update and the store counts the lost
+  their counted discard. A full receiver-window registry is not a refusal at all: the packet is stored without a window update and the store counts the lost
   evidence.
 
-UDP has no sender to hold, so a UDP listener holds differently (#255). It runs a
+UDP has no sender to hold, so a UDP listener holds differently. It runs a
 reader and a publisher joined by a first-in first-out queue bounded in bytes:
 
 - The reader takes datagrams off the socket as they arrive. It never calls the store
@@ -3977,7 +4072,7 @@ are bounded. Domain errors remain distinct from a broken RPC connection.
 | `keysList`, `valuesSearch`, `recordsSearch`, `recordsContext`, `sparqlQuery` | Shared native semantics, typed results, scope and query coverage; stored-text SPARQL relations remain required. |
 | `watchList`, `watchPut`, `watchRemove` | Durable revision-checked recursive consume/tail administration; removal preserves existing claims and active tail generations guard definition changes/removal. |
 | `watchClaimRetire` | Administration (schema 70): retire one claim that can never complete, recording the authenticated caller, time and reason; see "Retiring an unrecoverable claim". |
-| `backup` | Removed (#330). The method keeps its ordinal (@53) and answers `UNSUPPORTED`; see "Removed online backup". |
+| `backup` | Removed. The method keeps its ordinal (@53) and answers `UNSUPPORTED`; see "Removed online backup". |
 | `watchClaims` | Read-only (schema 71): every pending claim and every completed or abandoned claim whose pending span overlaps a time window, with its history; see "Per-claim state listing". |
 | `ingestPartReceipt` | Read-only (schema 71, additive): one set part's receipt state by request id (absent, stored, evicted or evicting) with its artifact id, byte length and format, and no record scan while the artifact is stored (once it is evicted or absent, the records it names are read until one is still stored); used by the part walk of a pending claim. |
 | `payloadLookup` | Read-only (schema 71, additive, ordinal 56): the artifacts that hold one payload id (`blake3:` and 64 lower-case hex digits), one page by artifact id, bounded by `pageSize` (1 to 1000, default 200), with `complete` false while the `payload-index` migration runs; see "Payload id index". |
@@ -4147,7 +4242,7 @@ typed syslog uploads have no fabricated receiver position.
 Use full typed record/context metadata, including CLI `context STORE_ID
 RECORD_ID --before 0 --after 0`, to resolve a search result's receiver position.
 
-A full receiver-window registry never refuses a packet (#215): the packet is stored
+A full receiver-window registry never refuses a packet: the packet is stored
 without a receiver position, a classified discard is not recorded, and either is
 counted per stream in status `stream_evidence_loss` (kind `receiver`, with the source
 and receiver instance) instead of counting a pressure discard.
@@ -4226,7 +4321,7 @@ window ID, including for the same source and instance. Pins on records preserve
 their original positions without extending the stream summary deadline. The
 bounded registry reclaims expired entries on its next atomic replacement.
 Missing or invalid registry state is a hard storage failure, not an empty
-fallback. Full capacity never refuses a log (#215): the batch is stored without
+fallback. Full capacity never refuses a log: the batch is stored without
 stream positions (its records carry no `producer` position) and only that stream's
 gap evidence is lost. The loss is counted per stream and shown in status under
 `stream_evidence_loss`: the `max_named` (16) streams with the most lost positions
@@ -4249,7 +4344,7 @@ existing window with nothing left to shed takes the batch without a window updat
 and counts it as lost; a later batch of that stream may then show those positions
 as a gap. The same holds for receiver windows.
 
-Source time mapping on the event route (#227). The daemon binds each event source's
+Source time mapping on the event route. The daemon binds each event source's
 `/event_time` (Unix milliseconds) mapping on its first batch. The mapping registry holds at
 most 1024 sources and never shrinks. A batch from a source past that ceiling is never refused:
 it is stored, its records carry unknown time (`no_profile`, the original `event_time` stays in
@@ -4262,19 +4357,19 @@ sources, the rest in `other_*`, and totals over all sources. A retry of an accep
 returns its receipt and is not counted twice. A source that already has a mapping keeps it,
 and a source with a different mapping still gets `CONFLICT`. Explicit
 `define_time_profile`, `define_log_time_profile` and diagnostic profile declarations past the
-ceiling are refused, but with the non-retryable `INVALID_ARGUMENT` (#238): they are not logs,
+ceiling are refused, but with the non-retryable `INVALID_ARGUMENT`: they are not logs,
 and nothing ever removes a mapping row, so no slot frees and a retry could never succeed.
 Once the registry is seen full the daemon remembers it for the life of the process, so a
 batch past the ceiling does not walk the mapping rows again.
 
-A batch that no retry can ever accept is not answered with a retryable code (#227). On the
+A batch that no retry can ever accept is not answered with a retryable code. On the
 event route an over-bound batch (more records than `max_records`, inline bytes over 16 MiB, an
 atomic write over 128 MiB or larger than the whole data budget) answers `INVALID_ARGUMENT`,
 which is not retryable, and the client quarantines it; an operator who raises `max_records`
 can replay the quarantine file. The size of the joined write, which includes source context
 and authority metadata, is judged at write time against the same whole data budget and
 answers the same non-retryable code. The `ingest` call answers an inline payload over 16 MiB
-with `INVALID_ARGUMENT` too. Other callers keep the code `RESOURCE_LIMIT`, answered non-retryable (#397). An input-only refusal
+with `INVALID_ARGUMENT` too. Other callers keep the code `RESOURCE_LIMIT`, answered non-retryable. An input-only refusal
 (record count, sequence count) is decided before the source mapping is bound, so a refused
 batch leaves no mapping behind. A batch refused after the mapping is bound (at the write-size
 checks, a record-level check, or when the write is applied) can still leave the mapping of its
@@ -4326,8 +4421,7 @@ check current retention. All counts render as decimal strings in agent output.
 
 Status now carries typed artifact catalog handle/byte counts, limits and lease
 duration. Artifact and pin pages share both their receipt wire codec and agent
-renderer. Schema 27 supersedes this initial scope with membership and diagnostic
-filtering. Producer stream discovery now uses `producerStreamGet` and source
+renderer. Producer stream discovery now uses `producerStreamGet` and source
 summaries; corpus-scale operational selection remains unqualified.
 
 Artifact upload metadata accepts `source_name`, an optional existing `source_id`,
@@ -4613,7 +4707,7 @@ claim's original acceptance.
 ### Removed online backup
 
 Sparrow backs up nothing except the archive age-out to GTS files on the NAS. The online store
-backup (#156) was removed in #330, with `sparrow-backup`, the restore, and the `backup_root` and
+backup was removed, with `sparrow-backup`, the restore, and the `backup_root` and
 `backup_keep` configuration keys. The server file refuses unknown fields, so a file that still
 names either key fails to load with the parser's `unknown field` error.
 
@@ -4671,7 +4765,7 @@ and about 5.5 MiB as MCP JSON, where the path is hex. Both an administrator's
 retirement and the consume worker's quarantine of a refused source add a row
 (see below), so the bound fills without anyone acting. A retirement past it is
 refused with `RESOURCE_LIMIT` and leaves the claim pending; no retired row is
-dropped, and issue #420 tracks ageing them out. The store-wide count and the
+dropped, and no supported step ages them out. The store-wide count and the
 bound are `Status.retiredClaimCount` and `Status.maxRetiredClaims`; each watch's
 rows are its `retired_claims`. Folding the oldest rows into a summary, which would remove the
 refusal, needs a stored-format change and is not part of this bound.
@@ -4744,8 +4838,8 @@ change that. `status` reports `retired_claim_count` and `max_retired_claims`
 (`Status.retiredClaimCount` and `Status.maxRetiredClaims`, schema 71, additive),
 and the daemon logs once per start when the count reaches three quarters of the
 bound (768, which leaves 256 retirements to act in) and once at the bound, saying
-what follows. No supported step frees the rows; issue #420 tracks ageing retired claims
-out, which needs a stored-format change. A parked claim that a configured limit
+what follows. No supported step frees the rows. Ageing retired claims out needs a
+stored-format change, which is not yet part of the contract. A parked claim that a configured limit
 refused (such as `max_records`) clears when the setting is raised and the daemon
 restarts, because its one upload after the restart then publishes.
 
@@ -5210,8 +5304,7 @@ or semantic engine. The public surface includes:
     counts those kept in files), and later events proceed. Status exposes `quarantine_dir`,
     `quarantine_files`, `last_quarantine_file` and `quarantine_write_failures`. The worker never
     deletes a quarantine file; its size is bounded only by the disk (a source whose time
-    mapping conflicts refuses every later batch, so each becomes one file until the operator
-    fixes the source). If the file cannot be written, the batch stays pending, the failure
+    mapping conflicts refuses every later batch, so each becomes one file until the source's time mapping is corrected). If the file cannot be written, the batch stays pending, the failure
     is counted and reported as the transient failure, which names the refusal code and
     reason, the directory and the I/O error, and the write is retried, so that batch is not
     dropped; later events wait behind it and are refused as `Full` once the queue is full.
@@ -5223,7 +5316,7 @@ or semantic engine. The public surface includes:
     `PERMISSION_DENIED`, `UNAUTHENTICATED`, `UNSUPPORTED` and `STORAGE_FAILURE`. A hold is visible as
     `retries` and `last_transient_failure`, which clears when a batch is acknowledged or set
     aside; the queue behind it is bounded as above. A busy refusal is never quarantined and
-    a full producer registry is not a refusal (#215).
+    a full producer registry is not a refusal.
   - Replaced store. `STORE_MISMATCH` (the store behind the socket changed) is set aside, not
     held: whether the old store holds the pending batch is unknown, and the batch must not
     reach another store unrecorded, so it goes to a quarantine file with the refusal. The
@@ -5537,7 +5630,7 @@ Typed errors carry `code`, a concise `message`, `retryable`, `request_id` when
 applicable, and bounded `details`. An error does not include a successful query
 prefix after an operational failure. Refusals do not silently select a smaller
 scope, shorter pin, altered datatype, or unrelated source generation. The wire
-`Failure` also carries a `class` (additive, #257): `freeSpaceFloor` marks a retryable
+`Failure` also carries a `class` (additive): `freeSpaceFloor` marks a retryable
 `STORAGE_PRESSURE` made by the free-space floor, and `unclassified` is every other
 refusal and every refusal of an older daemon.
 
@@ -5699,6 +5792,33 @@ produce `STORAGE_FAILURE`. Cancellation shares the connection/caller read lifeti
 and preserves worker admission through retirement. The SDK checks store identity,
 wire size, counts, ownership bounds and clock/window agreement before agents
 render the result. `UInt64` counters use decimal strings in CLI/MCP JSON.
+
+While the owner summary is incomplete, the account comes from the owner entries
+(the entry walk). Each artifact row is read twice: once for its identity, deadlines
+and retirement state, then again to fold its chunk identities after the retired
+position, so an artifact's retired chunks are never counted. The row is charged
+once while it is read, and each distinct digest in the ownership map is charged
+256 catalog bytes, a worst-case bound. A walk that answers is exact and counts
+every chunk its rows own. It never undercounts. Its visits are one per pin seek,
+one per artifact or record row, one per chunk occurrence in an artifact or record
+row, and one per `ref:` row. Each bound that does not fit makes the walk refuse
+with `RESOURCE_LIMIT` and publish no account, and the message names that bound:
+`retention metrics exceed max_visits` for `max_visits`,
+`retention ownership map exceeds catalog_bytes` and
+`manifest retirement exceeds catalog admission` for `catalog_bytes`, and
+`payload verification exceeds operation admission` for `payload_bytes`. The
+refusal is deterministic: the same store at the same limits refuses again until
+the store or the limits change.
+
+With R record rows, A chunk occurrences in artifact rows, B chunk occurrences in
+record rows, D `ref:` rows and P pin seeks, the visits are 1 + R + A + B + D + P
+(the 1 is the artifact row). An artifact of N distinct chunks with no record row
+needs 2N + 1 visits, so it answers only while 2N + 1 fits `max_visits`: up to
+49,999 chunks at the maximum of 100,000, and up to 4,999 at the default of 10,000.
+That 49,999 figure is the no-record case. An artifact whose records hold N chunk
+occurrences in total, as ingested evidence does, needs 3N + R + 1 visits and so
+reaches fewer chunks. The payload bytes bound applies as well: at full 64 KiB
+chunks the 1 GiB maximum `payload_bytes` cap refuses at 16,385 chunks.
 
 This read does not advance intake, synchronize buffered writes, retire evidence,
 renew pins or run compaction. Logical retirement eligibility never certifies

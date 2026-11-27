@@ -300,6 +300,48 @@ pub fn remove_artifact_rdf_upgrade(db: &rocksdb::DB) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// The shape of a one-record, one-artifact archive segment built by [`segment_with`]. Every
+/// field defaults to a consistent segment, so a test changes only what it forges.
+#[derive(Clone, Copy, Debug)]
+pub struct SegmentFixture<'a> {
+    /// The bytes whose digest the record's link quad names.
+    pub claimed: &'a [u8],
+    /// The bytes stored as the record's blob.
+    pub actual: &'a [u8],
+    /// The artifact's source label.
+    pub artifact_source: &'a str,
+    /// The record's source label.
+    pub record_source: &'a str,
+    /// The artifact's receipt time in Unix milliseconds.
+    pub artifact_received_at: u64,
+    /// The record's receipt time in Unix milliseconds.
+    pub record_received_at: u64,
+    /// A blob stored in the container that no record links to.
+    pub unreferenced_blob: Option<&'a [u8]>,
+    /// Whether a payload link quad names a subject that is not a record.
+    pub orphan_link: bool,
+    /// Whether the artifact itself carries a `payloadBlake3` link naming `claimed`.
+    pub artifact_digest_link: bool,
+}
+
+impl<'a> SegmentFixture<'a> {
+    /// A consistent segment whose record link names `claimed` and whose blob is `actual`.
+    #[must_use]
+    pub const fn new(claimed: &'a [u8], actual: &'a [u8]) -> Self {
+        Self {
+            claimed,
+            actual,
+            artifact_source: "host",
+            record_source: "host",
+            artifact_received_at: 1_700_000_000_000,
+            record_received_at: 1_700_000_000_000,
+            unreferenced_blob: None,
+            orphan_link: false,
+            artifact_digest_link: false,
+        }
+    }
+}
+
 /// The bytes of a one-record, one-artifact archive segment built with PurRDF's public writer.
 /// The record's link quad names the digest of `claimed`; the blob stored is `actual`, hashed
 /// honestly by the container, so the container is internally consistent whatever the two are.
@@ -309,20 +351,38 @@ pub fn remove_artifact_rdf_upgrade(db: &rocksdb::DB) -> Result<(), Box<dyn std::
 /// On a PurRDF writer failure, which a fixture cannot recover from.
 #[must_use]
 pub fn forged_segment(claimed: &[u8], actual: &[u8]) -> Vec<u8> {
+    segment_with(&SegmentFixture::new(claimed, actual))
+}
+
+/// The bytes of the segment `fixture` describes; see [`SegmentFixture`].
+///
+/// # Panics
+/// On a PurRDF writer failure, which a fixture cannot recover from.
+#[must_use]
+pub fn segment_with(fixture: &SegmentFixture<'_>) -> Vec<u8> {
     use purrdf::gts::writer::digest_string;
     use purrdf::gts_write::to_writer;
     use purrdf::{RdfDatasetBuilder, RdfLiteral, RdfLookaside};
     const NS: &str = "urn:sparrow:vocab:";
-    const AT: u64 = 1_700_000_000_000;
-    let at = sparrow_core::format_instant(AT).expect("fixture instant formats");
+    let SegmentFixture {
+        claimed, actual, ..
+    } = *fixture;
+    let artifact_at = sparrow_core::format_instant(fixture.artifact_received_at)
+        .expect("fixture instant formats");
+    let record_at =
+        sparrow_core::format_instant(fixture.record_received_at).expect("fixture instant formats");
     let mut builder = RdfDatasetBuilder::new();
     let facts: [(&str, &str, String); 9] = [
-        ("artifact:aa", "sourceName", "host".to_owned()),
+        (
+            "artifact:aa",
+            "sourceName",
+            fixture.artifact_source.to_owned(),
+        ),
         ("artifact:aa", "format", "log".to_owned()),
-        ("artifact:aa", "receivedAt", at.clone()),
+        ("artifact:aa", "receivedAt", artifact_at),
         ("artifact:aa", "byteLength", actual.len().to_string()),
-        ("record:bb", "sourceName", "host".to_owned()),
-        ("record:bb", "receivedAt", at),
+        ("record:bb", "sourceName", fixture.record_source.to_owned()),
+        ("record:bb", "receivedAt", record_at),
         ("record:bb", "sourceByteStart", "0".to_owned()),
         ("record:bb", "sourceByteEnd", actual.len().to_string()),
         ("record:bb", "payloadBlake3", digest_string(claimed)),
@@ -379,9 +439,45 @@ pub fn forged_segment(claimed: &[u8], actual: &[u8]) -> Vec<u8> {
     builder
         .push_quad(artifact, payload_link, payload, None)
         .expect("fixture quad");
+    if fixture.artifact_digest_link {
+        let link = builder
+            .intern_iri(&format!("{NS}payloadBlake3"))
+            .expect("fixture link");
+        let digest = builder
+            .intern_literal(RdfLiteral::simple(digest_string(claimed)))
+            .expect("fixture literal");
+        builder
+            .push_quad(artifact, link, digest, None)
+            .expect("fixture quad");
+    }
+    if fixture.orphan_link {
+        let orphan = builder
+            .intern_iri("urn:sparrow:record:orphan")
+            .expect("fixture orphan");
+        let link = builder
+            .intern_iri(&format!("{NS}payloadBlake3"))
+            .expect("fixture link");
+        let digest = builder
+            .intern_literal(RdfLiteral::simple(digest_string(b"orphan")))
+            .expect("fixture literal");
+        builder
+            .push_quad(orphan, link, digest, None)
+            .expect("fixture quad");
+    }
     let dataset = builder.freeze().expect("fixture dataset");
     let mut writer =
         to_writer(&dataset, &RdfLookaside::default(), "sparrow-archive").expect("fixture writer");
+    if let Some(extra) = fixture.unreferenced_blob {
+        writer
+            .add_blob_transformed(
+                extra.to_vec(),
+                Some("application/octet-stream"),
+                Some("record"),
+                &["zstd".to_owned()],
+                None,
+            )
+            .expect("fixture blob");
+    }
     writer
         .add_blob_transformed(
             actual.to_vec(),

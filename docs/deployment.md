@@ -71,8 +71,8 @@ For an explicit drain, run the `sparrow-client` example
 writer releases the directory. Inspect its final JSON progress and exit code.
 
 Schema 74 rebuilds the derived source summaries in resumable pages. Opening
-a store selects writer family 462 through 516 without a sealed receipt
-watermark, or 517 through 571 with one. The first eligible sealed request
+a store selects writer family 572 through 626 without a sealed receipt
+watermark, or 627 through 681 with one. The first eligible sealed request
 activates the watermark and advances the writer family within those ranges.
 During the rebuild, source listings combine rebuilt rows with totals from the
 remaining catalog entries. See [publication and durability](architecture.md#61-publication-and-durability).
@@ -164,7 +164,7 @@ A consume watch splits an over-bound file into ordered parts when the daemon
 advertises the required limits. The watch keeps the claim and names the
 refusal in status if those limits are unavailable. The shipper may refuse an
 over-bound non-line file before it reaches the watch.
-[Part sets](interfaces.md#part-sets-for-consume-roots-280)
+[Part sets](interfaces.md#part-sets-for-consume-roots)
 
 `min_free_bytes` (default 4 GiB) is a floor on free space in the filesystem
 that holds `data_dir`. `disk_budget` bounds only the store's own bytes, while
@@ -565,6 +565,279 @@ with `sparrow-ship.timer`.
 
 The timer runs five minutes after each completed run. Shipped data arrives when
 its producer finishes a file, not as it is written.
+
+### Spooling one unit's journal lines
+
+`deploy/libexec/sparrow-unit-spool UNIT SPOOL_DIR CURSOR_FILE` follows the default system journal
+for one unit and writes JSON Lines in ten-minute files, `SPOOL_DIR/unit-spool-YYYYMMDDTHHMM.jsonl`.
+Each record carries `source`, `unit`, `time`, `realtime_usec`, `priority`, `message`, and `manager` when the
+entry names a command. Lines the service manager writes about the unit (stops, exits, OOM kills) have
+`"source":"systemd-manager"`. The unit's own process lines are dropped by default. With
+`SPARROW_UNIT_SPOOL_OWN_LINES=keep`, they are kept with `"source":"systemd-unit"`, which a unit that logs through
+stdout or stderr to the default journal needs. The unit name is exact: a unit whose name extends another's is not
+that unit's line.
+
+The cursor file is written after each record is appended, so it never runs ahead of the spool.
+Across a process crash, a record appended before the cursor write is spooled again on the next run: the spool
+is at-least-once. The records are not fsynced. A host crash or power loss can therefore lose records the kernel
+had not yet written to disk, and a crash during the backfill spools the whole backfill again. A first start with
+no cursor and no `SPARROW_UNIT_SPOOL_SINCE` spools the unit's entire retained journal.
+
+The commands in this section use placeholders: `UNIT` is the unit's name without `.service`, `REPO` the checkout,
+`NAME` the source name, `SOURCE` the name of an existing source whose files are appended to after they settle. A
+host's literal commands belong in that host's install document, not here, because this document carries generic
+examples (AGENTS.md).
+
+The spool account must be able to read the system journal. A spool for one unit uses its own directory and
+cursor file, both under the account's state directory (`~/.local/state/sparrow/unit-spool`). Install the tracked
+program under its own name, `sparrow-unit-spool`, beside any spool program the host already runs. The template
+unit never changes or replaces another file in `~/.local/libexec/sparrow`, such as the program an existing spool
+unit runs: that unit keeps running its own program until it moves to the tracked program in a separate change.
+
+One template, `deploy/systemd/user/sparrow-spool@.service`, serves every unit. Its instance is the unit's name
+without `.service`, so `sparrow-spool@UNIT.service` spools `UNIT.service`. The template reads the instance with
+`%i`, which keeps it verbatim. The unescaping specifier `%I` would turn the hyphens of a name such as
+`example-sync-nightly` into slashes, so the template does not use it. The test renders the template and runs the
+program with a hyphenated instance.
+
+Find a unit's lines with the unit name:
+
+```sh
+jq -c 'select(.unit == "UNIT.service")' ~/.local/state/sparrow/unit-spool/UNIT.service/*.jsonl
+```
+
+#### The shipper
+
+On a host whose shipper runs in the user manager (`sparrow-ship.timer`, configuration `~/.config/sparrow/ship.toml`,
+consume roots under `~/.local/state/sparrow/intake`), the shipper is `~/.local/libexec/sparrow/sparrow-ship`. The
+system-install paths of this document (`/etc/sparrow`, `/var/lib/sparrow`) apply only to a system install.
+
+- Configuration: the shipper reads its configuration on each run, so a new `[[source]]` takes effect at the next run
+  without a restart.
+- Required directories: a source's `dir` must exist when the configuration is loaded. Its consume root
+  `intake_root/NAME` must exist when a run starts. A missing consume root aborts that run before any source is
+  queued, so it fails every source, not only the new one.
+- Watch: the consume root needs a consume watch on the daemon. A new watch takes expected revision `0`. Adding it is
+  a live store operation: it registers one more consume root with the running daemon, without a restart, and the
+  other watches keep running. This document does not record a measurement of the daemon during that operation.
+- In flight: a run holds the shipper's lock. A stop leaves queued items queued. A stop between queueing a file and
+  recording it in the ledger can queue that file again on the next run. Neither loses a record.
+- Waiting: nothing on the write path waits on the shipper. The sync writes to the journal whether or not the spool
+  or shipper runs. The journal keeps unread lines only within its own retention limits, so a spool that stays
+  stopped longer than that loses the lines it has not read.
+- A silent or stopped unit: the spool does not fail. `journalctl --follow` waits for new entries of the unit, so the
+  spool idles and writes nothing.
+- Latency in normal running: a line becomes readable in the store after its bucket file is complete, which needs
+  the next bucket file to exist (up to about ten minutes after the line), plus one shipper run. If the unit stops
+  logging, the newest bucket waits for the next spooled line. The source uses `rule = "daily"`, which holds the
+  newest bucket while it may still be appended to, so it reaches the store only once the next bucket file exists.
+
+#### Install
+
+Each step has a check that it took and the single command that undoes it. Stop at the first failed check and undo
+that step before anything else. Step 1 creates a consume root, step 2 registers a watch on the running daemon, step 4 starts the unit, and step 6
+replaces the live shipper configuration. Each of these needs its own explicit authorization.
+
+0. Back up the shipper configuration; the backup is kept until the removal step deletes it.
+   `cp -p ~/.config/sparrow/ship.toml ~/.config/sparrow/ship.toml.pre-NAME`
+   Check: `cmp ~/.config/sparrow/ship.toml ~/.config/sparrow/ship.toml.pre-NAME` prints nothing.
+   Undo: `rm -f ~/.config/sparrow/ship.toml.pre-NAME`
+
+1. Create the consume root, with the mode the other roots use.
+   `install -d -m 0700 ~/.local/state/sparrow/intake/NAME`
+   Check: `test -d ~/.local/state/sparrow/intake/NAME`
+   Undo: `rmdir ~/.local/state/sparrow/intake/NAME` (removes it only while empty)
+
+2. Register the consume watch on the production daemon. The definition copies an existing watch definition, with
+   its source and root changed to `NAME` and `~/.local/state/sparrow/intake/NAME`. The expected revision is `0`.
+   `sparrow SOCKET watch put REQUEST_ID 0 DEFINITION.toml`
+   Check: `sparrow SOCKET watch list` shows a watch with that root, enabled.
+   Undo: `sparrow SOCKET watch remove REQUEST_ID WATCH_ID REVISION`, with the watch ID and current revision that
+   `watch list` reports.
+
+3. Install the program and the template unit, not started. Install the template once: a second unit needs only
+   step 4 for its own instance.
+   `install -D -m 0755 REPO/deploy/libexec/sparrow-unit-spool ~/.local/libexec/sparrow/sparrow-unit-spool`
+   `install -D -m 0644 REPO/deploy/systemd/user/sparrow-spool@.service ~/.config/systemd/user/sparrow-spool@.service`
+   `systemctl --user daemon-reload`
+   Check: `cmp` of each installed file against its repository file prints nothing.
+   Undo: `rm -f ~/.local/libexec/sparrow/sparrow-unit-spool ~/.config/systemd/user/sparrow-spool@.service`
+   (while no other instance uses them), then `systemctl --user daemon-reload`.
+
+4. Start the spool unit (authorized by the sync's install).
+   `systemctl --user enable --now sparrow-spool@UNIT.service`
+   Check: `systemctl --user is-active sparrow-spool@UNIT.service` prints `active`, and
+   `test -d ~/.local/state/sparrow/unit-spool/UNIT.service` succeeds. The directory exists once the unit has started,
+   whether or not the sync has logged yet.
+   Undo: `systemctl --user disable --now sparrow-spool@UNIT.service`
+
+5. Write the candidate beside the live file, with the entry below appended. Validate it with the installed shipper's
+   loader, which writes nothing. The loader checks the entry's spool directory, which step 4 creates.
+   ```toml
+   [[source]]
+   name = "NAME"
+   dir = "/home/USER/.local/state/sparrow/unit-spool/UNIT.service"
+   pattern = "unit-spool-*.jsonl"
+   rule = "daily"
+   format = "jsonl"
+   settle_seconds = 120
+   ```
+   Check: `test -d ~/.local/state/sparrow/intake/NAME` (step 1) and the loader prints `valid`:
+   `python3 -I -B -c 'import importlib.machinery,importlib.util,sys; l=importlib.machinery.SourceFileLoader("ship",sys.argv[1]); s=importlib.util.spec_from_loader("ship",l); m=importlib.util.module_from_spec(s); l.exec_module(m); m.load_config(sys.argv[2]); print("valid")' ~/.local/libexec/sparrow/sparrow-ship ~/.config/sparrow/ship.toml.candidate`
+   Undo: `rm -f ~/.config/sparrow/ship.toml.candidate`
+
+6. Save the live file, then rename the candidate into place. The rename is atomic within the directory; the live
+   file is never written in place.
+   `cp -p ~/.config/sparrow/ship.toml ~/.config/sparrow/ship.toml.pre-swap-NAME`
+   `mv -f ~/.config/sparrow/ship.toml.candidate ~/.config/sparrow/ship.toml`
+   Check: the validation command of step 5, on `ship.toml`, prints `valid`. The next timer run logs `NAME:` in
+   `journalctl --user -u sparrow-ship.service`.
+   Undo: `cp -p ~/.config/sparrow/ship.toml.pre-swap-NAME ~/.config/sparrow/ship.toml.restore && mv -f ~/.config/sparrow/ship.toml.restore ~/.config/sparrow/ship.toml`
+
+The source has no `delete_acknowledged` key: the existing configuration has no store socket or CLI for reaping, so
+the spool's files are kept.
+
+#### Arrival check
+
+After step 6, expect nothing in the store for the first minutes. The first line reaches the store only after its
+ten-minute bucket file is complete, which needs the next bucket file to exist, and then one shipper run: up to
+about ten minutes plus one run, so about 15 to 20 minutes for the first arrival. Silence in that time is not a failure.
+
+- In the spool, for one unit's lines: `jq -c 'select(.unit == "UNIT.service")' ~/.local/state/sparrow/unit-spool/UNIT.service/*.jsonl`
+- In the store: `sparrow SOCKET records --text UNIT.service`. Its `total_items` grows as lines arrive. A stored
+  record's Sparrow `source` is the shipper source name. Read one record back with `bytes`: the spool line inside it
+  has `"source":"systemd-unit"` for the unit's own lines and `"unit":"UNIT.service"`.
+
+#### Separate step: the bucket rule of a source whose files grow
+
+This step is declined independently of the install above. It changes one line of the shipper configuration and is
+made only after install steps 0 to 6 have held.
+
+A. Back up the configuration next to the live file.
+   `cp -p ~/.config/sparrow/ship.toml ~/.config/sparrow/ship.toml.pre-SOURCE-daily`
+   Check: `cmp` of the two files prints nothing.
+   Undo: `rm -f ~/.config/sparrow/ship.toml.pre-SOURCE-daily`
+
+B. Write a candidate beside the live file, with one line changed in the `[[source]]` block whose name is
+   `SOURCE`: `rule = "settled"` becomes `rule = "daily"`. No other line changes; `settle_seconds` stays.
+   Validate it with the loader command of install step 5.
+   Undo: `rm -f ~/.config/sparrow/ship.toml.candidate`
+
+C. Rename the candidate into place: `mv -f ~/.config/sparrow/ship.toml.candidate ~/.config/sparrow/ship.toml`.
+   Check: the next timer run logs `SOURCE: queued` in `journalctl --user -u sparrow-ship.service`. After that
+   run, each bucket file that is not the newest appears in the ledger exactly once, and the repeated-path
+   count does not grow: `cut -f2 ~/.local/state/sparrow/ship/SOURCE.ledger | sort | uniq -d | wc -l`.
+   Undo: `cp -p ~/.config/sparrow/ship.toml.pre-SOURCE-daily ~/.config/sparrow/ship.toml.restore && mv -f ~/.config/sparrow/ship.toml.restore ~/.config/sparrow/ship.toml`
+
+Under the daily rule the newest bucket reaches Sparrow only once the next bucket file exists. That delay is
+the expected behaviour, not a fault.
+
+#### Remove
+
+Undo the install in reverse order. Each step has a check that it took. Do not restore a whole saved configuration
+to remove an entry: that would also revert any later change to the file. Remove the entry by a candidate instead.
+
+1. Remove the source entry: write a candidate without the `[[source]]` block, validate it with the loader, and rename
+   it into place atomically.
+   Check: the loader prints `valid`, and the next run no longer logs `NAME:`.
+2. Stop and disable the unit: `systemctl --user disable --now sparrow-spool@UNIT.service`.
+   Check: `systemctl --user is-enabled sparrow-spool@UNIT.service` prints `disabled` or reports no such unit, and
+   `systemctl --user is-active sparrow-spool@UNIT.service` prints `inactive`.
+3. Remove the program and the template unit file (while no other instance uses them), then
+   `systemctl --user daemon-reload`.
+   Check: `test ! -e ~/.local/libexec/sparrow/sparrow-unit-spool && test ! -e ~/.config/systemd/user/sparrow-spool@.service`.
+4. Wait until the consume root is empty, so that every item already fed has been consumed.
+   Check: `find ~/.local/state/sparrow/intake/NAME -mindepth 1 -print -quit` prints nothing.
+5. Remove the watch: `sparrow SOCKET watch remove REQUEST_ID WATCH_ID REVISION`, with the values `watch list`
+   reports.
+   Check: `watch list` no longer shows the root.
+6. Remove the consume root: `rmdir ~/.local/state/sparrow/intake/NAME` (only while empty).
+   Check: `test ! -e ~/.local/state/sparrow/intake/NAME`.
+7. Remove both configuration backups: `rm -f ~/.config/sparrow/ship.toml.pre-NAME ~/.config/sparrow/ship.toml.pre-swap-NAME`.
+   Check: `ls ~/.config/sparrow/ship.toml.pre-*NAME` finds neither.
+
+The spool directory, the cursor file, and the shipper's ledger and queue stay. The spool files hold records the store
+may not yet hold; whether to remove them is a separate decision, made outside this procedure.
+
+#### Moving an existing spool unit to the tracked program
+
+An existing spool unit may run an untracked copy of an earlier program that reads the journal with
+`journalctl --cursor-file=CURSOR --follow`. journalctl writes that cursor file when it ends by SIGTERM or SIGINT, and
+when its output pipe closes while SIGPIPE is ignored, as a systemd service has it by default. It writes nothing on
+SIGKILL. Entries journalctl has printed but the spool has not
+appended when it ends this way are lost from the spool. A SIGKILL replays from the last written cursor instead, so
+it duplicates entries rather than losing them. The `--help` and man page text say only that the cursor is written at
+the end; the signal and closed-pipe cases come from running journalctl, not from its documentation. The stop step
+below uses SIGTERM, so it does not depend on the closed-pipe case.
+
+The tracked program writes its cursor after each append, so a stop or crash never skips an entry it has not
+appended: the next run resumes after the last appended entry. The two programs store the same journal cursor
+string, so the tracked program resumes from the existing cursor file. The move does not recover entries the
+untracked copy already lost.
+
+The move changes live state: the running unit, its unit file and the shipper source. Each step needs its own
+authorization for the window in which it is run. Placeholders: `EXISTING_UNIT` is the existing unit's name with
+`.service`, `UNIT_FILE` its unit file, `EXISTING_DIR` its spool directory, `EXISTING_CURSOR` its cursor file,
+`OLD_PATTERN` the file pattern the untracked copy writes, `SOURCE` its shipper source name, `OLD_RULE` and
+`OLD_PATTERN_IN_SOURCE` the values step 0 records, and `WINDOW` the quiet period the stop uses.
+
+0. Record the state, read-only: `systemctl --user is-active EXISTING_UNIT`, `ls EXISTING_DIR | tail -n 3`,
+   `cat EXISTING_CURSOR`, and the source's current `rule` and `pattern` lines from the shipper configuration. Check:
+   the values are recorded in the task record before step 1. Undo: none.
+
+   Stop before step 1 if `pattern` in SOURCE matches files other than `OLD_PATTERN`, or if `EXISTING_DIR` is shared
+   with another forwarder. The tracked program writes `unit-spool-*.jsonl`, which the existing pattern does not
+   match, so step 5 would stop shipping those other files. That case needs a decision on the shipper configuration
+   before step 1, and this move does not make it.
+
+1. Back up the unit file and the cursor file.
+   `cp -p UNIT_FILE UNIT_FILE.pre-move` and `cp -p EXISTING_CURSOR EXISTING_CURSOR.pre-move`
+   Check: `cmp` of each pair prints nothing.
+   Undo: `rm -f UNIT_FILE.pre-move EXISTING_CURSOR.pre-move`
+
+2. Stop the existing unit during a WINDOW in which it has logged nothing for several minutes.
+   `systemctl --user stop EXISTING_UNIT`
+   Check: `systemctl --user is-active EXISTING_UNIT` prints `inactive`.
+   Undo: `systemctl --user start EXISTING_UNIT`
+   The quiet period keeps the set of printed-but-unappended entries empty in practice, which is the loss above. The
+   journal keeps unread entries only within its retention limits.
+
+3. Replace the unit file with the template's content for this unit: the tracked program on the same spool directory
+   and cursor file, with `SPARROW_UNIT_SPOOL_OWN_LINES=keep` and `IgnoreSIGPIPE=no`, as the template sets them.
+   Write the candidate beside the unit file, move it into place, and reload the user manager so that it reads the new
+   definition.
+   `mv -f CANDIDATE UNIT_FILE && systemctl --user daemon-reload`
+   Check: `systemd-analyze --user verify UNIT_FILE` exits 0, and `systemctl --user cat EXISTING_UNIT` shows
+   `sparrow-unit-spool` in `ExecStart` and `IgnoreSIGPIPE=no`.
+   Undo: `mv -f UNIT_FILE.pre-move UNIT_FILE && systemctl --user daemon-reload`
+
+4. Start the unit with the tracked program.
+   `systemctl --user start EXISTING_UNIT`
+   Check: `systemctl --user is-active EXISTING_UNIT` prints `active`, and the spool directory holds files named
+   `unit-spool-*.jsonl` once the unit's next entry is written.
+   Undo: `systemctl --user stop EXISTING_UNIT`
+
+5. Let the old files finish shipping, then move the source to the new file pattern. Two candidate writes, each
+   changing the `[[source]]` entry's lines named below, each candidate validated by the loader command of the install's
+   step 5 and renamed into place.
+   a. Set `rule = "settled"` for SOURCE, unless step 0 recorded it as settled already. The old files are no longer
+      appended to, so a settled rule ships the newest one; a daily rule would hold it indefinitely. Check: after a
+      shipper run that reports no further queued files for SOURCE and neither a per-run file limit nor a full queue, every
+      name matching `OLD_PATTERN` in `EXISTING_DIR` is in the ledger, by its path: `ls EXISTING_DIR/OLD_PATTERN | xargs -n1 basename` against
+      `cut -f2 ~/.local/state/sparrow/ship/SOURCE.ledger`.
+      Undo: write the candidate with the rule step 0 recorded, `OLD_RULE`.
+   b. Set `pattern = "unit-spool-*.jsonl"` and `rule = "daily"` for SOURCE, two lines in one candidate. The daily rule
+      holds the newest matching file, so the check needs a second `unit-spool-*.jsonl` file in `EXISTING_DIR`, and
+      the first one past its settle time. Check: after a shipper run past that point, the ledger names the first
+      `unit-spool-*.jsonl` file. The run's `SOURCE: queued N` line alone does not prove this, because the shipper
+      prints it with N = 0.
+      Undo: write one candidate with the pattern step 0 recorded, `OLD_PATTERN_IN_SOURCE`, and the rule `OLD_RULE`.
+
+Each undo changes the recorded lines by a candidate (step 5b changes two lines together, and its undo does the same),
+never by restoring a saved whole file, so a later change to the configuration survives.
+
+Until step 5b is complete, the new files are not shipped; the old files are shipped by the old pattern. A file
+under both names is never shipped twice, because each name is matched by one pattern only.
 
 ### Deleting acknowledged spool files
 

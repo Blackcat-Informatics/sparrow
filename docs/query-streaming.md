@@ -68,7 +68,7 @@ keeps its separate 64 MiB admission; output staging does not remove that bound.
 
 ## Native read foundation
 
-The production query candidate path now delegates temporal reads to
+The production query candidate path delegates temporal reads to
 `query_membership::temporal_candidates`. Current and native-snapshot backends
 provide their iterator and catalog lookup. One implementation supplies the
 half-open native seek/upper bound, index decoding, record identity/time checks,
@@ -162,7 +162,7 @@ staging and releases its disk reservation. It does not interrupt an individual
 native database call, codec/projection call, sort, or a wait for a storage mutex;
 the next host checkpoint observes it. PurRDF still owns analysis and scoring.
 
-A newly created capture has a reply guard until typed response rendering finishes.
+A created capture has a reply guard until typed response rendering finishes.
 If the blocking worker's result is abandoned or rendering fails, that guard
 releases the snapshot through the existing result owner. Cleanup failures are
 reported, not swallowed. Successfully rendered captures keep their ordinary

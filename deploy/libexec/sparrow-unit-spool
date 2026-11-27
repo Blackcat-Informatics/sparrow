@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
+# SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
+#
+# Follow the DEFAULT journal for the lines about one unit and spool them as JSON Lines in ten-minute
+# files for sparrow-ship.
+#
+# Usage: sparrow-unit-spool UNIT SPOOL_DIR CURSOR_FILE
+#
+# By default the script keeps the lines the service manager writes about the unit ("Stopping ...",
+# "Main process exited", "The kernel OOM killer killed some processes in this unit", "Consumed ... memory
+# peak") and drops the unit's own process lines. A unit that logs to its own journal namespace writes
+# its own lines there, which this program does not read. A unit that logs to the default journal, as a
+# system unit does through stdout and stderr, needs SPARROW_UNIT_SPOOL_OWN_LINES=keep so that its
+# failures are spooled too.
+#
+# Each unit has:
+#   * its own cursor file, given by the caller and shared with no other forwarder;
+#   * its own file names, SPOOL_DIR/unit-spool-YYYYMMDDTHHMM.jsonl, so a bucket another forwarder wrote
+#     is never appended to (sparrow-ship keys a file by device, inode, size and mtime and ships a
+#     changed file again whole);
+#   * for every record, a "source" of "systemd-manager" for a manager line and "systemd-unit" for a line
+#     from the unit's own process, so a reader can tell the two apart.
+# The bucket comes from the entry's own timestamp, so a backfill lands in the right files.
+#
+# The cursor file is written after each record is appended, so it never runs ahead of the spool. A
+# process crash between the append and the cursor write spools that record again on the next run: across
+# a process crash the spool is at-least-once, never lossy. The records are not fsynced, so a host crash or
+# power loss can lose records the kernel had not yet written to disk, and a crash during the backfill
+# spools the whole backfill again.
+#
+# Environment:
+#   SPARROW_UNIT_SPOOL_SINCE  A journalctl --since time. Used only while CURSOR_FILE does not exist, to
+#                           backfill the first run; with a cursor, the run resumes after it.
+#   SPARROW_UNIT_SPOOL_SCOPE  "system" (default) selects with --unit; "user" follows the user journal
+#                           with --user-unit, for a user unit.
+#   SPARROW_UNIT_SPOOL_OWN_LINES  "drop" (default) omits the unit's own process lines; "keep" spools them
+#                           with "source": "systemd-unit".
+set -euo pipefail
+unit=${1:?unit} dir=${2:?spool dir} cursor=${3:?cursor file}
+scope=${SPARROW_UNIT_SPOOL_SCOPE:-system}
+own_lines=${SPARROW_UNIT_SPOOL_OWN_LINES:-drop}
+case $scope in
+    system) select=(--unit="$unit") ;;
+    user) select=(--user-unit="$unit") ;;
+    *) printf 'sparrow-unit-spool: SPARROW_UNIT_SPOOL_SCOPE must be system or user, not %s\n' "$scope" >&2; exit 2 ;;
+esac
+case $own_lines in
+    drop) keep=false ;;
+    keep) keep=true ;;
+    *) printf 'sparrow-unit-spool: SPARROW_UNIT_SPOOL_OWN_LINES must be drop or keep, not %s\n' "$own_lines" >&2; exit 2 ;;
+esac
+(umask 077 && mkdir -p -- "$dir" "$(dirname -- "$cursor")")
+
+# JSON entries on stdin, spooled into SPOOL_DIR. $1 is the cursor file to advance after each record
+# is appended, or empty for the backfill pass, which writes its cursor once it has finished.
+spool() {
+    local cursor_out=$1 bucket cur line
+    jq -r --unbuffered --arg unit "$unit" --argjson keep "$keep" '
+(._SYSTEMD_UNIT == $unit or ._SYSTEMD_USER_UNIT == $unit) as $own
+# Exact name match: a unit whose name is a prefix of this one does not match.
+| select($keep or ($own | not))
+| (.__CURSOR) as $cursor
+| (.MESSAGE | if type == "string" then . else tostring end) as $m
+| (.__REALTIME_TIMESTAMP | tonumber) as $us
+| {
+    source: (if $own then "systemd-unit" else "systemd-manager" end),
+    priority: ((.PRIORITY // "6") | tonumber),
+    realtime_usec: $us,
+    time: ($us / 1000000 | todate),
+    unit: $unit,
+    manager: (._COMM // null),
+    message: $m
+  }
+| with_entries(select(.value != null))
+| ((($us / 1000000 | floor) / 600 | floor) * 600 | strftime("%Y%m%dT%H%M")) as $bucket
+| "\($bucket)\t\($cursor)\t\(tojson)"' |
+        while IFS=$'\t' read -r bucket cur line; do
+            printf '%s\n' "$line" >> "$dir/unit-spool-$bucket.jsonl"
+            if [[ -n $cursor_out ]]; then
+                printf '%s\n' "$cur" > "$cursor_out.tmp"
+                mv -f -- "$cursor_out.tmp" "$cursor_out"
+            fi
+        done
+}
+
+# journalctl refuses --since together with a cursor, so the backfill is its own pass: spool everything
+# since the given time, then start the cursor at the last entry that pass saw (or at the journal's
+# newest entry, when it saw none) and follow from there.
+if [[ ! -e $cursor && -n ${SPARROW_UNIT_SPOOL_SINCE:-} ]]; then
+    seen=$(mktemp -- "$cursor.backfill.XXXXXX")
+    journalctl "${select[@]}" --since="$SPARROW_UNIT_SPOOL_SINCE" --output=json --no-pager > "$seen"
+    spool '' < "$seen"
+    last=$(tail -n 1 -- "$seen" | jq -r '.__CURSOR // empty')
+    if [[ -z $last ]]; then
+        last=$(journalctl --lines=1 --output=json --no-pager | jq -r '.__CURSOR // empty')
+    fi
+    [[ -n $last ]] || { printf 'sparrow-unit-spool: cannot find a journal cursor to start from\n' >&2; exit 1; }
+    printf '%s\n' "$last" > "$cursor.tmp"
+    mv -f -- "$cursor.tmp" "$cursor"
+    rm -f -- "${seen:?}"
+fi
+
+# With a cursor, resume after it; without one (and without a backfill), read the whole journal.
+if [[ -e $cursor ]]; then
+    start=(--after-cursor="$(<"$cursor")")
+else
+    start=(--lines=all)
+fi
+journalctl "${select[@]}" --output=json --follow --no-pager "${start[@]}" | spool "$cursor"

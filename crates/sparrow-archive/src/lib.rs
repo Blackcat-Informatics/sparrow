@@ -10,10 +10,12 @@
 mod decode;
 mod error;
 mod extract;
+mod payload;
 mod segment;
 
 pub use error::ArchiveError;
 pub use extract::extract;
+pub use payload::{PayloadMatch, find_payload, validate_payload_id};
 pub use segment::{ArchivedArtifact, ArchivedRecord, Segment, Summary, list_segments};
 
 /// Decode one segment file and discard the result: `Ok` when it reads as GTS and every

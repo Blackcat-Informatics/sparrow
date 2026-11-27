@@ -4,6 +4,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use purrdf::gts::writer::digest_string;
+
 use crate::decode::{Decoded, decode};
 use crate::error::ArchiveError;
 
@@ -59,6 +61,7 @@ pub struct Summary {
 #[derive(Debug)]
 pub struct Segment {
     path: PathBuf,
+    digest: String,
     decoded: Decoded,
 }
 
@@ -115,6 +118,7 @@ impl Segment {
         })?;
         Ok(Self {
             path: name.to_owned(),
+            digest: digest_string(bytes),
             decoded,
         })
     }
@@ -123,6 +127,13 @@ impl Segment {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The digest of the file's whole bytes, `blake3:` and 64 hex digits. Two files with the
+    /// same digest are intact copies of one segment.
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
     }
 
     /// Counts for `verify`.

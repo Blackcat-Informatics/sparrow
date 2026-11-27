@@ -1,0 +1,6 @@
+{"__CURSOR":"s=fixture;i=1","__REALTIME_TIMESTAMP":"1795785000000000","MESSAGE":"Stopping example-sync.service...","PRIORITY":"6","UNIT":"example-sync.service","_COMM":"systemd"}
+{"__CURSOR":"s=fixture;i=2","__REALTIME_TIMESTAMP":"1795785001000000","MESSAGE":"pull failed: connection refused","PRIORITY":"3","_SYSTEMD_UNIT":"example-sync.service","_COMM":"example-sync"}
+{"__CURSOR":"s=fixture;i=3","__REALTIME_TIMESTAMP":"1795785002000000","MESSAGE":"line from a unit whose name extends ours","PRIORITY":"6","_SYSTEMD_UNIT":"example-sync.service.bak","_COMM":"other"}
+{"__CURSOR":"s=fixture;i=4","__REALTIME_TIMESTAMP":"1795785003000000","MESSAGE":"Main process exited, code=exited, status=1/FAILURE","PRIORITY":"6","UNIT":"example-sync.service","_COMM":"systemd"}
+{"__CURSOR":"s=fixture;i=5","__REALTIME_TIMESTAMP":"1795785900000000","MESSAGE":"retry after 10 seconds","PRIORITY":"4","_SYSTEMD_UNIT":"example-sync.service","_COMM":"example-sync"}
+{"__CURSOR":"s=fixture;i=6","__REALTIME_TIMESTAMP":"1795785901000000","MESSAGE":"sync resumed","_SYSTEMD_UNIT":"example-sync.service","_COMM":"example-sync"}

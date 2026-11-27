@@ -218,6 +218,7 @@ impl Writer {
         super::source_context::update(self, &mut batch)?;
         super::source_summary::apply(self, &mut batch)?;
         super::payload_index::apply(&self.db, &mut batch)?;
+        super::owner_summary::apply(&self.db, &mut batch)?;
         super::store_counters::apply(&self.db, &mut batch)?;
         let manifest_features = super::manifest_retire::features(&self.db)?;
         if publication.manifest_retirement || manifest_features.is_some() {

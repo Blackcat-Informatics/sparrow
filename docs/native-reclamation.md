@@ -136,8 +136,8 @@ Policy: intake and its recovery come before an old error. The error stays visibl
 the counters; nothing not yet archived is removed to make room, because the archive
 gate still decides what retirement may take.
 
-Any ended wait now deletes its persisted marker, so a release that retires nothing no
-longer leaves a marker that restores a wait nobody holds at the next open. A pass that
+Any ended wait deletes its persisted marker, so a release that retires nothing leaves
+no marker that restores a wait nobody holds at the next open. A pass that
 retires evidence stages a new marker with its own batch. A crash between the two
 reopens above the data allowance, which requests maintenance by itself.
 

@@ -412,7 +412,7 @@ admitting buffered writes when the durability queue cannot remain bounded.
 Configured SDKs acknowledge local disk acceptance independently of remote
 publication. When a producer first uses conditional sealed ingestion, the
 store atomically lifts its raw writer identity from the corresponding
-`sparrow.store/462` through `516` family to `517` through `571` and initializes
+`sparrow.store/572` through `626` family to `627` through `681` and initializes
 `producer:sealed-receipt-gc`. The eight-byte watermark is the greatest
 expiration time of any subsequently retired inline ingestion receipt.
 Retirement advances it in the same durable write as deletion. A missing
@@ -686,7 +686,7 @@ applies the writer-format fence and seeds each migration's checkpoint durably,
 then serves. The joined maintenance worker runs the migrations in turn,
 `store-counters` first and `source-summary` second, since, until the source
 summary completes, every source and live artifact listing first reads what that
-migration still owes, then `payload-index`; each migration resumes from its own checkpoint, so the
+migration still owes, then `payload-index` and `owner-summary`; each migration resumes from its own checkpoint, so the
 order can change between images. The worker runs one bounded page per admission,
 fairly with its other duties, and each page commits its rows and checkpoint
 atomically through the ordinary write path, so a restart resumes after the last
