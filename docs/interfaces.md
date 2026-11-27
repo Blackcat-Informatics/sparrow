@@ -771,10 +771,11 @@ accepts a matching file, never overwrites one, and refuses a directory that hold
 entries but no `STORE_ID`. A missing root, another store's id or a non-empty directory
 without `STORE_ID` is a
 failure, never a directory made on the local disk, and nothing in `dir` outside
-`<store_id>/` and `STORE_ID` is written. A record that cannot be archived (oversized, or its RDF
-projection failed at ingest) stops the watermark in front of it, is never deleted or
-skipped, and is journaled on every pass with its id, reason, bytes and position; the
-count held and the bytes waiting behind it are reported as unknown.
+`<store_id>/` and `STORE_ID` is written. A record whose stored bytes exceed the segment bound
+(oversized) stops the watermark in front of it, is never deleted or skipped, and is journaled on
+every pass with its id, reason, bytes and position; the count held and the bytes waiting behind it
+are reported as unknown. A record whose RDF projection failed at ingest is not held: it is archived
+with its bytes and carries a projection-absent mark.
 
 ```toml
 [archive]
