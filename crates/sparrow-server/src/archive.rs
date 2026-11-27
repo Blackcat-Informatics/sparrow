@@ -1437,11 +1437,15 @@ mod tests {
             status.clone(),
         )
         .unwrap();
+        // The watermark commits before the success path clears the reported failure, so the
+        // snapshot is read only once both have happened.
         assert!(
             wait_for(Duration::from_secs(30), || {
                 through(&store).as_deref() == Some(second.through.as_str())
+                    && status.snapshot().failure.is_none()
             }),
-            "the restarted coordinator did not commit the next segment"
+            "the restarted coordinator did not commit the next segment and clear its failure: {:?}",
+            status.snapshot().failure
         );
         let snapshot = status.snapshot();
         assert_eq!(snapshot.restarts, 1);
