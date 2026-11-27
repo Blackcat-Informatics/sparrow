@@ -249,6 +249,14 @@ fn a_record_with_a_failed_projection_is_archived_bytes_only() {
         vec![broken.record_ids[0].clone()],
         "the failed record is the one marked"
     );
+    // The record is archived with its exact bytes, though its projection is absent.
+    let (_, bytes) = &segment.files[0];
+    let mut graph = reader::read(bytes, false, None);
+    assert_eq!(
+        graph.blob_bytes(&digest_string(b"{not json\n")).unwrap(),
+        Some(&b"{not json\n"[..]),
+        "the marked record's bytes are archived exactly"
+    );
 }
 
 /// Replaces the value of one string field in a compact JSON catalog row, or `None` when the

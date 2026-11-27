@@ -735,3 +735,87 @@ pub(super) fn discovery(discovery: &sparrow_client::Discovery) -> Value {
             .into(),
     }
 }
+
+#[cfg(test)]
+mod archive_worker_tests {
+    use super::{Object, Value, archive_worker, wire};
+
+    /// Render an `ArchiveWorkerStatus` message through the reader that `status` uses.
+    fn rendered(fill: impl FnOnce(wire::archive_worker_status::Builder<'_>)) -> Object {
+        let mut message = capnp::message::Builder::new_default();
+        let mut root = message.init_root::<wire::archive_worker_status::Builder<'_>>();
+        root.set_phase(wire::ArchivePhase::Idle);
+        root.reborrow().init_failure().set_absent(());
+        fill(root);
+        let reader = message
+            .get_root_as_reader::<wire::archive_worker_status::Reader<'_>>()
+            .unwrap();
+        match archive_worker(reader).unwrap() {
+            Value::Object(ref object) => object.clone(),
+            other => panic!("status renders as an object, got {other}"),
+        }
+    }
+
+    /// INVARIANT: the status JSON names the held record with its reason, and reports the mark counts
+    /// and the last marked record. With nothing held or marked, both are `null` and zero.
+    #[test]
+    fn archive_status_renders_holds_and_marks() {
+        let object = rendered(|mut root| {
+            root.set_held_record_id("record:big");
+            root.set_held_reason("oversized");
+            root.set_last_segment_marked(2);
+            root.set_marked_total(5);
+            root.set_last_marked_record_id("record:last");
+            root.set_last_marked_reason("projection_failed");
+        });
+        let held = match object.get("held") {
+            Some(Value::Object(held)) => held,
+            other => panic!("held should be an object, got {other:?}"),
+        };
+        assert_eq!(
+            held.get("record_id").and_then(Value::as_str),
+            Some("record:big")
+        );
+        assert_eq!(
+            held.get("reason").and_then(Value::as_str),
+            Some("oversized")
+        );
+        let marked = match object.get("marked") {
+            Some(Value::Object(marked)) => marked,
+            other => panic!("marked should be an object, got {other:?}"),
+        };
+        assert_eq!(
+            marked.get("last_segment").and_then(Value::as_str),
+            Some("2")
+        );
+        assert_eq!(marked.get("total").and_then(Value::as_str), Some("5"));
+        let last = match marked.get("last") {
+            Some(Value::Object(last)) => last,
+            other => panic!("last should be an object, got {other:?}"),
+        };
+        assert_eq!(
+            last.get("record_id").and_then(Value::as_str),
+            Some("record:last")
+        );
+        assert_eq!(
+            last.get("reason").and_then(Value::as_str),
+            Some("projection_failed")
+        );
+
+        let empty = rendered(|_| {});
+        assert!(
+            matches!(empty.get("held"), Some(Value::Null)),
+            "no hold renders null"
+        );
+        let empty_marked = match empty.get("marked") {
+            Some(Value::Object(marked)) => marked,
+            other => panic!("marked should be an object, got {other:?}"),
+        };
+        assert_eq!(
+            empty_marked.get("last_segment").and_then(Value::as_str),
+            Some("0")
+        );
+        assert_eq!(empty_marked.get("total").and_then(Value::as_str), Some("0"));
+        assert!(matches!(empty_marked.get("last"), Some(Value::Null)));
+    }
+}
