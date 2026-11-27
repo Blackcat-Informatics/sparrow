@@ -789,11 +789,11 @@ untracked copy already lost.
 The move changes live state: the running unit, its unit file and the shipper source. Each step needs its own
 authorization for the window in which it is run. Placeholders: `EXISTING_UNIT` is the existing unit's name with
 `.service`, `UNIT_FILE` its unit file, `EXISTING_DIR` its spool directory, `EXISTING_CURSOR` its cursor file,
-`OLD_PATTERN` the file pattern the untracked copy writes, `SOURCE` its shipper source name, `OLD_RULE` and
-`OLD_PATTERN_IN_SOURCE` the values step 0 records, and `WINDOW` the quiet period the stop uses.
+`OLD_PATTERN` the file pattern the untracked copy writes, `SOURCE` its shipper source name, `OLD_RULE`,
+`OLD_PATTERN_IN_SOURCE` and `OLD_SETTLE` the values step 0 records, and `WINDOW` the quiet period the stop uses.
 
 0. Record the state, read-only: `systemctl --user is-active EXISTING_UNIT`, `ls EXISTING_DIR | tail -n 3`,
-   `cat EXISTING_CURSOR`, and the source's current `rule` and `pattern` lines from the shipper configuration. Check:
+   `cat EXISTING_CURSOR`, and the source's current `rule`, `pattern` and `settle_seconds` lines from the shipper configuration. Check:
    the values are recorded in the task record before step 1. Undo: none.
 
    Stop before step 1 if `pattern` in SOURCE matches files other than `OLD_PATTERN`, or if `EXISTING_DIR` is shared
@@ -841,9 +841,10 @@ authorization for the window in which it is run. Placeholders: `EXISTING_UNIT` i
       candidate. Check: `deploy/tests/spool-settle.sh CANDIDATE` prints PASS, and after a shipper run more than 900
       seconds after the first `unit-spool-*.jsonl` file's last write, the ledger names that file. The run's
       `SOURCE: queued N` line alone does not prove this, because the shipper prints it with N = 0.
-      Undo: write one candidate with the pattern step 0 recorded, `OLD_PATTERN_IN_SOURCE`, and the rule `OLD_RULE`.
+      Undo: write one candidate with the pattern step 0 recorded, `OLD_PATTERN_IN_SOURCE`, the rule `OLD_RULE` and
+      `settle_seconds` `OLD_SETTLE`.
 
-Each undo changes the recorded lines by a candidate (step 5b changes two lines together, and its undo does the same),
+Each undo changes the recorded lines by a candidate (step 5b changes three lines together, and its undo does the same),
 never by restoring a saved whole file, so a later change to the configuration survives.
 
 Until step 5b is complete, the new files are not shipped; the old files are shipped by the old pattern. A file
