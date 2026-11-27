@@ -283,7 +283,6 @@ fn journal_stall(stall: &Stall) {
 fn journal_held(held: &ArchiveHold) {
     let reason = match held.reason {
         HoldReason::TooLarge => "oversized",
-        HoldReason::ProjectionFailed => "projection_failed",
     };
     eprintln!(
         "sparrowd: archive held record={} reason={reason} bytes={} position={} \

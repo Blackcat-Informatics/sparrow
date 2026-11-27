@@ -91,28 +91,32 @@ struct Selection {
     artifacts: u64,
     /// Records whose bytes and graphs are encoded.
     encoded: Vec<Record>,
+    /// Encoded records whose RDF projection failed; each gets a projection-absent mark.
+    marks: Vec<String>,
     retired: u64,
     /// Artifacts whose graphs go in the file: recordless entries and the parents of encoded
     /// records.
     artifact_ids: std::collections::BTreeSet<String>,
 }
 
-/// Why a record at the head of the unarchived range is held.
+/// Why a record at the head of the unarchived range is held. A record whose RDF projection
+/// failed is not held: it is archived with its exact bytes and a projection-absent mark.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HoldReason {
     /// Its bytes exceed what the GTS writer can carry (`HOLD_BYTES`).
     TooLarge,
-    /// Its RDF content projection failed at ingest, so its evidence cannot be read whole.
-    ProjectionFailed,
 }
 
 /// Whether a record must be held rather than archived.
-fn hold_reason(writer: &Writer, record: &Record, length: u64) -> Result<Option<HoldReason>, Error> {
-    if length > HOLD_BYTES {
-        return Ok(Some(HoldReason::TooLarge));
-    }
+fn hold_reason(length: u64) -> Option<HoldReason> {
+    (length > HOLD_BYTES).then_some(HoldReason::TooLarge)
+}
+
+/// Whether a live record's RDF projection failed at ingest. Such a record is archived with
+/// its bytes and a projection-absent mark, and it does not hold the watermark.
+fn projection_failed(writer: &Writer, record: &Record) -> Result<bool, Error> {
     if record.evicted || record.retired || record.rdf_projection_id.is_empty() {
-        return Ok(None);
+        return Ok(false);
     }
     let key = format!("rdf:state:{}", record.rdf_projection_id);
     let Some(bytes) = writer.db.get(key)? else {
@@ -120,7 +124,7 @@ fn hold_reason(writer: &Writer, record: &Record, length: u64) -> Result<Option<H
     };
     let state = super::parse(&bytes)?;
     let state: String = super::read_field(&state, "state")?;
-    Ok((state == "failed").then_some(HoldReason::ProjectionFailed))
+    Ok(state == "failed")
 }
 
 /// Whether an entry is due: by age once `start_fraction` of its window has passed, or
@@ -265,6 +269,7 @@ fn select(
         records: 0,
         artifacts: 0,
         encoded: Vec::new(),
+        marks: Vec::new(),
         retired: 0,
         artifact_ids: std::collections::BTreeSet::new(),
     };
@@ -327,9 +332,7 @@ fn select(
             {
                 break 'scan;
             }
-            if let Some(record) = &record
-                && let Some(reason) = hold_reason(&writer, record, length)?
-            {
+            if let Some(reason) = hold_reason(length) {
                 if count == 0 {
                     // Neither archived nor deleted: the watermark never passes it. This runs
                     // under the writer lock, so the event is debug (off in the daemon) and the
@@ -383,6 +386,9 @@ fn select(
                         selection.retired += 1;
                     } else {
                         selection.artifact_ids.insert(record.artifact_id.clone());
+                        if projection_failed(&writer, &record)? {
+                            selection.marks.push(record.id.clone());
+                        }
                         selection.encoded.push(record);
                     }
                 }
@@ -495,14 +501,12 @@ impl Store {
         };
         let record: Record = writer.get(id)?;
         let bytes = encodable_length(&record);
-        Ok(
-            hold_reason(&writer, &record, bytes)?.map(|reason| ArchiveHold {
-                record_id: record.id,
-                bytes,
-                position: position.to_owned(),
-                reason,
-            }),
-        )
+        Ok(hold_reason(bytes).map(|reason| ArchiveHold {
+            record_id: record.id,
+            bytes,
+            position: position.to_owned(),
+            reason,
+        }))
     }
 
     /// Select and encode the next due segment, or `None` when nothing is due.
@@ -647,7 +651,8 @@ impl Store {
             .map(|record| record.id.clone())
             .collect();
         let artifact_ids: Vec<String> = selection.artifact_ids.iter().cloned().collect();
-        let (file, absent) = archive_encode::encode(self, &ids, &artifact_ids, contents)?;
+        let (file, absent) =
+            archive_encode::encode(self, &ids, &artifact_ids, &selection.marks, contents)?;
         let files = vec![(format!("{}-{}.gts", selection.first, selection.last), file)];
         let id = segment_id(store_id, &selection.first, &selection.last, &files);
         self.archive_intend(&ArchiveIntent {

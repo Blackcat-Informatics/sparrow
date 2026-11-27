@@ -20,6 +20,7 @@ mod vocabulary {
     pub(super) const TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
     pub(super) const ENTITY: &str = "urn:sparrow:";
     pub(super) const PAYLOAD_BLAKE3: &str = "urn:sparrow:vocab:payloadBlake3";
+    pub(super) const PROJECTION_ABSENT: &str = "urn:sparrow:vocab:projectionAbsent";
     pub(super) const RECORD: &str = "urn:sparrow:vocab:Record";
     pub(super) const ARTIFACT: &str = "urn:sparrow:vocab:Artifact";
 }
@@ -72,6 +73,10 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded, String> {
         }
         if predicate == vocabulary::PAYLOAD_BLAKE3 {
             entry.payload = Some(object);
+            continue;
+        }
+        if predicate == vocabulary::PROJECTION_ABSENT {
+            entry.projection_absent = Some(object);
             continue;
         }
         match predicate.strip_prefix(vocabulary::NS) {
@@ -141,6 +146,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded, String> {
                     received_at: instant(&id, &need(facts.received_at, "receivedAt")?)?,
                     byte_start: integer(&id, "sourceByteStart", facts.byte_start)?,
                     byte_end: integer(&id, "sourceByteEnd", facts.byte_end)?,
+                    projection_absent: facts.projection_absent,
                     id,
                     bytes,
                 });
@@ -181,6 +187,7 @@ struct Facts {
     byte_length: Option<String>,
     payload: Option<String>,
     artifact_payload: Option<String>,
+    projection_absent: Option<String>,
 }
 
 /// An artifact's payload id from its metadata graph's `payload` fact, an IRI

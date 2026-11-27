@@ -139,23 +139,59 @@ fn extract_writes_the_ingested_bytes_of_one_artifact() {
     }
 }
 
-/// Value: an artifact with no bytes holds no records, so no segment carries it and
-/// extraction names the missing artifact rather than writing an empty file.
+/// INVARIANT: a reader meets a projection-absent mark on a record and extracts the record's
+/// exact bytes without failing. The mark is a fact about the record; the reader needs no
+/// projection graph for it.
 #[test]
-fn extract_refuses_an_empty_artifact_that_no_segment_carries() {
+fn a_reader_meets_the_projection_absent_mark_and_extracts_the_exact_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    fixture_segment(
+        root.path(),
+        "marked",
+        &sparrow_test_support::SegmentFixture {
+            projection_absent: Some("projection_failed"),
+            ..sparrow_test_support::SegmentFixture::new(b"alpha\n", b"alpha\n")
+        },
+    );
+    let output = extract(root.path(), "artifact:aa");
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"alpha\n");
+}
+
+/// INVARIANT: the reader exposes a record's projection-absent mark on the decoded record, so a
+/// consumer can count bytes-only records. A record without a mark reads as `None`.
+#[test]
+fn the_decoded_record_exposes_its_projection_absent_mark() {
+    let marked = sparrow_test_support::segment_with(&sparrow_test_support::SegmentFixture {
+        projection_absent: Some("projection_failed"),
+        ..sparrow_test_support::SegmentFixture::new(b"alpha\n", b"alpha\n")
+    });
+    let segment = sparrow_archive::Segment::from_bytes(Path::new("marked.gts"), &marked).unwrap();
+    assert_eq!(
+        segment.records()[0].projection_absent.as_deref(),
+        Some("projection_failed")
+    );
+    let plain = sparrow_test_support::segment_with(&sparrow_test_support::SegmentFixture::new(
+        b"alpha\n", b"alpha\n",
+    ));
+    let segment = sparrow_archive::Segment::from_bytes(Path::new("plain.gts"), &plain).unwrap();
+    assert_eq!(segment.records()[0].projection_absent, None);
+}
+
+/// INVARIANT: an empty JSON artifact's one empty record fails its projection, so it is archived
+/// bytes-only with the projection-absent mark rather than held. Its segment carries the record,
+/// and extraction of the artifact succeeds with no bytes.
+#[test]
+fn an_empty_json_artifact_is_archived_bytes_only() {
     let archive_dir = tempfile::tempdir().unwrap();
     let (ids, paths) = archive(
         archive_dir.path(),
         ArchivePolicy::default(),
         &[("req-empty", "host-e", "json", b"", T1)],
     );
-    assert!(
-        paths.is_empty(),
-        "an empty artifact has no records to archive"
-    );
-    std::fs::create_dir_all(archive_dir.path().join("segments")).unwrap();
+    assert_eq!(paths.len(), 1, "the empty record is archived, not held");
     let output = extract(archive_dir.path(), &ids[0]);
-    assert!(!output.status.success());
+    assert!(output.status.success(), "{:?}", output.stderr);
     assert!(output.stdout.is_empty());
 }
 

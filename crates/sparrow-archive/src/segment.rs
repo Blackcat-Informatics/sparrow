@@ -26,6 +26,9 @@ pub struct ArchivedRecord {
     pub byte_end: u64,
     /// The record's exact bytes.
     pub bytes: Vec<u8>,
+    /// The reason the record's RDF projection is absent from the segment, when it has a
+    /// projection-absent mark; `None` for a record whose projection the segment carries.
+    pub projection_absent: Option<String>,
 }
 
 /// One artifact's metadata read back from a segment.

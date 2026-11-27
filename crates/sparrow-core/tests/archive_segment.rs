@@ -39,6 +39,62 @@ fn archive_prepare_selects_at_three_quarters_of_the_window() {
     assert!(store.archive_prepare(bound).unwrap().is_none());
 }
 
+/// INVARIANT: a record whose RDF projection failed does not hold the archive watermark. A
+/// healthy record behind it is archived in the same segment, and the failed record is
+/// archived with its exact bytes. Fails while a projection failure at the head makes
+/// `archive_prepare` return nothing for every record behind it.
+#[test]
+fn a_failed_projection_at_the_head_does_not_hold_a_later_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), archiving(ArchivePolicy::default())).unwrap();
+    store
+        .ingest("head", "source", "markdown", b"# alpha\n", 1)
+        .unwrap();
+    drop(store);
+    let db = sparrow_test_support::catalog_db(dir.path()).unwrap();
+    let mut failed = 0;
+    for entry in db.iterator(rocksdb::IteratorMode::Start) {
+        let (key, value) = entry.unwrap();
+        if !key.starts_with(b"rdf:state:") {
+            continue;
+        }
+        let text = String::from_utf8(value.to_vec()).unwrap();
+        if text.contains("\"state\":\"complete\"") {
+            let failed_text = text.replace("\"state\":\"complete\"", "\"state\":\"failed\"");
+            db.put(&key, failed_text).unwrap();
+            failed += 1;
+        }
+    }
+    assert_eq!(
+        failed, 1,
+        "the head record has one projection state to fail"
+    );
+    drop(db);
+    let store = Store::open(dir.path(), archiving(ArchivePolicy::default())).unwrap();
+    store
+        .ingest("tail", "source", "markdown", b"# beta\n", 2)
+        .unwrap();
+    // The tail was received one millisecond after the head, so both are due at this instant.
+    let bound = 2 + 30 * DAY * 3 / 4;
+    let segment = store
+        .archive_prepare(bound)
+        .unwrap()
+        .expect("a healthy record behind a failed projection is due");
+    assert_eq!((segment.records, segment.artifacts), (2, 0));
+    // The failed head is marked: exactly one projection-absent mark, naming the head record.
+    let (_, bytes) = &segment.files[0];
+    let graph = reader::read(bytes, false, None);
+    let marks: Vec<String> = graph
+        .quad_terms()
+        .filter(|quad| {
+            quad.predicate.value.as_deref() == Some("urn:sparrow:vocab:projectionAbsent")
+        })
+        .filter_map(|quad| quad.subject.value.clone())
+        .collect();
+    assert_eq!(marks.len(), 1, "one mark for the failed head: {marks:?}");
+    assert!(marks[0].starts_with("urn:sparrow:record:"), "{marks:?}");
+}
+
 /// INVARIANT: PurRDF's reader decodes a prepared segment back to every record's exact
 /// bytes, with a clean chain, so the segment is a complete copy of what the store holds.
 /// A record above the closing target gets a segment of its own and decodes the same way.
@@ -129,21 +185,26 @@ fn committed_segment_holds_every_covered_graph_by_id() {
     assert_eq!(fact("byteLength").as_deref(), Some("11"));
 }
 
-/// INVARIANT: a record whose content projection failed is held, named and not archived: the
-/// range does not move past it and the failure is not a silent retry loop.
+/// INVARIANT: a record whose content projection failed does not hold the archive range. It is
+/// prepared with its exact bytes and a projection-absent mark, and the watermark moves past it
+/// once the segment commits. Nothing is held: `archive_held` reports no hold.
 #[test]
-fn a_record_with_a_failed_projection_is_held_and_named() {
+fn a_record_with_a_failed_projection_is_archived_bytes_only() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path(), archiving(ArchivePolicy::default())).unwrap();
     let broken = store
-        .ingest("held-a", "source", "json", b"{not json\n", 1)
+        .ingest("marked-a", "source", "json", b"{not json\n", 1)
         .unwrap();
     let now = 1 + 30 * DAY;
-    assert!(store.archive_prepare(now).unwrap().is_none());
-    let held = store.archive_held().unwrap().expect("held");
-    assert_eq!(held.record_id, broken.record_ids[0]);
-    assert_eq!(held.reason, sparrow_core::HoldReason::ProjectionFailed);
-    assert!(store.archive_state().unwrap().unwrap().through.is_none());
+    let segment = store
+        .archive_prepare(now)
+        .unwrap()
+        .expect("a failed projection is not a hold");
+    assert_eq!(segment.records, 1);
+    assert!(store.archive_held().unwrap().is_none());
+    store.archive_commit(&segment.segment_id).unwrap();
+    assert!(store.archive_state().unwrap().unwrap().through.is_some());
+    let _ = broken;
 }
 
 /// INVARIANT: an artifact sorts before its own records, so a segment can end between them

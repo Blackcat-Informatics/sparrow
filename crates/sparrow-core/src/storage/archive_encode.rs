@@ -92,6 +92,32 @@ const BASE_REQUESTS: u64 = 10_000;
 const BASE_ROWS: u64 = 2_000;
 
 /// One record's link quads: its identity and the two digests of its bytes.
+/// The projection-absent mark's predicate, in the vocabulary namespace.
+const PROJECTION_ABSENT: &str = "urn:sparrow:vocab:projectionAbsent";
+/// The reason every mark carries: the record's RDF projection failed at ingest.
+const PROJECTION_FAILED: &str = "projection_failed";
+
+/// One mark per record whose RDF projection is absent from the segment, in the links graph.
+fn push_marks(builder: &mut purrdf::RdfDatasetBuilder, marks: &[String]) -> Result<(), Error> {
+    if marks.is_empty() {
+        return Ok(());
+    }
+    let graph = builder.intern_iri(LINK_GRAPH).map_err(failure)?;
+    let predicate = builder.intern_iri(PROJECTION_ABSENT).map_err(failure)?;
+    for id in marks {
+        let subject = builder
+            .intern_iri(&format!("urn:sparrow:{id}"))
+            .map_err(failure)?;
+        let reason = builder
+            .intern_literal(purrdf::RdfLiteral::simple(PROJECTION_FAILED))
+            .map_err(failure)?;
+        builder
+            .push_quad(subject, predicate, reason, Some(graph))
+            .map_err(failure)?;
+    }
+    Ok(())
+}
+
 fn push_links(
     builder: &mut purrdf::RdfDatasetBuilder,
     links: &[(String, String, String)],
@@ -128,6 +154,7 @@ pub(super) fn encode(
     store: &Store,
     ids: &[String],
     artifact_ids: &[String],
+    marks: &[String],
     contents: Vec<(String, Vec<u8>)>,
 ) -> Result<(Vec<u8>, u64), Error> {
     let mut links = Vec::with_capacity(contents.len());
@@ -157,12 +184,14 @@ pub(super) fn encode(
             0,
             archive_read(ids.len() + artifact_ids.len()),
             Some(ARCHIVE_ROW_ALLOWANCE),
+            false,
             |view, absent| {
                 let mut builder = purrdf::RdfDatasetBuilder::new();
                 DatasetImporter::try_new(&mut builder, view)
                     .and_then(|mut importer| importer.try_append())
                     .map_err(failure)?;
                 push_links(&mut builder, &links)?;
+                push_marks(&mut builder, marks)?;
                 Ok::<_, Error>((builder.freeze().map_err(failure)?, absent.len() as u64))
             },
         )
