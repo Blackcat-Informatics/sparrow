@@ -38,7 +38,11 @@
 //! running migration overtakes stops its pass and starts again from a newer view
 //! ([`Base::overtaken`]), which owes less.
 
+pub(super) use super::owner_summary::Progress;
 use super::store_counters::Reader;
+
+/// The status watermark of the record phase's start in this migration.
+pub(super) const RECORD_START_WATERMARK: &str = "record phase start";
 use super::{Error, Writer, integer, manifest_retire, parse, read_field};
 use purrdf_lex::json::{self, Object};
 use rocksdb::{DB, WriteBatch};
@@ -322,28 +326,9 @@ impl Retained {
     }
 }
 
-/// Committed migration position.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Progress {
-    /// Every catalog entry is counted.
-    Complete,
-    /// Counting artifacts; artifacts at or before the ID are counted.
-    Artifacts(Option<String>),
-    /// Counting the retained records of deleted parents; records at or before the ID are.
-    Records(Option<String>),
-}
-
+// The migration position is the owner summary's `Progress`: both migrations count their
+// entries in the same two phases, encode them the same way and report the same watermark.
 impl Progress {
-    fn encode(&self) -> Vec<u8> {
-        match self {
-            Self::Complete => vec![0],
-            Self::Artifacts(after) => {
-                [&[1][..], after.as_deref().unwrap_or("").as_bytes()].concat()
-            }
-            Self::Records(after) => [&[2][..], after.as_deref().unwrap_or("").as_bytes()].concat(),
-        }
-    }
-
     /// Whether an artifact whose entry exists has been counted.
     fn artifact_counted(&self, id: &str) -> bool {
         match self {
@@ -358,16 +343,6 @@ impl Progress {
             Self::Complete => true,
             Self::Artifacts(_) => false,
             Self::Records(after) => after.as_deref().is_some_and(|after| id <= after),
-        }
-    }
-
-    /// Opaque status watermark; absent once complete.
-    pub(super) fn watermark(&self) -> Option<String> {
-        match self {
-            Self::Complete => None,
-            Self::Artifacts(None) => Some("start".to_owned()),
-            Self::Artifacts(Some(id)) | Self::Records(Some(id)) => Some(id.clone()),
-            Self::Records(None) => Some("record phase start".to_owned()),
         }
     }
 }

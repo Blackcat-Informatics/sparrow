@@ -32,7 +32,9 @@
 //! its bound covers. Until seeding completes, readers report the rows as pending: exact
 //! through the seeding watermark, never a total. Nothing recounts at run time.
 
-use super::{Error, payload_index, rdf_index, read_field, source_context, source_summary};
+use super::{
+    Error, owner_summary, payload_index, rdf_index, read_field, source_context, source_summary,
+};
 use rocksdb::{DB, Direction, IteratorMode, WriteBatch};
 use source_summary::failure;
 use std::cmp::Ordering;
@@ -83,6 +85,8 @@ enum Follows {
     SourceSummaryRecords,
     SourceContext,
     PayloadIndexMigration,
+    OwnerSummaryArtifacts,
+    OwnerSummaryRecords,
 }
 
 struct Term {
@@ -106,10 +110,11 @@ pub(super) enum Counter {
     SourceContextDone,
     PayloadIndex,
     PayloadIndexDone,
+    OwnerSummaryDone,
 }
 
 impl Counter {
-    pub(super) const ALL: [Self; 12] = [
+    pub(super) const ALL: [Self; 13] = [
         Self::Records,
         Self::RetainedRecords,
         Self::Artifacts,
@@ -122,6 +127,7 @@ impl Counter {
         Self::SourceContextDone,
         Self::PayloadIndex,
         Self::PayloadIndexDone,
+        Self::OwnerSummaryDone,
     ];
 
     fn name(self) -> &'static str {
@@ -138,6 +144,7 @@ impl Counter {
             Self::SourceContextDone => "done:source-context",
             Self::PayloadIndex => "payload-index",
             Self::PayloadIndexDone => "done:payload-index",
+            Self::OwnerSummaryDone => "done:owner-summary",
         }
     }
 
@@ -148,8 +155,8 @@ impl Counter {
     fn terms(self) -> &'static [Term] {
         use Filter::{Any, Retained};
         use Follows::{
-            OwnerGraphIndex, PayloadIndexMigration, Population, SourceContext,
-            SourceSummaryArtifacts, SourceSummaryRecords,
+            OwnerGraphIndex, OwnerSummaryArtifacts, OwnerSummaryRecords, PayloadIndexMigration,
+            Population, SourceContext, SourceSummaryArtifacts, SourceSummaryRecords,
         };
         match self {
             Self::Records => &[Term {
@@ -219,6 +226,18 @@ impl Counter {
                 filter: Any,
                 follows: PayloadIndexMigration,
             }],
+            Self::OwnerSummaryDone => &[
+                Term {
+                    prefix: ARTIFACT,
+                    filter: Any,
+                    follows: OwnerSummaryArtifacts,
+                },
+                Term {
+                    prefix: RECORD,
+                    filter: Any,
+                    follows: OwnerSummaryRecords,
+                },
+            ],
         }
     }
 }
@@ -349,6 +368,7 @@ pub(super) struct Positions {
     summary: (Bound, Bound),
     context: Bound,
     payload: Bound,
+    owner_summary: (Bound, Bound),
 }
 
 /// The checkpoint keys [`Positions`] reads.
@@ -358,6 +378,7 @@ fn checkpoint_key(name: &[u8]) -> bool {
         || name == source_summary::CHECKPOINT.as_bytes()
         || name == source_context::CHECKPOINT.as_bytes()
         || name == payload_index::CHECKPOINT.as_bytes()
+        || name == owner_summary::CHECKPOINT.as_bytes()
 }
 
 impl Positions {
@@ -391,12 +412,23 @@ impl Positions {
             None => Bound::Everything,
             Some(after) => Bound::after(after),
         };
+        let owner_summary = match owner_summary::progress(&mut read)? {
+            owner_summary::Progress::Complete => (Bound::Everything, Bound::Everything),
+            owner_summary::Progress::Artifacts(after) => {
+                (Bound::after(after.map(String::into_bytes)), Bound::Nothing)
+            }
+            owner_summary::Progress::Records(after) => (
+                Bound::Everything,
+                Bound::after(after.map(String::into_bytes)),
+            ),
+        };
         Ok(Self {
             seed,
             owner,
             summary,
             context,
             payload,
+            owner_summary,
         })
     }
 
@@ -420,6 +452,8 @@ impl Positions {
             Follows::SourceSummaryRecords => self.summary.1.clone(),
             Follows::SourceContext => self.context.clone(),
             Follows::PayloadIndexMigration => self.payload.clone(),
+            Follows::OwnerSummaryArtifacts => self.owner_summary.0.clone(),
+            Follows::OwnerSummaryRecords => self.owner_summary.1.clone(),
         };
         follows.min(self.seed.bound(term.prefix))
     }
@@ -633,6 +667,12 @@ pub(super) fn seed_payload_index(batch: &mut WriteBatch) {
     for counter in [Counter::PayloadIndex, Counter::PayloadIndexDone] {
         batch.put(counter.key(), 0_u64.to_be_bytes());
     }
+}
+
+/// Zero the owner summary `done` row into `batch`, as its fence seeds it: the caller seeds the
+/// checkpoint in the same batch and commits it directly, outside [`apply`].
+pub(super) fn seed_owner_summary(batch: &mut WriteBatch) {
+    batch.put(Counter::OwnerSummaryDone.key(), 0_u64.to_be_bytes());
 }
 
 /// Zero one migration's `done` row into `batch`, for a migration reset at open: the caller

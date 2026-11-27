@@ -743,11 +743,196 @@ const SEALED_SOURCE_BYTES: [[&[u8]; 11]; 5] = [
     ],
 ];
 
+// Per-owner payload summaries: older binaries cannot change an artifact or record entry
+// without its `owner-summary:` row, so they refuse every identity below.
+const OWNER_SUMMARY: [[&[u8]; 11]; 5] = [
+    [
+        b"sparrow.store/572",
+        b"sparrow.store/573",
+        b"sparrow.store/574",
+        b"sparrow.store/575",
+        b"sparrow.store/576",
+        b"sparrow.store/577",
+        b"sparrow.store/578",
+        b"sparrow.store/579",
+        b"sparrow.store/580",
+        b"sparrow.store/581",
+        b"sparrow.store/582",
+    ],
+    [
+        b"sparrow.store/583",
+        b"sparrow.store/584",
+        b"sparrow.store/585",
+        b"sparrow.store/586",
+        b"sparrow.store/587",
+        b"sparrow.store/588",
+        b"sparrow.store/589",
+        b"sparrow.store/590",
+        b"sparrow.store/591",
+        b"sparrow.store/592",
+        b"sparrow.store/593",
+    ],
+    [
+        b"sparrow.store/594",
+        b"sparrow.store/595",
+        b"sparrow.store/596",
+        b"sparrow.store/597",
+        b"sparrow.store/598",
+        b"sparrow.store/599",
+        b"sparrow.store/600",
+        b"sparrow.store/601",
+        b"sparrow.store/602",
+        b"sparrow.store/603",
+        b"sparrow.store/604",
+    ],
+    [
+        b"sparrow.store/605",
+        b"sparrow.store/606",
+        b"sparrow.store/607",
+        b"sparrow.store/608",
+        b"sparrow.store/609",
+        b"sparrow.store/610",
+        b"sparrow.store/611",
+        b"sparrow.store/612",
+        b"sparrow.store/613",
+        b"sparrow.store/614",
+        b"sparrow.store/615",
+    ],
+    [
+        b"sparrow.store/616",
+        b"sparrow.store/617",
+        b"sparrow.store/618",
+        b"sparrow.store/619",
+        b"sparrow.store/620",
+        b"sparrow.store/621",
+        b"sparrow.store/622",
+        b"sparrow.store/623",
+        b"sparrow.store/624",
+        b"sparrow.store/625",
+        b"sparrow.store/626",
+    ],
+];
+// The same fence over a store that also requires sealed producer replay.
+const SEALED_OWNER_SUMMARY: [[&[u8]; 11]; 5] = [
+    [
+        b"sparrow.store/627",
+        b"sparrow.store/628",
+        b"sparrow.store/629",
+        b"sparrow.store/630",
+        b"sparrow.store/631",
+        b"sparrow.store/632",
+        b"sparrow.store/633",
+        b"sparrow.store/634",
+        b"sparrow.store/635",
+        b"sparrow.store/636",
+        b"sparrow.store/637",
+    ],
+    [
+        b"sparrow.store/638",
+        b"sparrow.store/639",
+        b"sparrow.store/640",
+        b"sparrow.store/641",
+        b"sparrow.store/642",
+        b"sparrow.store/643",
+        b"sparrow.store/644",
+        b"sparrow.store/645",
+        b"sparrow.store/646",
+        b"sparrow.store/647",
+        b"sparrow.store/648",
+    ],
+    [
+        b"sparrow.store/649",
+        b"sparrow.store/650",
+        b"sparrow.store/651",
+        b"sparrow.store/652",
+        b"sparrow.store/653",
+        b"sparrow.store/654",
+        b"sparrow.store/655",
+        b"sparrow.store/656",
+        b"sparrow.store/657",
+        b"sparrow.store/658",
+        b"sparrow.store/659",
+    ],
+    [
+        b"sparrow.store/660",
+        b"sparrow.store/661",
+        b"sparrow.store/662",
+        b"sparrow.store/663",
+        b"sparrow.store/664",
+        b"sparrow.store/665",
+        b"sparrow.store/666",
+        b"sparrow.store/667",
+        b"sparrow.store/668",
+        b"sparrow.store/669",
+        b"sparrow.store/670",
+    ],
+    [
+        b"sparrow.store/671",
+        b"sparrow.store/672",
+        b"sparrow.store/673",
+        b"sparrow.store/674",
+        b"sparrow.store/675",
+        b"sparrow.store/676",
+        b"sparrow.store/677",
+        b"sparrow.store/678",
+        b"sparrow.store/679",
+        b"sparrow.store/680",
+        b"sparrow.store/681",
+    ],
+];
+
 pub(super) fn has_source_bytes(format: &[u8]) -> bool {
-    position(&SOURCE_BYTES, format).is_some() || position(&SEALED_SOURCE_BYTES, format).is_some()
+    position(&SOURCE_BYTES, format).is_some()
+        || position(&SEALED_SOURCE_BYTES, format).is_some()
+        || has_owner_summary(format)
+}
+
+/// Whether `format` fences the per-owner payload summary rows.
+pub(super) fn has_owner_summary(format: &[u8]) -> bool {
+    owner_summary(format).is_some()
+}
+
+fn owner_summary(format: &[u8]) -> Option<&'static [u8]> {
+    position(&SEALED_OWNER_SUMMARY, format)
+        .map(|(family, index)| SEALED_OWNER_SUMMARY[family][index])
+        .or_else(|| {
+            position(&OWNER_SUMMARY, format).map(|(family, index)| OWNER_SUMMARY[family][index])
+        })
+}
+
+/// Fence a current source bytes family for the per-owner payload summary, keeping the
+/// sealed replay switch; idempotent.
+pub(super) fn enable_owner_summary(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some(identity) = owner_summary(format) {
+        return Ok(identity);
+    }
+    position(&SOURCE_BYTES, format)
+        .map(|(family, index)| OWNER_SUMMARY[family][index])
+        .or_else(|| {
+            position(&SEALED_SOURCE_BYTES, format)
+                .map(|(family, index)| SEALED_OWNER_SUMMARY[family][index])
+        })
+        .ok_or_else(|| {
+            Error::new(
+                "STORAGE_FAILURE",
+                "the owner summary requires a source bytes authority family",
+            )
+        })
+}
+
+/// The source bytes identity an owner summary family lifts; other formats are unchanged.
+fn before_owner_summary(format: &[u8]) -> &[u8] {
+    if let Some((family, index)) = position(&OWNER_SUMMARY, format) {
+        return SOURCE_BYTES[family][index];
+    }
+    position(&SEALED_OWNER_SUMMARY, format)
+        .map_or(format, |(family, index)| SEALED_SOURCE_BYTES[family][index])
 }
 
 pub(super) fn enable_source_bytes(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some(identity) = owner_summary(format) {
+        return Ok(identity);
+    }
     position(&SOURCE_BYTES, format)
         .or_else(|| position(&PAYLOAD_INDEX, format))
         .map(|(family, index)| SOURCE_BYTES[family][index])
@@ -765,6 +950,7 @@ pub(super) fn enable_source_bytes(format: &[u8]) -> Result<&'static [u8], Error>
 }
 
 fn before_source_bytes(format: &[u8]) -> &[u8] {
+    let format = before_owner_summary(format);
     if let Some((family, index)) = position(&SOURCE_BYTES, format) {
         return PAYLOAD_INDEX[family][index];
     }
@@ -774,20 +960,30 @@ fn before_source_bytes(format: &[u8]) -> &[u8] {
 pub(super) const RETRY_GC: &str = "producer:sealed-receipt-gc";
 
 fn sealed(format: &[u8]) -> Option<&'static [u8]> {
-    position(&SEALED_SOURCE_BYTES, format)
-        .map(|(family, index)| SEALED_SOURCE_BYTES[family][index])
+    position(&SEALED_OWNER_SUMMARY, format)
+        .map(|(family, index)| SEALED_OWNER_SUMMARY[family][index])
+        .or_else(|| {
+            position(&SEALED_SOURCE_BYTES, format)
+                .map(|(family, index)| SEALED_SOURCE_BYTES[family][index])
+        })
         .or_else(|| position(&SEALED, format).map(|(family, index)| SEALED[family][index]))
 }
 
 fn payload_index(format: &[u8]) -> Option<&'static [u8]> {
-    position(&SOURCE_BYTES, format)
-        .map(|(family, index)| SOURCE_BYTES[family][index])
+    position(&OWNER_SUMMARY, format)
+        .map(|(family, index)| OWNER_SUMMARY[family][index])
+        .or_else(|| {
+            position(&SOURCE_BYTES, format).map(|(family, index)| SOURCE_BYTES[family][index])
+        })
         .or_else(|| {
             position(&PAYLOAD_INDEX, format).map(|(family, index)| PAYLOAD_INDEX[family][index])
         })
 }
 
 fn enable_sealed(format: &[u8]) -> Result<&'static [u8], Error> {
+    if let Some((family, index)) = position(&OWNER_SUMMARY, format) {
+        return Ok(SEALED_OWNER_SUMMARY[family][index]);
+    }
     if let Some((family, index)) = position(&SOURCE_BYTES, format) {
         return Ok(SEALED_SOURCE_BYTES[family][index]);
     }
@@ -880,8 +1076,13 @@ fn relift<'a>(current: &[u8], next: &'a [u8]) -> Result<&'a [u8], Error> {
     } else {
         Ok(next)
     }?;
-    if has_source_bytes(current) {
+    let next = if has_source_bytes(current) {
         enable_source_bytes(next)
+    } else {
+        Ok(next)
+    }?;
+    if has_owner_summary(current) {
+        enable_owner_summary(next)
     } else {
         Ok(next)
     }
@@ -909,6 +1110,12 @@ pub(super) fn lower_store_counters(format: &[u8]) -> &[u8] {
     let format = lower_payload_index(format);
     position(&STORE_COUNTERS, format)
         .map_or(format, |(family, index)| SOURCE_SUMMARY[family][index])
+}
+
+/// The source bytes identity an owner summary family lifts; other formats are unchanged.
+#[cfg(feature = "test-support")]
+pub(super) fn lower_owner_summary(format: &[u8]) -> &[u8] {
+    before_owner_summary(format)
 }
 
 /// The store counter identity a payload index family lifts; other formats are unchanged.
@@ -1064,6 +1271,8 @@ fn families() -> impl Iterator<Item = &'static &'static [u8]> {
         .chain(SEALED.iter().flatten())
         .chain(SOURCE_BYTES.iter().flatten())
         .chain(SEALED_SOURCE_BYTES.iter().flatten())
+        .chain(OWNER_SUMMARY.iter().flatten())
+        .chain(SEALED_OWNER_SUMMARY.iter().flatten())
 }
 
 fn base_index(format: &[u8], purpose: &str) -> Result<usize, Error> {
@@ -1309,6 +1518,26 @@ mod tests {
             SEALED[2],
             SEALED[3],
             SEALED[4],
+            SOURCE_BYTES[0],
+            SOURCE_BYTES[1],
+            SOURCE_BYTES[2],
+            SOURCE_BYTES[3],
+            SOURCE_BYTES[4],
+            SEALED_SOURCE_BYTES[0],
+            SEALED_SOURCE_BYTES[1],
+            SEALED_SOURCE_BYTES[2],
+            SEALED_SOURCE_BYTES[3],
+            SEALED_SOURCE_BYTES[4],
+            OWNER_SUMMARY[0],
+            OWNER_SUMMARY[1],
+            OWNER_SUMMARY[2],
+            OWNER_SUMMARY[3],
+            OWNER_SUMMARY[4],
+            SEALED_OWNER_SUMMARY[0],
+            SEALED_OWNER_SUMMARY[1],
+            SEALED_OWNER_SUMMARY[2],
+            SEALED_OWNER_SUMMARY[3],
+            SEALED_OWNER_SUMMARY[4],
         ] {
             for (base, format) in BASE.into_iter().zip(family) {
                 db.put("store_format", format).unwrap();
@@ -1587,5 +1816,89 @@ mod tests {
             );
         }
         assert!(enable(b"sparrow.store/5").is_err());
+    }
+
+    /// INVARIANT: the owner summary fence lifts exactly the source bytes families, keeps the
+    /// sealed replay switch and every earlier fence in both directions, and uses identities
+    /// no earlier family holds, so an older binary refuses the store.
+    #[test]
+    fn the_owner_summary_fence_lifts_source_bytes_and_keeps_sealed_replay() {
+        for index in 0..BASE.len() {
+            for family in 0..5 {
+                let (plain, sealed_source) = (
+                    SOURCE_BYTES[family][index],
+                    SEALED_SOURCE_BYTES[family][index],
+                );
+                assert_eq!(
+                    enable_owner_summary(plain).unwrap(),
+                    OWNER_SUMMARY[family][index]
+                );
+                assert_eq!(
+                    enable_owner_summary(sealed_source).unwrap(),
+                    SEALED_OWNER_SUMMARY[family][index]
+                );
+                assert_eq!(
+                    enable_sealed(OWNER_SUMMARY[family][index]).unwrap(),
+                    SEALED_OWNER_SUMMARY[family][index]
+                );
+                for lifted in [
+                    OWNER_SUMMARY[family][index],
+                    SEALED_OWNER_SUMMARY[family][index],
+                ] {
+                    assert!(has_owner_summary(lifted) && has_source_bytes(lifted));
+                    assert!(has_payload_index(lifted) && has_store_counters(lifted));
+                    assert_eq!(enable_owner_summary(lifted).unwrap(), lifted);
+                    assert_eq!(enable_source_bytes(lifted).unwrap(), lifted);
+                    assert_eq!(enable_payload_index(lifted).unwrap(), lifted);
+                    assert_eq!(enable_event_fallback(lifted).unwrap(), lifted);
+                }
+                assert_eq!(sealed(OWNER_SUMMARY[family][index]), None);
+                assert!(sealed(SEALED_OWNER_SUMMARY[family][index]).is_some());
+                assert!(!has_owner_summary(plain) && !has_owner_summary(sealed_source));
+                assert_eq!(before_owner_summary(OWNER_SUMMARY[family][index]), plain);
+                assert_eq!(
+                    before_owner_summary(SEALED_OWNER_SUMMARY[family][index]),
+                    sealed_source
+                );
+            }
+            assert!(enable_owner_summary(PAYLOAD_INDEX_TRACING[index]).is_err());
+            assert_eq!(
+                enable_archive(OWNER_SUMMARY[1][index]).unwrap(),
+                OWNER_SUMMARY[2][index]
+            );
+        }
+        // Older binaries know none of the owner summary identities.
+        let earlier = [
+            BASE,
+            RDF,
+            ALL_RDF,
+            PROVENANCE,
+            TRACING,
+            LOG_TIME,
+            ARCHIVE,
+            INTAKE,
+            INTAKE_ARCHIVE,
+        ];
+        for identity in OWNER_SUMMARY
+            .iter()
+            .chain(SEALED_OWNER_SUMMARY.iter())
+            .flatten()
+        {
+            assert!(
+                earlier.iter().all(|family| !family.contains(identity))
+                    && [
+                        &FALLBACK,
+                        &OWNER_GRAPH,
+                        &SOURCE_SUMMARY,
+                        &STORE_COUNTERS,
+                        &PAYLOAD_INDEX,
+                        &SEALED,
+                        &SOURCE_BYTES,
+                        &SEALED_SOURCE_BYTES,
+                    ]
+                    .iter()
+                    .all(|families| families.iter().all(|family| !family.contains(identity)))
+            );
+        }
     }
 }

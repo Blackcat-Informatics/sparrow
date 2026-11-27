@@ -144,7 +144,8 @@ pub use storage::{
 };
 #[cfg(feature = "test-support")]
 pub use storage::{
-    SourceCountAudit, StoreCounterAudit, remove_payload_index_for_legacy_fixture,
-    remove_source_summary_for_legacy_fixture, remove_store_counters_for_legacy_fixture,
+    OwnerSummaryAudit, SourceCountAudit, StoreCounterAudit, lower_owner_summary_for_legacy_fixture,
+    remove_payload_index_for_legacy_fixture, remove_source_summary_for_legacy_fixture,
+    remove_store_counters_for_legacy_fixture,
 };
 pub use text::resolve_text_analyzer;
