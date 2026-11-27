@@ -1027,6 +1027,30 @@ panicking, because it is written while the store's writer lock is held, and a fa
 stderr write is dropped (the counter still holds the fact). Whether to stage an artifact's RDF in pieces or store it with
 its graph deferred is separate work.
 
+### Projection term limit
+
+Projection stores each scalar JSON value of a record as an RDF literal, and refuses a
+record whose encoded literal exceeds 65,536 bytes.
+
+- **Term.** Each JSON string, number, boolean and null value of a stored record becomes a
+  literal with datatype `xsd:string` and no language or direction. Its lexical form is the
+  value's source text exactly as written: for a string, the bytes between its quotes, with
+  escape sequences left undecoded.
+- **Unit.** The length in bytes of the term's canonical JSON, the compact encoding of its
+  kind, lexical form, datatype, language and direction. For a plain ASCII string this is
+  the source text's length plus 117 bytes. Each backslash in the source text is escaped
+  again in the canonical encoding, so an escape sequence costs more than its source length.
+- **Limit.** 65,536 bytes, inclusive. A term of exactly 65,536 bytes projects.
+- **Ingest.** Ingest does not check this limit. The record is stored with projection state
+  `failed` and zero primary rows. `rdf` and `rdf_inspect` report
+  `PROJECTION_FAILURE: projection resource-limit error: canonical term JSON exceeds the 65536-byte artifact limit`.
+- **Boundaries.** A plain ASCII value of 65,419 bytes projects and 65,420 does not. A value
+  of 65,415 characters followed by one double quote projects and 65,416 characters followed
+  by one quote does not. Two-byte UTF-8 values follow the plain boundary in bytes.
+- **What a sender must do.** Keep each value's source text, with escapes as written, so that
+  its canonical encoding stays within 65,536 bytes. Split a longer value across records.
+  Check `rdf_inspect` for `state` = `failed` to find a record that did not project.
+
 ### Archive worker status
 
 `Status.archiveWorker` (field 64, additive; a reader that does not know it sees no change) is

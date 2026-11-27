@@ -27642,6 +27642,53 @@ fn open_and_expiry_refuse_malformed_timed_record_metadata() {
     assert!(index_rows(&db).is_empty());
 }
 
+/// INVARIANT: a JSONL record's value projects while its canonical term JSON is at most
+/// 65,536 bytes. Ingest stores a record whose term exceeds that bound with a failed projection
+/// and the named `PROJECTION_FAILURE`, so the bound is enforced at projection, not at ingest.
+/// The boundaries pinned here are the ones measured on a scratch store: plain ASCII values of
+/// 65,419 bytes project and 65,420 do not; a value with one escaped double quote projects at
+/// 65,415 characters and not at 65,416.
+#[test]
+fn a_jsonl_value_projects_at_the_term_limit_and_one_byte_more_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), config()).unwrap();
+    let record_line = |value: &str| {
+        format!(
+            "{{\"kind\":\"synthetic-probe\",\"origin\":\"projection-limit\",\"field\":\"value\",\"value\":\"{}\"}}\n",
+            value.replace('"', "\\\"")
+        )
+    };
+    let cases = [
+        ("plain-at", "a".repeat(65_419), true),
+        ("plain-over", "a".repeat(65_420), false),
+        ("escaped-at", format!("{}\"", "a".repeat(65_415)), true),
+        ("escaped-over", format!("{}\"", "a".repeat(65_416)), false),
+    ];
+    for (name, value, projects) in cases {
+        let artifact = store
+            .ingest(
+                &format!("projection-limit-{name}"),
+                "projection-limit",
+                "jsonl",
+                record_line(&value).as_bytes(),
+                0,
+            )
+            .unwrap();
+        let inspection = store.rdf_inspect(&artifact.record_ids[0], 1).unwrap();
+        if projects {
+            assert_eq!(inspection["state"].as_str(), Some("complete"), "{name}");
+        } else {
+            assert_eq!(inspection["state"].as_str(), Some("failed"), "{name}");
+            assert!(
+                inspection["diagnostic"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("65536-byte artifact limit")),
+                "{name}: {inspection}"
+            );
+        }
+    }
+}
+
 /// Copy a closed store directory.
 fn copy_store(from: &std::path::Path, to: &std::path::Path) {
     std::fs::create_dir_all(to).unwrap();
