@@ -571,8 +571,15 @@ its producer finishes a file, not as it is written.
 `deploy/libexec/sparrow-unit-spool UNIT SPOOL_DIR CURSOR_FILE` follows the default system journal
 for one unit and writes JSON Lines in ten-minute files, `SPOOL_DIR/unit-spool-YYYYMMDDTHHMM.jsonl`.
 The file name is a transport grouping, not the time of the entry: a record carries its own `time` and
-`realtime_usec`. A line that arrives after a newer bucket exists joins the newest bucket, so a file is never
-appended to once a newer file exists.
+`realtime_usec`. A line that arrives after a newer bucket exists joins the newest bucket while that file is open.
+A bucket closes once its file has gone unwritten for 600 seconds (`SPOOL_QUIET_SECONDS`). A closed file is never
+appended to: a line that is not newer than it starts the bucket of the current time, or the bucket after the newest
+one when the clock is behind it.
+
+Every shipper source that reads these files must settle at least 300 seconds after the spool's quiet period:
+`settle_seconds` of 900 or more, with `rule = "settled"`. Then a file is shipped only after it has closed, and an
+accepted file does not change. `deploy/tests/spool-settle.sh SHIP_CONFIG` checks a shipper configuration and exits 1
+for a source that breaks this. Without an argument it checks its own fixtures.
 Each record carries `source`, `unit`, `time`, `realtime_usec`, `priority`, `message`, and `manager` when the
 entry names a command. Lines the service manager writes about the unit (stops, exits, OOM kills) have
 `"source":"systemd-manager"`. The unit's own process lines are dropped by default. With
@@ -630,10 +637,9 @@ system-install paths of this document (`/etc/sparrow`, `/var/lib/sparrow`) apply
   stopped longer than that loses the lines it has not read.
 - A silent or stopped unit: the spool does not fail. `journalctl --follow` waits for new entries of the unit, so the
   spool idles and writes nothing.
-- Latency in normal running: a line becomes readable in the store after its bucket file is complete, which needs
-  the next bucket file to exist (up to about ten minutes after the line), plus one shipper run. If the unit stops
-  logging, the newest bucket waits for the next spooled line. The source uses `rule = "daily"`, which holds the
-  newest bucket while it may still be appended to, so it reaches the store only once the next bucket file exists.
+- Latency in normal running: the shipper ships a bucket `settle_seconds` after its last write, plus one shipper run.
+  The required `settle_seconds` is 900, so a line reaches the store about 15 minutes after its bucket's last write.
+  A stopped unit's last bucket therefore ships within 15 minutes of its final line.
 
 #### Install
 
@@ -681,11 +687,12 @@ replaces the live shipper configuration. Each of these needs its own explicit au
    name = "NAME"
    dir = "/home/USER/.local/state/sparrow/unit-spool/UNIT.service"
    pattern = "unit-spool-*.jsonl"
-   rule = "daily"
+   rule = "settled"
    format = "jsonl"
-   settle_seconds = 120
+   settle_seconds = 900
    ```
-   Check: `test -d ~/.local/state/sparrow/intake/NAME` (step 1) and the loader prints `valid`:
+   Check: `test -d ~/.local/state/sparrow/intake/NAME` (step 1), `deploy/tests/spool-settle.sh ~/.config/sparrow/ship.toml.candidate`
+   prints PASS, and the loader prints `valid`:
    `python3 -I -B -c 'import importlib.machinery,importlib.util,sys; l=importlib.machinery.SourceFileLoader("ship",sys.argv[1]); s=importlib.util.spec_from_loader("ship",l); m=importlib.util.module_from_spec(s); l.exec_module(m); m.load_config(sys.argv[2]); print("valid")' ~/.local/libexec/sparrow/sparrow-ship ~/.config/sparrow/ship.toml.candidate`
    Undo: `rm -f ~/.config/sparrow/ship.toml.candidate`
 
@@ -702,9 +709,9 @@ the spool's files are kept.
 
 #### Arrival check
 
-After step 6, expect nothing in the store for the first minutes. The first line reaches the store only after its
-ten-minute bucket file is complete, which needs the next bucket file to exist, and then one shipper run: up to
-about ten minutes plus one run, so about 15 to 20 minutes for the first arrival. Silence in that time is not a failure.
+After step 6, expect nothing in the store for the first minutes. A bucket reaches the store `settle_seconds` (900)
+after its last write, plus one shipper run, so the first arrival takes about 15 minutes. Silence in that time is not a
+failure.
 
 - In the spool, for one unit's lines: `jq -c 'select(.unit == "UNIT.service")' ~/.local/state/sparrow/unit-spool/UNIT.service/*.jsonl`
 - In the store: `sparrow SOCKET records --text UNIT.service`. Its `total_items` grows as lines arrive. A stored
@@ -713,27 +720,28 @@ about ten minutes plus one run, so about 15 to 20 minutes for the first arrival.
 
 #### Separate step: the bucket rule of a source whose files grow
 
-This step is declined independently of the install above. It changes one line of the shipper configuration and is
+This step is declined independently of the install above. It changes two lines of the shipper configuration and is
 made only after install steps 0 to 6 have held.
 
 A. Back up the configuration next to the live file.
-   `cp -p ~/.config/sparrow/ship.toml ~/.config/sparrow/ship.toml.pre-SOURCE-daily`
+   `cp -p ~/.config/sparrow/ship.toml ~/.config/sparrow/ship.toml.pre-SOURCE-settled`
    Check: `cmp` of the two files prints nothing.
-   Undo: `rm -f ~/.config/sparrow/ship.toml.pre-SOURCE-daily`
+   Undo: `rm -f ~/.config/sparrow/ship.toml.pre-SOURCE-settled`
 
-B. Write a candidate beside the live file, with one line changed in the `[[source]]` block whose name is
-   `SOURCE`: `rule = "settled"` becomes `rule = "daily"`. No other line changes; `settle_seconds` stays.
+B. Write a candidate beside the live file, with two lines changed in the `[[source]]` block whose name is
+   `SOURCE`: `rule` becomes `"settled"` and `settle_seconds` becomes `900`, which is at least 300 seconds
+   after the spool's 600-second quiet period. No other line changes.
    Validate it with the loader command of install step 5.
    Undo: `rm -f ~/.config/sparrow/ship.toml.candidate`
 
 C. Rename the candidate into place: `mv -f ~/.config/sparrow/ship.toml.candidate ~/.config/sparrow/ship.toml`.
    Check: the next timer run logs `SOURCE: queued` in `journalctl --user -u sparrow-ship.service`. After that
-   run, each bucket file that is not the newest appears in the ledger exactly once, and the repeated-path
+   run, each bucket file settled past `settle_seconds` appears in the ledger exactly once, and the repeated-path
    count does not grow: `cut -f2 ~/.local/state/sparrow/ship/SOURCE.ledger | sort | uniq -d | wc -l`.
-   Undo: `cp -p ~/.config/sparrow/ship.toml.pre-SOURCE-daily ~/.config/sparrow/ship.toml.restore && mv -f ~/.config/sparrow/ship.toml.restore ~/.config/sparrow/ship.toml`
+   Undo: `cp -p ~/.config/sparrow/ship.toml.pre-SOURCE-settled ~/.config/sparrow/ship.toml.restore && mv -f ~/.config/sparrow/ship.toml.restore ~/.config/sparrow/ship.toml`
 
-Under the daily rule the newest bucket reaches Sparrow only once the next bucket file exists. That delay is
-the expected behaviour, not a fault.
+Under the settled rule with `settle_seconds = 900`, the newest bucket reaches Sparrow about 15 minutes after its
+last line, whether or not a newer bucket exists. That delay is the expected behaviour, not a fault.
 
 #### Remove
 
@@ -781,11 +789,11 @@ untracked copy already lost.
 The move changes live state: the running unit, its unit file and the shipper source. Each step needs its own
 authorization for the window in which it is run. Placeholders: `EXISTING_UNIT` is the existing unit's name with
 `.service`, `UNIT_FILE` its unit file, `EXISTING_DIR` its spool directory, `EXISTING_CURSOR` its cursor file,
-`OLD_PATTERN` the file pattern the untracked copy writes, `SOURCE` its shipper source name, `OLD_RULE` and
-`OLD_PATTERN_IN_SOURCE` the values step 0 records, and `WINDOW` the quiet period the stop uses.
+`OLD_PATTERN` the file pattern the untracked copy writes, `SOURCE` its shipper source name, `OLD_RULE`,
+`OLD_PATTERN_IN_SOURCE` and `OLD_SETTLE` the values step 0 records, and `WINDOW` the quiet period the stop uses.
 
 0. Record the state, read-only: `systemctl --user is-active EXISTING_UNIT`, `ls EXISTING_DIR | tail -n 3`,
-   `cat EXISTING_CURSOR`, and the source's current `rule` and `pattern` lines from the shipper configuration. Check:
+   `cat EXISTING_CURSOR`, and the source's current `rule`, `pattern` and `settle_seconds` lines from the shipper configuration. Check:
    the values are recorded in the task record before step 1. Undo: none.
 
    Stop before step 1 if `pattern` in SOURCE matches files other than `OLD_PATTERN`, or if `EXISTING_DIR` is shared
@@ -829,14 +837,14 @@ authorization for the window in which it is run. Placeholders: `EXISTING_UNIT` i
       name matching `OLD_PATTERN` in `EXISTING_DIR` is in the ledger, by its path: `ls EXISTING_DIR/OLD_PATTERN | xargs -n1 basename` against
       `cut -f2 ~/.local/state/sparrow/ship/SOURCE.ledger`.
       Undo: write the candidate with the rule step 0 recorded, `OLD_RULE`.
-   b. Set `pattern = "unit-spool-*.jsonl"` and `rule = "daily"` for SOURCE, two lines in one candidate. The daily rule
-      holds the newest matching file, so the check needs a second `unit-spool-*.jsonl` file in `EXISTING_DIR`, and
-      the first one past its settle time. Check: after a shipper run past that point, the ledger names the first
-      `unit-spool-*.jsonl` file. The run's `SOURCE: queued N` line alone does not prove this, because the shipper
-      prints it with N = 0.
-      Undo: write one candidate with the pattern step 0 recorded, `OLD_PATTERN_IN_SOURCE`, and the rule `OLD_RULE`.
+   b. Set `pattern = "unit-spool-*.jsonl"`, `rule = "settled"` and `settle_seconds = 900` for SOURCE, three lines in one
+      candidate. Check: `deploy/tests/spool-settle.sh CANDIDATE` prints PASS, and after a shipper run more than 900
+      seconds after the first `unit-spool-*.jsonl` file's last write, the ledger names that file. The run's
+      `SOURCE: queued N` line alone does not prove this, because the shipper prints it with N = 0.
+      Undo: write one candidate with the pattern step 0 recorded, `OLD_PATTERN_IN_SOURCE`, the rule `OLD_RULE` and
+      `settle_seconds` `OLD_SETTLE`.
 
-Each undo changes the recorded lines by a candidate (step 5b changes two lines together, and its undo does the same),
+Each undo changes the recorded lines by a candidate (step 5b changes three lines together, and its undo does the same),
 never by restoring a saved whole file, so a later change to the configuration survives.
 
 Until step 5b is complete, the new files are not shipped; the old files are shipped by the old pattern. A file

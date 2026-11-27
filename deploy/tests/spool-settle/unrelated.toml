@@ -1,0 +1,9 @@
+# A source that does not read unit-spool files is not held to the spool's quiet period.
+[[source]]
+name = "app-reports"
+dir = "/var/lib/app/reports"
+pattern = "*.json"
+rule = "settled"
+format = "json"
+settle_seconds = 60
+exclude = []

@@ -1,0 +1,9 @@
+# Settling only as long as the quiet period is less than the margin required, so the source is refused.
+[[source]]
+name = "unit-spool"
+dir = "/var/lib/sparrow/spool/units"
+pattern = "unit-spool-*.jsonl"
+rule = "settled"
+format = "jsonl"
+settle_seconds = 600
+exclude = []
