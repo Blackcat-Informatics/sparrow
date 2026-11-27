@@ -32,6 +32,11 @@ pub enum ArchiveError {
         /// The artifact identity asked for.
         artifact_id: String,
     },
+    /// The payload identity asked for is not `blake3:` followed by 64 lower-case hex digits.
+    InvalidPayloadId {
+        /// The value as given.
+        value: String,
+    },
 }
 
 impl fmt::Display for ArchiveError {
@@ -45,6 +50,10 @@ impl fmt::Display for ArchiveError {
             Self::NotFound { artifact_id } => {
                 write!(f, "no segment under the directory holds {artifact_id}")
             }
+            Self::InvalidPayloadId { value } => write!(
+                f,
+                "{value:?} is not a payload id: expected blake3: and 64 lower-case hex digits"
+            ),
         }
     }
 }

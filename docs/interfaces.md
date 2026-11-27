@@ -211,8 +211,9 @@ it holds and asks.
 - **Archive.** `sparrow-archive list DIR` prints one JSON line per segment with an
   `entries` array; each entry gives the artifact `id`, `source`, `received_at`,
   `byte_length` and `payload_id` (`blake3:` form, the same string `payloadLookup`
-  takes). The reader matches the payload id, or the artifact id from the ingest
-  receipt as the second route, then runs `sparrow-archive extract DIR ARTIFACT_ID`,
+  takes). The reader runs `sparrow-archive find DIR PAYLOAD_ID`, which names the
+  artifact and the segment file holding the payload, or matches the artifact id from
+  the ingest receipt as the second route; then it runs `sparrow-archive extract DIR ARTIFACT_ID`,
   which writes the artifact's verified bytes to stdout. The reader hashes the
   output and compares it with the payload id, since `extract` checks each record
   and the total length, not the whole-file hash. `sparrow-archive verify DIR`

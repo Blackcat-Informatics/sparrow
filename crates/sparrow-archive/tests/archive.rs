@@ -653,3 +653,65 @@ fn an_artifact_is_found_by_payload_id_live_and_in_the_archive() {
     assert!(output.status.success(), "{:?}", output.stderr);
     assert_eq!(output.stdout, FIRST);
 }
+
+/// A person finds the artifact and segment file that hold one payload with only
+/// the directory and the binary. `find` names that artifact and no other, reports an absent
+/// payload as `found:false` with exit 0, and refuses a payload id that is not in canonical
+/// form with a nonzero exit and nothing on stdout.
+#[test]
+fn find_names_the_artifact_and_segment_of_a_payload_and_reports_absence() {
+    let archive_dir = tempfile::tempdir().unwrap();
+    let root = archive_dir.path().to_str().unwrap();
+    let (ids, path) = archive_two(archive_dir.path());
+    let payload = purrdf::gts::writer::digest_string(FIRST);
+
+    let found = run(&["find", root, &payload]);
+    let text = String::from_utf8(found.stdout).unwrap();
+    assert_eq!(found.status.code(), Some(0), "{text}");
+    assert!(text.contains("\"found\":true"), "{text}");
+    assert!(
+        text.contains(&format!("\"artifact_id\":\"{}\"", ids[0])),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("\"path\":\"{}\"", path.display())),
+        "{text}"
+    );
+    assert!(
+        !text.contains(&ids[1]),
+        "the lookup names only the payload's artifact: {text}"
+    );
+
+    let absent = format!("blake3:{}", "0".repeat(64));
+    let missing = run(&["find", root, &absent]);
+    let text = String::from_utf8(missing.stdout).unwrap();
+    assert_eq!(missing.status.code(), Some(0), "{text}");
+    assert!(text.contains("\"found\":false"), "{text}");
+    assert!(text.contains("\"matches\":[]"), "{text}");
+
+    let not_a_root = archive_dir.path().join("no-such-directory");
+    let malformed = run(&["find", not_a_root.to_str().unwrap(), "blake3:ABC"]);
+    let stderr = String::from_utf8(malformed.stderr).unwrap();
+    assert_eq!(malformed.status.code(), Some(1));
+    assert!(malformed.stdout.is_empty());
+    assert!(stderr.contains("is not a payload id"), "{stderr}");
+}
+
+/// A damaged segment never disappears from a lookup. `find` fails and names
+/// the damaged file even when the payload sits in an intact segment, because a skipped
+/// segment could report the payload absent when it is present. Nothing reaches stdout.
+#[test]
+fn find_fails_by_name_on_a_damaged_segment_even_when_another_holds_the_payload() {
+    let archive_dir = tempfile::tempdir().unwrap();
+    let root = archive_dir.path().to_str().unwrap();
+    archive_two(archive_dir.path());
+    let damaged = archive_dir.path().join("segments").join("zz-damaged.gts");
+    std::fs::write(&damaged, b"not a segment").unwrap();
+    let payload = purrdf::gts::writer::digest_string(FIRST);
+
+    let output = run(&["find", root, &payload]);
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{error}");
+    assert!(output.stdout.is_empty());
+    assert!(error.contains(&damaged.display().to_string()), "{error}");
+}
