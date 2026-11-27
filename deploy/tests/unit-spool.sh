@@ -81,6 +81,22 @@ grep -q "\"unit\":\"$instance.service\"" "$state"/sparrow/unit-spool/"$instance"
     || fail "the hyphenated instance's records do not carry its unit name"
 cmp -s "$home/.local/libexec/sparrow/existing-spool" "$work/existing.before" || fail "the existing spool program changed"
 
+# A failed append ends the spool. A systemd service ignores SIGPIPE by default, so the template restores the default
+# (IgnoreSIGPIPE=no) and the test runs the program with the default disposition against a journalctl stand-in that
+# never ends. The program must exit, not run on; the timeout would report 124.
+[[ $(sed -n 's/^IgnoreSIGPIPE=//p' "$template") == no ]] || fail "the template does not restore SIGPIPE, so a failed append can stall"
+endless=$work/endless
+mkdir -p "$endless"
+cat > "$endless/journalctl" <<'DOUBLE'
+#!/usr/bin/env bash
+while :; do cat -- "$JOURNAL_FIXTURE" || exit 1; done
+DOUBLE
+chmod +x "$endless/journalctl"
+mkdir -p "$work/stalled" && mkdir "$work/stalled/unit-spool-20261127T1310.jsonl"
+rc=0
+PATH=$endless:$PATH timeout 30 bash "$script" "$unit" "$work/stalled" "$work/stalled.cursor" >/dev/null 2>&1 || rc=$?
+[[ $rc -ne 124 && $rc -ne 0 ]] || fail "a failed append did not end the spool (exit $rc)"
+
 # Bad settings refuse to start.
 if SPARROW_UNIT_SPOOL_OWN_LINES=maybe bash "$script" "$unit" "$work/x" "$work/x.cursor" 2>/dev/null; then
     fail "an unknown OWN_LINES value was accepted"

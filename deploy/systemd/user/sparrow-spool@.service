@@ -12,7 +12,9 @@
 # The program is the tracked copy, installed under its own name (sparrow-unit-spool). The template never
 # changes or replaces another spool program in ~/.local/libexec/sparrow, such as one an existing spool
 # unit runs. The unit's own lines are kept (SPARROW_UNIT_SPOOL_OWN_LINES=keep): a system unit logs through
-# stdout and stderr to the default journal.
+# stdout and stderr to the default journal. A systemd service ignores SIGPIPE by default; then a failed append can
+# leave the pipeline running with nothing spooled. IgnoreSIGPIPE=no restores the default, so the program ends and
+# the unit restarts.
 [Unit]
 Description=Spool %i.service journal lines for Sparrow
 
@@ -20,6 +22,7 @@ Description=Spool %i.service journal lines for Sparrow
 Type=exec
 Environment="SPARROW_UNIT_SPOOL_OWN_LINES=keep"
 ExecStart=%h/.local/libexec/sparrow/sparrow-unit-spool %i.service %S/sparrow/unit-spool/%i.service %S/sparrow/unit-spool/%i.service.cursor
+IgnoreSIGPIPE=no
 Restart=always
 RestartSec=10
 RestartPreventExitStatus=2

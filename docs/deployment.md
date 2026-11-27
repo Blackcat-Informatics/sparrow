@@ -761,27 +761,32 @@ may not yet hold; whether to remove them is a separate decision, made outside th
 
 #### Moving an existing spool unit to the tracked program
 
-A host may already run a spool for another unit with an untracked copy of an earlier program. The untracked copy
-runs `journalctl --cursor-file=CURSOR --follow`. Journalctl writes that cursor file only when it exits on SIGTERM
-or SIGINT, recording the last entry it printed; it writes nothing on SIGKILL. Entries printed but not yet appended
-when the unit stops are therefore lost from the spool, and nothing records the loss. A crash (SIGKILL) loses no
-entries but replays from the previous clean stop, so it duplicates instead. This mechanism was read from the
-untracked program's code and from the journalctl man page, and confirmed by a probe that followed a live unit;
-the loss under a stop was not measured under load.
+An existing spool unit may run an untracked copy of an earlier program that reads the journal with
+`journalctl --cursor-file=CURSOR --follow`. journalctl writes that cursor file when it ends by SIGTERM or SIGINT and
+when its output pipe closes, and writes nothing on SIGKILL. Entries journalctl has printed but the spool has not
+appended when it ends this way are lost from the spool. A SIGKILL replays from the last written cursor instead, so
+it duplicates entries rather than losing them. This is journalctl's documented cursor-file behavior; the loss under
+a stop was not measured.
 
 The tracked program writes its cursor after each append, so a stop or crash never skips an entry it has not
-appended: the next run resumes after the last appended entry. The move therefore reduces the loss to none for
-stops, and to duplicates for crashes. The two programs store the same journal cursor string, so the tracked
-program resumes from the existing cursor file. The move does not recover entries the untracked copy already lost.
+appended: the next run resumes after the last appended entry. The two programs store the same journal cursor
+string, so the tracked program resumes from the existing cursor file. The move does not recover entries the
+untracked copy already lost.
 
-The move changes live state: the running unit, its unit file and the shipper source. Each step below needs its
-own authorization, given for the window in which it is run. Placeholders: `EXISTING_UNIT` is the existing unit's
-name with `.service`, `UNIT_FILE` its unit file, `EXISTING_DIR` its spool directory, `EXISTING_CURSOR` its cursor
-file, `OLD_PATTERN` the file pattern the untracked copy writes, `SOURCE` its shipper source name, and `WINDOW` the
-quiet period the stop uses.
+The move changes live state: the running unit, its unit file and the shipper source. Each step needs its own
+authorization for the window in which it is run. Placeholders: `EXISTING_UNIT` is the existing unit's name with
+`.service`, `UNIT_FILE` its unit file, `EXISTING_DIR` its spool directory, `EXISTING_CURSOR` its cursor file,
+`OLD_PATTERN` the file pattern the untracked copy writes, `SOURCE` its shipper source name, `OLD_RULE` and
+`OLD_PATTERN_IN_SOURCE` the values step 0 records, and `WINDOW` the quiet period the stop uses.
 
-0. Record the state, read-only: `systemctl --user is-active EXISTING_UNIT`, `ls EXISTING_DIR | tail -n 3`, and
-   `cat EXISTING_CURSOR`. Check: the values are recorded in the task record before any step below. Undo: none.
+0. Record the state, read-only: `systemctl --user is-active EXISTING_UNIT`, `ls EXISTING_DIR | tail -n 3`,
+   `cat EXISTING_CURSOR`, and the source's current `rule` and `pattern` lines from the shipper configuration. Check:
+   the values are recorded in the task record before any step below. Undo: none.
+
+   Stop before step 5 if `pattern` in SOURCE matches files other than `OLD_PATTERN`, or if `EXISTING_DIR` is shared
+   with another forwarder. The tracked program writes `unit-spool-*.jsonl`, which the existing pattern does not
+   match, so step 5 would stop shipping those other files. That case needs a decision on the shipper configuration
+   before any step below, and this move does not make it.
 
 1. Back up the unit file and the cursor file.
    `cp -p UNIT_FILE UNIT_FILE.pre-move` and `cp -p EXISTING_CURSOR EXISTING_CURSOR.pre-move`
@@ -795,12 +800,13 @@ quiet period the stop uses.
    The quiet period keeps the set of printed-but-unappended entries empty in practice, which is the loss above. The
    journal keeps unread entries only within its retention limits.
 
-3. Replace the unit file so that it runs the tracked program on the same spool directory and cursor file, with
-   `SPARROW_UNIT_SPOOL_OWN_LINES=keep`, as the template does. Write the candidate beside the unit file, move it into
-   place, and reload the user manager so that it reads the new definition.
+3. Replace the unit file with the template's content for this unit: the tracked program on the same spool directory
+   and cursor file, with `SPARROW_UNIT_SPOOL_OWN_LINES=keep` and `IgnoreSIGPIPE=no`, as the template sets them.
+   Write the candidate beside the unit file, move it into place, and reload the user manager so that it reads the new
+   definition.
    `mv -f CANDIDATE UNIT_FILE && systemctl --user daemon-reload`
    Check: `systemd-analyze --user verify UNIT_FILE` exits 0, and `systemctl --user cat EXISTING_UNIT` shows
-   `sparrow-unit-spool` in `ExecStart`.
+   `sparrow-unit-spool` in `ExecStart` and `IgnoreSIGPIPE=no`.
    Undo: `mv -f UNIT_FILE.pre-move UNIT_FILE && systemctl --user daemon-reload`
 
 4. Start the unit with the tracked program.
@@ -809,20 +815,22 @@ quiet period the stop uses.
    `unit-spool-*.jsonl` once the unit's next entry is written.
    Undo: `systemctl --user stop EXISTING_UNIT`
 
-5. Let the old files finish shipping, then move the source to the new pattern. Two candidate writes, each one
+5. Let the old files finish shipping, then move the source to the new file pattern. Two candidate writes, each
    changing one line of the `[[source]]` entry, each validated by the loader command of the install's step 5 and
    renamed into place.
-   a. Set `rule = "settled"` for SOURCE. The old files are no longer appended to, so a settled rule ships the newest
-      one; a daily rule would hold it indefinitely. Check: after a shipper run past `settle_seconds`, every name
-      matching `OLD_PATTERN` in `EXISTING_DIR` is in the ledger, by its path:
-      `ls EXISTING_DIR/OLD_PATTERN | xargs -n1 basename` against `cut -f2 ~/.local/state/sparrow/ship/SOURCE.ledger`.
-      Undo: write the candidate with `rule = "daily"` again, the value the entry had before.
-   b. Set `pattern = "unit-spool-*.jsonl"` and `rule = "daily"` for SOURCE, which is the rule the new files need.
-      Check: the next shipper run logs `SOURCE:` for the new files.
-      Undo: write the candidate with the old `pattern` and `rule = "settled"` again.
+   a. Set `rule = "settled"` for SOURCE, unless step 0 recorded it as settled already. The old files are no longer
+      appended to, so a settled rule ships the newest one; a daily rule would hold it indefinitely. Check: after a
+      shipper run past `settle_seconds`, every name matching `OLD_PATTERN` in `EXISTING_DIR` is in the ledger, by
+      its path: `ls EXISTING_DIR/OLD_PATTERN | xargs -n1 basename` against
+      `cut -f2 ~/.local/state/sparrow/ship/SOURCE.ledger`.
+      Undo: write the candidate with the rule step 0 recorded, `OLD_RULE`.
+   b. Set `pattern = "unit-spool-*.jsonl"` and `rule = "daily"` for SOURCE. Check: after a shipper run past the first
+      new file's settle time, the ledger names a `unit-spool-*.jsonl` file. The run's `SOURCE: queued N` line alone
+      does not prove this, because the shipper prints it with N = 0.
+      Undo: write the candidate with the pattern step 0 recorded, `OLD_PATTERN_IN_SOURCE`, and the rule `OLD_RULE`.
 
-Undo for step 5 changes one line at a time by a candidate, never by restoring a saved whole file, so a later change
-to the configuration survives.
+Each undo changes the recorded lines one at a time by a candidate, never by restoring a saved whole file, so a later
+change to the configuration survives.
 
 Until step 5b is complete, the new files are not shipped; the old files are shipped by the old pattern. A file
 under both names is never shipped twice, because each name is matched by one pattern only.
