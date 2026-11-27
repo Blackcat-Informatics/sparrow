@@ -51,7 +51,13 @@ pub struct PreparedSegment {
     /// Present when the segment is shorter than the range first selected because encoding
     /// failed and the range was halved; absent otherwise.
     pub shortened: Option<Shortened>,
+    /// Ids of the encoded records whose RDF projection failed, in eviction order. Each carries
+    /// a projection-absent mark whose reason is `MARK_PROJECTION_FAILED`.
+    pub marked: Vec<String>,
 }
+
+/// The reason a projection-absent mark carries: the record's RDF projection failed at ingest.
+pub const MARK_PROJECTION_FAILED: &str = "projection_failed";
 
 /// How a prepare came to cover fewer entries than it first selected.
 ///
@@ -672,6 +678,7 @@ impl Store {
             retired_records: selection.retired,
             retired_artifacts: absent,
             shortened: None,
+            marked: selection.marks,
         })
     }
 }

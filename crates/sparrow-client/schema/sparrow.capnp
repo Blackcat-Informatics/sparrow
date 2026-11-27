@@ -369,6 +369,14 @@ struct ArchiveWorkerStatus {
   # store's durable watermark after each and records the panic as the `ARCHIVE_PANIC` failure. A
   # reader that does not know this field sees no change.
   restarts @4 :UInt64;
+  # Additive (R3): the record a hold stands on, empty when none; the reason is `oversized`.
+  # `lastSegmentMarked` counts the records the last committed segment marked as projection
+  # absent; `markedTotal` counts them in every committed segment since the daemon started. The
+  # `lastMarked*` pair names the latest marked record, empty before the first mark. A reader
+  # that does not know these fields sees no change.
+  heldRecordId @5 :Text; heldReason @6 :Text;
+  lastSegmentMarked @7 :UInt64; markedTotal @8 :UInt64;
+  lastMarkedRecordId @9 :Text; lastMarkedReason @10 :Text;
 }
 # `code` is the error class (`ARCHIVE_VERIFY`, `ARCHIVE_IO`, `STORAGE_PRESSURE`, ...); `segment`
 # is the segment's file name, empty when the failure came before a segment was chosen; `reason`

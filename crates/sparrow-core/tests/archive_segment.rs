@@ -39,19 +39,16 @@ fn archive_prepare_selects_at_three_quarters_of_the_window() {
     assert!(store.archive_prepare(bound).unwrap().is_none());
 }
 
-/// INVARIANT: a record whose RDF projection failed does not hold the archive watermark. A
-/// healthy record behind it is archived in the same segment, and the failed record is
-/// archived with its exact bytes. Fails while a projection failure at the head makes
-/// `archive_prepare` return nothing for every record behind it.
-#[test]
-fn a_failed_projection_at_the_head_does_not_hold_a_later_record() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path(), archiving(ArchivePolicy::default())).unwrap();
+/// A store whose head record (received at 1 ms) has a failed RDF projection and whose tail
+/// record (received at 2 ms) is healthy. Both are archive-eligible at the bound 2 ms + 3/4 of
+/// the window.
+fn store_with_failed_head(dir: &std::path::Path) -> Store {
+    let store = Store::open(dir, archiving(ArchivePolicy::default())).unwrap();
     store
         .ingest("head", "source", "markdown", b"# alpha\n", 1)
         .unwrap();
     drop(store);
-    let db = sparrow_test_support::catalog_db(dir.path()).unwrap();
+    let db = sparrow_test_support::catalog_db(dir).unwrap();
     let mut failed = 0;
     for entry in db.iterator(rocksdb::IteratorMode::Start) {
         let (key, value) = entry.unwrap();
@@ -70,10 +67,20 @@ fn a_failed_projection_at_the_head_does_not_hold_a_later_record() {
         "the head record has one projection state to fail"
     );
     drop(db);
-    let store = Store::open(dir.path(), archiving(ArchivePolicy::default())).unwrap();
+    let store = Store::open(dir, archiving(ArchivePolicy::default())).unwrap();
     store
         .ingest("tail", "source", "markdown", b"# beta\n", 2)
         .unwrap();
+    store
+}
+
+/// INVARIANT: a record whose RDF projection failed does not hold the archive watermark. A
+/// healthy record behind it is selected into the same segment, and the failed record is
+/// archived with its exact bytes and one projection-absent mark.
+#[test]
+fn a_failed_projection_at_the_head_does_not_hold_a_later_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_with_failed_head(dir.path());
     // The tail was received one millisecond after the head, so both are due at this instant.
     let bound = 2 + 30 * DAY * 3 / 4;
     let segment = store
@@ -93,6 +100,30 @@ fn a_failed_projection_at_the_head_does_not_hold_a_later_record() {
         .collect();
     assert_eq!(marks.len(), 1, "one mark for the failed head: {marks:?}");
     assert!(marks[0].starts_with("urn:sparrow:record:"), "{marks:?}");
+}
+
+/// INVARIANT: a marked record is retired by expiry only after its segment commits. While the
+/// segment is prepared and uncommitted, expiry past both records' deadlines retires neither and
+/// reports them waiting on the archive; after the commit it retires both.
+#[test]
+fn a_marked_record_retires_by_expiry_only_after_its_segment_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_with_failed_head(dir.path());
+    let segment = store
+        .archive_prepare(2 + 30 * DAY * 3 / 4)
+        .unwrap()
+        .expect("both records are due");
+    let past_deadlines = 2 + 31 * DAY;
+    let waiting = store
+        .expire_bounded(past_deadlines, sparrow_core::EvictionLimits::default())
+        .unwrap();
+    assert_eq!(waiting.records, 0, "nothing retires before the commit");
+    assert!(waiting.archive_waiting >= 1);
+    store.archive_commit(&segment.segment_id).unwrap();
+    let retired = store
+        .expire_bounded(past_deadlines, sparrow_core::EvictionLimits::default())
+        .unwrap();
+    assert_eq!(retired.records, 2, "both records retire once archived");
 }
 
 /// INVARIANT: PurRDF's reader decodes a prepared segment back to every record's exact

@@ -94,8 +94,6 @@ const BASE_ROWS: u64 = 2_000;
 /// One record's link quads: its identity and the two digests of its bytes.
 /// The projection-absent mark's predicate, in the vocabulary namespace.
 const PROJECTION_ABSENT: &str = "urn:sparrow:vocab:projectionAbsent";
-/// The reason every mark carries: the record's RDF projection failed at ingest.
-const PROJECTION_FAILED: &str = "projection_failed";
 
 /// One mark per record whose RDF projection is absent from the segment, in the links graph.
 fn push_marks(builder: &mut purrdf::RdfDatasetBuilder, marks: &[String]) -> Result<(), Error> {
@@ -109,7 +107,9 @@ fn push_marks(builder: &mut purrdf::RdfDatasetBuilder, marks: &[String]) -> Resu
             .intern_iri(&format!("urn:sparrow:{id}"))
             .map_err(failure)?;
         let reason = builder
-            .intern_literal(purrdf::RdfLiteral::simple(PROJECTION_FAILED))
+            .intern_literal(purrdf::RdfLiteral::simple(
+                super::archive_segment::MARK_PROJECTION_FAILED,
+            ))
             .map_err(failure)?;
         builder
             .push_quad(subject, predicate, reason, Some(graph))

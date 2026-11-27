@@ -588,13 +588,42 @@ fn archive_worker(status: wire::archive_worker_status::Reader<'_>) -> Result<Val
                 .into()
         }
     };
+    let held = named_record(
+        status.get_held_record_id()?.to_str()?,
+        status.get_held_reason()?.to_str()?,
+    );
+    let marked: Value = Object::new()
+        .with("last_segment", status.get_last_segment_marked().to_string())
+        .with("total", status.get_marked_total().to_string())
+        .with(
+            "last",
+            named_record(
+                status.get_last_marked_record_id()?.to_str()?,
+                status.get_last_marked_reason()?.to_str()?,
+            ),
+        )
+        .into();
     Ok(Object::new()
         .with("phase", phase)
         .with("through", status.get_through()?.to_str()?)
         .with("intent_in_flight", status.get_intent_in_flight())
         .with("failure", failure)
         .with("restarts", status.get_restarts().to_string())
+        .with("held", held)
+        .with("marked", marked)
         .into())
+}
+
+/// A record the archive names with its reason, or `null` when no record is named.
+fn named_record(record_id: &str, reason: &str) -> Value {
+    if record_id.is_empty() {
+        Value::Null
+    } else {
+        Object::new()
+            .with("record_id", record_id)
+            .with("reason", reason)
+            .into()
+    }
 }
 
 /// RDF staging refusals and the latest one (#340); a daemon that predates them reports zeros.

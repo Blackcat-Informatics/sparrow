@@ -39,7 +39,9 @@ evidence past its deadline. Ingestion can receive `STORAGE_PRESSURE`
 when the budget fills. A store that has adopted an archive policy requires
 compatible archive configuration at the next writable open.
 
-Status reports the worker phase, watermark and last failure. The offline
+Status reports the worker phase, watermark, last failure, the record a hold stands on, and the
+projection-absent marks: the count in the last committed segment, the count since the daemon
+started, and the last marked record. The offline
 `sparrow-archive` command lists, verifies and extracts from GTS files.
 [Write protocol](#write-protocol) · [Offline commands](#readers)
 
@@ -122,9 +124,9 @@ is therefore not written. Only records from layouts before 2026-11-02 can be tha
 large. Such a record is held: it is neither archived nor deleted. Selection
 stops before it, so the watermark never passes an unarchived record, and the
 writer reports it by identity and size in a structured warning.
-A record whose content projection failed at ingest is held the same way, because
-its evidence cannot be read whole. `Store::archive_held` reports the held record
-and the reason when it is the first unarchived entry. A segment that fails to
+A record whose content projection failed at ingest is not held: it is archived with its
+exact bytes and carries a projection-absent mark (section 4). `Store::archive_held` reports
+a held record and its reason when it is the first unarchived entry. A segment that fails to
 encode is halved until the failing entry stands alone, which is then named in
 the error; the worker journals that failed pass and the watermark does not move. The segment's read renews its lease while it makes
 progress, so a long segment is not a failure; only a read that stalls for the
@@ -250,11 +252,14 @@ Nothing is quarantined: the format has no quarantine files and no quarantine rec
 An entry that cannot be archived is held, so it does not leave the store unarchived and
 unreported:
 
-- A record whose bytes exceed 128 MiB (`TooLarge`), or whose content projection failed at
-  ingest (`ProjectionFailed`), is held at selection. Selection stops before it, so the
-  watermark never passes it and nothing after it is archived or deleted until it is
-  resolved. `Store::archive_held` reports the held record and the reason when it is the
-  first unarchived entry, and the worker journals it.
+- A record whose bytes exceed 128 MiB (`TooLarge`) is held at selection. Selection stops
+  before it, so the watermark never passes it and nothing after it is archived or deleted
+  until it is resolved. `Store::archive_held` reports the held record and the reason when it
+  is the first unarchived entry; the worker journals it and status names it.
+- A record whose content projection failed at ingest is not held. It is archived with its
+  exact bytes and both digests, and the segment marks it projection absent (section 4). A
+  marked record leaves the store only through the deletion gate of section 7, like any
+  archived record.
 - An entry the encoder refuses is found by halving the segment until it stands alone (a
   rebuild of an in-flight segment, and an `UNSUPPORTED` error, are not halved: the error
   then names the range's first entry). The prepare fails with the error naming that entry and its code, the worker journals

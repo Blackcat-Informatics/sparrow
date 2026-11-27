@@ -12,7 +12,7 @@ mod decode;
 mod status;
 
 pub use status::ArchiveStatus;
-use status::Phase;
+use status::{Phase, RecordReason};
 
 use sparrow_core::{ArchiveHold, HoldReason, PreparedSegment, Store};
 use std::{
@@ -278,12 +278,17 @@ fn journal_stall(stall: &Stall) {
     );
 }
 
+/// The reason a held record carries in the journal and in status.
+fn hold_reason_name(reason: HoldReason) -> &'static str {
+    match reason {
+        HoldReason::TooLarge => "oversized",
+    }
+}
+
 /// One structured line for a held record, written on every pass that sees one. The count of
 /// held records and the bytes waiting behind the first are not known to the store.
 fn journal_held(held: &ArchiveHold) {
-    let reason = match held.reason {
-        HoldReason::TooLarge => "oversized",
-    };
+    let reason = hold_reason_name(held.reason);
     eprintln!(
         "sparrowd: archive held record={} reason={reason} bytes={} position={} \
          count=unknown bytes_waiting=unknown; the watermark stays behind it",
@@ -1066,6 +1071,7 @@ impl Coordinator {
                 );
             }
             let (segment, dir) = self.archive(store, reservation, store_id, segment)?;
+            self.status.committed_marks(&segment.marked);
             failed_segment.clear();
             committed += 1;
             eprintln!(
@@ -1093,10 +1099,15 @@ impl Coordinator {
             return Ok(committed);
         }
         publish_position(&self.status, store)?;
-        if !self.stopped()
-            && let Some(held) = store.archive_held().map_err(ArchiveError::Store)?
-        {
-            journal_held(&held);
+        if !self.stopped() {
+            let held = store.archive_held().map_err(ArchiveError::Store)?;
+            self.status.held(held.as_ref().map(|held| RecordReason {
+                record_id: held.record_id.clone(),
+                reason: hold_reason_name(held.reason),
+            }));
+            if let Some(held) = &held {
+                journal_held(held);
+            }
         }
         Ok(committed)
     }

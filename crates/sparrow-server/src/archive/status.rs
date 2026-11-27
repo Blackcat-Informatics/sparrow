@@ -8,7 +8,15 @@
 //! stuck on a hung mount still reports where it stopped.
 
 use crate::sparrow_capnp as wire;
+use sparrow_core::MARK_PROJECTION_FAILED;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+/// The record id and reason of a named record, or two empty strings when there is none.
+fn named(record: Option<&RecordReason>) -> (&str, &str) {
+    record.map_or(("", ""), |record| {
+        (record.record_id.as_str(), record.reason)
+    })
+}
 
 /// The longest reason status carries, in characters. A decoder or filesystem message can be
 /// long; the journal line holds it whole.
@@ -45,6 +53,15 @@ pub(crate) struct Failure {
     pub(crate) since: Option<u64>,
 }
 
+/// A record the archive names: the one a hold stands on, or the last one marked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecordReason {
+    /// The record's id.
+    pub(crate) record_id: String,
+    /// Why the record is held or marked.
+    pub(crate) reason: &'static str,
+}
+
 /// A copy of the published state.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Snapshot {
@@ -56,6 +73,14 @@ pub(crate) struct Snapshot {
     pub(crate) failure: Option<Failure>,
     /// Passes that panicked and were restarted since the daemon started.
     pub(crate) restarts: u64,
+    /// The record the last pass that reached its hold check found held; absent when none.
+    pub(crate) held: Option<RecordReason>,
+    /// Records marked (projection absent) in the last committed segment.
+    pub(crate) last_segment_marked: u64,
+    /// Records marked in committed segments since the daemon started.
+    pub(crate) marked_total: u64,
+    /// The last record marked in a committed segment since the daemon started.
+    pub(crate) last_marked: Option<RecordReason>,
 }
 
 /// The shared copy: the worker writes it, `status` reads it.
@@ -104,6 +129,24 @@ impl ArchiveStatus {
         state.restarts
     }
 
+    /// The record the hold check found, or `None` when the head is free.
+    pub(crate) fn held(&self, held: Option<RecordReason>) {
+        self.lock().held = held;
+    }
+
+    /// A segment committed with these marked records, in eviction order.
+    pub(crate) fn committed_marks(&self, marked: &[String]) {
+        let mut state = self.lock();
+        state.last_segment_marked = marked.len() as u64;
+        state.marked_total += marked.len() as u64;
+        if let Some(record_id) = marked.last() {
+            state.last_marked = Some(RecordReason {
+                record_id: record_id.clone(),
+                reason: MARK_PROJECTION_FAILED,
+            });
+        }
+    }
+
     /// A pass failed at `now`, when the clock could be read. A failure with the same code and
     /// segment as the one standing keeps its start, so `since` dates the trouble and not the
     /// latest retry; a start missing for want of a clock is filled in once `now` is known.
@@ -143,6 +186,14 @@ impl ArchiveStatus {
         out.set_through(state.through.as_deref().unwrap_or(""));
         out.set_intent_in_flight(state.intent_in_flight);
         out.set_restarts(state.restarts);
+        let (held_id, held_reason) = named(state.held.as_ref());
+        out.set_held_record_id(held_id);
+        out.set_held_reason(held_reason);
+        out.set_last_segment_marked(state.last_segment_marked);
+        out.set_marked_total(state.marked_total);
+        let (marked_id, marked_reason) = named(state.last_marked.as_ref());
+        out.set_last_marked_record_id(marked_id);
+        out.set_last_marked_reason(marked_reason);
         match state.failure {
             None => out.init_failure().set_absent(()),
             Some(failure) => {

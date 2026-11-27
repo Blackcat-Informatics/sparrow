@@ -24,7 +24,9 @@ pub use storage::archive::{
     ARCHIVE_SEGMENT_QUADS, ARCHIVE_SEGMENT_RECORDS, ARCHIVE_START_FRACTION, ARCHIVE_WATERMARK,
     ArchiveIntent, ArchivePolicy, ArchiveState,
 };
-pub use storage::archive_segment::{ArchiveHold, HoldReason, PreparedSegment, Shortened};
+pub use storage::archive_segment::{
+    ArchiveHold, HoldReason, MARK_PROJECTION_FAILED, PreparedSegment, Shortened,
+};
 pub use storage::artifact_read::{
     ArtifactOrigin, ArtifactPageBody, ArtifactRead, ArtifactReadPage, ArtifactSelector,
     ArtifactSummary,
