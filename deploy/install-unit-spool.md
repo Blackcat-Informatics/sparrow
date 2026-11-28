@@ -206,7 +206,7 @@ E1. Save the current state. Runs as: the account that runs the shipper and the s
 
   Check: `cmp` of each file against its backup prints nothing. Record whether the instance is enabled and whether it is active:
   `systemctl --user is-enabled sparrow-spool@UNIT.service` and `systemctl --user is-active sparrow-spool@UNIT.service`.
-  Undo: `rm -f` of the three backups, after the next shipper run has passed with the restored configuration.
+  Undo: `rm -f` of the three backups, after the next shipper run has passed with the configuration then in place.
 
 E2. Stop and disable the instance. Runs as: the account, through its user manager. Live: yes; its own order.
 
@@ -214,7 +214,8 @@ E2. Stop and disable the instance. Runs as: the account, through its user manage
 
   Disabling keeps a restart of the user manager from starting the instance until E5 enables it again.
   Check: `systemctl --user is-active sparrow-spool@UNIT.service` prints `inactive`, and `systemctl --user is-enabled sparrow-spool@UNIT.service` prints `disabled`.
-  Undo: `systemctl --user enable --now sparrow-spool@UNIT.service`, only if E1 recorded it as enabled and active.
+  Undo: if E1 recorded the instance as enabled, `systemctl --user enable sparrow-spool@UNIT.service`; then, if E1 recorded it
+  as active, `systemctl --user start sparrow-spool@UNIT.service`. Each value is restored on its own.
 
 E3. Install the program and template from `fd34bc5` or later. Runs as: the account. Live: no process starts.
 
@@ -240,12 +241,12 @@ E5. Enable and start the instance. Runs as: the account, through its user manage
 
     systemctl --user enable --now sparrow-spool@UNIT.service
 
-  Check: `systemctl --user is-active sparrow-spool@UNIT.service` prints `active`, and the spool directory receives
-  `unit-spool-*.jsonl` lines once the unit's next entry is written. The existing cursor file is used, so records are not
-  spooled again.
-  Undo: `systemctl --user disable --now sparrow-spool@UNIT.service`, then the undo of E4 and E3, in that order. If E1
-  recorded the instance as enabled and active, `systemctl --user enable --now sparrow-spool@UNIT.service` after the undo of
-  E3 restores it.
+  Check: `systemctl --user is-active sparrow-spool@UNIT.service` prints `active`, `systemctl --user is-enabled
+  sparrow-spool@UNIT.service` prints `enabled`, and the spool directory receives `unit-spool-*.jsonl` lines once the unit's
+  next entry is written. The existing cursor file is used, so records are not spooled again.
+  Undo: `systemctl --user disable --now sparrow-spool@UNIT.service`, then the undo of E4 and E3, in that order. Then restore
+  the E1 state with the same rules as E2's undo: `enable` if E1 recorded it as enabled, and `start` if E1 recorded it as
+  active. Each value is restored on its own.
 
 An earlier revision of the tracked program does not carry the fixes listed in step 0. This section installs the program
 from `fd34bc5` or later, and nothing else from the earlier revision is kept.
