@@ -58,8 +58,9 @@ The shipper reads each source from its consume root. A missing root ends the shi
 - Needs: step 1 passes.
 - Command: `install -d -m 0700 HOME/.local/state/sparrow/intake/SOURCE`
 - Check: `test -d HOME/.local/state/sparrow/intake/SOURCE`
-- Leaves: one empty directory.
-- Undo: `rmdir HOME/.local/state/sparrow/intake/SOURCE` (removes it only while empty).
+- Leaves: one directory. Once the watch of step 3 has consumed a file, the daemon creates `.sparrow-inflight/.lock` in
+  it, and no supported command removes that directory or lock at this build. Leave the root in place.
+- Undo: none for the root. Step 3's undo stops its consumption.
 
 ### 3. Register the consume watch (live)
 
@@ -72,7 +73,8 @@ The shipper reads each source from its consume root. A missing root ends the shi
 - Check: `sparrow SOCKET watch list` shows a watch on that root, enabled.
 - Leaves: one more consume root with a running watch.
 - Undo: `sparrow SOCKET watch remove REQUEST_ID WATCH_ID REVISION`, with the watch ID and current revision that
-  `watch list` reports.
+  `watch list` reports. Then `sparrow SOCKET watch claims --watch WATCH_ID` must list no claim before the undo is
+  reported as done; a claim still held is named in the order, not removed by hand.
 
 ### 4. Install the program and the template (not started)
 
@@ -293,7 +295,7 @@ an entry; remove it by a candidate, so that a later change to the file survives.
    Check: `find HOME/.local/state/sparrow/intake/SOURCE -mindepth 1 -print -quit` prints nothing.
 5. Step 3: `sparrow SOCKET watch remove REQUEST_ID WATCH_ID REVISION`, with the values `sparrow SOCKET watch list` reports.
    Check: `watch list` no longer shows the root.
-6. Step 2: `rmdir HOME/.local/state/sparrow/intake/SOURCE` (only while empty).
+6. Step 2: leave the root in place (its `.sparrow-inflight/.lock` is daemon-owned; see step 2's undo).
 7. Remove the backups: `rm -f HOME/.config/sparrow/ship.toml.pre-swap-SOURCE HOME/.config/sparrow/unit-spool-entry.toml`.
    Check: `test ! -e HOME/.config/sparrow/ship.toml.pre-swap-SOURCE && test ! -e HOME/.config/sparrow/unit-spool-entry.toml`.
 
