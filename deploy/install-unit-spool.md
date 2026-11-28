@@ -183,32 +183,83 @@ from a previous reply's `next_cursor`; use the same constraints and budget.
 
 ## A unit with an existing spool
 
-A unit whose spool was installed from an earlier revision of the tracked program keeps its spool files, its cursor
-file and its shipper source. This guide does not replace that spool in place. Follow "Moving an existing spool unit to the
-tracked program" in `../docs/deployment.md`, with these rules:
+This section covers a unit whose instance of the template was installed from an earlier revision of the tracked program,
+with a shipper source already named `SOURCE`. The instance keeps its spool files, its cursor file, its consume root and
+its watch. Steps 2 and 3 do not run for this unit.
 
-- `SOURCE` is the name of the existing shipper source. The shipper keeps a ledger for each source name, at
-  `HOME/.local/state/sparrow/ship/SOURCE.ledger`. A new name starts with an empty ledger, so it would ship every file in
-  the directory again.
-- Do not add a second source with the same `dir`. Two sources read the same files, and every file ships twice.
-- The program at the same path and the template are replaced only while the existing instance is stopped, as the move's
-  step 2 orders.
-- The existing instance is stopped before its files are replaced (the move's step 2). Its source is changed to the
-  tracked pattern after the tracked program has started (the move's step 5), once the old files have shipped.
-- A watch on the unit's consume root already exists when the source was installed by an earlier guide. Do not register a
-  second watch. Steps 2 and 3 of this guide do not apply to that case.
+The order keeps the shipper source's rule and the running instance from disagreeing about files being written. The
+source changes while the instance is stopped, so no file is appended while its rule changes. A change made after the
+start would leave a daily rule reading files the running unit is still appending to. Each step's interruption point is
+safe:
 
-An earlier revision of the tracked program does not carry the fixes listed in step 0. The move installs the program from
-`fd34bc5` or later, not from the earlier revision.
+- After E2, nothing writes to the spool and the program is not running.
+- After E3 or E4, the program is replaced but not running, and the source is settled or not yet changed.
+- After E5, the instance runs with the source already settled.
+
+E1. Save the current state. Runs as: the account that runs the shipper and the spool. Live: no.
+
+    cp -p HOME/.local/libexec/sparrow/sparrow-unit-spool HOME/.local/libexec/sparrow/sparrow-unit-spool.pre-SOURCE
+    cp -p HOME/.config/systemd/user/sparrow-spool@.service HOME/.config/systemd/user/sparrow-spool@.service.pre-SOURCE
+    cp -p HOME/.config/sparrow/ship.toml HOME/.config/sparrow/ship.toml.pre-swap-SOURCE
+
+  Check: `cmp` of each file against its backup prints nothing. Record whether the instance is active:
+  `systemctl --user is-active sparrow-spool@UNIT.service`.
+  Undo: `rm -f` of the three backups, after step E5's check passes.
+
+E2. Stop the instance. Runs as: the account, through its user manager. Live: yes; its own order.
+
+    systemctl --user stop sparrow-spool@UNIT.service
+
+  Check: `systemctl --user is-active sparrow-spool@UNIT.service` prints `inactive`.
+  Undo: `systemctl --user start sparrow-spool@UNIT.service`, only if E1 recorded it as active.
+
+E3. Install the program and template from `fd34bc5` or later. Runs as: the account. Live: no process starts.
+
+  Use the commands of step 4 (`install`, then `systemctl --user daemon-reload`), with `REPO` at that head.
+  Check: `cmp` of each installed file against its repository file prints nothing.
+  Undo: `mv -f` each E1 backup back over its file, then `systemctl --user daemon-reload`.
+
+E4. Change the existing source to settled with 900 seconds. Runs as: the account that runs the shipper. Live: yes; its
+own order.
+
+  Write a candidate from `ship.toml` in which only the `[[source]]` block named `SOURCE` changes: `rule = "settled"` and
+  `settle_seconds = 900`. Its name, `dir` and `pattern` stay as they are, so the shipper's ledger for `SOURCE` carries over.
+  Check, all three:
+  - `diff HOME/.config/sparrow/ship.toml HOME/.config/sparrow/ship.toml.candidate` shows only those two lines.
+  - `REPO/deploy/tests/spool-settle.sh HOME/.config/sparrow/ship.toml.candidate` prints PASS.
+  - The loader of step 6 prints `valid` on the candidate.
+  Then `mv -f HOME/.config/sparrow/ship.toml.candidate HOME/.config/sparrow/ship.toml`.
+  Undo: write a candidate with the `rule` and `settle_seconds` lines the E1 backup records, validate it with the loader,
+  and rename it into place.
+
+E5. Start the instance. Runs as: the account, through its user manager. Live: yes; its own order.
+
+    systemctl --user start sparrow-spool@UNIT.service
+
+  Check: `systemctl --user is-active sparrow-spool@UNIT.service` prints `active`, and the spool directory receives
+  `unit-spool-*.jsonl` lines once the unit's next entry is written. The existing cursor file is used, so records are not
+  spooled again.
+  Undo: `systemctl --user stop sparrow-spool@UNIT.service`, then the undo of E4 and E3, in that order.
+
+An earlier revision of the tracked program does not carry the fixes listed in step 0. This section installs the program
+from `fd34bc5` or later, and nothing else from the earlier revision is kept.
 
 ## Way back, in order
 
-Undo the steps in reverse order and stop at the first failed check:
+Undo the steps in reverse order and stop at the first failed check. Do not restore a whole saved configuration to remove
+an entry; remove it by a candidate, so that a later change to the file survives.
 
-1. Step 5: `systemctl --user disable --now sparrow-spool@UNIT.service`.
-2. Step 6: remove the entry by the undo command of step 6.
-3. Step 4: remove the program and template, then `systemctl --user daemon-reload`.
-4. Step 3: `sparrow SOCKET watch remove REQUEST_ID WATCH_ID REVISION`.
-5. Step 2: `rmdir HOME/.local/state/sparrow/intake/SOURCE`.
+1. Step 6: write a candidate without the `[[source]]` entry, validate it with the loader, and rename it into place.
+   Check: the loader prints `valid`, and the next shipper run no longer logs `SOURCE:`.
+2. Step 5: `systemctl --user disable --now sparrow-spool@UNIT.service`.
+   Check: `systemctl --user is-active sparrow-spool@UNIT.service` prints `inactive`.
+3. Step 4: remove the program and the template, then `systemctl --user daemon-reload`.
+   Check: `test ! -e HOME/.local/libexec/sparrow/sparrow-unit-spool && test ! -e HOME/.config/systemd/user/sparrow-spool@.service`.
+4. Wait until the consume root is empty, so that every item already fed has been consumed.
+   Check: `find HOME/.local/state/sparrow/intake/SOURCE -mindepth 1 -print -quit` prints nothing.
+5. Step 3: `sparrow SOCKET watch remove REQUEST_ID WATCH_ID REVISION`, with the values `sparrow SOCKET watch list` reports.
+   Check: `watch list` no longer shows the root.
+6. Step 2: `rmdir HOME/.local/state/sparrow/intake/SOURCE` (only while empty).
+7. Remove the backups: `rm -f HOME/.config/sparrow/ship.toml.pre-SOURCE HOME/.config/sparrow/ship.toml.pre-swap-SOURCE HOME/.config/sparrow/unit-spool-entry.toml`.
 
 Nothing in the way back deletes records, spool files, cursor files or ledgers, and nothing changes the store.
