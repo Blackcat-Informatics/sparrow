@@ -1207,8 +1207,19 @@ impl Worker {
 }
 
 impl Drop for Worker {
+    /// Stops the coordinator and waits for it to exit, so the coordinator thread cannot run
+    /// into process teardown. A worker that `shutdown` already joined has no handle left.
     fn drop(&mut self) {
         self.request_stop();
+        let Some(coordinator) = self.coordinator.take() else {
+            return;
+        };
+        if let Err(panic) = coordinator.join() {
+            tracing::error!(
+                cause = %panic_message(panic.as_ref()),
+                "archive coordinator panicked; drop joined it after the panic"
+            );
+        }
     }
 }
 
