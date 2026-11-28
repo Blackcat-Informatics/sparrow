@@ -1083,6 +1083,9 @@ impl ClaimRoot {
         format: sparrow_client::Format,
         missing: Option<MissingLimits>,
     ) -> Result<String, Error> {
+        // Hashed once per claim; a retry reuses it, and `validate_claim` has already matched
+        // the file to its observation for this attempt.
+        let payload = attempt.parts.whole_payload(&claim.file).await?;
         let receipt = client
             .import_open_file_with_progress(
                 &claim.journal.request_id,
@@ -1090,6 +1093,7 @@ impl ClaimRoot {
                 format,
                 &mut claim.file,
                 Some(Arc::clone(&attempt.progress)),
+                Some(payload.as_str()),
             )
             .await
             .map_err(|error| match missing {

@@ -17597,6 +17597,7 @@ impl SetHarness {
                     span.format,
                     &mut file,
                     None,
+                    None,
                 )
                 .await
                 .unwrap();
