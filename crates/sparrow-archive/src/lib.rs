@@ -10,11 +10,13 @@
 mod decode;
 mod error;
 mod extract;
+mod index;
 mod payload;
 mod segment;
 
 pub use error::ArchiveError;
 pub use extract::extract;
+pub use index::{BuildSummary, INDEX_FILE, Lookup, Method, build_index, lookup_payload};
 pub use payload::{PayloadMatch, find_payload, validate_payload_id};
 pub use segment::{ArchivedArtifact, ArchivedRecord, Segment, Summary, list_segments};
 

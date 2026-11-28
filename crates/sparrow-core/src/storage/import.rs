@@ -393,7 +393,9 @@ impl ImportManifest {
     }
 }
 
-pub(super) fn valid_payload_id(id: &str) -> bool {
+/// Whether `id` is a payload identity the store writes: `blake3:` followed by 64 lower-case hex
+/// digits. This is the one check; the archive reader calls it for every payload id it accepts.
+pub fn valid_payload_id(id: &str) -> bool {
     id.strip_prefix("blake3:")
         .and_then(hex::decode_32_canonical)
         .is_some()

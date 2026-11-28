@@ -68,7 +68,7 @@ pub struct Segment {
     decoded: Decoded,
 }
 
-fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ArchiveError + '_ {
+pub(crate) fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ArchiveError + '_ {
     move |source| ArchiveError::Io {
         path: path.to_owned(),
         source,

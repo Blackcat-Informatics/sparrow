@@ -21,13 +21,7 @@ pub struct PayloadMatch {
 /// # Errors
 /// [`ArchiveError::InvalidPayloadId`] when `value` has any other form.
 pub fn validate_payload_id(value: &str) -> Result<(), ArchiveError> {
-    let canonical = value.strip_prefix("blake3:").is_some_and(|hex| {
-        hex.len() == 64
-            && hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    });
-    if canonical {
+    if sparrow_core::valid_payload_id(value) {
         Ok(())
     } else {
         Err(ArchiveError::InvalidPayloadId {
@@ -41,8 +35,8 @@ pub fn validate_payload_id(value: &str) -> Result<(), ArchiveError> {
 /// segment holds that payload. Nothing is written anywhere.
 ///
 /// Every segment is decoded in memory, as [`crate::extract`] does, so a damaged segment fails
-/// the call by name even when it does not hold the payload. No index exists, so each call
-/// reads the whole archive directory.
+/// the call by name even when it does not hold the payload. This is the scan that
+/// [`crate::lookup_payload`] falls back to when no usable index exists.
 ///
 /// # Errors
 /// A `payload_id` that is not `blake3:` followed by 64 lower-case hex digits, or a segment
