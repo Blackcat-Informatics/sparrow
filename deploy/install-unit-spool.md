@@ -155,32 +155,48 @@ The shipper's timer runs the shipper. A bucket is queued `settle_seconds` (900) 
 
 ### 8. Verify arrival on the store (live read, its own order)
 
-A store query runs against the production daemon, so it has its own order and a bounded window. Name the window in the
-order before the query runs.
+The check reads the store's exact per-source totals. It does not use the query scan budget, so it holds for a batch of
+any size. The store read is a live read of the production daemon, so it has its own order.
 
 - Runs as: the account that may read the store socket.
-- Needs: step 7 has shown a `SOURCE:` line after a settled bucket.
-- Write the constraints (a JSON array, on a path the account owns):
+- Needs: step 7 has shown a `SOURCE:` line after a settled bucket, and the totals read before step 6's shipper run.
+- Read the store identifier: `sparrow SOCKET status`. Its reply has the `store_id` field, which is `STORE_ID` below.
+- Read the totals:
+
+      sparrow SOCKET sources STORE_ID --source SOURCE
+
+  The reply's row for `SOURCE` has `complete_artifacts`, `retained_records` and `retained_payload_bytes`.
+- Check: the reply exits 0, its top-level `answer_certainty` is `exact` and `coverage.catalog_complete` is `true`. The
+  increase since the totals read before the shipper's run equals the batch the run fed:
+  - `complete_artifacts` increases by the `N` in the shipper's `SOURCE: fed N` line.
+  - `retained_payload_bytes` increases by the byte total of the files that run fed (`stat -c %s` on each).
+  - `retained_records` increases by the line total of those files (`wc -l` on each).
+- Measured on the scratch store at main `99bbf53`: the shipper logged `fed 3`. The reply had `complete_artifacts` 3,
+  `retained_records` 2571 and `retained_payload_bytes` 660812, which equal the `wc -l` total (2571) and the `wc -c` total
+  (660812) of the three files.
+- Leaves: nothing.
+
+Optional: a unit's own lines. The constraints form is a JSON array on a path the account owns:
 
       [{"path":"/source","decoded":"systemd-unit"},{"path":"/unit","decoded":"UNIT.service"}]
 
-- Query, narrowed by source and a receipt window, with the default scan budget:
-
       sparrow SOCKET records --where-file CONSTRAINTS.json --source SOURCE --received-from START --received-before END --page-size 100
 
-  `START` and `END` are RFC 3339 times that the order names. Do not pass `--scan-budget`. If the reply is
-  `RESOURCE_LIMIT`, narrow the window and run the query again; do not raise the budget.
-- Check: the reply has `page.total_items` greater than 0 and exits 0. The count is the unit's own lines, not the unit's
-  manager lines.
-- Leaves: nothing. Remove `CONSTRAINTS.json` afterwards.
+Measured at the default budget, a receipt window of one second passed (`total_items` 14 out of 49 eligible records); a
+two-second window and a sixteen-minute window returned `RESOURCE_LIMIT` with no rows. The window that passed
+was the one that contained the batch's receipt time; the `fed` line in `journalctl --user -u sparrow-ship.service` gives
+only an approximate centre. Do not pass `--scan-budget`. A
+`RESOURCE_LIMIT` means the window is too wide: narrow it, or skip this query, because the count check above is the
+check. Remove `CONSTRAINTS.json` afterwards.
 
 ## Scan budget
 
-`--scan-budget` is the number of occurrences the store may examine for one page. The command accepts 1 to 100000 and
-the default is 10000. A 1,167-record scratch store needed 100000 for the unit query without a source or window: with the
-default budget that query fails with `RESOURCE_LIMIT`, and the error returns no partial result. Nothing here measures how
-the budget grows with a larger store, so narrowing by source and window comes first. `--cursor CURSOR` continues a page
-from a previous reply's `next_cursor`; use the same constraints and budget.
+`--scan-budget` is the number of field occurrences the store may examine for one page. The command accepts 1 to 100000 and
+the default is 10000. A query over a unit's lines charges about 24 occurrences per eligible record in its window
+(measured with a two-field constraint on a 2,571-record store), so the default covers about 400 records of a window and
+the maximum about 4,000. A refusal is `RESOURCE_LIMIT` and returns no rows, so a window that holds more records than the
+budget covers cannot be read at the default. The count check in step 8 does not use the budget. `--cursor CURSOR`
+continues a page from a previous reply's `next_cursor`; use the same constraints and budget.
 
 ## A unit with an existing spool
 
