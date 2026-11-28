@@ -590,10 +590,9 @@ that unit's line.
 The cursor file is written after each record is appended, so it never runs ahead of the spool.
 Across a process crash, a record appended before the cursor write is spooled again on the next run: the spool
 is at-least-once. Each record's bucket file is synced to disk before the cursor moves past the record, so a host
-crash or power loss cannot leave the cursor ahead of record bytes that did not reach the disk. The directory entry
-of a bucket created by a record is not synced: a power loss just after a new bucket is created can lose that
-bucket's first records while the cursor has already moved past them. A crash during the backfill spools the whole
-backfill again. A first start with no cursor and no `SPARROW_UNIT_SPOOL_SINCE` spools the unit's entire retained
+crash or power loss cannot leave the cursor ahead of record bytes that did not reach the disk. A record that creates
+a bucket also syncs the spool directory, so the bucket's directory entry reaches the disk too. A crash during the
+backfill spools the whole backfill again. A first start with no cursor and no `SPARROW_UNIT_SPOOL_SINCE` spools the unit's entire retained
 journal.
 
 The commands in this section use placeholders: `UNIT` is the unit's name without `.service`, `REPO` the checkout,

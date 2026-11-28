@@ -31,9 +31,9 @@
 #
 # The cursor file is written after each record is appended, so it never runs ahead of the spool. A
 # process crash between the append and the cursor write spools that record again on the next run: across
-# a process crash the spool is at-least-once, never lossy. The records are not fsynced, so a host crash or
-# power loss can lose records the kernel had not yet written to disk, and a crash during the backfill
-# spools the whole backfill again.
+# a process crash the spool is at-least-once, never lossy. Each record is fsynced, with its bucket's directory
+# entry when the record creates the bucket, before the cursor moves past it, so a host crash or power loss
+# cannot lose a record the cursor has passed. A crash during the backfill spools the whole backfill again.
 #
 # Environment:
 #   SPARROW_UNIT_SPOOL_SINCE  A journalctl --since time. Used only while CURSOR_FILE does not exist, to
@@ -116,7 +116,7 @@ route_bucket() {
 # JSON entries on stdin, spooled into SPOOL_DIR. $1 is the cursor file to advance after each record
 # is appended, or empty for the backfill pass, which writes its cursor once it has finished.
 spool() {
-    local LC_ALL=C cursor_out=$1 bucket cur line newest now age
+    local LC_ALL=C cursor_out=$1 bucket cur line newest now age file created
     newest=$(newest_bucket "$dir")
     jq -r --unbuffered --arg unit "$unit" --argjson keep "$keep" '
 (._SYSTEMD_UNIT == $unit or ._SYSTEMD_USER_UNIT == $unit) as $own
@@ -145,10 +145,15 @@ spool() {
             fi
             bucket=$(route_bucket "$bucket" "$newest" "$age" "$now")
             newest=$bucket
-            printf '%s\n' "$line" >> "$dir/unit-spool-$bucket.jsonl"
-            # The record reaches disk before the cursor moves past it. The directory entry of a new bucket
-            # is not synced.
-            sync -- "$dir/unit-spool-$bucket.jsonl"
+            file=$dir/unit-spool-$bucket.jsonl
+            created=0
+            [[ -e $file ]] || created=1
+            printf '%s\n' "$line" >> "$file"
+            # The record and, for a new bucket, its directory entry reach disk before the cursor moves past it.
+            sync -- "$file"
+            if (( created )); then
+                sync -- "$dir"
+            fi
             if [[ -n $cursor_out ]]; then
                 printf '%s\n' "$cur" > "$cursor_out.tmp"
                 mv -f -- "$cursor_out.tmp" "$cursor_out"

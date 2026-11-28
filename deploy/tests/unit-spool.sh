@@ -3,11 +3,12 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 #
 # Checks deploy/libexec/sparrow-unit-spool against a fixture journal. journalctl is replaced by a
-# test double that prints the fixture whatever its arguments, so the checks cover the spool's own
-# filtering, records and cursor, not journalctl's selection.
+# test double that prints the fixture, or after --after-cursor when one is passed, so the checks cover
+# the spool's own filtering, records and cursor, not journalctl's selection.
 #
-# drop.jsonl is the recorded default output for the fixture; the default must still produce it byte for byte. keep.jsonl is the output with
-# SPARROW_UNIT_SPOOL_OWN_LINES=keep. Prints PASS, or names the failed check and exits 1.
+# drop.jsonl is the recorded default output for the fixture; the default must still produce it byte
+# for byte. keep.jsonl is the output with SPARROW_UNIT_SPOOL_OWN_LINES=keep. Prints PASS, or names the
+# failed check and exits 1.
 set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 script=$here/../libexec/sparrow-unit-spool
