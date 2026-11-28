@@ -146,9 +146,9 @@ change is made on a candidate, validated, and then renamed into place. The live 
 
 ### 7. Wait for the first arrival (no command)
 
-- Runs as: the shipper's timer. Nothing to run.
 The shipper's timer runs the shipper. A bucket is queued `settle_seconds` (900) after its last write, plus one shipper run.
 
+- Runs as: the account that runs the shipper's timer. Nothing to run.
 - Check: `journalctl --user -u sparrow-ship.service` shows a `SOURCE:` line after the bucket has settled. The line
   `SOURCE: queued 0` alone does not prove that a file arrived.
 - Leaves: nothing.
@@ -193,9 +193,9 @@ source changes while the instance is stopped, so no file is appended while its r
 start would leave the old rule reading files the running unit is still appending to. Each step's interruption point is
 safe:
 
-- After E2, nothing writes to the spool and the instance is stopped (it stays stopped across a restart of the user manager).
-- After E3, the program and template are replaced and the instance is still stopped; the source is not yet changed.
-- After E4, the source is settled and the instance is still stopped.
+- After E2, nothing writes to the spool and the instance is stopped and disabled, so a restart of the user manager does not start it.
+- After E3, the program and template are replaced and the instance is still stopped and disabled; the source is not yet changed.
+- After E4, the source is settled and the instance is still stopped and disabled.
 - After E5, the instance runs with the source already settled.
 
 E1. Save the current state. Runs as: the account that runs the shipper and the spool. Live: no.
@@ -204,16 +204,17 @@ E1. Save the current state. Runs as: the account that runs the shipper and the s
     cp -p HOME/.config/systemd/user/sparrow-spool@.service HOME/.config/systemd/user/sparrow-spool@.service.pre-SOURCE
     cp -p HOME/.config/sparrow/ship.toml HOME/.config/sparrow/ship.toml.pre-swap-SOURCE
 
-  Check: `cmp` of each file against its backup prints nothing. Record whether the instance is active:
-  `systemctl --user is-active sparrow-spool@UNIT.service`.
-  Undo: `rm -f` of the three backups, after step E5's check passes.
+  Check: `cmp` of each file against its backup prints nothing. Record whether the instance is enabled and whether it is active:
+  `systemctl --user is-enabled sparrow-spool@UNIT.service` and `systemctl --user is-active sparrow-spool@UNIT.service`.
+  Undo: `rm -f` of the three backups, after the next shipper run has passed with the restored configuration.
 
-E2. Stop the instance. Runs as: the account, through its user manager. Live: yes; its own order.
+E2. Stop and disable the instance. Runs as: the account, through its user manager. Live: yes; its own order.
 
-    systemctl --user stop sparrow-spool@UNIT.service
+    systemctl --user disable --now sparrow-spool@UNIT.service
 
-  Check: `systemctl --user is-active sparrow-spool@UNIT.service` prints `inactive`.
-  Undo: `systemctl --user start sparrow-spool@UNIT.service`, only if E1 recorded it as active.
+  Disabling keeps a restart of the user manager from starting the instance until E5 enables it again.
+  Check: `systemctl --user is-active sparrow-spool@UNIT.service` prints `inactive`, and `systemctl --user is-enabled sparrow-spool@UNIT.service` prints `disabled`.
+  Undo: `systemctl --user enable --now sparrow-spool@UNIT.service`, only if E1 recorded it as enabled and active.
 
 E3. Install the program and template from `fd34bc5` or later. Runs as: the account. Live: no process starts.
 
@@ -235,15 +236,16 @@ own order.
   Undo: write a candidate with the `rule` and `settle_seconds` lines the E1 backup records, validate it with the loader,
   and rename it into place.
 
-E5. Start the instance. Runs as: the account, through its user manager. Live: yes; its own order.
+E5. Enable and start the instance. Runs as: the account, through its user manager. Live: yes; its own order.
 
-    systemctl --user start sparrow-spool@UNIT.service
+    systemctl --user enable --now sparrow-spool@UNIT.service
 
   Check: `systemctl --user is-active sparrow-spool@UNIT.service` prints `active`, and the spool directory receives
   `unit-spool-*.jsonl` lines once the unit's next entry is written. The existing cursor file is used, so records are not
   spooled again.
-  Undo: `systemctl --user stop sparrow-spool@UNIT.service`, then the undo of E4 and E3, in that order. If E1 recorded the
-  instance as active, `systemctl --user start sparrow-spool@UNIT.service` after the undo of E3 restores it.
+  Undo: `systemctl --user disable --now sparrow-spool@UNIT.service`, then the undo of E4 and E3, in that order. If E1
+  recorded the instance as enabled and active, `systemctl --user enable --now sparrow-spool@UNIT.service` after the undo of
+  E3 restores it.
 
 An earlier revision of the tracked program does not carry the fixes listed in step 0. This section installs the program
 from `fd34bc5` or later, and nothing else from the earlier revision is kept.
@@ -266,6 +268,6 @@ an entry; remove it by a candidate, so that a later change to the file survives.
    Check: `watch list` no longer shows the root.
 6. Step 2: `rmdir HOME/.local/state/sparrow/intake/SOURCE` (only while empty).
 7. Remove the backups: `rm -f HOME/.config/sparrow/ship.toml.pre-swap-SOURCE HOME/.config/sparrow/unit-spool-entry.toml`.
-   Check: `ls HOME/.config/sparrow/ship.toml.pre-*` finds no `pre-swap-SOURCE` file.
+   Check: `test ! -e HOME/.config/sparrow/ship.toml.pre-swap-SOURCE && test ! -e HOME/.config/sparrow/unit-spool-entry.toml`.
 
 Nothing in the way back deletes records, spool files, cursor files or ledgers, and nothing changes the store.
