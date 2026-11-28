@@ -73,8 +73,10 @@ The shipper reads each source from its consume root. A missing root ends the shi
 - Check: `sparrow SOCKET watch list` shows a watch on that root, enabled.
 - Leaves: one more consume root with a running watch.
 - Undo: `sparrow SOCKET watch remove REQUEST_ID WATCH_ID REVISION`, with the watch ID and current revision that
-  `watch list` reports. Then `sparrow SOCKET watch claims --watch WATCH_ID` must list no claim before the undo is
-  reported as done; a claim still held is named in the order, not removed by hand.
+  `watch list` reports. Then `sparrow SOCKET watch claims` (no option; this build
+  accepts only `--since` and `--until`) must show no row whose `watch` is `WATCH_ID` and whose `state` is `pending`
+  before the undo is reported as done. Rows for other watches are not the undo's concern. A pending claim is named in
+  the order, not removed by hand.
 
 ### 4. Install the program and the template (not started)
 
@@ -176,7 +178,9 @@ the shipper's run and once after, each with the default budget.
   `execution_status`, `answer_certainty` and `coverage.catalog_complete` still read `complete`, `exact` and `true`. If the
   reply has `build`, run the same command with `--cursor NEXT_CURSOR` (same source and budget) until it has no `build`
   field. Use the counts from that reply only.
-- Check: the reply exits 0, has no `build` field and has a row for `SOURCE`. The increase in the counts since the
+- Check: the reply exits 0, has no `build` field and has a row for `SOURCE`. A missing row is a failed check, not a
+  zero count: the row exists for a source with a declared watch even when its counts are zero, and a source with no watch
+  and no counted entries has no row. The increase in the counts since the
   before-reading equals the batch the run fed:
   - `complete_artifacts` increases by the `N` in the shipper's `SOURCE: fed N` line.
   - `retained_records` increases by the line total of the files that run fed (`wc -l` on each).
