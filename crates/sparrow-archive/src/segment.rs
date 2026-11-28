@@ -68,7 +68,31 @@ pub struct Segment {
     decoded: Decoded,
 }
 
-fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ArchiveError + '_ {
+/// The store identity the root's `STORE_ID` names, `store:<hex>`, or `None` when the root has
+/// no `STORE_ID`. Any other form refuses the root.
+///
+/// # Errors
+/// A `STORE_ID` that cannot be read, or whose content is not a store identity.
+pub fn store_binding(root: &Path) -> Result<Option<String>, ArchiveError> {
+    let path = root.join("STORE_ID");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(ArchiveError::Io { path, source }),
+    };
+    let id = text.strip_suffix('\n').unwrap_or(&text);
+    match id.strip_prefix("store:") {
+        Some(hex) if !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            Ok(Some(id.to_owned()))
+        }
+        _ => Err(ArchiveError::InvalidStoreId {
+            path,
+            value: id.to_owned(),
+        }),
+    }
+}
+
+pub(crate) fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ArchiveError + '_ {
     move |source| ArchiveError::Io {
         path: path.to_owned(),
         source,

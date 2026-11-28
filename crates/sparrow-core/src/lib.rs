@@ -66,7 +66,7 @@ pub use storage::import::{
     DEFAULT_IMPORT_JOURNALS, IMPORT_CHUNK_BYTES, IMPORT_JOURNALS_OCCUPIED,
     IMPORT_LAYOUT_PAGE_RECORDS, ImportAdmission, ImportLayoutPage, ImportManifest, ImportOperation,
     ImportRecordSpan, ImportStart, MAX_IMPORT_BYTES, MAX_IMPORT_JOURNALS, RAW_RECORD_BYTES,
-    import_journals_occupied, validate_import_journal_limit,
+    import_journals_occupied, valid_payload_id, validate_import_journal_limit,
 };
 pub use storage::ingest_status::{
     IngestDeletion, IngestIndexCounts, IngestReadLimits, IngestSelector, IngestStatus, PartReceipt,

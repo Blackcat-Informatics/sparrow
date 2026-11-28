@@ -751,3 +751,229 @@ fn find_fails_by_name_on_a_damaged_segment_even_when_another_holds_the_payload()
     assert!(output.stdout.is_empty());
     assert!(error.contains(&damaged.display().to_string()), "{error}");
 }
+
+/// Two segments under `root`, one holding only FIRST (the payload the tests look up) and one
+/// holding only SECOND. Returns `(first, second)`. Each segment comes from its own archive run,
+/// so the record of each payload sits in its own file.
+fn two_segments(root: &Path) -> (PathBuf, PathBuf) {
+    let first_dir = tempfile::tempdir().unwrap();
+    let (_, first) = archive(
+        first_dir.path(),
+        ArchivePolicy::default(),
+        &[("req-a", "host-a", "log", FIRST, T1)],
+    );
+    let second_dir = tempfile::tempdir().unwrap();
+    let (_, second) = archive(
+        second_dir.path(),
+        ArchivePolicy::default(),
+        &[("req-b", "host-b", "jsonl", SECOND, T2)],
+    );
+    let segments = root.join("segments");
+    std::fs::create_dir_all(&segments).unwrap();
+    let first_copy = segments.join("a-first.gts");
+    let second_copy = segments.join("b-second.gts");
+    std::fs::copy(&first[0], &first_copy).unwrap();
+    std::fs::copy(&second[0], &second_copy).unwrap();
+    (first_copy, second_copy)
+}
+
+/// A lookup through the index answers exactly as the scan does, names the artifact and file, and
+/// reports absence the same way. The index is built by the binary and read back by `find`.
+#[test]
+fn an_index_built_by_the_binary_answers_like_the_scan() {
+    let archive_dir = tempfile::tempdir().unwrap();
+    let root = archive_dir.path().to_str().unwrap();
+    let (ids, path) = archive_two(archive_dir.path());
+    let payload = purrdf::gts::writer::digest_string(FIRST);
+
+    let built = run(&["index", root]);
+    let text = String::from_utf8(built.stdout).unwrap();
+    assert_eq!(built.status.code(), Some(0), "{text}");
+    assert!(text.contains("\"segments\":1,\"entries\":2"), "{text}");
+    assert!(archive_dir.path().join("payload.index").is_file());
+
+    let found = run(&["find", root, &payload]);
+    let text = String::from_utf8(found.stdout).unwrap();
+    assert_eq!(found.status.code(), Some(0), "{text}");
+    assert!(text.contains("\"lookup\":\"index\""), "{text}");
+    assert!(text.contains("\"decoded\":0"), "{text}");
+    assert!(text.contains("\"found\":true"), "{text}");
+    assert!(
+        text.contains(&format!("\"artifact_id\":\"{}\"", ids[0])),
+        "{text}"
+    );
+    assert!(!text.contains(&ids[1]), "{text}");
+    assert!(
+        text.contains(&format!("\"path\":\"{}\"", path.display())),
+        "{text}"
+    );
+
+    let absent = format!("blake3:{}", "0".repeat(64));
+    let missing = run(&["find", root, &absent]);
+    let text = String::from_utf8(missing.stdout).unwrap();
+    assert_eq!(missing.status.code(), Some(0), "{text}");
+    assert!(text.contains("\"lookup\":\"index\""), "{text}");
+    assert!(text.contains("\"found\":false"), "{text}");
+}
+
+/// Without an index, or with one that does not cover every segment on disk, `find` decodes the
+/// archive and says why the index was not used.
+#[test]
+fn a_missing_or_stale_index_falls_back_to_the_scan_and_says_why() {
+    let archive_dir = tempfile::tempdir().unwrap();
+    let root = archive_dir.path().to_str().unwrap();
+    let (_, path) = archive_two(archive_dir.path());
+    let payload = purrdf::gts::writer::digest_string(FIRST);
+
+    let missing = run(&["find", root, &payload]);
+    let text = String::from_utf8(missing.stdout).unwrap();
+    assert_eq!(missing.status.code(), Some(0), "{text}");
+    assert!(text.contains("\"lookup\":\"scan\""), "{text}");
+    assert!(text.contains("no payload index exists"), "{text}");
+    assert!(text.contains("\"found\":true"), "{text}");
+
+    assert!(run(&["index", root]).status.success());
+    let copy = archive_dir.path().join("segments").join("zz-copy.gts");
+    std::fs::copy(&path, &copy).unwrap();
+    let stale = run(&["find", root, &payload]);
+    let text = String::from_utf8(stale.stdout).unwrap();
+    assert_eq!(stale.status.code(), Some(0), "{text}");
+    assert!(text.contains("\"lookup\":\"scan\""), "{text}");
+    assert!(text.contains("does not cover exactly"), "{text}");
+    assert!(text.contains("\"found\":true"), "{text}");
+}
+
+/// An index built for one store identity is not trusted under another: the lookup scans and
+/// names both identities.
+#[test]
+fn an_index_built_for_another_store_falls_back_to_the_scan() {
+    let archive_dir = tempfile::tempdir().unwrap();
+    let root = archive_dir.path().to_str().unwrap();
+    let _ = archive_two(archive_dir.path());
+    let payload = purrdf::gts::writer::digest_string(FIRST);
+    std::fs::write(archive_dir.path().join("STORE_ID"), "store:aa\n").unwrap();
+    assert!(run(&["index", root]).status.success());
+    std::fs::write(archive_dir.path().join("STORE_ID"), "store:bb\n").unwrap();
+
+    let found = run(&["find", root, &payload]);
+    let text = String::from_utf8(found.stdout).unwrap();
+    assert_eq!(found.status.code(), Some(0), "{text}");
+    assert!(text.contains("\"lookup\":\"scan\""), "{text}");
+    assert!(text.contains("built for store:aa"), "{text}");
+    assert!(text.contains("names store:bb"), "{text}");
+    assert!(text.contains("\"found\":true"), "{text}");
+}
+
+/// A `STORE_ID` that is not a store identity fails `find` by name, as it fails `verify`.
+#[test]
+fn a_malformed_store_id_fails_find_by_name() {
+    let archive_dir = tempfile::tempdir().unwrap();
+    let root = archive_dir.path().to_str().unwrap();
+    let _ = archive_two(archive_dir.path());
+    std::fs::write(archive_dir.path().join("STORE_ID"), "store:zz\n").unwrap();
+    let payload = purrdf::gts::writer::digest_string(FIRST);
+
+    let found = run(&["find", root, &payload]);
+    let stderr = String::from_utf8(found.stderr).unwrap();
+    assert_ne!(found.status.code(), Some(0));
+    assert!(stderr.contains("not a store identity"), "{stderr}");
+    assert!(stderr.contains("STORE_ID"), "{stderr}");
+    assert!(found.stdout.is_empty());
+}
+
+/// With two segments on disk, the index path reports the payload from the segment that names
+/// it and from no other segment.
+#[test]
+fn the_index_names_only_the_segment_that_holds_the_payload() {
+    let archive_dir = tempfile::tempdir().unwrap();
+    let root = archive_dir.path().to_str().unwrap();
+    let _ = two_segments(archive_dir.path());
+    assert!(run(&["index", root]).status.success());
+
+    let found = run(&["find", root, &purrdf::gts::writer::digest_string(SECOND)]);
+    let text = String::from_utf8(found.stdout).unwrap();
+    assert_eq!(found.status.code(), Some(0), "{text}");
+    assert!(text.contains("\"lookup\":\"index\""), "{text}");
+    assert!(text.contains("b-second.gts"), "{text}");
+    assert!(!text.contains("a-first.gts"), "{text}");
+}
+
+/// A damaged index is never trusted: a flipped byte fails its checksum and the lookup scans.
+#[test]
+fn a_damaged_index_falls_back_to_the_scan() {
+    let archive_dir = tempfile::tempdir().unwrap();
+    let root = archive_dir.path().to_str().unwrap();
+    archive_two(archive_dir.path());
+    assert!(run(&["index", root]).status.success());
+    let index = archive_dir.path().join("payload.index");
+    let mut bytes = std::fs::read(&index).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x01;
+    std::fs::write(&index, &bytes).unwrap();
+    let payload = purrdf::gts::writer::digest_string(FIRST);
+
+    let output = run(&["find", root, &payload]);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(text.contains("\"lookup\":\"scan\""), "{text}");
+    assert!(text.contains("payload index is damaged"), "{text}");
+    assert!(text.contains("\"found\":true"), "{text}");
+}
+
+/// A covered segment damaged after indexing fails the lookup by name, both when the segment holds
+/// the payload's own record (the index names it) and when it holds only another record that the
+/// index does not name for this payload. The damage is a byte the decoder rejects, found with the
+/// decoder itself (`verify`), so the test does not rely on a guessed offset. The whole segment is
+/// compared with the index, so the second case is caught as well as the first.
+#[test]
+fn a_covered_segment_damaged_after_indexing_fails_the_lookup_in_a_named_or_unnamed_record() {
+    let payload = purrdf::gts::writer::digest_string(FIRST);
+    for (label, pick) in [("named", 0), ("unnamed", 1)] {
+        let archive_dir = tempfile::tempdir().unwrap();
+        let root = archive_dir.path().to_str().unwrap();
+        let segments = two_segments(archive_dir.path());
+        let target = if pick == 0 { &segments.0 } else { &segments.1 };
+        assert!(run(&["index", root]).status.success());
+
+        let intact = std::fs::read(target).unwrap();
+        let broken_at = (0..intact.len())
+            .find(|&at| {
+                let mut bytes = intact.clone();
+                bytes[at] ^= 0x20;
+                sparrow_archive::verify(&bytes).is_err()
+            })
+            .unwrap_or_else(|| {
+                panic!("{label}: no byte of the segment is rejected by the decoder")
+            });
+        let mut bytes = intact.clone();
+        bytes[broken_at] ^= 0x20;
+        std::fs::write(target, &bytes).unwrap();
+
+        let output = run(&["find", root, &payload]);
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{label}: {error}");
+        assert!(output.stdout.is_empty(), "{label}");
+        assert!(
+            error.contains(&target.display().to_string()),
+            "{label}: {error}"
+        );
+    }
+}
+
+/// The index is written only when every segment decodes: a damaged segment refuses the build
+/// by name and leaves no index behind.
+#[test]
+fn building_the_index_refuses_a_damaged_segment_and_writes_nothing() {
+    let archive_dir = tempfile::tempdir().unwrap();
+    let root = archive_dir.path().to_str().unwrap();
+    let (_, path) = archive_two(archive_dir.path());
+    std::fs::write(&path, b"not a segment").unwrap();
+
+    let output = run(&["index", root]);
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{error}");
+    assert!(output.stdout.is_empty());
+    assert!(error.contains(&path.display().to_string()), "{error}");
+    assert!(!archive_dir.path().join("payload.index").exists());
+    assert!(!archive_dir.path().join("payload.index.tmp").exists());
+}
