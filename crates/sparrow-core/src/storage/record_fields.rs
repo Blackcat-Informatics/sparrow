@@ -134,18 +134,22 @@ pub(super) fn qualify_from_projection<B: AsRef<[u8]>>(
     let values = field(&facts, "values")?
         .as_array()
         .ok_or_else(|| Error::new("STORAGE_FAILURE", "native JSON values missing"))?;
+    // Each constraint scans the occurrences on its own. A record that no occurrence satisfies for one
+    // constraint cannot qualify, so the remaining constraints are not scanned for it. The first scan
+    // reads every occurrence, so it checks identity and parent order before reading each one.
     let mut candidates = vec![BTreeMap::<Option<usize>, usize>::new(); constraints.len()];
-    for (index, fact) in values.iter().enumerate() {
-        coverage.visit(budget)?;
-        if integer(fact, "occurrence")? != index as u64 {
-            return Err(Error::new(
-                "STORAGE_FAILURE",
-                "native occurrence identity differs from retained order",
-            ));
-        }
-        parent(values, index)?;
-        for (ordinal, constraint) in constraints.iter().enumerate() {
+    for (ordinal, constraint) in constraints.iter().enumerate() {
+        for (index, fact) in values.iter().enumerate() {
             coverage.visit(budget)?;
+            if ordinal == 0 {
+                if integer(fact, "occurrence")? != index as u64 {
+                    return Err(Error::new(
+                        "STORAGE_FAILURE",
+                        "native occurrence identity differs from retained order",
+                    ));
+                }
+                parent(values, index)?;
+            }
             if !constraint.predicate.matches(fact)? {
                 continue;
             }
@@ -160,9 +164,9 @@ pub(super) fn qualify_from_projection<B: AsRef<[u8]>>(
             };
             candidates[ordinal].entry(bound).or_insert(index);
         }
-    }
-    if candidates.iter().any(BTreeMap::is_empty) {
-        return Ok(None);
+        if candidates[ordinal].is_empty() {
+            return Ok(None);
+        }
     }
     let mut groups = BTreeMap::<&str, BTreeSet<Option<usize>>>::new();
     for (ordinal, constraint) in constraints.iter().enumerate() {

@@ -17276,6 +17276,23 @@ fn combined_records_report_index_coverage_and_refuse_exhausted_field_work() {
         store.records_query(&scope, &query, 3).unwrap_err().code,
         "RESOURCE_LIMIT"
     );
+    // Each constraint is charged once per occurrence: two constraints over the four occurrences of
+    // the qualifying record cost eight visits, and one fewer refuses.
+    scope.scan_budget = 8;
+    let result = store.records_query(&scope, &query, 3).unwrap();
+    assert_eq!(result["field_visits"].as_str(), Some("8"));
+    scope.scan_budget = 7;
+    assert_eq!(
+        store.records_query(&scope, &query, 3).unwrap_err().code,
+        "RESOURCE_LIMIT"
+    );
+    // A record that no occurrence satisfies for the first constraint is not scanned for the second.
+    query.fields[0].predicate.lexical = Some("2".into());
+    scope.scan_budget = 4;
+    let result = store.records_query(&scope, &query, 3).unwrap();
+    assert!(result["rows"].as_array().unwrap().is_empty());
+    assert_eq!(result["field_visits"].as_str(), Some("4"));
+    query.fields[0].predicate.lexical = Some("1e0".into());
     scope.scan_budget = 10000;
     scope.received_before = 1;
     assert_eq!(

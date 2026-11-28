@@ -204,10 +204,15 @@ check. Remove `CONSTRAINTS.json` afterwards.
 ## Scan budget
 
 `--scan-budget` is the number of field occurrences the store may examine for one page. The command accepts 1 to 100000 and
-the default is 10000. A query over a unit's lines charges about 24 occurrences per eligible record in its window
-(measured with a two-field constraint on a 2,571-record store), so the default covers about 400 records of a window and
-the maximum about 4,000. A refusal is `RESOURCE_LIMIT` and returns no rows, so a window that holds more records than the
-budget covers cannot be read at the default. The count check in step 8 does not use the budget. `--cursor CURSOR`
+the default is 10000. Each constraint charges one occurrence for every occurrence of a record it examines, in the order
+the constraint file lists them, and a record that fails one constraint is not examined for the rest. A spooled journal
+line has 8 occurrences, so the constraint file above, which lists `/source` first, charges 8 occurrences for each
+eligible record and 8 more for each record that matches `/source`. On a measured 2,571-record store where 604 records
+matched `/source`, that came to about 10 per eligible record, so the default covered about 1,000 records of a window.
+A window where most records match `/source` approaches 16 per record, about 600 at the default. A refusal is
+`RESOURCE_LIMIT` and returns no rows, so a window that holds more records than the budget covers cannot be read at the
+default. The records of one shipped file share a receipt time, so no window splits a file. The count check in step 8
+does not use the budget. `--cursor CURSOR`
 continues a page from a previous reply's `next_cursor`; use the same constraints and budget.
 
 ## A unit with an existing spool
