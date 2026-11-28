@@ -37,6 +37,13 @@ pub enum ArchiveError {
         /// The value as given.
         value: String,
     },
+    /// The root's `STORE_ID` file names something other than a store identity.
+    InvalidStoreId {
+        /// The `STORE_ID` file.
+        path: PathBuf,
+        /// Its content, without the trailing newline.
+        value: String,
+    },
 }
 
 impl fmt::Display for ArchiveError {
@@ -53,6 +60,11 @@ impl fmt::Display for ArchiveError {
             Self::InvalidPayloadId { value } => write!(
                 f,
                 "{value:?} is not a payload id: expected blake3: and 64 lower-case hex digits"
+            ),
+            Self::InvalidStoreId { path, value } => write!(
+                f,
+                "{} is not a store identity: {value:?} (expected store: and hex digits)",
+                path.display()
             ),
         }
     }

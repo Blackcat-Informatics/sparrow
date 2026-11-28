@@ -15,18 +15,30 @@ pub struct PayloadMatch {
     pub path: PathBuf,
 }
 
-/// Check that `value` has the payload identity form the archive writes: `blake3:` followed
-/// by exactly 64 lower-case hex digits.
-///
-/// # Errors
-/// [`ArchiveError::InvalidPayloadId`] when `value` has any other form.
-pub fn validate_payload_id(value: &str) -> Result<(), ArchiveError> {
-    if sparrow_core::valid_payload_id(value) {
-        Ok(())
-    } else {
-        Err(ArchiveError::InvalidPayloadId {
-            value: value.to_owned(),
-        })
+/// A canonical payload identity: `blake3:` followed by exactly 64 lower-case hex digits. The
+/// only way to make one is [`PayloadId::parse`], which is the single check the archive uses.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PayloadId(String);
+
+impl PayloadId {
+    /// Parse `value` as a payload identity.
+    ///
+    /// # Errors
+    /// [`ArchiveError::InvalidPayloadId`] when `value` has any other form.
+    pub fn parse(value: &str) -> Result<Self, ArchiveError> {
+        if sparrow_core::valid_payload_id(value) {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(ArchiveError::InvalidPayloadId {
+                value: value.to_owned(),
+            })
+        }
+    }
+
+    /// The identity as `blake3:` followed by 64 lower-case hex digits.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -39,20 +51,18 @@ pub fn validate_payload_id(value: &str) -> Result<(), ArchiveError> {
 /// [`crate::lookup_payload`] falls back to when no usable index exists.
 ///
 /// # Errors
-/// A `payload_id` that is not `blake3:` followed by 64 lower-case hex digits, or a segment
-/// that cannot be read or decoded.
+/// A segment that cannot be read or decoded.
 pub fn find_payload(
     paths: &[PathBuf],
-    payload_id: &str,
+    payload_id: &PayloadId,
 ) -> Result<Vec<PayloadMatch>, ArchiveError> {
-    validate_payload_id(payload_id)?;
     let mut matches = Vec::new();
     for path in paths {
         let segment = Segment::open(path)?;
         for artifact in segment
             .artifacts()
             .iter()
-            .filter(|artifact| artifact.payload_id == payload_id)
+            .filter(|artifact| artifact.payload_id == payload_id.as_str())
         {
             matches.push(PayloadMatch {
                 artifact_id: artifact.id.clone(),

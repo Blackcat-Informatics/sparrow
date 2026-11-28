@@ -407,7 +407,7 @@ walks `DIR` for `*.gts` files (it also skips a directory named `.staging`, which
 format does not write), decodes each in memory through one decoder module, and
 prints one JSON line per segment with its record, artifact and blob counts. `verify`
 also fails any segment the decoder refuses, with `"ok":false` and exit 1. The tool never
-opens a live store and writes nothing.
+opens a live store. Only `index` writes, and only `DIR/payload.index`.
 
 To take one artifact out of the archive with only the NAS directory and the binary:
 `sparrow-archive list DIR` prints one JSON line per segment, whose `entries` array gives
@@ -418,11 +418,11 @@ each artifact's `id`, `source`, `received_at` (Unix milliseconds), `byte_length`
 
 `sparrow-archive index DIR` writes `DIR/payload.index`, the archive payload lookup index, and prints `{"index":"payload.index","segments":N,"entries":M}`. It decodes every segment first; a damaged segment refuses the build, names the file on stderr, exits nonzero and leaves any previous index as it was. The file is written to `payload.index.tmp` and renamed over the old one.
 
-The index is derived data. It is rebuilt from the segments alone, holds nothing a segment lacks, and is never read by expiry, archiving or retention. It is a binary file: the magic `SPAPIDX1`, a little-endian `u32` format version (1), the covered segments (name relative to `DIR`, byte length, digest), the entries sorted by (payload id, artifact id, segment) with each string length-prefixed by a `u32`, and a trailing digest of everything before it. A binary that does not know it ignores the file, since discovery reads `*.gts` files only.
+The index is derived data. It is rebuilt from the segments alone, holds nothing a segment lacks, and is never read by expiry, archiving or retention. It is a binary file: the magic `SPAPIDX1`, a little-endian `u32` format version (1), the root's store identity (`store:<hex>`, or an empty string when the root has no `STORE_ID`), the covered segments (name relative to `DIR`, byte length, digest), the entries sorted by (payload id, artifact id, segment) with each string length-prefixed by a `u32`, and a trailing digest of everything before it. A binary that does not know it ignores the file, since discovery reads `*.gts` files only.
 
-A `find` reads, per call: the directory listing; the index file in full; and every covered segment file in full, hashing it and comparing its length and digest with the index. A segment that matches is answered from the index without decoding it. A segment that differs is decoded in full, and a decode failure fails the lookup naming that segment. The index therefore saves decoding, not reading: the whole-file read is what keeps damage in a record the index does not name from becoming invisible. The index may make a lookup faster; it never makes a damaged segment invisible. The lookup falls back to the full scan, and says why in `reason`, when there is no index, when the index is damaged, truncated or of another version, and when the segments on disk are not exactly the covered set (a segment added or removed since the build).
+A `find` reads, per call: the root's `STORE_ID`; the directory listing; the index file in full; and every covered segment file in full, hashing it and comparing its length and digest with the index. A segment that matches is answered from the index without decoding it. A segment that differs is decoded in full, and a decode failure fails the lookup naming that segment. The index therefore saves decoding, not reading: the whole-file read is what keeps damage in a record the index does not name from becoming invisible. The index may make a lookup faster; it never makes a damaged segment invisible. The lookup falls back to the full scan, and says why in `reason`, when there is no index, when the index is damaged, truncated or of another version, and when the segments on disk are not exactly the covered set (a segment added or removed since the build), and when the root's `STORE_ID` differs from the one the index was built for.
 
-`sparrow-archive find` never writes or repairs the index; rerun `index` after segments are added. The index does not record the root's `STORE_ID`: only `verify` checks segment directories against it, and `find` answers the same with or without the index.
+`sparrow-archive find` never writes or repairs the index; rerun `index` after segments are added. A root whose `STORE_ID` is not a store identity fails `find` by name, as it fails `verify`.
 
 
 `sparrow-archive extract DIR ARTIFACT_ID > file` joins the artifact's records from every

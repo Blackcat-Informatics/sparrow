@@ -843,6 +843,60 @@ fn a_missing_or_stale_index_falls_back_to_the_scan_and_says_why() {
     assert!(text.contains("\"found\":true"), "{text}");
 }
 
+/// An index built for one store identity is not trusted under another: the lookup scans and
+/// names both identities.
+#[test]
+fn an_index_built_for_another_store_falls_back_to_the_scan() {
+    let archive_dir = tempfile::tempdir().unwrap();
+    let root = archive_dir.path().to_str().unwrap();
+    let _ = archive_two(archive_dir.path());
+    let payload = purrdf::gts::writer::digest_string(FIRST);
+    std::fs::write(archive_dir.path().join("STORE_ID"), "store:aa\n").unwrap();
+    assert!(run(&["index", root]).status.success());
+    std::fs::write(archive_dir.path().join("STORE_ID"), "store:bb\n").unwrap();
+
+    let found = run(&["find", root, &payload]);
+    let text = String::from_utf8(found.stdout).unwrap();
+    assert_eq!(found.status.code(), Some(0), "{text}");
+    assert!(text.contains("\"lookup\":\"scan\""), "{text}");
+    assert!(text.contains("built for store:aa"), "{text}");
+    assert!(text.contains("names store:bb"), "{text}");
+    assert!(text.contains("\"found\":true"), "{text}");
+}
+
+/// A `STORE_ID` that is not a store identity fails `find` by name, as it fails `verify`.
+#[test]
+fn a_malformed_store_id_fails_find_by_name() {
+    let archive_dir = tempfile::tempdir().unwrap();
+    let root = archive_dir.path().to_str().unwrap();
+    let _ = archive_two(archive_dir.path());
+    std::fs::write(archive_dir.path().join("STORE_ID"), "store:zz\n").unwrap();
+    let payload = purrdf::gts::writer::digest_string(FIRST);
+
+    let found = run(&["find", root, &payload]);
+    let stderr = String::from_utf8(found.stderr).unwrap();
+    assert_ne!(found.status.code(), Some(0));
+    assert!(stderr.contains("not a store identity"), "{stderr}");
+    assert!(found.stdout.is_empty());
+}
+
+/// With two segments on disk, the index path reports the payload from the segment that names
+/// it and from no other segment.
+#[test]
+fn the_index_names_only_the_segment_that_holds_the_payload() {
+    let archive_dir = tempfile::tempdir().unwrap();
+    let root = archive_dir.path().to_str().unwrap();
+    let _ = two_segments(archive_dir.path());
+    assert!(run(&["index", root]).status.success());
+
+    let found = run(&["find", root, &purrdf::gts::writer::digest_string(SECOND)]);
+    let text = String::from_utf8(found.stdout).unwrap();
+    assert_eq!(found.status.code(), Some(0), "{text}");
+    assert!(text.contains("\"lookup\":\"index\""), "{text}");
+    assert!(text.contains("b-second.gts"), "{text}");
+    assert!(!text.contains("a-first.gts"), "{text}");
+}
+
 /// A damaged index is never trusted: a flipped byte fails its checksum and the lookup scans.
 #[test]
 fn a_damaged_index_falls_back_to_the_scan() {

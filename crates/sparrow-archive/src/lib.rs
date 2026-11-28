@@ -5,7 +5,8 @@
 //!
 //! A segment is one GTS file, read into memory and decoded by one function,
 //! `decode::decode`, the only code that knows the byte format. Nothing here opens a live
-//! store or writes to the archive; [`extract`] returns one artifact's bytes to the caller.
+//! store. The only write is [`build_index`], which writes `DIR/payload.index` and nothing else;
+//! [`extract`] returns one artifact's bytes to the caller.
 
 mod decode;
 mod error;
@@ -17,7 +18,8 @@ mod segment;
 pub use error::ArchiveError;
 pub use extract::extract;
 pub use index::{BuildSummary, INDEX_FILE, Lookup, Method, build_index, lookup_payload};
-pub use payload::{PayloadMatch, find_payload, validate_payload_id};
+pub use payload::{PayloadId, PayloadMatch, find_payload};
+pub use segment::store_binding;
 pub use segment::{ArchivedArtifact, ArchivedRecord, Segment, Summary, list_segments};
 
 /// Decode one segment file and discard the result: `Ok` when it reads as GTS and every

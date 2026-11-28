@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 // SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 
-//! `sparrow-archive list|verify DIR`, `extract DIR ARTIFACT_ID` and `find DIR PAYLOAD_ID`:
-//! offline, read-only. `list` and `verify` print one JSON line per segment on stdout;
-//! `extract` prints one artifact's bytes, and only after they are verified; `find` prints one
-//! JSON line naming the artifacts that hold the payload, and whether any does. `find` reads
-//! every segment under the directory on each call, since the archive has no payload index.
-//! Diagnostics go to stderr, and any failure exits nonzero.
+//! `sparrow-archive list|verify|index DIR`, `extract DIR ARTIFACT_ID` and `find DIR PAYLOAD_ID`.
+//! Every command reads the archive and never opens a live store; the only write is `index`,
+//! which writes `DIR/payload.index`. `list` and `verify` print one JSON line per segment on
+//! stdout; `extract` prints one artifact's bytes, and only after they are verified; `find`
+//! prints one JSON line naming the artifacts that hold the payload, and whether any does. `find`
+//! uses `payload.index` when it is valid and current, and otherwise scans every segment, as the
+//! format document states. Diagnostics go to stderr, and any failure exits nonzero.
 
 use std::io::Write;
 use std::path::Path;
@@ -15,8 +16,8 @@ use std::process::ExitCode;
 use purrdf_lex::json::{self, Value};
 
 use sparrow_archive::{
-    ArchiveError, Method, Segment, Summary, build_index, extract, list_segments, lookup_payload,
-    validate_payload_id,
+    ArchiveError, Method, PayloadId, Segment, Summary, build_index, extract, list_segments,
+    lookup_payload, store_binding,
 };
 
 const USAGE: &str =
@@ -62,24 +63,6 @@ fn emit(line: &str) -> Result<(), ExitCode> {
         let _ = writeln!(std::io::stderr(), "sparrow-archive: stdout: {error}");
         ExitCode::from(2)
     })
-}
-
-/// The store identity a root's `STORE_ID` names, `store:<hex>`, or none when the root has no
-/// `STORE_ID`. A `STORE_ID` of any other form refuses the whole root.
-fn store_binding(root: &Path) -> Result<Option<String>, String> {
-    let path = root.join("STORE_ID");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("{}: {error}", path.display())),
-    };
-    let id = text.strip_suffix('\n').unwrap_or(&text);
-    match id.strip_prefix("store:") {
-        Some(hex) if !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
-            Ok(Some(id.to_owned()))
-        }
-        _ => Err(format!("{}: not a store identity: {id:?}", path.display())),
-    }
 }
 
 /// Why a segment does not belong to the bound store: its directory is not the store's
@@ -215,11 +198,14 @@ fn take(root: &Path, artifact_id: &str) -> ExitCode {
 /// `reason` when the index was not used). An absent payload is a normal answer, not a failure.
 /// A damaged segment fails the call by name, wherever the payload is.
 fn find(root: &Path, payload_id: &str) -> ExitCode {
-    if let Err(error) = validate_payload_id(payload_id) {
-        let _ = writeln!(std::io::stderr(), "sparrow-archive: {error}");
-        return ExitCode::FAILURE;
-    }
-    let lookup = match lookup_payload(root, payload_id) {
+    let payload_id = match PayloadId::parse(payload_id) {
+        Ok(id) => id,
+        Err(error) => {
+            let _ = writeln!(std::io::stderr(), "sparrow-archive: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let lookup = match lookup_payload(root, &payload_id) {
         Ok(lookup) => lookup,
         Err(error) => {
             let _ = writeln!(std::io::stderr(), "sparrow-archive: {error}");
@@ -234,7 +220,7 @@ fn find(root: &Path, payload_id: &str) -> ExitCode {
         ])
     }));
     let mut members = vec![
-        ("payload_id", Value::from(payload_id)),
+        ("payload_id", Value::from(payload_id.as_str())),
         ("found", found.into()),
         ("matches", matches),
     ];

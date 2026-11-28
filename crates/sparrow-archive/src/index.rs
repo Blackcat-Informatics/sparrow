@@ -4,12 +4,13 @@
 //! The payload lookup index, `DIR/payload.index`: derived data rebuilt from the segments alone.
 //!
 //! The index names, for each payload, the artifact and segment that hold it, and the digest and
-//! length of every segment it covers. A lookup uses it only when its coverage equals the set of
-//! segment files on disk. For each covered segment the lookup reads the whole file and compares
-//! its length and digest with the index: a match trusts the index entries for that segment, and
-//! a mismatch decodes the segment in full, so a damaged segment fails the lookup by name exactly
-//! as in the scan. Any other condition (no index, a damaged index, an uncovered or missing
-//! segment) makes the lookup a full scan and says why.
+//! length of every segment it covers. A lookup uses it only when the index is valid, was built
+//! for the root's current store identity, and covers exactly the segment files on disk. For each
+//! covered segment the lookup reads the whole file and compares its length and digest with the
+//! index: a match trusts the index entries for that segment, and a mismatch decodes the segment
+//! in full, so a damaged segment fails the lookup by name exactly as in the scan. Any other
+//! condition (no index, a damaged index, another store, an uncovered or missing segment) makes
+//! the lookup a full scan and says why.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -18,8 +19,8 @@ use std::path::{Path, PathBuf};
 use purrdf::gts::writer::digest_string;
 
 use crate::error::ArchiveError;
-use crate::payload::{PayloadMatch, find_payload, validate_payload_id};
-use crate::segment::{Segment, io, list_segments};
+use crate::payload::{PayloadId, PayloadMatch, find_payload};
+use crate::segment::{Segment, io, list_segments, store_binding};
 
 /// The index file's name, directly under the archive root.
 pub const INDEX_FILE: &str = "payload.index";
@@ -79,6 +80,8 @@ struct Entry {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Index {
+    /// The `STORE_ID` the root named when the index was built, or `None` for an unbound root.
+    store: Option<String>,
     covered: Vec<Covered>,
     entries: Vec<Entry>,
 }
@@ -103,6 +106,7 @@ fn relative_name(root: &Path, path: &Path) -> Result<String, ArchiveError> {
 /// fails. On error the previous index, if any, is left as it was.
 pub fn build_index(root: &Path) -> Result<BuildSummary, ArchiveError> {
     let paths = list_segments(root)?;
+    let store = store_binding(root)?;
     let mut covered = Vec::with_capacity(paths.len());
     let mut entries = Vec::new();
     for path in &paths {
@@ -127,7 +131,11 @@ pub fn build_index(root: &Path) -> Result<BuildSummary, ArchiveError> {
         segments: covered.len(),
         entries: entries.len(),
     };
-    let encoded = encode(&Index { covered, entries });
+    let encoded = encode(&Index {
+        store,
+        covered,
+        entries,
+    });
     let temp = root.join(TEMP_FILE);
     fs::write(&temp, &encoded).map_err(io(&temp))?;
     let target = root.join(INDEX_FILE);
@@ -142,24 +150,36 @@ pub fn build_index(root: &Path) -> Result<BuildSummary, ArchiveError> {
 }
 
 /// Every artifact among the segments under `root` whose payload identity is `payload_id`, using
-/// the index where it is valid and covers the segments on disk. Nothing is written.
+/// the index where it is valid, was built for the root's store identity, and covers the segments
+/// on disk. Nothing is written.
 ///
-/// What is read: the index file in full, and the directory listing. For each covered segment the
+/// What is read: the root's `STORE_ID`, the index file in full, and the directory listing. For each covered segment the
 /// whole file is read and hashed, because damage anywhere in a covered segment must fail the
 /// lookup, including damage in a record the index does not name. The index saves the decoding
 /// of intact segments, not their reads. A segment whose length or digest differs from the index
 /// is decoded in full, and a decode failure fails the lookup naming that segment.
 ///
 /// # Errors
-/// A payload id that is not canonical, a segment that cannot be read, or a segment that fails to
-/// decode when the index does not cover it or disagrees with it.
-pub fn lookup_payload(root: &Path, payload_id: &str) -> Result<Lookup, ArchiveError> {
-    validate_payload_id(payload_id)?;
+/// A `STORE_ID` that cannot be read or is not a store identity, a segment that cannot be read,
+/// or a segment that fails to decode when the index does not cover it or disagrees with it.
+pub fn lookup_payload(root: &Path, payload_id: &PayloadId) -> Result<Lookup, ArchiveError> {
     let paths = list_segments(root)?;
+    let store = store_binding(root)?;
     let index = match read_index(root) {
         Ok(index) => index,
         Err(reason) => return scan(&paths, payload_id, reason),
     };
+    if index.store != store {
+        return scan(
+            &paths,
+            payload_id,
+            format!(
+                "the index was built for {}, and the root now names {}",
+                describe_store(index.store.as_deref()),
+                describe_store(store.as_deref()),
+            ),
+        );
+    }
     let on_disk: BTreeSet<String> = paths
         .iter()
         .map(|path| relative_name(root, path))
@@ -180,10 +200,10 @@ pub fn lookup_payload(root: &Path, payload_id: &str) -> Result<Lookup, ArchiveEr
         if intact {
             let range = index
                 .entries
-                .partition_point(|entry| entry.payload_id.as_str() < payload_id);
+                .partition_point(|entry| entry.payload_id.as_str() < payload_id.as_str());
             for entry in index.entries[range..]
                 .iter()
-                .take_while(|entry| entry.payload_id == payload_id)
+                .take_while(|entry| entry.payload_id == payload_id.as_str())
                 .filter(|entry| entry.segment == cover.name)
             {
                 matches.push(PayloadMatch {
@@ -198,7 +218,7 @@ pub fn lookup_payload(root: &Path, payload_id: &str) -> Result<Lookup, ArchiveEr
                 segment
                     .artifacts()
                     .iter()
-                    .filter(|artifact| artifact.payload_id == payload_id)
+                    .filter(|artifact| artifact.payload_id == payload_id.as_str())
                     .map(|artifact| PayloadMatch {
                         artifact_id: artifact.id.clone(),
                         path: path.clone(),
@@ -213,7 +233,11 @@ pub fn lookup_payload(root: &Path, payload_id: &str) -> Result<Lookup, ArchiveEr
     })
 }
 
-fn scan(paths: &[PathBuf], payload_id: &str, reason: String) -> Result<Lookup, ArchiveError> {
+fn describe_store(store: Option<&str>) -> &str {
+    store.unwrap_or("no STORE_ID")
+}
+
+fn scan(paths: &[PathBuf], payload_id: &PayloadId, reason: String) -> Result<Lookup, ArchiveError> {
     let matches = find_payload(paths, payload_id)?;
     Ok(Lookup {
         matches,
@@ -240,6 +264,7 @@ fn encode(index: &Index) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(MAGIC);
     body.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    put_str(&mut body, index.store.as_deref().unwrap_or(""));
     put_len(&mut body, index.covered.len());
     for cover in &index.covered {
         put_str(&mut body, &cover.name);
@@ -270,6 +295,8 @@ fn decode(bytes: &[u8]) -> Option<Index> {
     if reader.u32()? != FORMAT_VERSION {
         return None;
     }
+    let store = reader.str()?;
+    let store = (!store.is_empty()).then_some(store);
     let covered_count = reader.u32()? as usize;
     let mut covered = Vec::new();
     for _ in 0..covered_count {
@@ -287,13 +314,17 @@ fn decode(bytes: &[u8]) -> Option<Index> {
             artifact_id: reader.str()?,
             segment: reader.str()?,
         };
-        validate_payload_id(&entry.payload_id).ok()?;
+        PayloadId::parse(&entry.payload_id).ok()?;
         entries.push(entry);
     }
     if reader.at != body.len() || !entries.windows(2).all(|pair| pair[0] <= pair[1]) {
         return None;
     }
-    Some(Index { covered, entries })
+    Some(Index {
+        store,
+        covered,
+        entries,
+    })
 }
 
 fn put_len(out: &mut Vec<u8>, len: usize) {

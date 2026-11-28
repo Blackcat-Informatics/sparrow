@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use purrdf::gts::writer::digest_string;
 
+use crate::payload::PayloadId;
 use crate::segment::{ArchivedArtifact, ArchivedRecord};
 
 /// The metadata vocabulary a segment's graphs use (`sparrow-core` writes it; this is its
@@ -201,7 +202,7 @@ fn payload_id(id: &str, value: Option<String>) -> Result<String, String> {
         return Err(format!("{id} has a malformed payload {text:?}"));
     };
     let identity = format!("blake3:{hex}");
-    if sparrow_core::valid_payload_id(&identity) {
+    if PayloadId::parse(&identity).is_ok() {
         Ok(identity)
     } else {
         Err(format!("{id} has a malformed payload {text:?}"))
