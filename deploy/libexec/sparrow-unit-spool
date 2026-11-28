@@ -57,7 +57,7 @@ case $own_lines in
     *) printf 'sparrow-unit-spool: SPARROW_UNIT_SPOOL_OWN_LINES must be drop or keep, not %s\n' "$own_lines" >&2; exit 2 ;;
 esac
 (umask 077 && mkdir -p -- "$dir" "$(dirname -- "$cursor")")
-# A start syncs the parents of the spool directory and the cursor directory, so their entries survive a power loss.
+# A start syncs the parent directories of the spool directory and the cursor file.
 sync -- "$(dirname -- "$dir")" "$(dirname -- "$cursor")"
 
 # A bucket is closed once its file has gone unwritten for this many seconds. A closed bucket is never
