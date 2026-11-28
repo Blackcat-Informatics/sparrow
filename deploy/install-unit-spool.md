@@ -155,25 +155,31 @@ The shipper's timer runs the shipper. A bucket is queued `settle_seconds` (900) 
 
 ### 8. Verify arrival on the store (live read, its own order)
 
-The check reads the store's exact per-source totals. It does not use the query scan budget, so it holds for a batch of
-any size. The store read is a live read of the production daemon, so it has its own order.
+The check reads the store's exact per-source counts. The count does not use the query scan budget, so it holds for a batch
+of any size. The store read is a live read of the production daemon, so it has its own order. Run it twice, once before
+the shipper's run and once after, each with the default budget.
 
 - Runs as: the account that may read the store socket.
-- Needs: step 7 has shown a `SOURCE:` line after a settled bucket, and the totals read before step 6's shipper run.
+- Needs: step 7 has shown a `SOURCE:` line after a settled bucket.
+- Before the after-reading: no file is left in the watch root for `SOURCE` or in its `.sparrow-inflight` directory. The
+  consumer moves a file into `.sparrow-inflight` and removes it after publication, so an empty root alone does not show
+  that the batch was published.
 - Read the store identifier: `sparrow SOCKET status`. Its reply has the `store_id` field, which is `STORE_ID` below.
-- Read the totals:
+- Read the counts:
 
       sparrow SOCKET sources STORE_ID --source SOURCE
 
-  The reply's row for `SOURCE` has `complete_artifacts`, `retained_records` and `retained_payload_bytes`.
-- Check: the reply exits 0, its top-level `answer_certainty` is `exact` and `coverage.catalog_complete` is `true`. The
-  increase since the totals read before the shipper's run equals the batch the run fed:
+  The reply's row for `SOURCE` has `complete_artifacts` and `retained_records`.
+- A reply that is still building is not a count. It has a `build` field, no rows and a `next_cursor`, and its
+  `execution_status`, `answer_certainty` and `coverage.catalog_complete` still read `complete`, `exact` and `true`. If the
+  reply has `build`, run the same command with `--cursor NEXT_CURSOR` (same source and budget) until it has no `build`
+  field. Use the counts from that reply only.
+- Check: the reply exits 0, has no `build` field and has a row for `SOURCE`. The increase in the counts since the
+  before-reading equals the batch the run fed:
   - `complete_artifacts` increases by the `N` in the shipper's `SOURCE: fed N` line.
-  - `retained_payload_bytes` increases by the byte total of the files that run fed (`stat -c %s` on each).
-  - `retained_records` increases by the line total of those files (`wc -l` on each).
-- Measured on the scratch store at main `99bbf53`: the shipper logged `fed 3`. The reply had `complete_artifacts` 3,
-  `retained_records` 2571 and `retained_payload_bytes` 660812, which equal the `wc -l` total (2571) and the `wc -c` total
-  (660812) of the three files.
+  - `retained_records` increases by the line total of the files that run fed (`wc -l` on each).
+- Measured on the scratch store at main `99bbf53`: the shipper logged `fed 3`. The reply had `complete_artifacts` 3 and
+  `retained_records` 2571, which equal the `wc -l` total of the three files (2571).
 - Leaves: nothing.
 
 Optional: a unit's own lines. The constraints form is a JSON array on a path the account owns:
