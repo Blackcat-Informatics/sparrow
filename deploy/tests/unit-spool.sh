@@ -170,9 +170,42 @@ grep -q '"message":"priority is not a number"' "$work/badprio"/unit-spool-*.json
 grep -q '"priority"' "$work/badprio"/unit-spool-*.jsonl && fail "a bad priority was written as a field"
 [[ $(cat -- "$work/badprio.cursor") == 's=fixture;i=1' ]] || fail "the cursor did not move past the kept record"
 
+# A namespace: every journalctl call reads that namespace, the backfill and the follow alike, and the default
+# journal is read without the flag. A namespace holds only the unit's own lines, so it requires OWN_LINES=keep.
+: > "$work/journalctl.args"
+SPARROW_UNIT_SPOOL_OWN_LINES=keep SPARROW_UNIT_SPOOL_NAMESPACE=example-namespace bash "$script" "$unit" "$work/ns" "$work/ns.cursor" 2>/dev/null
+[[ -s $work/journalctl.args ]] || fail "the namespace run called no journalctl"
+while IFS= read -r call; do
+    [[ $call == *"--namespace=example-namespace"* ]] || fail "a journalctl call did not read the namespace: $call"
+done < "$work/journalctl.args"
+: > "$work/journalctl.args"
+SPARROW_UNIT_SPOOL_OWN_LINES=keep SPARROW_UNIT_SPOOL_NAMESPACE=example-namespace SPARROW_UNIT_SPOOL_SINCE='2026-11-27 00:00' \
+    bash "$script" "$unit" "$work/nsbackfill" "$work/nsbackfill.cursor" 2>/dev/null
+[[ $(grep -c -- '--namespace=example-namespace' "$work/journalctl.args") -eq $(wc -l < "$work/journalctl.args") ]] \
+    || fail "a backfill or fallback journalctl call did not read the namespace"
+# The fallback call runs only when the backfill is empty. With an empty journal the program then fails to find a
+# cursor, which is expected; the check is that the fallback call read the namespace.
+: > "$work/empty.jsonl"
+: > "$work/journalctl.args"
+SPARROW_UNIT_SPOOL_OWN_LINES=keep SPARROW_UNIT_SPOOL_NAMESPACE=example-namespace SPARROW_UNIT_SPOOL_SINCE='2026-11-27 00:00' \
+    JOURNAL_FIXTURE=$work/empty.jsonl bash "$script" "$unit" "$work/nsempty" "$work/nsempty.cursor" 2>/dev/null || true
+[[ $(grep -c -- '--lines=1' "$work/journalctl.args") -eq 1 ]] || fail "the empty-backfill fallback call did not run"
+[[ $(grep -c -- '--namespace=example-namespace' "$work/journalctl.args") -eq $(wc -l < "$work/journalctl.args") ]] \
+    || fail "the empty-backfill fallback call did not read the namespace"
+: > "$work/journalctl.args"
+bash "$script" "$unit" "$work/nons" "$work/nons.cursor"
+grep -q -- '--namespace' "$work/journalctl.args" && fail "the default run passed a namespace flag"
+if SPARROW_UNIT_SPOOL_NAMESPACE=example-namespace bash "$script" "$unit" "$work/dropns" "$work/dropns.cursor" 2>/dev/null; then
+    fail "a namespace with OWN_LINES=drop was accepted"
+fi
+[[ ! -e $work/dropns ]] || fail "a refused namespace run created the spool directory"
+
 # Bad settings refuse to start.
 if SPARROW_UNIT_SPOOL_OWN_LINES=maybe bash "$script" "$unit" "$work/x" "$work/x.cursor" 2>/dev/null; then
     fail "an unknown OWN_LINES value was accepted"
+fi
+if SPARROW_UNIT_SPOOL_NAMESPACE='bad name' bash "$script" "$unit" "$work/y" "$work/y.cursor" 2>/dev/null; then
+    fail "a namespace name with a space was accepted"
 fi
 
 printf 'PASS\n'

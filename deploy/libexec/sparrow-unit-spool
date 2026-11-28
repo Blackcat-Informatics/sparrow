@@ -2,17 +2,16 @@
 # SPDX-FileCopyrightText: 2026 Blackcat Informatics® Inc. <paudley@blackcatinformatics.ca>
 # SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 #
-# Follow the DEFAULT journal for the lines about one unit and spool them as JSON Lines in ten-minute
-# files for sparrow-ship.
+# Follow one unit's journal lines and spool them as JSON Lines in ten-minute files for sparrow-ship. The
+# default journal is read unless SPARROW_UNIT_SPOOL_NAMESPACE names a journal namespace.
 #
 # Usage: sparrow-unit-spool UNIT SPOOL_DIR CURSOR_FILE
 #
 # By default the script keeps the lines the service manager writes about the unit ("Stopping ...",
 # "Main process exited", "The kernel OOM killer killed some processes in this unit", "Consumed ... memory
-# peak") and drops the unit's own process lines. A unit that logs to its own journal namespace writes
-# its own lines there, which this program does not read. A unit that logs to the default journal, as a
-# system unit does through stdout and stderr, needs SPARROW_UNIT_SPOOL_OWN_LINES=keep so that its
-# failures are spooled too.
+# peak") and drops the unit's own process lines. A unit that logs to the default journal, as a system unit
+# does through stdout and stderr, needs SPARROW_UNIT_SPOOL_OWN_LINES=keep so that its failures are spooled
+# too. A namespace holds only the unit's own lines, so a namespace requires OWN_LINES=keep.
 #
 # Each unit has:
 #   * its own cursor file, given by the caller and shared with no other forwarder;
@@ -42,6 +41,10 @@
 #                           with --user-unit, for a user unit.
 #   SPARROW_UNIT_SPOOL_OWN_LINES  "drop" (default) omits the unit's own process lines; "keep" spools them
 #                           with "source": "systemd-unit".
+#   SPARROW_UNIT_SPOOL_NAMESPACE  A journal namespace to read, for a unit that logs to one (as a unit started
+#                           with LogNamespace= does). Unset (default) reads the default journal. Its value
+#                           must be a namespace name made of letters, digits, dots, underscores and hyphens,
+#                           and it requires SPARROW_UNIT_SPOOL_OWN_LINES=keep.
 set -euo pipefail
 unit=${1:?unit} dir=${2:?spool dir} cursor=${3:?cursor file}
 scope=${SPARROW_UNIT_SPOOL_SCOPE:-system}
@@ -56,6 +59,18 @@ case $own_lines in
     keep) keep=true ;;
     *) printf 'sparrow-unit-spool: SPARROW_UNIT_SPOOL_OWN_LINES must be drop or keep, not %s\n' "$own_lines" >&2; exit 2 ;;
 esac
+namespace_args=()
+if [[ -n ${SPARROW_UNIT_SPOOL_NAMESPACE:-} ]]; then
+    [[ $SPARROW_UNIT_SPOOL_NAMESPACE =~ ^[A-Za-z0-9._-]+$ ]] || {
+        printf 'sparrow-unit-spool: SPARROW_UNIT_SPOOL_NAMESPACE must be a namespace name, not %s\n' "$SPARROW_UNIT_SPOOL_NAMESPACE" >&2
+        exit 2
+    }
+    [[ $keep == true ]] || {
+        printf 'sparrow-unit-spool: SPARROW_UNIT_SPOOL_NAMESPACE requires SPARROW_UNIT_SPOOL_OWN_LINES=keep, because a namespace holds only the unit'"'"'s own lines\n' >&2
+        exit 2
+    }
+    namespace_args=(--namespace="$SPARROW_UNIT_SPOOL_NAMESPACE")
+fi
 (umask 077 && mkdir -p -- "$dir" "$(dirname -- "$cursor")")
 # A start syncs the parent directories of the spool directory and the cursor file.
 sync -- "$(dirname -- "$dir")" "$(dirname -- "$cursor")"
@@ -169,11 +184,11 @@ spool() {
 # newest entry, when it saw none) and follow from there.
 if [[ ! -e $cursor && -n ${SPARROW_UNIT_SPOOL_SINCE:-} ]]; then
     seen=$(mktemp -- "$cursor.backfill.XXXXXX")
-    journalctl "${select[@]}" --since="$SPARROW_UNIT_SPOOL_SINCE" --output=json --no-pager > "$seen"
+    journalctl "${namespace_args[@]}" "${select[@]}" --since="$SPARROW_UNIT_SPOOL_SINCE" --output=json --no-pager > "$seen"
     spool '' < "$seen"
     last=$(tail -n 1 -- "$seen" | jq -r '.__CURSOR // empty')
     if [[ -z $last ]]; then
-        last=$(journalctl --lines=1 --output=json --no-pager | jq -r '.__CURSOR // empty')
+        last=$(journalctl "${namespace_args[@]}" --lines=1 --output=json --no-pager | jq -r '.__CURSOR // empty')
     fi
     [[ -n $last ]] || { printf 'sparrow-unit-spool: cannot find a journal cursor to start from\n' >&2; exit 1; }
     printf '%s\n' "$last" > "$cursor.tmp"
@@ -187,4 +202,4 @@ if [[ -e $cursor ]]; then
 else
     start=(--lines=all)
 fi
-journalctl "${select[@]}" --output=json --follow --no-pager "${start[@]}" | spool "$cursor"
+journalctl "${namespace_args[@]}" "${select[@]}" --output=json --follow --no-pager "${start[@]}" | spool "$cursor"
