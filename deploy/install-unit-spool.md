@@ -198,6 +198,10 @@ safe:
 - After E4, the source is settled and the instance is still stopped and disabled.
 - After E5, the instance runs with the source already settled.
 
+Undo the steps of this section in reverse order: E5, then E4, then E3, then E2, then the E1 backups. An undo that starts the
+instance (E2's or E5's) runs only after the E3 undo has put the old program back, so the instance never runs the new program
+under the old rule.
+
 E1. Save the current state. Runs as: the account that runs the shipper and the spool. Live: no.
 
     cp -p HOME/.local/libexec/sparrow/sparrow-unit-spool HOME/.local/libexec/sparrow/sparrow-unit-spool.pre-SOURCE
