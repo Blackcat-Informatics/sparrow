@@ -500,13 +500,15 @@ impl Client {
         format: Format,
         file: &mut std::fs::File,
     ) -> Result<ArtifactReceipt, Error> {
-        self.import_open_file_with_progress(request_id, source, format, file, None)
+        self.import_open_file_with_progress(request_id, source, format, file, None, None)
             .await
     }
 
     /// Upload as [`Client::import_open_file`] does, reporting each durable progress raise to
     /// `progress`, so a caller that drops this future at a deadline still knows how far the
-    /// upload got (#280).
+    /// upload got (#280). `payload` is the digest of the file's exact bytes when the caller
+    /// already holds it (see [`parts::ClaimParts::whole_payload`]); when `None`, the digest is
+    /// read on the blocking pool before the upload begins.
     pub async fn import_open_file_with_progress(
         &self,
         request_id: &str,
@@ -514,6 +516,7 @@ impl Client {
         format: Format,
         file: &mut std::fs::File,
         progress: Option<std::sync::Arc<parts::PartsProgress>>,
+        payload: Option<&str>,
     ) -> Result<ArtifactReceipt, Error> {
         self.discovery.require(receipt::Contract::Producer)?;
         imports::upload_or_cancel(
@@ -522,7 +525,7 @@ impl Client {
             request_id,
             source,
             format,
-            &imports::CompletedInput::capture(file)?,
+            &imports::staged_completed(file, payload).await?,
             &mut imports::Checkpoint::reporting(progress, 0),
         )
         .await

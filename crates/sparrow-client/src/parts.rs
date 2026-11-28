@@ -505,9 +505,35 @@ pub struct ClaimParts {
     state: Mutex<Option<(CompletedFileIdentity, Vec<PartState>)>>,
     /// The part whose cancelled or lapsed staging is awaited; its next begin is a begin again.
     waiting: Mutex<Option<u32>>,
+    /// The payload digest of the whole file, kept for a single-artifact retry.
+    whole: Mutex<Option<String>>,
 }
 
 impl ClaimParts {
+    /// The payload digest of the whole completed file, read once for this claim and reused by
+    /// each later attempt. The caller must have validated the file's identity for the attempt,
+    /// so a digest taken earlier still describes the bytes that attempt would upload.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of reading the file, or [`Error::Io`] when the digest task fails.
+    pub async fn whole_payload(&self, file: &File) -> Result<String, Error> {
+        if let Some(payload) = self
+            .whole
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return Ok(payload);
+        }
+        let payload = crate::imports::completed_payload(file).await?;
+        *self
+            .whole
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(payload.clone());
+        Ok(payload)
+    }
+
     fn payload(&self, index: u32, span: &PartSpan) -> Option<String> {
         self.state
             .lock()
@@ -554,6 +580,30 @@ impl ClaimParts {
             false
         }
     }
+}
+
+/// Digest one span of a completed file on the blocking pool. The file descriptor is duplicated
+/// so the reads are positional and do not move the caller's offset.
+async fn span_payload(
+    file: &File,
+    identity: CompletedFileIdentity,
+    start: u64,
+    length: u64,
+) -> Result<String, Error> {
+    let owned = file.try_clone()?;
+    tokio::task::spawn_blocking(move || {
+        let input = PartInput {
+            file: &owned,
+            identity,
+            start,
+            length,
+            payload: None,
+        };
+        let mut buffer = vec![0; crate::IMPORT_CHUNK_BYTES];
+        payload_id(&input, &mut buffer)
+    })
+    .await
+    .map_err(crate::imports::blocking_failure)?
 }
 
 /// One part of a completed file, read positionally, bound to the whole file's identity.
@@ -871,16 +921,8 @@ async fn continue_draft(
     };
     let admitted =
         start.saturating_add(span.length) <= identity.length && admits(file, &span, limits)?;
-    let mut buffer = vec![0; crate::IMPORT_CHUNK_BYTES];
     let payload = if admitted {
-        let input = PartInput {
-            file,
-            identity,
-            start,
-            length: span.length,
-            payload: None,
-        };
-        Some(payload_id(&input, &mut buffer)?)
+        Some(span_payload(file, identity, start, span.length).await?)
     } else {
         None
     };
@@ -973,7 +1015,6 @@ pub async fn upload_parts(
             }
         }
     }
-    let mut buffer = vec![0; crate::IMPORT_CHUNK_BYTES];
     let mut index = 0_u32;
     let mut start = 0_u64;
     let mut listed = Vec::new();
@@ -1004,7 +1045,7 @@ pub async fn upload_parts(
                 };
                 let payload = match parts.payload(index, &span) {
                     Some(payload) => payload,
-                    None => payload_id(&input, &mut buffer)?,
+                    None => span_payload(file, identity, span.start, span.length).await?,
                 };
                 parts.remember(index, span, payload.clone());
                 input.payload = Some(&payload);

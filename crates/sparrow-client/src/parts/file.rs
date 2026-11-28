@@ -46,7 +46,7 @@ pub async fn import_file_or_set(
     path: &Path,
 ) -> Result<FileImport, Error> {
     let file = crate::open_completed_file(path)?;
-    let input = CompletedInput::capture(&file)?;
+    let input = crate::imports::staged_completed(&file, None).await?;
     let expect = Expect::store(&client.discovery().store_id);
     let endpoint = client.endpoint();
     let client = imports::reconnect(endpoint, Some(&expect)).await?;
@@ -274,7 +274,7 @@ async fn publish_file_set(
     input: &CompletedInput<'_>,
     limits: &PartLimits,
 ) -> Result<(ArtifactReceipt, Vec<(PartSpan, String)>), Error> {
-    let CompletedInput { file, identity } = *input;
+    let CompletedInput { file, identity, .. } = *input;
     if !directory.is_absolute()
         || request.is_empty()
         || request.len() > 128

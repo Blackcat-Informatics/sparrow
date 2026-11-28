@@ -54,16 +54,9 @@ async fn import_checked(
     format: wire::Format,
     path: &Path,
 ) -> Result<ArtifactReceipt, Error> {
-    import_open_checked(
-        endpoint,
-        expect,
-        request_id,
-        source,
-        format,
-        &CompletedInput::capture(&open_completed_file(path)?)?,
-        None,
-    )
-    .await
+    let file = open_completed_file(path)?;
+    let input = staged_completed(&file, None).await?;
+    import_open_checked(endpoint, expect, request_id, source, format, &input, None).await
 }
 
 pub(crate) async fn import_open_checked(
@@ -403,7 +396,7 @@ pub async fn import_open_file(
         request_id,
         source,
         format,
-        &CompletedInput::capture(file)?,
+        &staged_completed(file, None).await?,
         &mut checkpoint,
     )
     .await
@@ -428,10 +421,12 @@ pub(crate) trait StagedInput {
     }
 }
 
-/// A completed regular file, bound to the identity observed before upload.
+/// A completed regular file, bound to the identity observed before upload, and its payload
+/// digest when the caller has already computed it.
 pub(crate) struct CompletedInput<'a> {
     pub(crate) file: &'a File,
     pub(crate) identity: CompletedFileIdentity,
+    payload: Option<String>,
 }
 
 impl<'a> CompletedInput<'a> {
@@ -445,6 +440,7 @@ impl<'a> CompletedInput<'a> {
         Ok(Self {
             file,
             identity: CompletedFileIdentity::capture(&metadata),
+            payload: None,
         })
     }
 }
@@ -459,6 +455,47 @@ impl StagedInput for CompletedInput<'_> {
     fn unchanged(&self) -> Result<(), Error> {
         self.identity.require(self.file)
     }
+    fn payload_hint(&self) -> Option<&str> {
+        self.payload.as_deref()
+    }
+}
+
+/// Capture a completed file for upload with its payload digest. The digest is `hint` when the
+/// caller holds one for these exact bytes, otherwise it is read on the blocking pool so the
+/// caller's runtime keeps running while the file is hashed.
+pub(crate) async fn staged_completed<'a>(
+    file: &'a File,
+    hint: Option<&str>,
+) -> Result<CompletedInput<'a>, Error> {
+    let mut input = CompletedInput::capture(file)?;
+    input.payload = Some(match hint {
+        Some(payload) => payload.to_owned(),
+        None => completed_payload(file).await?,
+    });
+    Ok(input)
+}
+
+/// Digest the whole of a completed file on the blocking pool. The file descriptor is
+/// duplicated so the reads are positional and do not move the caller's offset.
+pub(crate) async fn completed_payload(file: &File) -> Result<String, Error> {
+    let owned = file.try_clone()?;
+    let identity = CompletedFileIdentity::capture(&owned.metadata()?);
+    tokio::task::spawn_blocking(move || {
+        let input = CompletedInput {
+            file: &owned,
+            identity,
+            payload: None,
+        };
+        let mut buffer = vec![0; crate::IMPORT_CHUNK_BYTES];
+        payload_id(&input, &mut buffer)
+    })
+    .await
+    .map_err(blocking_failure)?
+}
+
+/// A blocking digest task that could not finish, for example because it panicked.
+pub(crate) fn blocking_failure(error: tokio::task::JoinError) -> Error {
+    Error::Io(std::io::Error::other(error))
 }
 
 /// Caller-owned bytes are immutable for the borrow, so they never change.
@@ -862,5 +899,27 @@ mod tests {
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(b"replaced").unwrap();
         assert!(identity.require(&file).is_err());
+    }
+
+    /// INVARIANT: hashing a completed file does not hold the task that polls its caller. A
+    /// sibling future on the same single-thread runtime runs while the digest is still in
+    /// flight, so a publication deadline or connection keep-alive on that runtime keeps
+    /// running during a large hash. A synchronous digest finishes before the sibling is polled.
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_digest_yields_to_its_runtime_while_hashing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source");
+        std::fs::write(&path, vec![7_u8; 4 * 1024 * 1024]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let finished = std::sync::atomic::AtomicBool::new(false);
+        let digest = async {
+            let payload = super::completed_payload(&file).await;
+            finished.store(true, std::sync::atomic::Ordering::SeqCst);
+            payload
+        };
+        let sibling = async { !finished.load(std::sync::atomic::Ordering::SeqCst) };
+        let (payload, ran_during_digest) = tokio::join!(digest, sibling);
+        assert!(ran_during_digest);
+        assert!(payload.unwrap().starts_with("blake3:"));
     }
 }
