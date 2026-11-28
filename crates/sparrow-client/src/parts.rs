@@ -20,8 +20,9 @@ use crate::{
 use purrdf_lex::json::{self, Object, Value};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// The daemon's chunk unit; a record of `n` bytes costs `ceil(n / CHUNK)` chunks.
 const CHUNK: u64 = crate::IMPORT_CHUNK_BYTES as u64;
@@ -431,6 +432,10 @@ pub struct PartsProgress {
     mark: Mutex<ProgressMark>,
     parts_total: AtomicU32,
     begun_again: AtomicU32,
+    /// Microseconds spent in completed digests of this attempt.
+    digest_micros: AtomicU64,
+    /// Whether a digest of this attempt was running and had not finished.
+    digest_in_flight: AtomicBool,
 }
 
 impl PartsProgress {
@@ -449,6 +454,8 @@ impl PartsProgress {
             .mark
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = ProgressMark::default();
+        self.digest_micros.store(0, Ordering::Relaxed);
+        self.digest_in_flight.store(false, Ordering::Relaxed);
     }
 
     /// Parts known once the last part is planned; zero while the cut has not reached the end.
@@ -461,16 +468,37 @@ impl PartsProgress {
         self.begun_again.load(Ordering::Relaxed)
     }
 
-    /// The part counts that lead a recorded attempt text.
+    /// Run one digest of this attempt, recording its time. A digest dropped at a deadline
+    /// leaves the in-flight flag set, which the attempt text then names.
+    pub async fn timed_digest(
+        &self,
+        digest: impl std::future::Future<Output = Result<String, Error>>,
+    ) -> Result<String, Error> {
+        self.digest_in_flight.store(true, Ordering::Relaxed);
+        let started = Instant::now();
+        let result = digest.await;
+        let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.digest_micros.fetch_add(micros, Ordering::Relaxed);
+        self.digest_in_flight.store(false, Ordering::Relaxed);
+        result
+    }
+
+    /// The part counts and digest timings that lead a recorded attempt text.
     pub fn summary(&self) -> String {
         let total = match self.parts_total() {
             0 => "?".to_owned(),
             total => total.to_string(),
         };
+        let in_flight = if self.digest_in_flight.load(Ordering::Relaxed) {
+            ", digest in flight"
+        } else {
+            ""
+        };
         format!(
-            "parts {} of {total}, {} begun again",
+            "parts {} of {total}, {} begun again, digest {} ms{in_flight}",
             self.mark().parts_done,
-            self.begun_again()
+            self.begun_again(),
+            self.digest_micros.load(Ordering::Relaxed) / 1000,
         )
     }
 
@@ -505,32 +533,36 @@ pub struct ClaimParts {
     state: Mutex<Option<(CompletedFileIdentity, Vec<PartState>)>>,
     /// The part whose cancelled or lapsed staging is awaited; its next begin is a begin again.
     waiting: Mutex<Option<u32>>,
-    /// The payload digest of the whole file, kept for a single-artifact retry.
-    whole: Mutex<Option<String>>,
+    /// The payload digest of the whole file and the identity it was read under, kept for a
+    /// single-artifact retry.
+    whole: Mutex<Option<(CompletedFileIdentity, String)>>,
 }
 
 impl ClaimParts {
-    /// The payload digest of the whole completed file, read once for this claim and reused by
-    /// each later attempt. The caller must have validated the file's identity for the attempt,
-    /// so a digest taken earlier still describes the bytes that attempt would upload.
+    /// The payload digest of the whole completed file, reused by later attempts while the file
+    /// keeps the identity it had when it was read. A file with another identity is read again.
+    /// The entry is stored only after the read completes, so a read dropped at a deadline leaves
+    /// no partial digest behind.
     ///
     /// # Errors
     ///
     /// Returns the error of reading the file, or [`Error::Io`] when the digest task fails.
     pub async fn whole_payload(&self, file: &File) -> Result<String, Error> {
-        if let Some(payload) = self
+        let identity = CompletedFileIdentity::capture(&file.metadata()?);
+        if let Some((_, payload)) = self
             .whole
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .as_ref()
+            .filter(|(known, _)| *known == identity)
         {
-            return Ok(payload);
+            return Ok(payload.clone());
         }
         let payload = crate::imports::completed_payload(file).await?;
         *self
             .whole
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(payload.clone());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((identity, payload.clone()));
         Ok(payload)
     }
 
@@ -909,7 +941,7 @@ async fn continue_draft(
     file: &File,
     identity: CompletedFileIdentity,
     limits: Result<&PartLimits, MissingLimits>,
-    (index, start): (u32, u64),
+    (index, start, progress): (u32, u64, &PartsProgress),
     draft: &PartDraft,
 ) -> Result<(PartSpan, String), Error> {
     let limits = limits.map_err(|missing| missing_pending(index, missing))?;
@@ -922,7 +954,11 @@ async fn continue_draft(
     let admitted =
         start.saturating_add(span.length) <= identity.length && admits(file, &span, limits)?;
     let payload = if admitted {
-        Some(span_payload(file, identity, start, span.length).await?)
+        Some(
+            progress
+                .timed_digest(span_payload(file, identity, start, span.length))
+                .await?,
+        )
     } else {
         None
     };
@@ -1007,7 +1043,7 @@ pub async fn upload_parts(
                         file,
                         identity,
                         limits,
-                        (frontier, frontier_start),
+                        (frontier, frontier_start, progress),
                         draft,
                     )
                     .await?,
@@ -1045,7 +1081,11 @@ pub async fn upload_parts(
                 };
                 let payload = match parts.payload(index, &span) {
                     Some(payload) => payload,
-                    None => span_payload(file, identity, span.start, span.length).await?,
+                    None => {
+                        progress
+                            .timed_digest(span_payload(file, identity, span.start, span.length))
+                            .await?
+                    }
                 };
                 parts.remember(index, span, payload.clone());
                 input.payload = Some(&payload);
@@ -1637,5 +1677,55 @@ mod tests {
         let whole = recorded_spans("consumeset:abc", &recorded, 80).unwrap();
         assert_eq!(whole.len(), 2);
         assert!(whole[1].1.is_none(), "an evicted part is sent again");
+    }
+
+    /// INVARIANT: a claim's whole-file digest is reused only while the file keeps the identity it
+    /// was read under. After the file changes length, the cached digest is not returned, and the
+    /// digest is the one the file's current bytes have.
+    #[tokio::test(flavor = "current_thread")]
+    async fn whole_digest_is_reread_when_the_file_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source");
+        std::fs::write(&path, vec![1_u8; 1024]).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let parts = ClaimParts::default();
+        let first = parts.whole_payload(&file).await.unwrap();
+        std::fs::write(&path, vec![2_u8; 2048]).unwrap();
+        file = std::fs::File::open(&path).unwrap();
+        let second = parts.whole_payload(&file).await.unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            second,
+            crate::imports::completed_payload(&file).await.unwrap()
+        );
+    }
+
+    /// INVARIANT: a digest cut off at the publication deadline is named in the attempt text, so
+    /// an operator can tell a stalled hash from a stalled connection.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_digest_cut_off_at_the_deadline_is_named_in_the_attempt_text() {
+        let progress = PartsProgress::default();
+        let cut = tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            progress.timed_digest(std::future::pending::<Result<String, Error>>()),
+        )
+        .await;
+        assert!(cut.is_err());
+        assert!(progress.summary().ends_with("digest in flight"));
+    }
+
+    /// INVARIANT: a digest cut off at a deadline is named only by the attempt it belongs to. A
+    /// later attempt that stalls outside any digest does not report one in flight.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_later_attempt_does_not_inherit_a_cut_off_digest() {
+        let progress = PartsProgress::default();
+        let cut = tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            progress.timed_digest(std::future::pending::<Result<String, Error>>()),
+        )
+        .await;
+        assert!(cut.is_err());
+        progress.restart();
+        assert!(!progress.summary().contains("in flight"));
     }
 }

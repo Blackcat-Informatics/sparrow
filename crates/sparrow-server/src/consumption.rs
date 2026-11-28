@@ -1085,7 +1085,10 @@ impl ClaimRoot {
     ) -> Result<String, Error> {
         // Hashed once per claim; a retry reuses it, and `validate_claim` has already matched
         // the file to its observation for this attempt.
-        let payload = attempt.parts.whole_payload(&claim.file).await?;
+        let payload = attempt
+            .progress
+            .timed_digest(attempt.parts.whole_payload(&claim.file))
+            .await?;
         let receipt = client
             .import_open_file_with_progress(
                 &claim.journal.request_id,
