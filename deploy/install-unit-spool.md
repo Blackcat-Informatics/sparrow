@@ -6,73 +6,115 @@ SPDX-License-Identifier: MIT OR Apache-2.0 OR MulanPSL-2.0
 # Install a unit spool
 
 This guide installs one spool for the journal lines of one system unit, through the tracked program
-`deploy/libexec/sparrow-unit-spool`, and ships them to the store under their own shipper source. It applies the
-procedure in `docs/deployment.md`, "Spooling one unit's journal lines", to one unit.
+`deploy/libexec/sparrow-unit-spool`, and ships them to the store under their own shipper source. It applies
+"Spooling one unit's journal lines" in `../docs/deployment.md`. A unit that already has a spool is not installed
+by this guide; see "A unit with an existing spool" below.
 
-Placeholders, to be replaced by the host's values, which are recorded with the host and not in this repository:
+Placeholders. Each host records its values in its own host record, outside this repository:
 
 | Placeholder | Meaning |
 | --- | --- |
 | `UNIT` | The system unit's name without `.service`. |
-| `REPO` | The checkout of this repository at the head named in the order. |
+| `REPO` | The checkout of this repository at a head that contains the tracked program at `fd34bc5` or later. |
 | `HOME` | The home directory of the account that runs the spool. |
 | `SOCKET` | The store socket: the `socket_path` of the daemon's server configuration. |
-| `SOURCE` | A shipper source name for this unit, such as `UNIT-spool`. |
+| `SOURCE` | The shipper source name for this unit. Use the name of the existing source when one exists. |
 
-Every step names the account that runs it. Steps 1 to 3 install files and start nothing. Steps 4 and 5 change
-live shipper and spool state, and each needs its own order. Step 6 reads the store and changes nothing.
+Every step names the account that runs it and whether it is live. Steps 0 and 1 read only. Step 2 creates a directory.
+Step 3 changes the running daemon. Steps 5 and 6 change live spool and shipper state. Step 7 reads the store. Each live
+step needs its own order and is run in the order given.
 
-## Before you start
+## Which path applies
 
-- Check the head: `git -C REPO rev-parse --short HEAD` must print the head named in the order.
-- Check the tools on the account's PATH: `jq`, `journalctl`, `sync`, `stat` (GNU coreutils), `date`, `mv`.
-- Check that the account reads the system journal: `journalctl --system --unit=UNIT.service -n 3 --no-pager`
-  prints lines. The account is in the group that may read the journal; `sudo` is not needed.
+- No instance exists: `systemctl --user is-enabled sparrow-spool@UNIT.service` fails, and
+  `HOME/.local/state/sparrow/unit-spool/UNIT.service` does not exist. Run steps 0 to 7.
+- An instance exists, or its spool directory exists: do not run steps 4 to 6 as written. Follow "A unit with an
+  existing spool".
 
 ## Steps
 
-### 0. The unit writes its own lines
+### 0. Preconditions
 
-- Runs as: the account (read only).
-- Needs: nothing.
-- Check: the command in "Before you start" prints at least one line whose process name is not `systemd`.
-- Leaves: nothing.
-- Way back: none needed.
+- Runs as: the account. Read only.
+- Check the head: `git -C REPO merge-base --is-ancestor fd34bc5 HEAD` exits 0. An earlier head lacks the fixes for a
+  non-numeric `PRIORITY`, for the sync of each record before the cursor moves, and for the directory sync of a new
+  bucket. An earlier head is not installed.
+- Check the tools on the account's PATH: `jq`, `journalctl`, `sync`, `stat` (GNU coreutils), `date`, `mv`.
+- Check that the account reads the system journal: `journalctl --system --unit=UNIT.service -n 3 --no-pager` prints
+  lines. The account is in the group that may read the journal; `sudo` is not needed.
+- Undo: none.
 
-### 1. Install the program
+### 1. The unit writes its own lines
+
+- Runs as: the account. Read only.
+- Check: the command in step 0 prints at least one line whose process name is not `systemd`.
+- Undo: none.
+
+### 2. Create the consume root
+
+The shipper reads each source from its consume root. A missing root ends the shipper's run before any source is queued.
+
+- Runs as: the account that runs the shipper. Writes under `HOME`; no privilege.
+- Needs: step 1 passes.
+- Command: `install -d -m 0700 HOME/.local/state/sparrow/intake/SOURCE`
+- Check: `test -d HOME/.local/state/sparrow/intake/SOURCE`
+- Leaves: one empty directory.
+- Undo: `rmdir HOME/.local/state/sparrow/intake/SOURCE` (removes it only while empty).
+
+### 3. Register the consume watch (live)
+
+- Runs as: the account that owns the store socket. Changes the running daemon; the daemon is not restarted.
+- Needs: step 2 passes.
+- Order: its own order. Name the request ID in the order.
+- Command: copy the definition of an existing consume watch, change its source and root to `SOURCE` and
+  `HOME/.local/state/sparrow/intake/SOURCE`, keep the expected revision `0`, then:
+  `sparrow SOCKET watch put REQUEST_ID 0 DEFINITION.toml`
+- Check: `sparrow SOCKET watch list` shows a watch on that root, enabled.
+- Leaves: one more consume root with a running watch.
+- Undo: `sparrow SOCKET watch remove REQUEST_ID WATCH_ID REVISION`, with the watch ID and current revision that
+  `watch list` reports.
+
+### 4. Install the program and the template (not started)
 
 - Runs as: the account. Writes under `HOME`; no privilege.
-- Needs: step 0 passes; the checkout is at the head named in the order.
+- Needs: step 3 passes.
 - Command:
 
       install -D -m 0755 REPO/deploy/libexec/sparrow-unit-spool HOME/.local/libexec/sparrow/sparrow-unit-spool
-
-- Check: `cmp REPO/deploy/libexec/sparrow-unit-spool HOME/.local/libexec/sparrow/sparrow-unit-spool` prints nothing.
-- Leaves: one file. No running process.
-- Way back: `rm -f HOME/.local/libexec/sparrow/sparrow-unit-spool`.
-- Note: the program is not copied over any other spool program in `HOME/.local/libexec/sparrow`. A spool unit that
-  already runs an earlier program keeps running it.
-
-### 2. Install the template user unit
-
-- Runs as: the account. Writes under `HOME`; no privilege.
-- Needs: step 1 passes.
-- Command:
-
       install -D -m 0644 REPO/deploy/systemd/user/sparrow-spool@.service HOME/.config/systemd/user/sparrow-spool@.service
       systemctl --user daemon-reload
 
-- Check: `systemctl --user cat sparrow-spool@UNIT.service` shows `ExecStart=%h/.local/libexec/sparrow/sparrow-unit-spool %i.service %S/sparrow/unit-spool/%i.service %S/sparrow/unit-spool/%i.service.cursor` and `IgnoreSIGPIPE=no`.
-- Leaves: the template file. Installing it starts nothing.
-- Way back: `rm -f HOME/.config/systemd/user/sparrow-spool@.service` then `systemctl --user daemon-reload`.
+- Check: `cmp` of each installed file against its repository file prints nothing.
+- Leaves: two files and a reloaded user manager. No process runs.
+- Undo: `rm -f HOME/.local/libexec/sparrow/sparrow-unit-spool HOME/.config/systemd/user/sparrow-spool@.service`, then
+  `systemctl --user daemon-reload`. Run this undo only while no instance of the template exists.
 
-### 3. Add the shipper source
+### 5. Start the spool instance (live)
 
-- Runs as: the account that runs the shipper's user configuration (`HOME/.config/sparrow/ship.toml`).
-- Needs: steps 1 and 2 pass; the shipper configuration exists.
-- Command: back up the file, then append one source:
+- Runs as: the account, through its user manager.
+- Needs: step 4 passes.
+- Order: its own order.
+- Command: `systemctl --user enable --now sparrow-spool@UNIT.service`
+- Check, after the unit has read its first journal entries:
+  - `systemctl --user is-active sparrow-spool@UNIT.service` prints `active`.
+  - `HOME/.local/state/sparrow/unit-spool/UNIT.service/` exists, and `HOME/.local/state/sparrow/unit-spool/UNIT.service.cursor` exists
+    once the unit has written a line.
+- Leaves: a running user unit, spool files, a cursor file. A first start with no cursor spools the unit's retained journal.
+- Undo: `systemctl --user disable --now sparrow-spool@UNIT.service`. Keep the spool directory and the cursor file; a
+  spool file is removed only after the shipper has taken it and an archive copy is verified. This guide deletes none.
 
-      cp -p HOME/.config/sparrow/ship.toml HOME/.config/sparrow/ship.toml.pre-UNIT-spool
+### 6. Add the shipper source (live)
+
+The shipper reads its configuration on each run, and a bad configuration fails every source, not only this one. The
+change is made on a candidate, validated, and then renamed into place. The live file is never written in place.
+
+- Runs as: the account that runs the shipper.
+- Needs: steps 2 and 5 pass; the spool directory exists.
+- Order: its own order.
+- a. Save the live file:
+  `cp -p HOME/.config/sparrow/ship.toml HOME/.config/sparrow/ship.toml.pre-swap-SOURCE`
+  Check: `cmp` of the two files prints nothing.
+- b. Write the candidate: copy the live file, then append this entry, written to `HOME/.config/sparrow/unit-spool-entry.toml`:
 
       [[source]]
       name = "SOURCE"
@@ -82,83 +124,91 @@ live shipper and spool state, and each needs its own order. Step 6 reads the sto
       format = "jsonl"
       settle_seconds = 900
 
-- Check: `REPO/deploy/tests/spool-settle.sh HOME/.config/sparrow/ship.toml` exits 0. Exit 1 names a source that breaks
-  the settle margin; correct the source before going on. `settle_seconds` 900 is the 600-second quiet period plus the
-  300-second margin.
-- Leaves: the configuration with one added source; the backup file.
-- Way back: `cp -p HOME/.config/sparrow/ship.toml.pre-UNIT-spool HOME/.config/sparrow/ship.toml`. Remove the backup only
-  after the next shipper run has passed with the restored configuration.
+  `cp -p HOME/.config/sparrow/ship.toml HOME/.config/sparrow/ship.toml.candidate` and then
+  `cat HOME/.config/sparrow/unit-spool-entry.toml >> HOME/.config/sparrow/ship.toml.candidate`.
+  Check, all three:
+  - `REPO/deploy/tests/spool-settle.sh HOME/.config/sparrow/ship.toml.candidate` prints PASS.
+  - The installed shipper's loader prints `valid`:
+    `python3 -I -B -c 'import importlib.machinery,importlib.util,sys; l=importlib.machinery.SourceFileLoader("ship",sys.argv[1]); s=importlib.util.spec_from_loader("ship",l); m=importlib.util.module_from_spec(s); l.exec_module(m); m.load_config(sys.argv[2]); print("valid")' HOME/.local/libexec/sparrow/sparrow-ship HOME/.config/sparrow/ship.toml.candidate`
+  - `test -d HOME/.local/state/sparrow/intake/SOURCE` (step 2).
+- c. Rename the candidate into place. The rename is atomic within the directory.
+  `mv -f HOME/.config/sparrow/ship.toml.candidate HOME/.config/sparrow/ship.toml`
+  Check: the loader command of step b, run on `ship.toml`, prints `valid`.
+- Leaves: one source added; the saved copy of the live file.
+- Undo: build a candidate from the live file with the entry removed. The entry must be found exactly once, or the
+  candidate is not written:
 
-### 4. Start the spool instance
+      python3 -I -B -c 'import sys; live=open(sys.argv[1]).read(); entry=open(sys.argv[2]).read(); assert live.count(entry)==1, "entry not found exactly once"; open(sys.argv[3],"w").write(live.replace(entry,""))' HOME/.config/sparrow/ship.toml HOME/.config/sparrow/unit-spool-entry.toml HOME/.config/sparrow/ship.toml.undo
 
-- Runs as: the account, through its user manager.
-- Needs: steps 1 to 3 pass.
-- Command:
+  Validate `ship.toml.undo` with the loader command of step b, then `mv -f HOME/.config/sparrow/ship.toml.undo HOME/.config/sparrow/ship.toml`.
+  This undo changes only the lines the step added; a later change to the file survives. Remove `ship.toml.pre-swap-SOURCE`
+  and `unit-spool-entry.toml` only after the next shipper run has passed.
 
-      systemctl --user enable --now sparrow-spool@UNIT.service
+### 7. Wait for the first arrival (no command)
 
-- Check, after the first journal entries are read:
-  - `systemctl --user is-active sparrow-spool@UNIT.service` prints `active`.
-  - `HOME/.local/state/sparrow/unit-spool/UNIT.service/` holds `unit-spool-*.jsonl` files, and
-    `HOME/.local/state/sparrow/unit-spool/UNIT.service.cursor` exists.
-- Leaves: a running user unit; spool files; the cursor file. A first start with no cursor spools the unit's retained journal.
-- Way back:
+The shipper's timer runs the shipper. A bucket is queued `settle_seconds` (900) after its last write, plus one shipper run.
 
-      systemctl --user disable --now sparrow-spool@UNIT.service
+- Check: `journalctl --user -u sparrow-ship.service` shows a `SOURCE:` line after the bucket has settled. The line
+  `SOURCE: queued 0` alone does not prove that a file arrived.
+- Leaves: nothing.
 
-  Keep the spool directory and the cursor file. A spool file is removed only after the shipper has taken it and an
-  archive copy is verified; this guide does not delete any.
+### 8. Verify arrival on the store (live read, its own order)
 
-### 5. Ship the spool (the shipper's own run)
-
-- Runs as: the account that runs the shipper.
-- Needs: step 4 passes and the first bucket has settled (its last write is 900 seconds old).
-- Leaves: the shipper's queue state. Records reach the intake of the store.
-- Way back: step 4's undo stops the spool. The shipper's queue can be left as it is; the configuration is restored by
-  step 3's undo.
-
-### 6. Verify arrival on the store (read only)
+A store query runs against the production daemon, so it has its own order and a bounded window. Name the window in the
+order before the query runs.
 
 - Runs as: the account that may read the store socket.
-- Needs: step 5 has run at least once after the bucket settled.
-- Write the constraint file (a JSON array, on a path the account owns):
+- Needs: step 7 has shown a `SOURCE:` line after a settled bucket.
+- Write the constraints (a JSON array, on a path the account owns):
 
       [{"path":"/source","decoded":"systemd-unit"},{"path":"/unit","decoded":"UNIT.service"}]
 
-- Query, with the scan budget. Omit `--scan-budget` and the query fails with `RESOURCE_LIMIT`:
+- Query, narrowed by source and a receipt window, with the default scan budget:
 
-      sparrow SOCKET records --where-file CONSTRAINTS.json --scan-budget 100000 --page-size 500
+      sparrow SOCKET records --where-file CONSTRAINTS.json --source SOURCE --received-from START --received-before END --page-size 100
 
-- Check: the reply has `page.total_items` greater than 0 and exits 0. The count is the unit's own lines, not the
-  unit's manager lines.
+  `START` and `END` are RFC 3339 times that the order names. Do not pass `--scan-budget`. If the reply is
+  `RESOURCE_LIMIT`, narrow the window and run the query again; do not raise the budget.
+- Check: the reply has `page.total_items` greater than 0 and exits 0. The count is the unit's own lines, not the unit's
+  manager lines.
 - Leaves: nothing. Remove `CONSTRAINTS.json` afterwards.
-- Way back: none needed; this step reads only.
 
-## Scan budget and large stores
+## Scan budget
 
 `--scan-budget` is the number of occurrences the store may examine for one page. The command accepts 1 to 100000 and
-the default is 10000. A 1,167-record scratch store needed 100000 for the unit query above: with the default budget the
-query fails with `RESOURCE_LIMIT`, and the error returns no partial result. Nothing here measures how the budget grows
-with a larger store, so the ceiling of 100000 may be reached on a larger store.
+the default is 10000. A 1,167-record scratch store needed 100000 for the unit query without a source or window: with the
+default budget that query fails with `RESOURCE_LIMIT`, and the error returns no partial result. Nothing here measures how
+the budget grows with a larger store, so narrowing by source and window comes first. `--cursor CURSOR` continues a page
+from a previous reply's `next_cursor`; use the same constraints and budget.
 
-When the query exceeds the budget, the reader narrows the scope and pages; it does not raise the budget past 100000:
+## A unit with an existing spool
 
-- `--source SOURCE` limits the scan to the shipper source for this unit. Use it first.
-- `--received-from RFC3339` and `--received-before RFC3339` limit the scan to a receipt window.
-- `--limit N` bounds the number of rows returned.
-- `--cursor CURSOR` continues a page from a previous reply's `next_cursor`. Use the same constraints and budget.
+A unit whose spool was installed from an earlier revision of the tracked program keeps its spool files, its cursor
+file and its shipper source. This guide does not replace that spool in place. Follow "Moving an existing spool unit to the
+tracked program" in `../docs/deployment.md`, with these rules:
 
-A reader who needs all of the unit's lines over a long period pages through the window with `--cursor`, one
-receipt window at a time, and records each window's `total_items`. A `RESOURCE_LIMIT` at the narrowest window means
-that window must be split again.
+- `SOURCE` is the name of the existing shipper source. The shipper keeps a ledger for each source name, at
+  `HOME/.local/state/sparrow/ship/SOURCE.ledger`. A new name starts with an empty ledger, so it would ship every file in
+  the directory again.
+- Do not add a second source with the same `dir`. Two sources read the same files, and every file ships twice.
+- The program at the same path and the template are replaced only while the existing instance is stopped, as the move's
+  step 2 orders.
+- The existing instance is stopped before its files are replaced (the move's step 2). Its source is changed to the
+  tracked pattern after the tracked program has started (the move's step 5), once the old files have shipped.
+- A watch on the unit's consume root already exists when the source was installed by an earlier guide. Do not register a
+  second watch. Steps 2 and 3 of this guide do not apply to that case.
+
+An earlier revision of the tracked program does not carry the fixes listed in step 0. The move installs the program from
+`fd34bc5` or later, not from the earlier revision.
 
 ## Way back, in order
 
-Undo steps in reverse order and stop at the first failed check:
+Undo the steps in reverse order and stop at the first failed check:
 
-1. Step 4: `systemctl --user disable --now sparrow-spool@UNIT.service`.
-2. Step 3: restore `HOME/.config/sparrow/ship.toml` from its backup.
-3. Step 2: remove the template and run `systemctl --user daemon-reload`.
-4. Step 1: remove the program.
+1. Step 5: `systemctl --user disable --now sparrow-spool@UNIT.service`.
+2. Step 6: remove the entry by the undo command of step 6.
+3. Step 4: remove the program and template, then `systemctl --user daemon-reload`.
+4. Step 3: `sparrow SOCKET watch remove REQUEST_ID WATCH_ID REVISION`.
+5. Step 2: `rmdir HOME/.local/state/sparrow/intake/SOURCE`.
 
-Nothing in the way back deletes records, spool files or cursor files, and nothing changes the store.
+Nothing in the way back deletes records, spool files, cursor files or ledgers, and nothing changes the store.
