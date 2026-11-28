@@ -102,8 +102,8 @@ fn relative_name(root: &Path, path: &Path) -> Result<String, ArchiveError> {
 /// temporary file and renamed over any previous index.
 ///
 /// # Errors
-/// A segment that cannot be read or decoded, a segment name that is not UTF-8, or a write that
-/// fails. On error the previous index, if any, is left as it was.
+/// A segment that cannot be read or decoded, a segment name that is not UTF-8, a `STORE_ID` that
+/// cannot be read or is not a store identity, or a write that fails. On error the previous index, if any, is left as it was.
 pub fn build_index(root: &Path) -> Result<BuildSummary, ArchiveError> {
     let paths = list_segments(root)?;
     let store = store_binding(root)?;

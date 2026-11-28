@@ -877,6 +877,7 @@ fn a_malformed_store_id_fails_find_by_name() {
     let stderr = String::from_utf8(found.stderr).unwrap();
     assert_ne!(found.status.code(), Some(0));
     assert!(stderr.contains("not a store identity"), "{stderr}");
+    assert!(stderr.contains("STORE_ID"), "{stderr}");
     assert!(found.stdout.is_empty());
 }
 
