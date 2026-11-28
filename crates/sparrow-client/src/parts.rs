@@ -505,32 +505,36 @@ pub struct ClaimParts {
     state: Mutex<Option<(CompletedFileIdentity, Vec<PartState>)>>,
     /// The part whose cancelled or lapsed staging is awaited; its next begin is a begin again.
     waiting: Mutex<Option<u32>>,
-    /// The payload digest of the whole file, kept for a single-artifact retry.
-    whole: Mutex<Option<String>>,
+    /// The payload digest of the whole file and the identity it was read under, kept for a
+    /// single-artifact retry.
+    whole: Mutex<Option<(CompletedFileIdentity, String)>>,
 }
 
 impl ClaimParts {
-    /// The payload digest of the whole completed file, read once for this claim and reused by
-    /// each later attempt. The caller must have validated the file's identity for the attempt,
-    /// so a digest taken earlier still describes the bytes that attempt would upload.
+    /// The payload digest of the whole completed file, reused by later attempts while the file
+    /// keeps the identity it had when it was read. A file with another identity is read again.
+    /// The entry is stored only after the read completes, so a read dropped at a deadline leaves
+    /// no partial digest behind.
     ///
     /// # Errors
     ///
     /// Returns the error of reading the file, or [`Error::Io`] when the digest task fails.
     pub async fn whole_payload(&self, file: &File) -> Result<String, Error> {
-        if let Some(payload) = self
+        let identity = CompletedFileIdentity::capture(&file.metadata()?);
+        if let Some((_, payload)) = self
             .whole
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .as_ref()
+            .filter(|(known, _)| *known == identity)
         {
-            return Ok(payload);
+            return Ok(payload.clone());
         }
         let payload = crate::imports::completed_payload(file).await?;
         *self
             .whole
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(payload.clone());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((identity, payload.clone()));
         Ok(payload)
     }
 
@@ -1637,5 +1641,26 @@ mod tests {
         let whole = recorded_spans("consumeset:abc", &recorded, 80).unwrap();
         assert_eq!(whole.len(), 2);
         assert!(whole[1].1.is_none(), "an evicted part is sent again");
+    }
+
+    /// INVARIANT: a claim's whole-file digest is reused only while the file keeps the identity it
+    /// was read under. After the file changes length, the cached digest is not returned, and the
+    /// digest is the one the file's current bytes have.
+    #[tokio::test(flavor = "current_thread")]
+    async fn whole_digest_is_reread_when_the_file_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source");
+        std::fs::write(&path, vec![1_u8; 1024]).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let parts = ClaimParts::default();
+        let first = parts.whole_payload(&file).await.unwrap();
+        std::fs::write(&path, vec![2_u8; 2048]).unwrap();
+        file = std::fs::File::open(&path).unwrap();
+        let second = parts.whole_payload(&file).await.unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            second,
+            crate::imports::completed_payload(&file).await.unwrap()
+        );
     }
 }
