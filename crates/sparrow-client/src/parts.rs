@@ -454,6 +454,8 @@ impl PartsProgress {
             .mark
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = ProgressMark::default();
+        self.digest_micros.store(0, Ordering::Relaxed);
+        self.digest_in_flight.store(false, Ordering::Relaxed);
     }
 
     /// Parts known once the last part is planned; zero while the cut has not reached the end.
@@ -939,7 +941,7 @@ async fn continue_draft(
     file: &File,
     identity: CompletedFileIdentity,
     limits: Result<&PartLimits, MissingLimits>,
-    (index, start): (u32, u64),
+    (index, start, progress): (u32, u64, &PartsProgress),
     draft: &PartDraft,
 ) -> Result<(PartSpan, String), Error> {
     let limits = limits.map_err(|missing| missing_pending(index, missing))?;
@@ -952,7 +954,11 @@ async fn continue_draft(
     let admitted =
         start.saturating_add(span.length) <= identity.length && admits(file, &span, limits)?;
     let payload = if admitted {
-        Some(span_payload(file, identity, start, span.length).await?)
+        Some(
+            progress
+                .timed_digest(span_payload(file, identity, start, span.length))
+                .await?,
+        )
     } else {
         None
     };
@@ -1037,7 +1043,7 @@ pub async fn upload_parts(
                         file,
                         identity,
                         limits,
-                        (frontier, frontier_start),
+                        (frontier, frontier_start, progress),
                         draft,
                     )
                     .await?,
@@ -1706,5 +1712,20 @@ mod tests {
         .await;
         assert!(cut.is_err());
         assert!(progress.summary().ends_with("digest in flight"));
+    }
+
+    /// INVARIANT: a digest cut off at a deadline is named only by the attempt it belongs to. A
+    /// later attempt that stalls outside any digest does not report one in flight.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_later_attempt_does_not_inherit_a_cut_off_digest() {
+        let progress = PartsProgress::default();
+        let cut = tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            progress.timed_digest(std::future::pending::<Result<String, Error>>()),
+        )
+        .await;
+        assert!(cut.is_err());
+        progress.restart();
+        assert!(!progress.summary().contains("in flight"));
     }
 }
