@@ -20,8 +20,9 @@ use crate::{
 use purrdf_lex::json::{self, Object, Value};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// The daemon's chunk unit; a record of `n` bytes costs `ceil(n / CHUNK)` chunks.
 const CHUNK: u64 = crate::IMPORT_CHUNK_BYTES as u64;
@@ -431,6 +432,10 @@ pub struct PartsProgress {
     mark: Mutex<ProgressMark>,
     parts_total: AtomicU32,
     begun_again: AtomicU32,
+    /// Microseconds spent in completed digests of this attempt.
+    digest_micros: AtomicU64,
+    /// Whether a digest of this attempt was running and had not finished.
+    digest_in_flight: AtomicBool,
 }
 
 impl PartsProgress {
@@ -461,16 +466,37 @@ impl PartsProgress {
         self.begun_again.load(Ordering::Relaxed)
     }
 
-    /// The part counts that lead a recorded attempt text.
+    /// Run one digest of this attempt, recording its time. A digest dropped at a deadline
+    /// leaves the in-flight flag set, which the attempt text then names.
+    pub async fn timed_digest(
+        &self,
+        digest: impl std::future::Future<Output = Result<String, Error>>,
+    ) -> Result<String, Error> {
+        self.digest_in_flight.store(true, Ordering::Relaxed);
+        let started = Instant::now();
+        let result = digest.await;
+        let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.digest_micros.fetch_add(micros, Ordering::Relaxed);
+        self.digest_in_flight.store(false, Ordering::Relaxed);
+        result
+    }
+
+    /// The part counts and digest timings that lead a recorded attempt text.
     pub fn summary(&self) -> String {
         let total = match self.parts_total() {
             0 => "?".to_owned(),
             total => total.to_string(),
         };
+        let in_flight = if self.digest_in_flight.load(Ordering::Relaxed) {
+            ", digest in flight"
+        } else {
+            ""
+        };
         format!(
-            "parts {} of {total}, {} begun again",
+            "parts {} of {total}, {} begun again, digest {} ms{in_flight}",
             self.mark().parts_done,
-            self.begun_again()
+            self.begun_again(),
+            self.digest_micros.load(Ordering::Relaxed) / 1000,
         )
     }
 
@@ -1049,7 +1075,11 @@ pub async fn upload_parts(
                 };
                 let payload = match parts.payload(index, &span) {
                     Some(payload) => payload,
-                    None => span_payload(file, identity, span.start, span.length).await?,
+                    None => {
+                        progress
+                            .timed_digest(span_payload(file, identity, span.start, span.length))
+                            .await?
+                    }
                 };
                 parts.remember(index, span, payload.clone());
                 input.payload = Some(&payload);
@@ -1662,5 +1692,19 @@ mod tests {
             second,
             crate::imports::completed_payload(&file).await.unwrap()
         );
+    }
+
+    /// INVARIANT: a digest cut off at the publication deadline is named in the attempt text, so
+    /// an operator can tell a stalled hash from a stalled connection.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_digest_cut_off_at_the_deadline_is_named_in_the_attempt_text() {
+        let progress = PartsProgress::default();
+        let cut = tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            progress.timed_digest(std::future::pending::<Result<String, Error>>()),
+        )
+        .await;
+        assert!(cut.is_err());
+        assert!(progress.summary().ends_with("digest in flight"));
     }
 }
