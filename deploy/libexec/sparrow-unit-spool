@@ -57,6 +57,8 @@ case $own_lines in
     *) printf 'sparrow-unit-spool: SPARROW_UNIT_SPOOL_OWN_LINES must be drop or keep, not %s\n' "$own_lines" >&2; exit 2 ;;
 esac
 (umask 077 && mkdir -p -- "$dir" "$(dirname -- "$cursor")")
+# The directories this run may have just created are durable only once their parents are synced.
+sync -- "$(dirname -- "$dir")" "$(dirname -- "$cursor")"
 
 # A bucket is closed once its file has gone unwritten for this many seconds. A closed bucket is never
 # appended to again. Every shipper source fed by this spool must settle at least
@@ -116,7 +118,7 @@ route_bucket() {
 # JSON entries on stdin, spooled into SPOOL_DIR. $1 is the cursor file to advance after each record
 # is appended, or empty for the backfill pass, which writes its cursor once it has finished.
 spool() {
-    local LC_ALL=C cursor_out=$1 bucket cur line newest now age file created
+    local LC_ALL=C cursor_out=$1 bucket cur line newest now age file synced_bucket=
     newest=$(newest_bucket "$dir")
     jq -r --unbuffered --arg unit "$unit" --argjson keep "$keep" '
 (._SYSTEMD_UNIT == $unit or ._SYSTEMD_USER_UNIT == $unit) as $own
@@ -146,13 +148,14 @@ spool() {
             bucket=$(route_bucket "$bucket" "$newest" "$age" "$now")
             newest=$bucket
             file=$dir/unit-spool-$bucket.jsonl
-            created=0
-            [[ -e $file ]] || created=1
             printf '%s\n' "$line" >> "$file"
-            # The record and, for a new bucket, its directory entry reach disk before the cursor moves past it.
+            # The record reaches disk before the cursor moves past it. The first record this process writes to a
+            # bucket also syncs the spool directory, so a bucket created by an earlier run that died before its
+            # directory sync is made durable too.
             sync -- "$file"
-            if (( created )); then
+            if [[ $bucket != "$synced_bucket" ]]; then
                 sync -- "$dir"
+                synced_bucket=$bucket
             fi
             if [[ -n $cursor_out ]]; then
                 printf '%s\n' "$cur" > "$cursor_out.tmp"
