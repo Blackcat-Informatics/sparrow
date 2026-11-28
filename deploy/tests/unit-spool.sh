@@ -19,7 +19,23 @@ mkdir -p "$work/bin"
 cat > "$work/bin/journalctl" <<'DOUBLE'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$JOURNAL_ARGS_LOG"
-cat -- "$JOURNAL_FIXTURE"
+# Like journalctl, print only the entries after --after-cursor, not after the fixture's end.
+after=
+for arg in "$@"; do
+    case $arg in --after-cursor=*) after=${arg#--after-cursor=} ;; esac
+done
+if [[ -z $after ]]; then
+    cat -- "$JOURNAL_FIXTURE"
+else
+    seen=0
+    while IFS= read -r line; do
+        if (( seen )); then
+            printf '%s\n' "$line"
+        elif [[ $line == *"\"__CURSOR\":\"$after\""* ]]; then
+            seen=1
+        fi
+    done < "$JOURNAL_FIXTURE"
+fi
 DOUBLE
 chmod +x "$work/bin/journalctl"
 export PATH=$work/bin:$PATH JOURNAL_FIXTURE=$fixtures/journal.jsonl JOURNAL_ARGS_LOG=$work/journalctl.args
@@ -42,6 +58,7 @@ SPARROW_UNIT_SPOOL_OWN_LINES=keep bash "$script" "$unit" "$work/keep" "$work/kee
 second=$(tail -n 1 -- "$work/journalctl.args")
 [[ $second == *"--after-cursor=s=fixture;i=6"* ]] || fail "a resumed run did not ask journalctl for the entries after the cursor"
 [[ $second != *"--lines=all"* ]] || fail "a resumed run read the whole journal"
+cmp -s <(records "$work/keep") "$fixtures/keep.jsonl" || fail "a resumed run spooled the records again"
 
 # A record that names a unit whose name extends ours is not the unit's own line.
 grep -q '"message":"line from a unit whose name extends ours"' "$work/keep/unit-spool-20261127T1310.jsonl" || fail "extended unit name lost"
@@ -144,6 +161,13 @@ cp -- "$behind/unit-spool-20991231T2350.jsonl" "$work/behind-old.before"
 SPARROW_UNIT_SPOOL_NOW=$((base + 601)) SPARROW_UNIT_SPOOL_OWN_LINES=keep bash "$script" "$unit" "$behind" "$work/behind.cursor"
 cmp -s "$behind/unit-spool-20991231T2350.jsonl" "$work/behind-old.before" || fail "a closed bucket was appended to with a clock behind it"
 cmp -s "$behind/unit-spool-21000101T0000.jsonl" "$fixtures/keep.jsonl" || fail "a clock behind the newest bucket did not start the bucket after it"
+
+# A PRIORITY that is not a number keeps its record: the message is spooled and the priority is left out.
+printf '%s\n' '{"__CURSOR":"s=fixture;i=1","__REALTIME_TIMESTAMP":"1795785000000000","MESSAGE":"priority is not a number","PRIORITY":"high","_SYSTEMD_UNIT":"example-sync.service","_COMM":"example-sync"}' > "$work/badprio.jsonl"
+SPARROW_UNIT_SPOOL_OWN_LINES=keep JOURNAL_FIXTURE=$work/badprio.jsonl bash "$script" "$unit" "$work/badprio" "$work/badprio.cursor"
+grep -q '"message":"priority is not a number"' "$work/badprio"/unit-spool-*.jsonl || fail "a record with a bad priority was dropped"
+grep -q '"priority"' "$work/badprio"/unit-spool-*.jsonl && fail "a bad priority was written as a field"
+[[ $(cat -- "$work/badprio.cursor") == 's=fixture;i=1' ]] || fail "the cursor did not move past the kept record"
 
 # Bad settings refuse to start.
 if SPARROW_UNIT_SPOOL_OWN_LINES=maybe bash "$script" "$unit" "$work/x" "$work/x.cursor" 2>/dev/null; then

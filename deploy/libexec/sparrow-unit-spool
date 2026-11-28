@@ -127,7 +127,7 @@ spool() {
 | (.__REALTIME_TIMESTAMP | tonumber) as $us
 | {
     source: (if $own then "systemd-unit" else "systemd-manager" end),
-    priority: ((.PRIORITY // "6") | tonumber),
+    priority: (try ((.PRIORITY // "6") | tonumber) catch null),
     realtime_usec: $us,
     time: ($us / 1000000 | todate),
     unit: $unit,
@@ -146,6 +146,9 @@ spool() {
             bucket=$(route_bucket "$bucket" "$newest" "$age" "$now")
             newest=$bucket
             printf '%s\n' "$line" >> "$dir/unit-spool-$bucket.jsonl"
+            # The record reaches disk before the cursor moves past it. The directory entry of a new bucket
+            # is not synced.
+            sync -- "$dir/unit-spool-$bucket.jsonl"
             if [[ -n $cursor_out ]]; then
                 printf '%s\n' "$cur" > "$cursor_out.tmp"
                 mv -f -- "$cursor_out.tmp" "$cursor_out"
