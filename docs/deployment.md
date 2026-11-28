@@ -587,6 +587,11 @@ entry names a command. A `PRIORITY` that is not a number leaves `priority` out o
 stdout or stderr to the default journal needs. The unit name is exact: a unit whose name extends another's is not
 that unit's line.
 
+`SPARROW_UNIT_SPOOL_NAMESPACE=NAME` reads the named journal namespace instead of the default journal, for a unit
+that logs to its own namespace. The namespace holds only the unit's own lines, so the setting requires
+`SPARROW_UNIT_SPOOL_OWN_LINES=keep`; without it the program refuses to start. Manager lines stay in the default
+journal and are not spooled from a namespace.
+
 The cursor file is written after each record is appended, so it never runs ahead of the spool.
 Across a process crash, a record appended before the cursor write is spooled again on the next run: the spool
 is at-least-once. Each record's bucket file is synced to disk before the cursor moves past the record, so a host
